@@ -52,9 +52,9 @@ in `init/1` or `handle_frame/2` and forwards inbound messages to
 the WebSocket peer. Handlers that don't export this callback have
 unknown messages dropped silently.
 
-A `terminate` callback is intentionally NOT provided — most handlers
-don't need bespoke teardown, and the conn process's drain plus
-listener slot reconciliation cover the lifecycle bookkeeping.
+The optional `terminate/2` callback runs once when the session ends in
+an orderly way, with the reason it ended, for handlers that need to
+release something the session owned.
 
 All callbacks share the same return shape — `{reply, Frames,
 NewState}`, `{ok, NewState}`, `{close, NewState}`, or
@@ -144,6 +144,33 @@ running until the deadline expires; the listener then sends
 """.
 -callback handle_drain(Deadline :: integer(), State :: term()) -> result().
 
--optional_callbacks([init/1, handle_info/2, handle_drain/2]).
+-doc """
+Why a session ended, as `terminate/2` gets it:
 
--export_type([opt/0, result/0]).
+- `normal` — the handler closed it (a `close` return).
+- `remote` — the client sent a close frame.
+- `shutdown` — the handler closed it from `handle_drain/2`, as the
+  listener drains.
+- `{error, Reason}` — the connection or the client failed: `closed`
+  when the socket closed without a close frame, the transport's error,
+  or the close the session sent for a client error (`protocol_error`,
+  `invalid_payload`, or the cap a frame or message went over:
+  `max_frame_size`, `max_message_size`).
+""".
+-type terminate_reason() :: normal | remote | shutdown | {error, term()}.
+
+-doc """
+Optional. Runs once in the session process as the session ends, after
+any final frames (including the close) went out, with the reason it
+ended and the last state. The return value is ignored. Use it to
+release what the session holds that its exit would not.
+
+It is not called when a callback crashes, or when the session is killed
+(the listener's drain deadline passing for a handler without
+`handle_drain/2`).
+""".
+-callback terminate(Reason :: terminate_reason(), State :: term()) -> term().
+
+-optional_callbacks([init/1, handle_info/2, handle_drain/2, terminate/2]).
+
+-export_type([opt/0, result/0, terminate_reason/0]).

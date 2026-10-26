@@ -69,6 +69,9 @@
 %%
 %% ## Optional handler callbacks
 %%
+%% `terminate/2` runs once from `exit_clean/2`, the funnel every orderly
+%% end goes through, with the reason the session ended.
+%%
 %% `init/1` runs once on the awaiting_socket → frame_loop transition,
 %% **before** the first inbound frame; the handler can push priming
 %% frames or refuse the session by returning `{close, _}`. `handle_info/2`
@@ -109,6 +112,7 @@
     has_init :: boolean(),
     has_handle_info :: boolean(),
     has_handle_drain :: boolean(),
+    has_terminate :: boolean(),
     %% permessage-deflate (RFC 7692) state. `pmd_params = undefined`
     %% means the extension was NOT negotiated; the session bypasses
     %% all compression machinery on the hot path.
@@ -369,6 +373,7 @@ init_session(
                 has_init = erlang:function_exported(Mod, init, 1),
                 has_handle_info = erlang:function_exported(Mod, handle_info, 2),
                 has_handle_drain = erlang:function_exported(Mod, handle_drain, 2),
+                has_terminate = erlang:function_exported(Mod, terminate, 2),
                 pmd_params = PmdParams,
                 inflate_z = InflateZ,
                 deflate_z = DeflateZ,
@@ -421,7 +426,7 @@ init_pmd({permessage_deflate, Params, _ResponseValue}) ->
 awaiting_socket(#data{has_init = true, mod = Mod, mod_state = State} = Data) ->
     receive
         socket_ready ->
-            apply_handler_result(Mod:init(State), Data, false, fun enter_frame_loop/2)
+            apply_handler_result(Mod:init(State), Data, false, fun enter_frame_loop/2, normal)
     end;
 awaiting_socket(Data) ->
     receive
@@ -461,9 +466,9 @@ recv_loop(#data{socket = Socket, hibernate_after = HibernateAfter} = Data) ->
         {DataTag, _Sock, Bytes} ->
             process_buffer(append_buffer(Data, Bytes), false);
         {ClosedTag, _Sock} ->
-            exit_clean(Data);
-        {ErrorTag, _Sock, _Reason} ->
-            exit_clean(Data);
+            exit_clean({error, closed}, Data);
+        {ErrorTag, _Sock, Reason} ->
+            exit_clean({error, Reason}, Data);
         {roadrunner_drain, Deadline} ->
             %% Drain broadcast — dispatch to optional handle_drain/2 and
             %% drop. Drain messages never reach handle_info/2 so handlers
@@ -483,18 +488,28 @@ recv_loop(#data{socket = Socket, hibernate_after = HibernateAfter} = Data) ->
         erlang:hibernate(?MODULE, recv_loop, [Data])
     end.
 
-%% Release the permessage-deflate zlib contexts (was `terminate/3`) and
-%% exit normally. All normal termination paths funnel through here; the
+%% Run the handler's optional `terminate/2` with why the session ended,
+%% then release the permessage-deflate zlib contexts and exit normally.
+%% All normal termination paths funnel through here; a handler crash
+%% skips it (no `terminate/2`, as with WebSock servers). The
 %% runtime would reclaim the zlib NIF resources on process exit anyway,
 %% but explicit release reclaims their working buffers immediately rather
 %% than waiting on GC. A crash skips this and relies on that GC. The
 %% conn's monitor sees `{'DOWN', _, _, _, normal}` and wakes from its
 %% hibernated wait to run the connection's close path.
--spec exit_clean(#data{}) -> no_return().
-exit_clean(#data{inflate_z = InflateZ, deflate_z = DeflateZ}) ->
+-spec exit_clean(roadrunner_ws_handler:terminate_reason(), #data{}) -> no_return().
+exit_clean(Reason, #data{inflate_z = InflateZ, deflate_z = DeflateZ} = Data) ->
+    ok = terminate(Reason, Data),
     close_zlib(InflateZ),
     close_zlib(DeflateZ),
     exit(normal).
+
+-spec terminate(roadrunner_ws_handler:terminate_reason(), #data{}) -> ok.
+terminate(Reason, #data{has_terminate = true, mod = Mod, mod_state = State}) ->
+    _ = Mod:terminate(Reason, State),
+    ok;
+terminate(_Reason, #data{has_terminate = false}) ->
+    ok.
 
 -spec close_zlib(zlib:zstream() | undefined) -> ok.
 close_zlib(undefined) -> ok;
@@ -701,7 +716,7 @@ arm_and_recv(#data{socket = Socket} = Data0, Hibernate) ->
     case roadrunner_transport:setopts(Socket, [{active, once}]) of
         ok when Hibernate -> erlang:hibernate(?MODULE, recv_loop, [Data]);
         ok -> recv_loop(Data);
-        {error, _} -> exit_clean(Data)
+        {error, Reason} -> exit_clean({error, Reason}, Data)
     end.
 
 -spec handle_frame(roadrunner_ws:frame(), #data{}, boolean()) -> no_return().
@@ -712,7 +727,7 @@ handle_frame(#{opcode := close, payload := P}, Data, _Hibernate) ->
     %% UTF-8 reason, 1-byte payload). Per §7.4.1 the server then
     %% MUST close with 1002 (protocol error) instead of echoing.
     Reply = close_reply(P),
-    flush_and_exit(queue_frame(Data, close, Reply));
+    flush_and_exit(remote, queue_frame(Data, close, Reply));
 handle_frame(#{opcode := ping, payload := P}, Data, Hibernate) ->
     process_buffer(queue_frame(Data, pong, P), Hibernate);
 handle_frame(#{opcode := pong}, Data, Hibernate) ->
@@ -1090,7 +1105,16 @@ close_message_too_big() ->
 
 -spec close_with(binary(), #data{}) -> no_return().
 close_with(StatusBin, Data) ->
-    flush_and_exit(queue_frame(Data, close, StatusBin)).
+    close_with(error_reason(StatusBin), StatusBin, Data).
+
+-spec close_with(term(), binary(), #data{}) -> no_return().
+close_with(Reason, StatusBin, Data) ->
+    flush_and_exit({error, Reason}, queue_frame(Data, close, StatusBin)).
+
+%% The `terminate/2` reason for a close the session sends on a client error.
+-spec error_reason(binary()) -> protocol_error | invalid_payload.
+error_reason(<<1002:16>>) -> protocol_error;
+error_reason(<<1007:16>>) -> invalid_payload.
 
 %% Close with 1009 because an inbound size cap was exceeded, emitting
 %% `ws_frame_rejected` first so operators can see the
@@ -1100,7 +1124,7 @@ close_with(StatusBin, Data) ->
     no_return().
 close_oversize(Reason, Size, #data{span = Span} = Data) ->
     ok = roadrunner_event:ws_frame_rejected(Span, Reason, Size),
-    close_with(close_message_too_big(), reset_msg(Data)).
+    close_with(Reason, close_message_too_big(), reset_msg(Data)).
 
 %% Build the payload for the close-handshake reply. RFC 6455 §5.5.1
 %% says servers typically echo the received status code back, BUT
@@ -1154,11 +1178,13 @@ is_valid_utf8(Bin) ->
 
 -spec dispatch_data_frame(roadrunner_ws:frame(), #data{}, boolean()) -> no_return().
 dispatch_data_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate) ->
-    apply_handler_result(Mod:handle_frame(Frame, State), Data, Hibernate, fun process_buffer/2).
+    apply_handler_result(
+        Mod:handle_frame(Frame, State), Data, Hibernate, fun process_buffer/2, normal
+    ).
 
 -spec handle_info_msg(term(), #data{}, boolean()) -> no_return().
 handle_info_msg(Msg, #data{has_handle_info = true, mod = Mod, mod_state = State} = Data, Hibernate) ->
-    apply_handler_result(Mod:handle_info(Msg, State), Data, Hibernate, fun arm_and_recv/2);
+    apply_handler_result(Mod:handle_info(Msg, State), Data, Hibernate, fun arm_and_recv/2, normal);
 handle_info_msg(_Msg, #data{has_handle_info = false} = Data, _Hibernate) ->
     arm_and_recv(Data, false).
 
@@ -1168,7 +1194,9 @@ handle_drain_msg(
     #data{has_handle_drain = true, mod = Mod, mod_state = State} = Data,
     Hibernate
 ) ->
-    apply_handler_result(Mod:handle_drain(Deadline, State), Data, Hibernate, fun arm_and_recv/2);
+    apply_handler_result(
+        Mod:handle_drain(Deadline, State), Data, Hibernate, fun arm_and_recv/2, shutdown
+    );
 handle_drain_msg(_Deadline, #data{has_handle_drain = false} = Data, _Hibernate) ->
     arm_and_recv(Data, false).
 
@@ -1176,13 +1204,16 @@ handle_drain_msg(_Deadline, #data{has_handle_drain = false} = Data, _Hibernate) 
 %% non-close return: `fun process_buffer/2` after handle_frame (drain any
 %% more buffered frames), `fun arm_and_recv/2` after handle_info/drain
 %% (re-arm and wait), `fun enter_frame_loop/2` after the optional init/1.
+%% `CloseReason` is what `terminate/2` gets on a `close` return: `shutdown`
+%% from `handle_drain/2`, `normal` otherwise.
 -spec apply_handler_result(
     roadrunner_ws_handler:result(),
     #data{},
     boolean(),
-    fun((#data{}, boolean()) -> no_return())
+    fun((#data{}, boolean()) -> no_return()),
+    normal | shutdown
 ) -> no_return().
-apply_handler_result(Result, Data, Hibernate, Continue) ->
+apply_handler_result(Result, Data, Hibernate, Continue, CloseReason) ->
     case Result of
         {reply, OutFrames, NewState} ->
             Continue((queue_frames(Data, OutFrames))#data{mod_state = NewState}, Hibernate);
@@ -1198,10 +1229,13 @@ apply_handler_result(Result, Data, Hibernate, Continue) ->
                 Data#data{mod_state = NewState},
                 Hibernate orelse lists:member(hibernate, Opts)
             );
-        {close, _NewState} ->
-            flush_and_exit(queue_frame(Data, close, ~""));
-        {close, Code, Reason, _NewState} ->
-            flush_and_exit(queue_frame(Data, close, close_payload(Code, Reason)))
+        {close, NewState} ->
+            flush_and_exit(CloseReason, queue_frame(Data#data{mod_state = NewState}, close, ~""));
+        {close, Code, Reason, NewState} ->
+            flush_and_exit(
+                CloseReason,
+                queue_frame(Data#data{mod_state = NewState}, close, close_payload(Code, Reason))
+            )
     end.
 
 %% Build the wire payload for a handler-driven close. RFC 6455 §5.5.1
@@ -1272,9 +1306,9 @@ flush_out(#data{socket = Socket, out = Out} = Data) ->
 
 %% Flush pending frames (typically ending in a just-queued close) and
 %% end the session.
--spec flush_and_exit(#data{}) -> no_return().
-flush_and_exit(Data) ->
-    exit_clean(flush_out(Data)).
+-spec flush_and_exit(roadrunner_ws_handler:terminate_reason(), #data{}) -> no_return().
+flush_and_exit(Reason, Data) ->
+    exit_clean(Reason, flush_out(Data)).
 
 -spec encode_frames(
     #data{}, roadrunner_event_handler:span(), [{roadrunner_ws:opcode(), iodata()}]

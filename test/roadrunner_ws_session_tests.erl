@@ -2761,3 +2761,96 @@ unmask_slice_offset_test() ->
     Bytes = <<10, 20, 30, 40>>,
     Expected = <<(10 bxor 2), (20 bxor 3), (30 bxor 4), (40 bxor 1)>>,
     ?assertEqual(Expected, roadrunner_ws_session:unmask_slice(Bytes, Mask, 1)).
+
+%% --- terminate/2 ---
+
+terminate_reasons_test_() ->
+    {spawn, [
+        {"handler close is normal, with its last state", fun() ->
+            ?assertEqual(
+                {normal, #{closed_by => frame}},
+                terminated([{recv, frame(text, ~"hi")}], #{close_on_frame => true})
+            )
+        end},
+        {"client close frame is remote", fun() ->
+            ?assertMatch({remote, _}, terminated([{recv, frame(close, <<1000:16>>)}], #{}))
+        end},
+        {"socket closed without a close frame", fun() ->
+            ?assertMatch({{error, closed}, _}, terminated([{error, closed}], #{}))
+        end},
+        {"transport error", fun() ->
+            ?assertMatch({{error, econnreset}, _}, terminated([{error, econnreset}], #{}))
+        end},
+        {"unmasked client frame is a protocol error", fun() ->
+            ?assertMatch(
+                {{error, protocol_error}, _}, terminated([{recv, <<16#81, 2, "hi">>}], #{})
+            )
+        end},
+        {"invalid UTF-8 text is an invalid payload", fun() ->
+            ?assertMatch(
+                {{error, invalid_payload}, _}, terminated([{recv, frame(text, <<255>>)}], #{})
+            )
+        end},
+        {"frame over the cap", fun() ->
+            ?assertMatch(
+                {{error, max_frame_size}, _},
+                terminated([{recv, frame(text, ~"hello")}], #{}, ws_proto_opts(4, 16777216))
+            )
+        end},
+        {"message over the cap", fun() ->
+            ?assertMatch(
+                {{error, max_message_size}, _},
+                terminated([{recv, frame(text, ~"hello")}], #{}, ws_proto_opts(16777216, 4))
+            )
+        end},
+        {"close from handle_drain is shutdown", fun() ->
+            {Pid, Sink} = terminate_session([], #{}, ws_proto_opts()),
+            Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5000},
+            ?assertEqual({shutdown, #{closed_by => drain}}, await_terminated(Sink))
+        end},
+        {"socket gone when re-arming", fun() ->
+            {Pid, Sink} = start_terminate_session([], #{}, ws_proto_opts()),
+            exit(Sink, kill),
+            erlang:demonitor(monitor(process, Sink), [flush]),
+            Pid ! socket_ready,
+            ?assertMatch({{error, _}, _}, await_terminated(Sink))
+        end}
+    ]}.
+
+%% The reason and the state (without the `report` key) `terminate/2` got.
+terminated(Script, State) ->
+    terminated(Script, State, ws_proto_opts()).
+
+terminated(Script, State, ProtoOpts) ->
+    {_Pid, Sink} = terminate_session(Script, State, ProtoOpts),
+    await_terminated(Sink).
+
+terminate_session(Script, State, ProtoOpts) ->
+    {Pid, Sink} = start_terminate_session(Script, State, ProtoOpts),
+    Pid ! socket_ready,
+    {Pid, Sink}.
+
+start_terminate_session(Script, State, ProtoOpts) ->
+    Sink = spawn_active_sink(self(), make_ref(), Script),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_terminate_handler,
+            State#{report => self()},
+            ws_ctx(),
+            none,
+            <<>>,
+            ProtoOpts
+        },
+        []
+    ),
+    {Pid, Sink}.
+
+await_terminated(Sink) ->
+    receive
+        {terminated, Reason, State} ->
+            Sink ! stop,
+            {Reason, maps:without([report, close_on_frame], State)}
+    after 2000 -> error(no_terminate)
+    end.
