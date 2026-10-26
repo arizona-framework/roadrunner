@@ -1,7 +1,7 @@
 -module(roadrunner_resp).
 -moduledoc """
 Convenience builders for the buffered `{Status, Headers, Body}`
-triple — one of the five shapes a roadrunner handler can return.
+triple — one of the shapes a roadrunner handler can return.
 
 Each helper sets `Content-Type` and `Content-Length` so handlers
 don't repeat the boilerplate. The generic `body/3,4` builder backs
@@ -14,7 +14,7 @@ the connection layer's job — these helpers only fill in what the
 handler can know.
 
 These helpers only construct the buffered form
-(`t:buffered_response/0`). Streaming, loop, sendfile, and
+(`t:buffered_response/0`). Streaming, loop, sendfile, respond, and
 WebSocket-upgrade handlers build their own tuple directly; see
 `t:roadrunner_handler:response/0` for the full union.
 """.

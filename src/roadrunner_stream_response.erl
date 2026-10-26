@@ -24,12 +24,12 @@
 %%
 %% No process spawn — runs in the conn process.
 
--export([run/4]).
+-export([run/4, start/3]).
 %% Shared with `roadrunner_loop_response`'s push.
 -export([chunk_or_empty/1]).
 
 %% Process-dict flag: set once `Send` writes a fin variant. The conn runs
-%% one stream response at a time, and `run/4` clears it first.
+%% one stream response at a time, and `start/3` clears it first.
 -define(FIN_KEY, '$roadrunner_stream_fin').
 
 -doc """
@@ -46,13 +46,25 @@ decision).
     roadrunner_handler:stream_fun()
 ) -> ok | {error, term()}.
 run(Socket, Status, UserHeaders, Fun) ->
+    {_, Send} = start(Socket, Status, UserHeaders),
+    _ = Fun(Send),
+    _ = erase(?FIN_KEY) =:= true orelse roadrunner_transport:send(Socket, ~"0\r\n\r\n"),
+    ok.
+
+%% Send the chunked-response head and return the head write's result with
+%% the `Send/2` that writes the body: `run/4`'s first half, for a
+%% `roadrunner_respond:stream/3` call, whose fun goes on after it.
+-doc false.
+-spec start(roadrunner_transport:socket(), roadrunner_http:status(), roadrunner_http:headers()) ->
+    {ok | {error, term()}, roadrunner_handler:send_fun()}.
+start(Socket, Status, UserHeaders) ->
     %% A stream response always closes the connection (the conn loop force-
     %% closes once this returns), so advertise it on the wire per RFC 9112
     %% §9.6 — without it a fronting proxy treats the connection as reusable
     %% and can race a request onto a socket we are about to drop.
     Headers = [{~"transfer-encoding", ~"chunked"}, {~"connection", ~"close"} | UserHeaders],
     Head = roadrunner_http1:response(Status, Headers, ~""),
-    _ = roadrunner_event:response_send(
+    Result = roadrunner_event:response_send(
         roadrunner_transport:send(Socket, Head), stream_response_head
     ),
     _ = erase(?FIN_KEY),
@@ -63,9 +75,7 @@ run(Socket, Status, UserHeaders, Fun) ->
             _ = put(?FIN_KEY, true),
             roadrunner_transport:send(Socket, stream_frame(Data, FinFlag))
     end,
-    _ = Fun(Send),
-    _ = erase(?FIN_KEY) =:= true orelse roadrunner_transport:send(Socket, ~"0\r\n\r\n"),
-    ok.
+    {Result, Send}.
 
 %% Build the wire frame for one chunked-stream emission.
 %%

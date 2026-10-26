@@ -112,7 +112,11 @@ care which protocol delivered the bytes.
     %% `merge_private/2`, `delete_private/2`, `update_private/4`. Absent
     %% until first written; the accessors default it to `#{}`. Distinct
     %% from `state` (the user's per-route config) — see `private/1`.
-    private => private()
+    private => private(),
+    %% How a `{respond, Headers, Fun}` response's fun reaches its
+    %% connection, set only on the request that fun gets. Read by
+    %% `roadrunner_respond`.
+    respond => roadrunner_respond_writer:responder()
 }.
 
 -type headers() :: roadrunner_http:headers().

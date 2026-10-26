@@ -30,7 +30,7 @@
 %% `{fin, _}` we auto-close the stream with an empty `END_STREAM`
 %% DATA frame so the peer doesn't see a half-open stream.
 
--export([run/5]).
+-export([run/5, start/4]).
 
 %% Process-dict flag: set once Send observed a fin variant. Lives
 %% in the WORKER's process dict (not the conn's), so isolation
@@ -52,15 +52,25 @@ conn (which owns HPACK encoder state and serialises wire writes).
     roadrunner_handler:stream_fun()
 ) -> ok.
 run(ConnPid, StreamId, Status, Headers, Fun) ->
+    Send = start(ConnPid, StreamId, Status, Headers),
+    _ = Fun(Send),
+    erase(?FIN_KEY) =:= true orelse do_send(ConnPid, StreamId, <<>>, fin),
+    ok.
+
+%% Send the response HEADERS and return the `Send/2` that writes the body:
+%% `run/5`'s first half, for a `roadrunner_respond:stream/3` call, whose fun
+%% goes on after it (`roadrunner_respond_writer` ends the stream when the
+%% fun leaves it open).
+-doc false.
+-spec start(pid(), pos_integer(), roadrunner_http:status(), roadrunner_http:headers()) ->
+    roadrunner_handler:send_fun().
+start(ConnPid, StreamId, Status, Headers) ->
     %% Every frame below waits on the conn's ack: monitor it so a dead conn
     %% wakes the worker instead of leaving it blocked.
     _ = roadrunner_http2_worker_sync:monitor_conn(ConnPid),
     ok = roadrunner_http2_worker_sync:send_headers(ConnPid, StreamId, Status, Headers, false),
     erase(?FIN_KEY),
-    Send = fun(Data, FinFlag) -> do_send(ConnPid, StreamId, Data, FinFlag) end,
-    _ = Fun(Send),
-    erase(?FIN_KEY) =:= true orelse do_send(ConnPid, StreamId, <<>>, fin),
-    ok.
+    fun(Data, FinFlag) -> do_send(ConnPid, StreamId, Data, FinFlag) end.
 
 do_send(ConnPid, StreamId, Data, nofin) ->
     %% Ship as iodata. The conn fast-paths single-frame sends

@@ -39,7 +39,7 @@ accessors that operate on it.
 -export([http_date_now/0, format_http_date/1, with_date/1, auto_headers/2]).
 -export([with_defaults/2, drop_unset/1]).
 -export([header_list_size/1, fits_header_list_size/2]).
--export([check_header_safe/2, is_header_safe/1]).
+-export([check_header_safe/2, is_header_safe/1, unsafe_header/1]).
 -export([strip_connection_specific_fields/1, strip_connection_specific_fields_safe/1]).
 -export([
     request_pseudo_headers/1,
@@ -215,6 +215,24 @@ check_header_safe(Bin, Kind) ->
     case is_header_safe(Bin) of
         true -> ok;
         false -> error({header_injection, Kind, Bin})
+    end.
+
+%% The kind of the first field with CR, LF or NUL in it, or `none`: the
+%% check a response path that answers 500 for an unsafe header, instead
+%% of crashing on it, runs before anything is sent.
+-doc false.
+-spec unsafe_header(headers()) -> none | name | value.
+unsafe_header([]) ->
+    none;
+unsafe_header([{Name, Value} | Rest]) ->
+    case is_header_safe(Name) of
+        true ->
+            case is_header_safe(Value) of
+                true -> unsafe_header(Rest);
+                false -> value
+            end;
+        false ->
+            name
     end.
 
 %% `true` when `Bin` holds no CR, LF or NUL. SWAR, 7 bytes per step (see

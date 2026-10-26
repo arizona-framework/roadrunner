@@ -224,6 +224,10 @@ add_actual_headers({loop, Status, Headers, LoopState}, State, Origin) when
     is_integer(Status), Status >= 100, Status =< 599
 ->
     {loop, Status, actual_headers(Headers, State, Origin), LoopState};
+add_actual_headers({respond, Headers, Fun}, State, Origin) when
+    is_list(Headers), is_function(Fun, 1)
+->
+    {respond, actual_headers(Headers, State, Origin), Fun};
 add_actual_headers(Other, _State, _Origin) ->
     Other.
 

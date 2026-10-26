@@ -47,6 +47,11 @@ threading `Req` through the entire request lifecycle.
   `sec-websocket-accept`, `sec-websocket-extensions`) win: an entry
   naming one of them is dropped, as is a `content-length` or
   `transfer-encoding`, which a 1xx response must not carry.
+- `{respond, Headers, Fun}` — the handler sends the response itself, as
+  it runs. The connection calls `Fun(Req)`, which sends it with
+  `roadrunner_respond` (interim 1xx responses, then a complete, streamed
+  or file response) and returns the request. `Headers` are added to the
+  final response; middlewares add theirs there. See `roadrunner_respond`.
 
 If the handler did not call `roadrunner_req:read_body/1,2`, just thread
 the original `Req` back. Idiomatic shape:
@@ -148,7 +153,8 @@ it come after the status is sent, so the stream is reset instead.
     | {loop, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), State :: term()}
     | {sendfile, StatusCode :: roadrunner_http:status(), roadrunner_http:headers(), sendfile_spec()}
     | {websocket, Module :: module(), State :: term()}
-    | {websocket, Module :: module(), State :: term(), roadrunner_http:headers()}.
+    | {websocket, Module :: module(), State :: term(), roadrunner_http:headers()}
+    | {respond, roadrunner_http:headers(), roadrunner_respond:respond_fun()}.
 
 -doc """
 What `handle/1` returns: a pair of the handler's `t:response/0` and
@@ -162,7 +168,7 @@ middlewares observe / rewrite.
 Invoked once per parsed request. Receives the request map and
 returns a `{Response, Req2}` pair where `Response` is one of the
 shapes listed in the moduledoc (buffered, stream, sendfile, loop,
-websocket) and `Req2` is the (possibly mutated) request map threaded
+websocket, respond) and `Req2` is the (possibly mutated) request map threaded
 back to the framework. Always return `Req2` so the conn can drain
 unread bodies in manual-buffering mode and response middlewares can
 observe / rewrite.

@@ -69,7 +69,7 @@
 -export([start/5]).
 -export([init/5]).
 %% `roadrunner_stream_worker` callbacks.
--export([send_buffered/5, emit_handler_response/4]).
+-export([send_buffered/5, emit_handler_response/4, send_interim/4, start_stream/5]).
 %% For the conn, which builds the section it sends with it.
 -export([field_section/3]).
 %% For the trailers `roadrunner_http2_stream_response` sends.
@@ -180,25 +180,79 @@ emit_handler_response(ConnPid, StreamId, Handler, Response) ->
                 Size when Size =< Limit ->
                     emit(ConnPid, StreamId, Handler, Response);
                 Size ->
-                    %% RFC 9113 §6.5.2: the client will likely refuse a
-                    %% header section over its SETTINGS_MAX_HEADER_LIST_SIZE.
-                    %% Nothing is sent yet, so answer 500, as for an unsafe
-                    %% header, and report it; only the sizes are logged,
-                    %% never the fields.
-                    logger:error(#{
-                        msg => "roadrunner h2 response headers exceed the client's limit",
-                        handler => Handler,
-                        size => Size,
-                        limit => Limit
-                    }),
-                    ok = send_buffered(
-                        ConnPid,
-                        StreamId,
-                        500,
-                        [{~"content-type", ~"text/plain"}],
-                        ~"Internal Server Error"
-                    ),
-                    500
+                    over_peer_limit(ConnPid, StreamId, Handler, Size, Limit)
+            end
+    end.
+
+%% RFC 9113 §6.5.2: the client will likely refuse a header section over its
+%% SETTINGS_MAX_HEADER_LIST_SIZE. Nothing is sent yet, so answer 500, as for
+%% an unsafe header, and report it; only the sizes are logged, never the
+%% fields.
+-spec over_peer_limit(pid(), pos_integer(), module(), non_neg_integer(), non_neg_integer()) ->
+    500.
+over_peer_limit(ConnPid, StreamId, Handler, Size, Limit) ->
+    logger:error(#{
+        msg => "roadrunner h2 response headers exceed the client's limit",
+        handler => Handler,
+        size => Size,
+        limit => Limit
+    }),
+    ok = send_buffered(
+        ConnPid, StreamId, 500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"
+    ),
+    500.
+
+%% An interim 1xx for `roadrunner_respond:inform/3`: a HEADERS frame without
+%% END_STREAM, the final response's HEADERS to follow (RFC 9113 §8.1). Not
+%% sent when over the client's header limit.
+-doc false.
+-spec send_interim(pid(), pos_integer(), roadrunner_http:status(), roadrunner_http:headers()) ->
+    ok | {error, header_list_too_large}.
+send_interim(ConnPid, StreamId, Status, Headers) ->
+    case peer_overflow(Status, Headers) of
+        none ->
+            _ = roadrunner_http2_worker_sync:monitor_conn(ConnPid),
+            roadrunner_http2_worker_sync:send_headers(ConnPid, StreamId, Status, Headers, false);
+        {_Size, _Limit} ->
+            {error, header_list_too_large}
+    end.
+
+%% The head of a `roadrunner_respond:stream/3` response, with the status
+%% sent: answered 500 instead when over the client's header limit.
+-doc false.
+-spec start_stream(
+    pid(), pos_integer(), module(), roadrunner_http:status(), roadrunner_http:headers()
+) ->
+    {
+        {ok, roadrunner_handler:send_fun()} | {error, header_list_too_large},
+        roadrunner_http:status()
+    }.
+start_stream(ConnPid, StreamId, Handler, Status, Headers) ->
+    case peer_overflow(Status, Headers) of
+        none ->
+            {
+                {ok, roadrunner_http2_stream_response:start(ConnPid, StreamId, Status, Headers)},
+                Status
+            };
+        {Size, Limit} ->
+            {
+                {error, header_list_too_large},
+                over_peer_limit(ConnPid, StreamId, Handler, Size, Limit)
+            }
+    end.
+
+%% The size of the response's header section and the client's limit when
+%% it is over it, `none` otherwise.
+-spec peer_overflow(roadrunner_http:status(), roadrunner_http:headers()) ->
+    none | {non_neg_integer(), non_neg_integer()}.
+peer_overflow(Status, Headers) ->
+    case get(?PEER_LIMIT_KEY) of
+        undefined ->
+            none;
+        {Limit, AltSvc} ->
+            case roadrunner_http:header_list_size(field_section(Status, Headers, AltSvc)) of
+                Size when Size =< Limit -> none;
+                Size -> {Size, Limit}
             end
     end.
 

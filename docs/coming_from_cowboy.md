@@ -22,6 +22,7 @@ response as a value, and Roadrunner sends it.
 | `cowboy_handler`, `init/2` | `roadrunner_handler`, `handle/1` |
 | `cowboy_req` | `roadrunner_req` (read) and `roadrunner_resp` (build responses) |
 | `cowboy_req:stream_reply/3` + `stream_body/3` | a `{stream, ...}` response |
+| `cowboy_req:reply/4` or `inform/3` while the handler runs | a `{respond, ...}` response and `roadrunner_respond` |
 | `cowboy_loop` | a `{loop, ...}` response plus `handle_info/3` |
 | `cowboy_websocket` | `roadrunner_ws_handler` |
 | `cowboy_static` | `roadrunner_static` |
@@ -416,6 +417,28 @@ handle(Req) ->
     {{sendfile, 200, Headers, {File, 0, Size}}, Req}.
 ```
 
+### Sending the response as the handler runs
+
+Some Cowboy handlers send while they work: an `inform/3` first, then the
+reply, chosen as the code goes. Return `{respond, Headers, Fun}` for that.
+Roadrunner calls `Fun(Req)`, and the fun sends with `roadrunner_respond`, in
+the same order as Cowboy's calls, with `Req` last:
+
+```erlang
+handle(Req) ->
+    {{respond, [], fun respond/1}, Req}.
+
+respond(Req0) ->
+    ok = roadrunner_respond:inform(103, [{~"link", ~"</app.css>; rel=preload"}], Req0),
+    {ok, Body, Req} = roadrunner_req:read_body(Req0),
+    ok = roadrunner_respond:reply(200, [{~"content-type", ~"text/plain"}], Body, Req),
+    Req.
+```
+
+`roadrunner_respond:stream/3` returns the same `Send` as a `{stream, ...}`
+response, and `sendfile/4` sends a file. The fun returns the request, the
+last one it got from `roadrunner_req`.
+
 ## Middlewares and stream handlers
 
 A Cowboy middleware runs between the router and the handler. To answer early
@@ -704,8 +727,7 @@ cover each one.
 - **`match_qs/2`, `match_cookies/2`, `parse_header/2`**: read the list from
   `parse_qs/1` or `parse_cookies/1`, or the raw value from `header/2`, and
   convert it in your code
-- **`cowboy_req:inform/2,3`** (`1xx` responses) and **`cowboy_req:push/3,4`**
-  (HTTP/2 server push): not available
+- **`cowboy_req:push/3,4`** (HTTP/2 server push): not available
 - **`read_part/1` and `read_part_body/1`** (reading multipart one part at a
   time): `read_form/1` parses a multipart body after reading all of it
 - **`cowboy_req:cast/2`** (messages to stream handlers): there are no stream
@@ -740,7 +762,8 @@ cover each one.
 - Change binding lookups from atom keys to binary keys
 - Rewrite each `init/2` as `handle/1` that returns `{Response, Req}`
 - Replace `cowboy_req:reply/4` calls with response tuples or `roadrunner_resp`
-  builders, and response header maps with lists
+  builders, and response header maps with lists. Code that has to send as it
+  runs, or sends `inform/3`, moves to a `{respond, ...}` response
 - Move `set_resp_header` and `set_resp_cookie` to `roadrunner_resp:add_header/3`
   and `roadrunner_resp:set_cookie/4`
 - Turn `stream_reply` code into `{stream, ...}` responses and `cowboy_loop`

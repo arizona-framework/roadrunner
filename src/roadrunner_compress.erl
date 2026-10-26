@@ -38,8 +38,8 @@ apart (RFC 9110 §12.5.5).
 
 ## Not covered
 
-- `{loop, ...}`, `{sendfile, ...}`, and `{websocket, ...}` responses pass
-  through unchanged.
+- `{loop, ...}`, `{sendfile, ...}`, `{respond, ...}`, and `{websocket, ...}`
+  responses pass through unchanged.
 - Brotli (`br`) is not supported.
 - For static files, `roadrunner_static` serves precompressed `.br` / `.gz`
   files instead of compressing on the fly.

@@ -118,6 +118,15 @@ stream_response_decorated_test() ->
     ?assertEqual(Fun, OutFun),
     ?assertEqual(~"nosniff", header(~"x-content-type-options", Headers)).
 
+respond_response_decorated_test() ->
+    %% The headers go on the tuple; the fun's final response gets them.
+    Req = req(http, []),
+    Fun = fun(R) -> R end,
+    Next = fun(R) -> {{respond, [], Fun}, R} end,
+    {{respond, Headers, OutFun}, _Req2} = call(Req, Next, #{}),
+    ?assertEqual(Fun, OutFun),
+    ?assertEqual(~"nosniff", header(~"x-content-type-options", Headers)).
+
 sendfile_response_decorated_test() ->
     %% A file served via sendfile gets the headers too (nosniff matters most
     %% here — MIME-sniffing of served files).
