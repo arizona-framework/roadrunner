@@ -582,7 +582,7 @@ handle_info(_Info, State) ->
 | `websocket_init/1` | `init/1` (optional) |
 | `websocket_handle/2` | `handle_frame/2`, with a frame map |
 | `websocket_info/2` | `handle_info/2` (optional) |
-| `terminate/3` | none |
+| `terminate/3` | `terminate/2` (optional), with the reason the session ended |
 | `{Frames, State}` | `{reply, Frames, State}` |
 | `{[], State, hibernate}` | `{ok, State, [hibernate]}` |
 | `{[{close, 1000, Reason}], State}` | `{close, 1000, Reason, State}` |
@@ -743,8 +743,8 @@ cover each one.
   `{cowboy_loop, Req, State, hibernate}` has no equivalent
 - **`cowboy_decompress_h`** and **`cowboy_tracer_h`**: no built-in version;
   a middleware can cover your own cases
-- **`terminate/3`** in handlers and WebSocket handlers: there is no such
-  callback
+- **`terminate/3`** in HTTP handlers: there is no such callback (WebSocket
+  handlers have an optional `terminate/2`)
 - **WebSocket idle timeout** (`idle_timeout`): there is no option for it
 - **WebSockets over HTTP/2 and HTTP/3**: a `{websocket, ...}` response on
   those protocols answers `501`; WebSocket clients connect over HTTP/1.1
