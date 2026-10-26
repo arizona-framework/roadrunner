@@ -214,6 +214,9 @@ Notable differences:
 - Always return the latest `Req` (the one from `read_body/1` if you read the
   body)
 - There is no `terminate/3` callback
+- An optional `init_route/1` runs once per route when the routes compile
+  (and again on `reload_routes/2`), to check and prepare the route's state;
+  its return is what `roadrunner_req:state/1` gives the handler
 - Where Cowboy switches with `{cowboy_websocket, Req, State}` or
   `{cowboy_loop, Req, State}`, Roadrunner returns a `{websocket, ...}` or
   `{loop, ...}` response (see below)
@@ -392,10 +395,9 @@ handle_info(_Msg, _Push, State) ->
 
 The status and headers go out when the loop starts. Keep a catch-all clause:
 Roadrunner also sends `{roadrunner_disconnect, Reason}` when the client goes
-away and, on HTTP/1.1, `{roadrunner_drain, Deadline}` when the listener
-drains (on HTTP/2 and HTTP/3 the connection sends GOAWAY instead, and the loop
-gets no drain message). `roadrunner_sse` builds Server-Sent Events frames for
-`Push`.
+away and `{roadrunner_drain, Deadline}` when the listener drains, so a
+long-lived response can end cleanly. `roadrunner_sse` builds Server-Sent
+Events frames for `Push`.
 
 ### Sending files
 
@@ -576,46 +578,49 @@ Notable differences:
 
 ## Static files
 
-Cowboy serves a directory with `cowboy_static` and a `[...]` route:
+Cowboy serves a directory or a single file with `cowboy_static`:
 
 ```erlang
-{"/assets/[...]", cowboy_static, {priv_dir, my_app, "static/assets"}}
+{"/assets/[...]", cowboy_static, {priv_dir, my_app, "static/assets"}},
+{"/assets/[...]", cowboy_static, {dir, "/var/www/assets"}},
+{"/", cowboy_static, {priv_file, my_app, "static/index.html"}},
+{"/favicon.ico", cowboy_static, {file, "/var/www/favicon.ico"}}
 ```
+
+Roadrunner uses `roadrunner_static` with a `dir` or a `file` option. A path in
+your application's `priv` directory is written `{priv, App, SubPath}`. A
+directory route needs a wildcard named `*path`:
 
 ```erlang
-{"/assets/[...]", cowboy_static, {dir, "/var/www/assets"}}
+{~"/assets/*path", roadrunner_static, #{dir => {priv, my_app, ~"static/assets"}}},
+{~"/assets/*path", roadrunner_static, #{dir => ~"/var/www/assets"}},
+{~"/", roadrunner_static, #{file => {priv, my_app, ~"static/index.html"}}},
+{~"/favicon.ico", roadrunner_static, #{file => ~"/var/www/favicon.ico"}}
 ```
 
-Roadrunner uses `roadrunner_static` with a `dir` option. The wildcard must be
-named `*path`:
-
-```erlang
-{~"/assets/*path", roadrunner_static, #{dir => ~"/var/www/assets"}}
-```
-
-For a `priv` directory, build the path when you build the routes:
-
-```erlang
-Assets = list_to_binary(filename:join(code:priv_dir(my_app), "static/assets")),
-Routes = [{~"/assets/*path", roadrunner_static, #{dir => Assets}}].
-```
+| Cowboy | Roadrunner |
+|---|---|
+| `{dir, Path}` | `#{dir => Path}` |
+| `{priv_dir, App, Path}` | `#{dir => {priv, App, Path}}` |
+| `{file, Path}` | `#{file => Path}` |
+| `{priv_file, App, Path}` | `#{file => {priv, App, Path}}` |
+| the `{mimetypes, Module, Function}` extra | `#{mime_types => #{Ext => Type}}` |
 
 Notable differences:
 
+- The options are checked when the listener starts. A missing application,
+  an unknown option, or a bad value stops the start with an error naming the
+  option, instead of failing on a request
 - `ETag`, `Last-Modified`, and `Range` are built in
 - Precompressed `.br` and `.gz` files next to the original are served when
   the client accepts them
 - Other options: `cache_control` (a `Cache-Control` value),
-  `symlink_policy`, and `cache_ttl_ms`
-- There is no single-file form like `{priv_file, ...}` or `{file, ...}`. Use a
-  small handler that returns a `{sendfile, ...}` response (see
-  [Sending files](#sending-files))
-- The MIME type comes from a small built-in table (html, css, js, json, png,
-  jpg and jpeg, gif, svg, ico, txt). Any other extension, fonts and `.wasm`
-  included, is served as `application/octet-stream`, and there is no
-  `mimetypes` or `etag` option to change it. Serve other types from your own
-  handler (see [Sending files](#sending-files)) or set `content-type` in a
-  middleware
+  `symlink_policy` (directory routes only), and `cache_ttl_ms`
+- The content type comes from a built-in table of common web types (pages,
+  scripts, styles, images, fonts, `.wasm`, media, and more); anything else is
+  `application/octet-stream`. `mime_types` adds types or overrides built-in
+  ones for a route, with keys such as `~".glb"` in any case
+- There is no `etag` option to change how the `ETag` is built
 
 ## Events and observability
 
