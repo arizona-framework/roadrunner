@@ -1440,19 +1440,24 @@ date_line(Headers) ->
     end.
 
 %% The encoded `date: <IMF-fixdate>\r\n` line, cached per process and
-%% keyed by the current Posix second like `roadrunner_http:http_date_now/0`
-%% caches the bare value: an HTTP/1 connection reformats it at most once a
-%% second.
+%% keyed by the clock's date stamp (`roadrunner_clock:stamp/0`): an
+%% HTTP/1 connection rebuilds it at most once a second, and a hit costs
+%% a `persistent_term` read and a dictionary lookup.
 -spec cached_date_line() -> binary().
 cached_date_line() ->
-    Now = erlang:system_time(second),
-    case get(?DATE_LINE_KEY) of
-        {Now, Line} ->
-            Line;
-        _ ->
-            Line = <<"date: ", (roadrunner_http:format_http_date(Now))/binary, "\r\n">>,
-            _ = put(?DATE_LINE_KEY, {Now, Line}),
-            Line
+    case roadrunner_clock:stamp() of
+        undefined ->
+            Now = erlang:system_time(second),
+            <<"date: ", (roadrunner_clock:format(Now))/binary, "\r\n">>;
+        Stamp ->
+            case get(?DATE_LINE_KEY) of
+                {Stamp, Line} ->
+                    Line;
+                _ ->
+                    Line = <<"date: ", (roadrunner_clock:stamp_to_date(Stamp))/binary, "\r\n">>,
+                    _ = put(?DATE_LINE_KEY, {Stamp, Line}),
+                    Line
+            end
     end.
 
 %% Common status codes, and the ones roadrunner sends on its own when

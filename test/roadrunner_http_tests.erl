@@ -34,28 +34,6 @@ http_date_now_format_matches_imf_fixdate_test() ->
         ])
     ).
 
-http_date_now_caches_per_process_test_() ->
-    %% Run in a fresh process so the dictionary starts empty: the first
-    %% read takes the reformat (miss) branch, and a same-second second
-    %% read takes the cached (hit) branch. `same_second_pair/0` retries
-    %% across a second boundary so the hit assertion is deterministic.
-    {spawn, fun() ->
-        %% Cold dictionary => miss branch.
-        First = roadrunner_http:http_date_now(),
-        ?assertEqual(29, byte_size(First)),
-        {A, B} = same_second_pair(),
-        ?assertEqual(A, B)
-    end}.
-
-same_second_pair() ->
-    S0 = erlang:system_time(second),
-    A = roadrunner_http:http_date_now(),
-    B = roadrunner_http:http_date_now(),
-    case erlang:system_time(second) of
-        S0 -> {A, B};
-        _ -> same_second_pair()
-    end.
-
 with_date_keeps_handler_date_test() ->
     %% A handler-set Date wins: `with_date/1` leaves the list untouched.
     Headers = [{~"date", ~"Sun, 06 Nov 1994 08:49:37 GMT"}],
@@ -80,9 +58,22 @@ format_http_date_matches_calendar_test() ->
         1709164800,
         1735689599,
         4102444800,
+        8078572799,
+        8078572800,
         253402300799
     ],
     [?assertEqual(calendar_http_date(P), roadrunner_http:format_http_date(P)) || P <- Posixes].
+
+format_http_date_covers_every_table_entry_test() ->
+    %% Every day the tables cover (each weekday, day+month, and year
+    %% entry) and every second of one day (each hour:minute and second
+    %% entry), checked against `calendar`.
+    Days = [Day * 86400 || Day <- lists:seq(0, (8078572800 div 86400) - 1)],
+    Seconds = [86400 * 20000 + S || S <- lists:seq(0, 86399)],
+    [
+        ?assertEqual(calendar_http_date(P), roadrunner_http:format_http_date(P))
+     || P <- Days ++ Seconds
+    ].
 
 calendar_http_date(Posix) ->
     {{Y, M, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Posix, second),
