@@ -43,3 +43,12 @@ failed_stream_head_returns_the_error_test() ->
     Send = fun(_Data, _Fin) -> ok end,
     ?assertEqual({error, closed}, roadrunner_respond_writer:started({error, closed}, Send)),
     ?assertEqual({ok, Send}, roadrunner_respond_writer:started(ok, Send)).
+
+respond_tuple_has_no_returned_kind_test() ->
+    %% Its kind is the response its fun sent; a respond tuple reaching the
+    %% returned-shape helper is a dispatch bug, not a buffered response.
+    ?assertError(
+        function_clause,
+        roadrunner_conn:response_kind({respond, [], fun(Req) -> Req end})
+    ),
+    ?assertEqual(buffered, roadrunner_conn:response_kind({200, [], <<>>})).
