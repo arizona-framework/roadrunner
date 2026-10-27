@@ -119,13 +119,15 @@ header.
     | {permessage_deflate, permessage_deflate_params(), ResponseHeaderValue :: binary()}.
 
 -doc """
-Close status codes a server is permitted to send per RFC 6455 §7.4.
-1004/1005/1006 are reserved (MUST NOT appear on the wire);
-1012/1013 are unassigned. 3000-3999 is the IANA-registered range,
-4000-4999 is for application-private use.
+Close status codes a server is permitted to send per RFC 6455 §7.4 and
+the IANA WebSocket Close Code Number Registry. 1004/1005/1006 are
+reserved (MUST NOT appear on the wire); 1012 (service restart), 1013
+(try again later) and 1014 (bad gateway) are registered after RFC 6455.
+3000-3999 is the IANA-registered range, 4000-4999 is for
+application-private use.
 """.
 -type close_code() ::
-    1000..1003 | 1007..1011 | 1014 | 3000..4999.
+    1000..1003 | 1007..1014 | 3000..4999.
 
 %% RFC 6455 §1.3 magic GUID concatenated with the client key before
 %% hashing — fixed by spec.

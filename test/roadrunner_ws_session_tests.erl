@@ -1054,6 +1054,34 @@ close_with_invalid_utf8_reason_crashes_session_test() ->
     end,
     Sink ! stop.
 
+handler_close_with_overlong_reason_crashes_session_test() ->
+    %% A reason over 123 bytes would make a close frame over the 125-byte
+    %% control-frame limit: refused like any other malformed close.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => {close, 1000, binary:copy(~"a", 124)}},
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_lifecycle_handler,
+            State,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, {{invalid_close_payload, 1000, _}, _}} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sink ! stop.
+
 %% =============================================================================
 %% permessage-deflate (RFC 7692) — end-to-end through the session.
 %% =============================================================================
@@ -2881,3 +2909,68 @@ idle_timeout_test_() ->
 
 idle_proto_opts() ->
     (ws_proto_opts())#{ws_idle_timeout := 50}.
+
+%% --- close with frames, IANA close codes, handle_control/2 ---
+
+close_and_control_test_() ->
+    {spawn, [
+        {"frames then the close go out in one write", fun() ->
+            ?assertEqual(
+                [<<16#81, 4, "last", 16#88, 5, 1000:16, "bye">>],
+                control_sends([{recv, frame(text, ~"stop")}])
+            )
+        end},
+        {"a handler may close with 1012", fun() ->
+            ?assertEqual(
+                [<<16#88, 2, 1012:16>>], control_sends([{recv, frame(text, ~"restart")}])
+            )
+        end},
+        {"a client's 1013 close is echoed, not refused", fun() ->
+            ?assertEqual(
+                [<<16#88, 2, 1013:16>>], control_sends([{recv, frame(close, <<1013:16>>)}])
+            )
+        end},
+        {"handle_control/2 sees a ping after the session's pong", fun() ->
+            Sends = control_sends([{recv, control(16#89, ~"p1")}]),
+            ?assertEqual([<<16#8A, 2, "p1", 16#81, 4, "seen">>], Sends),
+            ?assertEqual({control, ping, ~"p1"}, receive_control())
+        end},
+        {"handle_control/2 sees a pong", fun() ->
+            ?assertEqual([<<16#81, 4, "seen">>], control_sends([{recv, control(16#8A, ~"p2")}])),
+            ?assertEqual({control, pong, ~"p2"}, receive_control())
+        end}
+    ]}.
+
+%% What the session wrote, per write, for a script against
+%% `roadrunner_ws_control_handler`.
+control_sends(Script) ->
+    Tag = make_ref(),
+    Sink = spawn_active_sink(self(), Tag, Script),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_control_handler,
+            self(),
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    Sends = [iolist_to_binary(Send) || Send <- collect_sends(Tag, 1000)],
+    ok = stop_ws_session(Pid),
+    Sink ! stop,
+    Sends.
+
+%% A masked control frame (`Op` is the first byte, FIN set).
+control(Op, Payload) ->
+    <<Op, (16#80 bor byte_size(Payload)), 1, 2, 3, 4, (mask(Payload, <<1, 2, 3, 4>>))/binary>>.
+
+receive_control() ->
+    receive
+        {control, _, _} = Msg -> Msg
+    after 1000 -> error(no_control)
+    end.
