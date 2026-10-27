@@ -229,8 +229,8 @@ check_peer_limit(Fields) ->
 
 %% The `websocket` response shape is not yet wired for HTTP/3 (it needs
 %% Extended CONNECT, RFC 9220); until then it answers 501, mirroring how
-%% h2 answers 501 for it. The buffered / stream / sendfile / loop shapes
-%% are supported.
+%% h2 answers 501 for it, also from `roadrunner_send:websocket/4`. The
+%% buffered / stream / sendfile / loop / send shapes are supported.
 -spec emit_501(pid(), non_neg_integer()) -> 501.
 emit_501(Conn, StreamId) ->
     send_buffered(

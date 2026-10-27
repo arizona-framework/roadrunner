@@ -79,11 +79,15 @@ tell listeners apart, match on the listener name the events carry.
   written to the wire, or queued for the connection to write. For
   `stream`, `loop`, and `websocket` responses, after the initial
   dispatch returns. `Status` is `101` for a WebSocket upgrade. `Kind`
-  is `buffered | stream | loop | sendfile | websocket`.
+  is `buffered | stream | loop | sendfile | websocket`; a `{send, ...}`
+  response reports the kind it sent. It also fires for a `{send, ...}`
+  fun that stopped on purpose (`{shutdown, _}`), with what it sent.
 - `request_exception`, `{Span, Class, Reason, Stacktrace}`: the
   pipeline raised. `Class` is `error | exit | throw`, and `Stacktrace`
   is where it raised, as caught by `catch Class:Reason:Stacktrace`.
-  The connection then answers `500`.
+  The connection then answers `500`, unless a `{send, ...}` fun had
+  already sent its final response; then the connection only closes (or,
+  on HTTP/2 and HTTP/3, the stream ends or is reset).
 - `request_rejected`, `{ListenerName, Peer, Reason}`: a request was
   dropped by the parser or a limit before any handler ran (malformed
   request line, header injection, header count or size limits,
@@ -97,8 +101,8 @@ tell listeners apart, match on the listener name the events carry.
   its `rate_limit`, answered `429`).
 - `response_send_failed`, `{Phase, Reason}`: a response write failed
   after the status line was already going out, so the connection is
-  about to close. `Phase` is `buffered_response`,
-  `stream_response_head`, `loop_response_head`,
+  about to close. `Phase` is `buffered_response`, `interim_response`
+  (a `roadrunner_send:inform/3`), `stream_response_head`, `loop_response_head`,
   `sendfile_response_head`, `sendfile_body`, or
   `websocket_upgrade_response`. The connection's `logger` process
   metadata (`request_id`, `peer`, `method`, `path`) is set in the

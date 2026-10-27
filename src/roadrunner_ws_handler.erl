@@ -106,7 +106,7 @@ Unified return shape for all `roadrunner_ws_handler` callbacks.
 -doc """
 Optional. Runs once in the session process after the 101 has been
 written to the wire and before the first frame is read, with the
-state from the upgrade tuple `{websocket, Module, State[, Headers]}`. Use it
+state from the upgrade tuple `{websocket, Module, State[, Opts]}`. Use it
 to register pubsub subscriptions, start linked workers, or push
 priming frames at connect-time. Returns the same shape as
 `handle_frame/2`. Handlers that don't export this callback skip
@@ -185,19 +185,25 @@ name (`t:roadrunner_listener:ws_opts/0`):
 - `compress` — whether to accept the client's permessage-deflate offer.
 - `idle_timeout` — close the session (code 1001, `terminate/2` gets
   `timeout`) when the client sent nothing for this many milliseconds;
-  checked once per interval, so within two of them.
+  checked once per interval, so within two of them. `infinity` turns off
+  a listener-wide one for this session.
 - `max_frame_size`, `max_message_size`, `recv_buffer`,
-  `hibernate_after` — as the listener's.
+  `hibernate_after` — as the listener's (`hibernate_after` also takes
+  `infinity`, to turn the listener's off for this session).
 - `fullsweep_after`, `max_heap_size` — the session process's garbage
   collection settings (`erlang:spawn_opt/4`).
+
+The values are the application's to get right, as the rest of a
+response is: they are not checked at the upgrade, and a key not listed
+here crashes it.
 """.
 -type upgrade_opts() :: #{
     headers => roadrunner_http:headers(),
     compress => boolean(),
     idle_timeout => pos_integer() | infinity,
-    max_frame_size => non_neg_integer(),
-    max_message_size => non_neg_integer(),
-    recv_buffer => pos_integer(),
+    max_frame_size => 0..16#7FFFFFFF,
+    max_message_size => 0..16#7FFFFFFF,
+    recv_buffer => 1..16#7FFFFFFF,
     hibernate_after => pos_integer() | infinity,
     fullsweep_after => non_neg_integer(),
     max_heap_size => erlang:max_heap_size()

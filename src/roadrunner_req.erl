@@ -623,7 +623,9 @@ peer(_) -> undefined.
 
 -doc """
 Return the server's local address the request came in on: the listening
-address and port the client connected to. Read from the socket when called,
+address and port the client connected to. Unlike `peer/1`, which the
+connection reads once, this reads the socket when called, so it can
+fail: it returns `{ok, _}` or `{error, Reason}`. Read from the socket when called,
 not per request. Returns `{error, unavailable}` for a request map built
 outside the connection pipeline.
 """.
@@ -635,7 +637,7 @@ sockname(_) -> {error, unavailable}.
 -doc """
 Return the client's TLS certificate (DER), as the TLS handshake received
 it. `{error, no_peercert}` when the client sent none (the listener's
-`tls` options decide whether one is asked for: `verify => verify_peer`),
+`tls` options decide whether one is asked for: `{verify, verify_peer}`),
 `{error, not_tls}` on a plain connection. HTTP/3 does not ask clients for
 a certificate, so it answers `{error, no_peercert}`. Returns
 `{error, unavailable}` for a request map built outside the connection

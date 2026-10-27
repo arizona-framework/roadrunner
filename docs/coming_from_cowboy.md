@@ -244,6 +244,8 @@ name.
 | `cowboy_req:read_body(Req)` | `roadrunner_req:read_body(Req)` |
 | `cowboy_req:read_urlencoded_body(Req)` | `roadrunner_req:read_form(Req)` |
 | `cowboy_req:peer(Req)` | `roadrunner_req:peer(Req)` |
+| `cowboy_req:sock(Req)`, `cowboy_req:port(Req)` | `roadrunner_req:sockname(Req)`, `{ok, {Ip, Port}}` |
+| `cowboy_req:cert(Req)` | `roadrunner_req:peercert(Req)`, `{ok, Der}` or `{error, no_peercert}` |
 | `cowboy_req:scheme(Req)` | `roadrunner_req:scheme(Req)`, the atom `http` or `https` |
 | `cowboy_req:host(Req)` | `roadrunner_req:header(~"host", Req)` |
 
@@ -747,9 +749,6 @@ cover each one.
   handlers have an optional `terminate/2`)
 - **WebSockets over HTTP/2 and HTTP/3**: a `{websocket, ...}` response on
   those protocols answers `501`; WebSocket clients connect over HTTP/1.1
-- **`cowboy_req:cert/1`, `sock/1` and `port/1`** (TLS client certificate,
-  local address, port): no reader for them. The port can be read from the
-  `host` header
 - **Middleware `{suspend, M, F, A}`**: not available
 - **`cowboy:set_env/3`** for values other than routes: keep them in your own
   application env or in route state

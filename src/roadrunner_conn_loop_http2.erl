@@ -69,7 +69,8 @@
 %% | `{stream, _, _, Fun}` | yes |
 %% | `{loop, _}` | yes (worker enters handle_info loop) |
 %% | `{sendfile, _}` | yes (chunked DATA via the stream-response engine) |
-%% | `{websocket, ...}` (with or without headers) | 501 (Phase H13) |
+%% | `{send, _, Fun}` | yes (each `roadrunner_send` call as its shape) |
+%% | `{websocket, ...}`, `roadrunner_send:websocket/4` | 501 (RFC 8441, roadmap) |
 
 -export([enter/6]).
 
