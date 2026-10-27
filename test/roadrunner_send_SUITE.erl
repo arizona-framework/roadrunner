@@ -24,6 +24,10 @@ fun does.
     head_reply_has_no_body/1,
     head_sendfile_has_no_body/1,
     no_response_is_500/1,
+    shutdown_after_the_reply_is_quiet/1,
+    shutdown_before_a_response_is_500/1,
+    shutdown_in_a_stream_ends_it/1,
+    shutdown_closes_the_connection/1,
     crash_before_the_response_is_500/1,
     crash_after_the_response_keeps_it/1,
     crash_in_an_open_stream_cuts_it/1,
@@ -77,6 +81,9 @@ common() ->
         head_reply_has_no_body,
         head_sendfile_has_no_body,
         no_response_is_500,
+        shutdown_after_the_reply_is_quiet,
+        shutdown_before_a_response_is_500,
+        shutdown_in_a_stream_ends_it,
         crash_before_the_response_is_500,
         crash_after_the_response_keeps_it,
         crash_in_an_open_stream_cuts_it,
@@ -93,6 +100,7 @@ common() ->
 http1() ->
     [
         keeps_the_connection_alive,
+        shutdown_closes_the_connection,
         signals_close_at_the_keep_alive_ceiling,
         skips_interims_for_http10,
         upgrades_from_the_fun,
@@ -173,6 +181,9 @@ routes(TestPid, File) ->
         {~"/trailers", ?H, stream_trailers},
         {~"/file", ?H, {sendfile, File}},
         {~"/nothing", ?H, nothing},
+        {~"/shutdown-after-reply", ?H, shutdown_after_reply},
+        {~"/shutdown-before", ?H, shutdown_before},
+        {~"/shutdown-stream", ?H, shutdown_open_stream},
         {~"/crash-before", ?H, crash_before},
         {~"/crash-after", ?H, crash_after},
         {~"/crash-open", ?H, crash_open},
@@ -236,6 +247,23 @@ head_sendfile_has_no_body(Config) ->
 no_response_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, get(Config, ~"/nothing")),
     ?assertEqual({500, buffered}, stopped()).
+
+shutdown_after_the_reply_is_quiet(Config) ->
+    %% A `{shutdown, _}` exit stops on purpose: the reply stands, the request
+    %% reports a stop with its status, and no exception.
+    ?assertMatch({[403], _, ~"nope", complete}, get(Config, ~"/shutdown-after-reply")),
+    ?assertEqual({403, buffered}, stopped()),
+    ok = no_exception().
+
+shutdown_before_a_response_is_500(Config) ->
+    ?assertMatch({[500], _, _, complete}, get(Config, ~"/shutdown-before")),
+    ?assertEqual({500, buffered}, stopped()),
+    ok = no_exception().
+
+shutdown_in_a_stream_ends_it(Config) ->
+    ?assertMatch({[200], _, ~"part", complete}, get(Config, ~"/shutdown-stream")),
+    ?assertEqual({200, stream}, stopped()),
+    ok = no_exception().
 
 crash_before_the_response_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, get(Config, ~"/crash-before")),
@@ -305,6 +333,12 @@ keeps_the_connection_alive(Config) ->
     ?assertMatch({[200], _, ~"replied", complete}, h1_parse(First, ~"GET")),
     ok = gen_tcp:send(Sock, h1_request(~"GET", ~"/reply", [{~"connection", ~"close"}], <<>>)),
     ?assertMatch({[200], _, ~"replied", complete}, h1_parse(h1_recv_all(Sock), ~"GET")).
+
+shutdown_closes_the_connection(Config) ->
+    %% A keep-alive request: the connection still closes after the stop.
+    Sock = h1_connect(Config),
+    ok = gen_tcp:send(Sock, h1_request(~"GET", ~"/shutdown-after-reply", [], <<>>)),
+    ?assertMatch({[403], _, ~"nope", complete}, h1_parse(h1_recv_all(Sock), ~"GET")).
 
 signals_close_at_the_keep_alive_ceiling(Config) ->
     %% The server closes after the connection's last request, and says so.
@@ -540,6 +574,14 @@ stopped() ->
         {telemetry_event, [roadrunner, request, stop], #{status := Status, response_kind := Kind}} ->
             {Status, Kind}
     after 5000 -> ct:fail(no_request_stop)
+    end.
+
+%% No request exception event came (they fire before the stop that was
+%% just received, on the same process).
+no_exception() ->
+    receive
+        {telemetry_event, [roadrunner, request, exception], _} -> ct:fail(exception_reported)
+    after 0 -> ok
     end.
 
 %% The reason of the next request exception event.

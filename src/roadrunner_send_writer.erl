@@ -55,6 +55,7 @@
 
 -type outcome() ::
     {done, sent(), roadrunner_req:request()}
+    | {closed, sent()}
     | {crashed, error | exit | throw, term(), erlang:stacktrace(), none | complete | open}.
 
 -type result() :: ok | {ok, roadrunner_handler:send_fun()} | {error, term()}.
@@ -217,9 +218,30 @@ run(Handler, Fun, Headers, Req, Emit) ->
             Req3 = maps:remove(send, Req2),
             {done, finish(Handler, Emit, Req3), Req3}
     catch
+        exit:{shutdown, _} = Reason:Stack ->
+            %% The OTP way to stop on purpose: the response is finished as
+            %% far as it went, nothing is logged, and the request reports a
+            %% stop. Inside the protocol's writer it stays a crash.
+            case erase(?KEY) of
+                emitting -> {crashed, exit, Reason, Stack, open};
+                Sent -> {closed, closed(Sent, Emit, Req)}
+            end;
         Class:Reason:Stack ->
             {crashed, Class, Reason, Stack, crashed_state(erase(?KEY))}
     end.
+
+%% The response a `{shutdown, _}` exit leaves: as sent, an open stream
+%% ended, a 500 for none.
+-spec closed(term(), emit(), roadrunner_req:request()) -> sent().
+closed({sent, Kind, Status, Headers}, _Emit, _Req) ->
+    {Kind, Status, Headers};
+closed({open, Status, Headers, Send}, _Emit, _Req) ->
+    _ = Send(<<>>, fin),
+    {stream, Status, Headers};
+closed(undefined, Emit, Req) ->
+    ok = internal_error(Emit, Req),
+    {sent, buffered, Status, Headers} = erase(?KEY),
+    {buffered, Status, Headers}.
 
 %% What the fun left: an open stream is ended, no response answered 500.
 -spec finish(module(), emit(), roadrunner_req:request()) -> sent().

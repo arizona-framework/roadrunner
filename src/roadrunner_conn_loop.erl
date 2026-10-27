@@ -1249,6 +1249,11 @@ send_phase(S0, Handler, Req, Headers, Fun, Span) ->
         {done, {Kind, Status, SentHeaders}, Req2} ->
             ok = roadrunner_event:request_stop(Span, Status, Kind),
             send_finish(S, Req2, Kind, SentHeaders);
+        {closed, {Kind, Status, _SentHeaders}} ->
+            %% The fun stopped on purpose (`{shutdown, _}`): what it read of
+            %% the body is unknown, so the connection closes.
+            ok = roadrunner_event:request_stop(Span, Status, Kind),
+            exit_unread(S, Req);
         {crashed, Class, Reason, Stack, Sent} ->
             ok = roadrunner_event:request_exception(Span, Class, Reason, Stack),
             logger:error(#{

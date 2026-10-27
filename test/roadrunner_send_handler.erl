@@ -62,6 +62,19 @@ send_fun({sendfile, File}) ->
         ok = roadrunner_send:file(200, Headers, {File, 2, 4}, Req),
         Req
     end;
+send_fun(shutdown_after_reply) ->
+    fun(Req) ->
+        ok = roadrunner_send:reply(403, [], ~"nope", Req),
+        exit({shutdown, forbidden})
+    end;
+send_fun(shutdown_before) ->
+    fun(_Req) -> exit({shutdown, nothing_sent}) end;
+send_fun(shutdown_open_stream) ->
+    fun(Req) ->
+        {ok, Send} = roadrunner_send:stream(200, [], Req),
+        ok = Send(~"part", nofin),
+        exit({shutdown, done})
+    end;
 send_fun(nothing) ->
     fun(Req) -> Req end;
 send_fun(crash_before) ->

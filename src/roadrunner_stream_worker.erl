@@ -190,6 +190,10 @@ invoke(
 run_send(Worker, Protocol, Conn, StreamId, Handler, Req, Headers, Fun, Span) ->
     Emit = send_emit(Worker, Protocol, Conn, StreamId, Handler),
     case roadrunner_send_writer:run(Handler, Fun, Headers, Req, Emit) of
+        {closed, {Kind, Status, _SentHeaders}} ->
+            %% The fun stopped on purpose (`{shutdown, _}`): only its stream
+            %% ends.
+            roadrunner_event:request_stop(Span, Status, Kind);
         {done, {Kind, Status, _SentHeaders}, _Req2} ->
             roadrunner_event:request_stop(Span, Status, Kind);
         {crashed, exit, Reason, _Stack, _Sent} when
