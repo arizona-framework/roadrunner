@@ -116,6 +116,12 @@ send_fun({report, Pid, upgrade}) ->
                 roadrunner_send:websocket(roadrunner_ws_echo_handler, no_state, #{}, Req)},
         Req
     end;
+send_fun({report, Pid, {file, Spec}}) ->
+    fun(Req) ->
+        Headers = [{~"content-type", ~"text/plain"}, {~"content-length", ~"4"}],
+        Pid ! {send_result, roadrunner_send:file(200, Headers, Spec, Req)},
+        Req
+    end;
 send_fun({report, Pid, big_stream}) ->
     fun(Req) ->
         Pid ! {send_result, roadrunner_send:stream(200, big_header(), Req)},

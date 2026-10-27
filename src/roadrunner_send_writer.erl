@@ -9,6 +9,8 @@
 %% went out is kept in that process's dictionary, so a second final
 %% response is refused and `run/5` can finish what the fun left open.
 
+-include_lib("kernel/include/file.hrl").
+
 -export([inform/3, final/3, run/5, started/2]).
 
 -export_type([writer/0, op/0, emit/0, sent/0, outcome/0]).
@@ -18,10 +20,10 @@
     headers :: roadrunner_http:headers()
 }).
 
-%% The response so far: `undefined` before a final response, `{open, ...}`
-%% while a stream is not ended, `{sent, ...}` once the final response is
-%% complete. One response runs at a time per process, and `run/5` clears
-%% it.
+%% The response so far: `undefined` before a final response, `emitting`
+%% while the protocol writes one, `{open, ...}` while a stream is not
+%% ended, `{sent, ...}` once the final response is complete. One response
+%% runs at a time per process, and `run/5` clears it.
 -define(KEY, '$roadrunner_send').
 
 -opaque writer() :: #writer{}.
@@ -67,7 +69,10 @@ inform(Status, Headers, #{send := #writer{emit = Emit}} = Req) ->
     end.
 
 %% The final response, with the tuple's headers added: sent, or answered
-%% 500 when a header is unsafe.
+%% 500 when it cannot be (`check/1`). A protocol's writer can crash once
+%% part of the response is on the wire (a file read failing after its
+%% head), so the response counts as started while the writer runs: a crash
+%% then cuts it, as one in an open stream does, and no 500 follows a head.
 -spec final(kind(), op(), roadrunner_req:request()) -> result().
 final(websocket, Op, #{send := #writer{emit = Emit}} = Req) ->
     %% A 101 carries the upgrade options' headers, never the tuple's: the
@@ -78,15 +83,47 @@ final(websocket, Op, #{send := #writer{emit = Emit}} = Req) ->
 final(Kind, Op0, #{send := #writer{emit = Emit, headers = Extra}} = Req) ->
     ok = unsent(),
     Op = with_headers(Op0, Extra),
-    case roadrunner_http:unsafe_header(element(3, Op)) of
-        none ->
+    case check(Op) of
+        ok ->
+            _ = put(?KEY, emitting),
             {Result, Status, Headers} = Emit(Op, Req),
             record(Kind, Result, Status, Headers);
-        HeaderKind ->
-            ok = log_unsafe(HeaderKind),
+        {error, _} = Error ->
             ok = internal_error(Emit, Req),
+            Error
+    end.
+
+%% What keeps a final response from going out, found before any of it
+%% does: a header with CR/LF/NUL, or a file that is not there or shorter
+%% than its range. A file can still change before it is read; a read
+%% failing after the head cuts the response.
+-spec check(op()) -> ok | {error, term()}.
+check(Op) ->
+    case roadrunner_http:unsafe_header(element(3, Op)) of
+        none ->
+            check_file(Op);
+        Kind ->
+            ok = log_unsafe(Kind),
             {error, unsafe_header}
     end.
+
+-spec check_file(op()) -> ok | {error, term()}.
+check_file({sendfile, _Status, _Headers, {File, Offset, Length}}) ->
+    case file:read_file_info(File, [raw]) of
+        {ok, #file_info{type = regular, size = Size}} when Size < Offset + Length ->
+            log_file(file_too_short);
+        {ok, #file_info{}} ->
+            ok;
+        {error, Reason} ->
+            log_file(Reason)
+    end;
+check_file(_Op) ->
+    ok.
+
+-spec log_file(term()) -> {error, term()}.
+log_file(Reason) ->
+    logger:error(#{msg => "roadrunner send file could not be read", reason => Reason}),
+    {error, Reason}.
 
 -spec with_headers(op(), roadrunner_http:headers()) -> op().
 with_headers(Op, []) ->
@@ -179,6 +216,10 @@ finish(Handler, Emit, Req) ->
         {open, Status, Headers, Send} ->
             _ = Send(<<>>, fin),
             {stream, Status, Headers};
+        emitting ->
+            %% The fun caught a crash of the protocol's writer: what went
+            %% out is unknown, so the response is cut.
+            error(unfinished_response);
         undefined ->
             logger:error(#{
                 msg => "roadrunner send fun returned without a response",
@@ -197,5 +238,6 @@ started({error, _} = Error, _Send) -> Error.
 
 -spec crashed_state(term()) -> none | complete | open.
 crashed_state(undefined) -> none;
+crashed_state(emitting) -> open;
 crashed_state({sent, _, _, _}) -> complete;
 crashed_state({open, _, _, _}) -> open.

@@ -41,7 +41,8 @@ not end with `Send(Data, fin)` is ended when the fun returns. A fun that
 returns without a final response gets a `500` sent for it. A fun that
 crashes before a final response is answered `500`; one that crashes
 after it closes the connection (HTTP/1.1) or resets the stream (HTTP/2,
-HTTP/3) when the body was still open.
+HTTP/3) when the body was still open. A file that fails to read once its
+response has started cuts the response the same way.
 
 `Headers` in the `{send, Headers, Fun}` tuple is where middlewares add
 their headers (`roadrunner_cors`, `roadrunner_security_headers`). They
@@ -119,7 +120,10 @@ stream(Status, Headers, Req) when
 Send bytes `[Offset, Offset + Length)` of a file as the response body, as
 a `{sendfile, ...}` response does: the headers must carry its
 `content-length` and `content-type`. Returns `ok` once it is sent, or
-`{error, Reason}` when it could not be.
+`{error, Reason}` when it could not be. A file that is not there, or is
+shorter than the range, is answered `500` before anything is sent, and
+the call returns `{error, enoent}`, `{error, file_too_short}` or the
+like.
 """.
 -spec file(
     roadrunner_http:status(),

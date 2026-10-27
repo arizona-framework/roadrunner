@@ -30,6 +30,9 @@ fun does.
     second_final_response_raises/1,
     unsafe_inform_is_not_sent/1,
     unsafe_reply_is_500/1,
+    missing_file_is_500/1,
+    short_file_is_500/1,
+    file_failing_after_the_head_is_cut/1,
     keeps_the_connection_alive/1,
     signals_close_at_the_keep_alive_ceiling/1,
     skips_interims_for_http10/1,
@@ -74,7 +77,9 @@ common() ->
         crash_in_an_open_stream_cuts_it,
         second_final_response_raises,
         unsafe_inform_is_not_sent,
-        unsafe_reply_is_500
+        unsafe_reply_is_500,
+        missing_file_is_500,
+        short_file_is_500
     ].
 
 http1() ->
@@ -91,7 +96,8 @@ multiplexed() ->
         upgrade_is_not_supported,
         within_the_client_limit_is_sent,
         inform_over_the_client_limit_is_not_sent,
-        stream_over_the_client_limit_is_500
+        stream_over_the_client_limit_is_500,
+        file_failing_after_the_head_is_cut
     ].
 
 init_per_suite(Config) ->
@@ -164,8 +170,14 @@ routes(TestPid, File) ->
         {~"/big-inform", ?H, {report, TestPid, big_inform}},
         {~"/big-stream", ?H, {report, TestPid, big_stream}},
         {~"/until-reset", ?H, {report, TestPid, until_reset}},
-        {~"/upgrade", ?H, {report, TestPid, upgrade}}
+        {~"/upgrade", ?H, {report, TestPid, upgrade}},
+        {~"/missing-file", ?H, {report, TestPid, {file, {missing_file(File), 0, 4}}}},
+        {~"/short-file", ?H, {report, TestPid, {file, {File, 6, 4}}}},
+        {~"/empty-device", ?H, {report, TestPid, {file, {"/dev/null", 0, 4}}}}
     ].
+
+missing_file(File) ->
+    filename:join(filename:dirname(File), "missing.txt").
 
 %% =============================================================================
 %% Every protocol
@@ -236,6 +248,18 @@ unsafe_reply_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, get(Config, ~"/unsafe-reply")),
     ?assertEqual({error, unsafe_header}, result()).
 
+missing_file_is_500(Config) ->
+    %% Checked before anything is sent: no head goes out ahead of the 500.
+    ?assertMatch({[500], _, _, complete}, get(Config, ~"/missing-file")),
+    ?assertEqual({error, enoent}, result()),
+    ?assertEqual({500, buffered}, stopped()).
+
+short_file_is_500(Config) ->
+    %% The range ends past the file's 8 bytes.
+    ?assertMatch({[500], _, _, complete}, get(Config, ~"/short-file")),
+    ?assertEqual({error, file_too_short}, result()),
+    ?assertEqual({500, buffered}, stopped()).
+
 %% =============================================================================
 %% HTTP/1.1
 %% =============================================================================
@@ -299,6 +323,14 @@ inform_over_the_client_limit_is_not_sent(Config) ->
 stream_over_the_client_limit_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, limited_get(Config, ~"/big-stream")),
     ?assertMatch({error, _}, result()).
+
+file_failing_after_the_head_is_cut(Config) ->
+    %% `/dev/null` passes the check (a device has no size to hold the range
+    %% to) and ends before the range does, so the read fails after the
+    %% HEADERS: the stream is reset, no 500 follows the 200.
+    {[200], _, <<>>, End} = get(Config, ~"/empty-device"),
+    ?assertMatch({reset, _}, End),
+    ?assertMatch({badmatch, eof}, crashed()).
 
 client_reset_ends_the_fun(Config) ->
     %% The stream reset under a write ends the worker as for the `stream`
