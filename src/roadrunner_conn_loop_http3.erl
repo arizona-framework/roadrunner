@@ -387,13 +387,23 @@ loop(#h3{conn = Conn} = State) ->
 %% span keeps the handshake address.
 %% The connection queries for HTTP/3: the local address is the listener's
 %% UDP socket's and the TLS session the QUIC connection's. The server asks
-%% no client certificate over QUIC.
+%% no client certificate over QUIC. A request can outlive its connection
+%% (a handler that keeps it), and a query then fails as it does on a closed
+%% HTTP/1.1 or HTTP/2 socket, instead of exiting the caller.
 -spec conn_info(pid()) -> roadrunner_req:conn_info().
 conn_info(Conn) ->
     fun
-        (sockname) -> roadrunner_quic:sockname(Conn);
+        (sockname) -> while_up(fun roadrunner_quic:sockname/1, Conn);
         (peercert) -> {error, no_peercert};
-        (tls_info) -> roadrunner_quic:tls_info(Conn)
+        (tls_info) -> while_up(fun roadrunner_quic:tls_info/1, Conn)
+    end.
+
+-spec while_up(fun((pid()) -> {ok, T} | {error, term()}), pid()) -> {ok, T} | {error, term()}.
+while_up(Query, Conn) ->
+    try
+        Query(Conn)
+    catch
+        exit:{quic_conn_down, _} -> {error, closed}
     end.
 
 -spec peer_changed(#h3{}, {inet:ip_address(), inet:port_number()}) -> #h3{}.

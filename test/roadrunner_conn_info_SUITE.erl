@@ -17,7 +17,8 @@ what the three return.
     tls_http1_with_client_cert/1,
     plain_http2/1,
     http3/1,
-    http3_aes_256_gcm/1
+    http3_aes_256_gcm/1,
+    http3_after_the_connection_is_gone/1
 ]).
 
 suite() ->
@@ -30,7 +31,8 @@ all() ->
         tls_http1_with_client_cert,
         plain_http2,
         http3,
-        http3_aes_256_gcm
+        http3_aes_256_gcm,
+        http3_after_the_connection_is_gone
     ].
 
 init_per_suite(Config) ->
@@ -47,6 +49,8 @@ init_per_testcase(Case, Config) ->
     ),
     [{port, roadrunner_listener:port(?MODULE)} | Config].
 
+end_per_testcase(http3_after_the_connection_is_gone, _Config) ->
+    ok;
 end_per_testcase(_Case, _Config) ->
     ok = roadrunner_listener:stop(?MODULE).
 
@@ -59,7 +63,13 @@ opts(tls_http1_with_client_cert) ->
 opts(plain_http2) ->
     #{protocols => [http2]};
 opts(Case) when Case =:= http3; Case =:= http3_aes_256_gcm ->
-    #{protocols => [http3], tls => roadrunner_test_certs:server_opts()}.
+    #{protocols => [http3], tls => roadrunner_test_certs:server_opts()};
+opts(http3_after_the_connection_is_gone) ->
+    #{
+        protocols => [http3],
+        tls => roadrunner_test_certs:server_opts(),
+        routes => [{~"/", roadrunner_conn_info_handler, {report, self()}}]
+    }.
 
 plain_http1(Config) ->
     {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, port(Config), [binary, {active, false}]),
@@ -121,6 +131,20 @@ http3_aes_256_gcm(Config) ->
         {ok, #{selected_cipher_suite := #{cipher := aes_256_gcm, prf := sha384}}},
         maps:get(tls_info, Info)
     ).
+
+%% A request kept past its QUIC connection: the queries fail, as on a
+%% closed HTTP/1.1 or HTTP/2 socket, instead of exiting the caller.
+http3_after_the_connection_is_gone(Config) ->
+    _ = h3_info(Config, #{}),
+    Req =
+        receive
+            {req, R} -> R
+        after 5000 -> ct:fail(no_request)
+        end,
+    ok = roadrunner_listener:stop(?MODULE),
+    ?assertEqual({error, closed}, roadrunner_req:sockname(Req)),
+    ?assertEqual({error, no_peercert}, roadrunner_req:peercert(Req)),
+    ?assertEqual({error, closed}, roadrunner_req:tls_info(Req)).
 
 h3_info(Config, Opts) ->
     {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, port(Config), Opts),
