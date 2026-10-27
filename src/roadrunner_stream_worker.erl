@@ -188,7 +188,7 @@ invoke(
     roadrunner_event_handler:span()
 ) -> ok.
 run_send(Worker, Protocol, Conn, StreamId, Handler, Req, Headers, Fun, Span) ->
-    Emit = send_emit(Worker, Conn, StreamId, Handler),
+    Emit = send_emit(Worker, Protocol, Conn, StreamId, Handler),
     case roadrunner_send_writer:run(Handler, Fun, Headers, Req, Emit) of
         {done, {Kind, Status, _SentHeaders}, _Req2} ->
             roadrunner_event:request_stop(Span, Status, Kind);
@@ -223,19 +223,22 @@ crash_answer(open, _Worker, _Conn, _StreamId) ->
 
 %% `roadrunner_send`'s writer for this stream. A complete or file response
 %% goes through the shapes' own send path (`emit_handler_response/4`), so it
-%% gets their HEAD and header-limit handling.
--spec send_emit(module(), pid(), non_neg_integer(), module()) ->
+%% gets their HEAD and header-limit handling: a status other than the one
+%% asked for is the 500 that answered headers over the client's limit.
+-spec send_emit(module(), h2 | h3, pid(), non_neg_integer(), module()) ->
     roadrunner_send_writer:emit().
-send_emit(Worker, Conn, StreamId, Handler) ->
+send_emit(Worker, Protocol, Conn, StreamId, Handler) ->
     fun
         ({inform, Status, Headers}, _Req) ->
             Worker:send_interim(Conn, StreamId, Status, Headers);
         ({reply, Status, Headers, Body}, #{method := Method}) ->
             Response = roadrunner_conn:head_response({Status, Headers, Body}, Method),
-            {ok, Worker:emit_handler_response(Conn, StreamId, Handler, Response), Headers};
+            Sent = Worker:emit_handler_response(Conn, StreamId, Handler, Response),
+            {sent(Protocol, Status, Sent), Sent, Headers};
         ({sendfile, Status, Headers, Spec}, #{method := Method}) ->
             Response = roadrunner_conn:head_response({sendfile, Status, Headers, Spec}, Method),
-            {ok, Worker:emit_handler_response(Conn, StreamId, Handler, Response), Headers};
+            Sent = Worker:emit_handler_response(Conn, StreamId, Handler, Response),
+            {sent(Protocol, Status, Sent), Sent, Headers};
         ({stream, Status, Headers}, Req) ->
             ok = roadrunner_conn:continue_before_stream(Req),
             {Result, Sent} = Worker:start_stream(Conn, StreamId, Handler, Status, Headers),
@@ -249,6 +252,14 @@ send_emit(Worker, Conn, StreamId, Handler) ->
                 []
             }
     end.
+
+%% A complete response's result: `ok` when its status went out, the
+%% header-limit error `start_stream/5` returns when a 500 did instead.
+-spec sent(h2 | h3, roadrunner_http:status(), roadrunner_http:status()) ->
+    ok | {error, header_list_too_large | field_section_too_large}.
+sent(_Protocol, Status, Status) -> ok;
+sent(h2, _Status, _Sent) -> {error, header_list_too_large};
+sent(h3, _Status, _Sent) -> {error, field_section_too_large}.
 
 %% RFC 9110 §5.5: a response header name or value containing CR, LF or
 %% NUL is a handler bug (usually unvalidated user input echoed into a

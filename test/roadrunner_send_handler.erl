@@ -122,6 +122,17 @@ send_fun({report, Pid, {file, Spec}}) ->
         Pid ! {send_result, roadrunner_send:file(200, Headers, Spec, Req)},
         Req
     end;
+send_fun({report, Pid, big_reply}) ->
+    fun(Req) ->
+        Pid ! {send_result, roadrunner_send:reply(200, big_header(), ~"ok", Req)},
+        Req
+    end;
+send_fun({report, Pid, {big_file, File}}) ->
+    fun(Req) ->
+        Headers = [{~"content-length", ~"4"} | big_header()],
+        Pid ! {send_result, roadrunner_send:file(200, Headers, {File, 2, 4}, Req)},
+        Req
+    end;
 send_fun({report, Pid, big_stream}) ->
     fun(Req) ->
         Pid ! {send_result, roadrunner_send:stream(200, big_header(), Req)},

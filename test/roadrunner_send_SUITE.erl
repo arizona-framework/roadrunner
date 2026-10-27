@@ -42,6 +42,8 @@ fun does.
     within_the_client_limit_is_sent/1,
     inform_over_the_client_limit_is_not_sent/1,
     stream_over_the_client_limit_is_500/1,
+    reply_over_the_client_limit_is_500/1,
+    file_over_the_client_limit_is_500/1,
     client_reset_ends_the_fun/1
 ]).
 
@@ -97,6 +99,8 @@ multiplexed() ->
         within_the_client_limit_is_sent,
         inform_over_the_client_limit_is_not_sent,
         stream_over_the_client_limit_is_500,
+        reply_over_the_client_limit_is_500,
+        file_over_the_client_limit_is_500,
         file_failing_after_the_head_is_cut
     ].
 
@@ -169,6 +173,8 @@ routes(TestPid, File) ->
         {~"/unsafe-reply", ?H, {report, TestPid, unsafe_reply}},
         {~"/big-inform", ?H, {report, TestPid, big_inform}},
         {~"/big-stream", ?H, {report, TestPid, big_stream}},
+        {~"/big-reply", ?H, {report, TestPid, big_reply}},
+        {~"/big-file", ?H, {report, TestPid, {big_file, File}}},
         {~"/until-reset", ?H, {report, TestPid, until_reset}},
         {~"/upgrade", ?H, {report, TestPid, upgrade}},
         {~"/missing-file", ?H, {report, TestPid, {file, {missing_file(File), 0, 4}}}},
@@ -318,11 +324,19 @@ within_the_client_limit_is_sent(Config) ->
 
 inform_over_the_client_limit_is_not_sent(Config) ->
     ?assertMatch({[200], _, ~"ok", complete}, limited_get(Config, ~"/big-inform")),
-    ?assertMatch({error, _}, result()).
+    ?assertEqual({error, limit_error(Config)}, result()).
 
 stream_over_the_client_limit_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, limited_get(Config, ~"/big-stream")),
-    ?assertMatch({error, _}, result()).
+    ?assertEqual({error, limit_error(Config)}, result()).
+
+reply_over_the_client_limit_is_500(Config) ->
+    ?assertMatch({[500], _, _, complete}, limited_get(Config, ~"/big-reply")),
+    ?assertEqual({error, limit_error(Config)}, result()).
+
+file_over_the_client_limit_is_500(Config) ->
+    ?assertMatch({[500], _, _, complete}, limited_get(Config, ~"/big-file")),
+    ?assertEqual({error, limit_error(Config)}, result()).
 
 file_failing_after_the_head_is_cut(Config) ->
     %% `/dev/null` passes the check (a device has no size to hold the range
@@ -392,6 +406,13 @@ request(http3, Config, Method, Path, Body, Limit) ->
         h3_response(Conn, StreamId)
     after
         _ = roadrunner_quic_test_h3:close(Conn)
+    end.
+
+%% What a call over the client's header limit returns.
+limit_error(Config) ->
+    case ?config(protocol, Config) of
+        http2 -> header_list_too_large;
+        http3 -> field_section_too_large
     end.
 
 %% The status and kind of the next request stop event.
