@@ -567,7 +567,7 @@ recv_loop(
 %% Run the handler's optional `terminate/2` with why the session ended,
 %% then release the permessage-deflate zlib contexts and exit normally.
 %% All normal termination paths funnel through here; a handler crash
-%% skips it (no `terminate/2`, as with WebSock servers). The
+%% skips it (no `terminate/2`). The
 %% runtime would reclaim the zlib NIF resources on process exit anyway,
 %% but explicit release reclaims their working buffers immediately rather
 %% than waiting on GC. A crash skips this and relies on that GC. The
@@ -1343,7 +1343,12 @@ apply_handler_result(Result, Data, Hibernate, Continue, CloseReason) ->
 -spec close_payload(roadrunner_ws:close_code(), iodata()) -> binary().
 close_payload(Code, Reason) ->
     ReasonBin = iolist_to_binary(Reason),
-    case is_valid_close_code(Code) andalso is_valid_utf8(ReasonBin) of
+    %% A close is a control frame: its payload, the 2-byte code and the
+    %% reason, is at most 125 bytes (RFC 6455 §5.5).
+    case
+        is_valid_close_code(Code) andalso byte_size(ReasonBin) =< 123 andalso
+            is_valid_utf8(ReasonBin)
+    of
         true -> <<Code:16, ReasonBin/binary>>;
         false -> error({invalid_close_payload, Code, ReasonBin})
     end.

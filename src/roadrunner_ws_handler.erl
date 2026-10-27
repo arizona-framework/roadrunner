@@ -22,7 +22,8 @@ with zero or more frames (each `{Opcode, Payload}` — always
   send: 1000-1003, 1007-1014 (RFC 6455 §7.4 and the IANA registry:
   1012 service restart, 1013 try again later, 1014 bad gateway), or
   3000-4999. `Reason` is iodata that must be
-  valid UTF-8. The framework crashes the session on invalid
+  valid UTF-8 and at most 123 bytes (a control frame's payload limit,
+  RFC 6455 §5.5). The framework crashes the session on invalid
   `Code` / `Reason` rather than emit a malformed close frame.
 - `{close, Code, Reason, Frames, State}` sends `Frames`, then that
   close frame, in the same write.

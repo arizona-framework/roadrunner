@@ -1054,6 +1054,34 @@ close_with_invalid_utf8_reason_crashes_session_test() ->
     end,
     Sink ! stop.
 
+handler_close_with_overlong_reason_crashes_session_test() ->
+    %% A reason over 123 bytes would make a close frame over the 125-byte
+    %% control-frame limit: refused like any other malformed close.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, []),
+    State = #{sink => Self, on_init => {close, 1000, binary:copy(~"a", 124)}},
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_lifecycle_handler,
+            State,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, {{invalid_close_payload, 1000, _}, _}} -> ok
+    after 500 -> ?assert(false)
+    end,
+    Sink ! stop.
+
 %% =============================================================================
 %% permessage-deflate (RFC 7692) — end-to-end through the session.
 %% =============================================================================
