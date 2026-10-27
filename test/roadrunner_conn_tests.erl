@@ -2606,3 +2606,15 @@ keep_alive_decision_cached_keep_alive_request_test() ->
     ?assertEqual(
         close, roadrunner_conn:keep_alive_decision(Req, [{~"connection", ~"close"}])
     ).
+
+websocket_header_list_is_a_500_test() ->
+    %% The 0.11 `{websocket, Mod, State, Headers}`: the options are a map
+    %% now, so the list form is answered 500, named in the log.
+    ?assertEqual(
+        {500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"},
+        roadrunner_conn:final_response(h1, my_handler, {websocket, my_ws, state, []})
+    ),
+    ?assertEqual(
+        {websocket, my_ws, state, #{}},
+        roadrunner_conn:final_response(h1, my_handler, {websocket, my_ws, state, #{}})
+    ).

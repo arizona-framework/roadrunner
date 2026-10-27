@@ -147,8 +147,12 @@ Optional middleware and timing knobs (durations in milliseconds):
   defaulting to 10 MB with over-cap closing the connection with code
   1009, plus `recv_buffer` (per-session inet `buffer` override — bounds
   per-connection memory at high WebSocket concurrency; inherits the
-  listener's `recv_buffer` when unset) and `hibernate_after` (idle-session
-  hibernation timeout in milliseconds; off when unset).
+  listener's `recv_buffer` when unset), `hibernate_after` (idle-session
+  hibernation timeout in milliseconds; off when unset), `compress`
+  (accept permessage-deflate; default `true`) and `idle_timeout` (close
+  a session whose client sent nothing for that many milliseconds; off
+  when unset). An upgrade can set each for its own session
+  (`t:roadrunner_ws_handler:upgrade_opts/0`).
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
 - `tls_handshake_timeout` — bound on the TLS handshake (TLS listeners

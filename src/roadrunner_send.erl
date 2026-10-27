@@ -31,11 +31,23 @@ Use it when the response can only be decided while the handler runs:
   `{websocket, Module, State, Opts}` response does
 
 The fun sends one final response (`reply/2,4`, `stream/3`, `file/4` or
-`websocket/4`); a second one raises `already_sent`. The calls take the request the fun
-holds now, so pass the one returned by `roadrunner_req:read_body/1,2`,
-and return the last one from the fun, as `handle/1` does. The calls work
-only inside the fun, in its process: one made from any other process,
-such as one the fun spawns, raises `not_in_send_fun`.
+`websocket/4`). The calls take the request the fun holds now, so pass
+the one returned by `roadrunner_req:read_body/1,2`, and return the last
+one from the fun, as `handle/1` does.
+
+What a call returns and when it raises:
+
+- `ok` (or `{ok, Send}` from `stream/3`) once the response went out.
+- `{error, Reason}` when it could not: the transport failed, a header has
+  CR/LF/NUL (`unsafe_header`), the headers are over the client's HTTP/2
+  or HTTP/3 limit, `file/4`'s file is missing or shorter than its range,
+  or an upgrade was refused. A final response that could not go out is
+  answered `500` in its place.
+- It raises `already_sent` for a final response, or an `inform/3`,
+  after the final response; and `not_in_send_fun` when called outside
+  the fun's process, such as from a process the fun spawns. The `Send`
+  fun `stream/3` returns is the fun's too: call it from the fun's
+  process.
 
 A fun that exits with `{shutdown, Reason}` stops the request on purpose,
 the OTP way: the response ends as far as it went (an open stream is

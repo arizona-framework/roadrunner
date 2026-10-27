@@ -6,9 +6,9 @@ drop off as they ship.
 
 ## HTTP/2 response-shape coverage
 
-One of the five handler return shapes still returns `501 Not Implemented`
-when served over HTTP/2 (`src/roadrunner_conn_loop_http2.erl` moduledoc
-has the matrix).
+A WebSocket upgrade (`{websocket, ...}` returned, or
+`roadrunner_send:websocket/4`) still answers `501 Not Implemented` over
+HTTP/2 and HTTP/3; every other response shape works on all protocols.
 
 ### `{websocket, _, _}` over h2 — RFC 8441 Extended CONNECT — large effort
 
