@@ -86,7 +86,8 @@ Unified return shape for all `roadrunner_ws_handler` callbacks.
 - `{ok, NewState, Opts}` — same, with an opt list.
 - `{close, NewState}` — send an empty close frame and terminate.
 - `{close, Code, Reason, NewState}` — send a close frame carrying
-  `Code` (a server-permitted code, see the module docs) and UTF-8 `Reason`.
+  `Code` (a server-permitted code: RFC 6455 §7.4 and the IANA close code
+  registry, see the module docs) and UTF-8 `Reason`.
   The framework crashes the session if `Code` / `Reason` is invalid
   rather than emit a malformed close.
 - `{close, Code, Reason, Frames, NewState}` — emit `Frames`, then that
