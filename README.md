@@ -86,6 +86,20 @@ $ curl localhost:8080
 hello, roadrunner!
 ```
 
+## Elixir and Phoenix
+
+[Roadrunner.Plug](https://github.com/arizona-framework/roadrunner_plug) runs
+Plug and Phoenix apps on Roadrunner. Add it to your `mix.exs`:
+
+```elixir
+{:roadrunner_plug, ">= 0.0.0"}
+```
+
+Then start a plug with `{Roadrunner.Plug, plug: MyApp.Router, port: 4000}`,
+or set `adapter: Roadrunner.PhoenixAdapter` on a Phoenix endpoint. See its
+[README](https://github.com/arizona-framework/roadrunner_plug#readme) for the
+options.
+
 ## Documentation
 
 | Topic | Description |
