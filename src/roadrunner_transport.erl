@@ -59,6 +59,7 @@
     sendfile/4,
     setopts/2,
     messages/1,
+    passive_message/1,
     default_tls_opts/0,
     apply_tls_defaults/1,
     build_tls_opts/2,
@@ -481,6 +482,21 @@ Tag conventions:
 messages({gen_tcp, _}) -> {tcp, tcp_closed, tcp_error};
 messages({ssl, _}) -> {ssl, ssl_closed, ssl_error};
 messages({fake, _}) -> {roadrunner_fake_data, roadrunner_fake_closed, roadrunner_fake_error}.
+
+-doc """
+Return the tag of the message this transport sends when an
+`{active, N}` socket has delivered its N messages and gone passive.
+The message is `{Tag, Socket}`; set `{active, N}` again to keep
+reading.
+
+- `{gen_tcp, _}` → `tcp_passive`
+- `{ssl, _}`    → `ssl_passive`
+- `{fake, _}`   → `roadrunner_fake_passive`
+""".
+-spec passive_message(socket()) -> atom().
+passive_message({gen_tcp, _}) -> tcp_passive;
+passive_message({ssl, _}) -> ssl_passive;
+passive_message({fake, _}) -> roadrunner_fake_passive.
 
 -doc """
 Hardened TLS server defaults — see the moduledoc.

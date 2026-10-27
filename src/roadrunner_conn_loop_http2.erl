@@ -153,6 +153,11 @@
 %% RST_STREAM(REFUSED_STREAM) on the over-limit HEADERS.
 -define(MAX_CONCURRENT_STREAMS, 100).
 
+%% Socket read mode fallback when proto_opts omits `http2_active` (only
+%% test harnesses do; the listener always sets it). Matches the listener
+%% default.
+-define(DEFAULT_ACTIVE, 16).
+
 %% Request-body cap fallback when proto_opts omits `max_content_length`
 %% (only test harnesses do; the listener always sets it). Matches the
 %% listener default.
@@ -245,6 +250,13 @@
     msg_data :: atom(),
     msg_closed :: atom(),
     msg_error :: atom(),
+    msg_passive :: atom(),
+    %% Socket read mode: `once` re-arms after every read; `N` arms
+    %% `{active, N}` and re-arms on the transport's passive message.
+    active :: once | 1..32767,
+    %% True while an `{active, N}` arm still has reads left, so the
+    %% frame loop skips the setopts call. Always false under `once`.
+    armed = false :: boolean(),
     %% Inbound bytes still to parse.
     buffer = <<>> :: binary(),
     %% HPACK contexts.
@@ -425,6 +437,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         msg_data = Data,
         msg_closed = Closed,
         msg_error = Error,
+        msg_passive = roadrunner_transport:passive_message(Socket),
+        active = maps:get(http2_active, ProtoOpts, ?DEFAULT_ACTIVE),
         hpack_dec = roadrunner_http2_hpack:new_decoder(?HPACK_TABLE_SIZE),
         hpack_enc = roadrunner_http2_hpack:new_encoder(?HPACK_TABLE_SIZE),
         buffer = Buffered,
@@ -580,10 +594,19 @@ frame_loop(#loop{buffer = Buf} = State) ->
             goaway_exit(State, protocol_error)
     end.
 
+%% Under `{active, N}` the socket stays armed across reads until the
+%% transport's passive message, so an armed loop goes straight to the
+%% mailbox. On TLS each setopts is a call into the ssl connection
+%% process, which is what `N` saves.
 -spec arm_and_recv(#loop{}) -> no_return().
-arm_and_recv(#loop{socket = Sock} = State) ->
+arm_and_recv(#loop{armed = true} = State) ->
+    recv_more(State);
+arm_and_recv(#loop{socket = Sock, active = once} = State) ->
     _ = roadrunner_transport:setopts(Sock, [{active, once}]),
-    recv_more(State).
+    recv_more(State);
+arm_and_recv(#loop{socket = Sock, active = N} = State) ->
+    _ = roadrunner_transport:setopts(Sock, [{active, N}]),
+    recv_more(State#loop{armed = true}).
 
 %% Unified mailbox dispatch: socket events, worker send requests,
 %% worker DOWN signals, and the idle-timeout `after` clause.
@@ -593,12 +616,15 @@ recv_more(
         msg_data = MData,
         msg_closed = MClosed,
         msg_error = MError,
+        msg_passive = MPassive,
         buffer = Buf
     } = State
 ) ->
     receive
         {MData, _, Bytes} ->
             frame_loop(State#loop{buffer = roadrunner_bin:append(Buf, Bytes)});
+        {MPassive, _} ->
+            arm_and_recv(State#loop{armed = false});
         {MClosed, _} ->
             exit_clean(State, peer_closed);
         {MError, _, Reason} ->
@@ -647,7 +673,7 @@ recv_timeout(#loop{idle_timeout = T}) ->
 
 %% Fired when `recv_more/1` sees no traffic for `recv_timeout/1`. With
 %% an empty streams map and `hibernate_after` the shorter wait, collapse
-%% the heap via hibernation; the socket is already `{active, once}`-armed
+%% the heap via hibernation; the socket is already armed
 %% (we reached recv_more through `arm_and_recv/1`), so the next inbound
 %% frame, or any worker / `'DOWN'` / drain message, wakes us and
 %% `recv_more_hib/2` resumes the loop. A hibernated process only wakes

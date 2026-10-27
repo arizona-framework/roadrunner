@@ -93,6 +93,8 @@ all_test_() ->
         fun frame_loop_parse_error_triggers_goaway/0,
         fun runtime_transport_error_triggers_goaway/0,
         fun runtime_idle_timeout_emits_goaway/0,
+        fun active_n_rearms_only_on_passive/0,
+        fun active_once_rearms_after_every_read/0,
         fun hibernate_after_fires_when_idle/0,
         fun hibernated_idle_conn_still_emits_goaway/0,
         fun hibernate_after_past_idle_timeout_emits_goaway/0,
@@ -2076,6 +2078,38 @@ runtime_idle_timeout_emits_goaway() ->
     after
         persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
     end.
+
+active_n_rearms_only_on_passive() ->
+    %% Under the default `{active, 16}` the frame loop arms once and
+    %% reads on without another setopts, until the transport's passive
+    %% message asks it to arm again.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    %% Sync on a first read: by its ack every arm so far is out. The
+    %% handshake arms `once`; the frame loop arms `{active, 16}` once.
+    ok = ping_roundtrip(ConnPid, 0),
+    Arms = collect_setopts(ConnPid),
+    ?assertEqual([{active, 16}], lists:last(Arms)),
+    ?assertEqual([], [A || A <- lists:droplast(Arms), A =/= [{active, once}]]),
+    ok = ping_roundtrip(ConnPid, 1),
+    ok = ping_roundtrip(ConnPid, 2),
+    %% The second ack went out after the loop had passed the first
+    %% read's re-arm point, so a re-arm would already be here.
+    ?assertEqual(none, take_setopts(ConnPid)),
+    ConnPid ! {roadrunner_fake_passive, {fake, self()}},
+    ?assertEqual([{active, 16}], expect_setopts(ConnPid)),
+    cleanup(Pid, Ref).
+
+active_once_rearms_after_every_read() ->
+    %% `active => once` keeps the per-read arm: every frame read ends
+    %% with a fresh `{active, once}`.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_active => once}),
+    ok = ping_roundtrip(ConnPid, 0),
+    _ = collect_setopts(ConnPid),
+    ok = ping_roundtrip(ConnPid, 1),
+    ?assertEqual([{active, once}], expect_setopts(ConnPid)),
+    ok = ping_roundtrip(ConnPid, 2),
+    ?assertEqual([{active, once}], expect_setopts(ConnPid)),
+    cleanup(Pid, Ref).
 
 hibernate_after_fires_when_idle() ->
     %% With `hibernate_after` set and no streams in flight, the conn
@@ -4997,6 +5031,33 @@ serve_recv(ConnPid, Data) ->
     %% from filling up across long tests.
     drain_setopts(),
     ConnPid ! {roadrunner_fake_data, {fake, self()}, iolist_to_binary([Data])},
+    ok.
+
+expect_setopts(ConnPid) ->
+    receive
+        {roadrunner_fake_setopts, ConnPid, Opts} -> Opts
+    after 500 -> error(no_setopts)
+    end.
+
+%% Every arm `ConnPid` has sent so far, oldest first.
+collect_setopts(ConnPid) ->
+    case take_setopts(ConnPid) of
+        none -> [];
+        Opts -> [Opts | collect_setopts(ConnPid)]
+    end.
+
+take_setopts(ConnPid) ->
+    receive
+        {roadrunner_fake_setopts, ConnPid, Opts} -> Opts
+    after 0 -> none
+    end.
+
+%% Deliver a PING without draining setopts (unlike `serve_recv/2`) and
+%% wait for its ACK, so a test can watch the arms around a read.
+ping_roundtrip(ConnPid, N) ->
+    Ping = iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<N:64>>})),
+    ConnPid ! {roadrunner_fake_data, {fake, self()}, Ping},
+    ?assertMatch(<<_:24, 6, 1, 0:32, N:64>>, expect_send()),
     ok.
 
 drain_setopts() ->

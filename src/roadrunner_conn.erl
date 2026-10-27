@@ -239,6 +239,7 @@ deadline in milliseconds. The shed form answers it `503` with the
     http2_window_refill_threshold => 1..16#7FFFFFFF,
     http2_max_concurrent_streams => 1..16#7FFFFFFF,
     http2_max_header_block => 1..16#7FFFFFFF,
+    http2_active => once | 1..32767,
     %% HTTP/3 tuning, flattened from `{http3, #{...}}` when http3 is enabled.
     http3_listeners => 1..1024,
     http3_max_header_block => 1..16#7FFFFFFF,

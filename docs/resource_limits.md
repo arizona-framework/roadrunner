@@ -93,6 +93,7 @@ are advertised to the peer in the initial `SETTINGS` frame.
 | Header block (HEADERS + CONTINUATION) | 16 KB | yes |
 | Connection receive window (`conn_window`) | 65535 | yes |
 | Stream receive window (`stream_window`) | 65535 | yes |
+| Unread socket reads per connection (`active`) | 16 | yes |
 
 A frame whose declared length exceeds the negotiated max frame size is
 rejected on its 9-byte header, before the body is buffered. Streams over
@@ -101,6 +102,13 @@ the concurrency limit are refused. The cumulative header block has no
 overruns it gets `GOAWAY(ENHANCE_YOUR_CALM)`. The concurrency and
 header-block caps are tuned under `{http2, #{...}}` in the `protocols`
 list, with the keys `max_concurrent_streams` and `max_header_block`.
+
+`active` sets how many socket reads a connection takes before it asks
+the socket for more (`once` asks after every read). On TLS each ask is a
+call into the TLS connection process, so a larger value saves CPU. A
+connection can hold up to that many unread reads (each up to
+`recv_buffer` bytes on plain TCP), so a smaller value bounds that memory
+more tightly.
 
 Response headers are held to the client's own limit: a client that sends
 `SETTINGS_MAX_HEADER_LIST_SIZE` gets no header section over it (RFC 9113
