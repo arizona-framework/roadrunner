@@ -1242,6 +1242,10 @@ send_phase(S0, Handler, Req, Headers, Fun, Span) ->
     %% Queued pipelined responses go out ahead of anything the fun sends.
     #loop_state{socket = Socket} = S = flush_out(S0),
     case roadrunner_send_writer:run(Handler, Fun, Headers, Req, send_emit(S, Handler)) of
+        {done, {websocket, _Status, {session, Upgrade, MRef, SessPid}}, Req2} ->
+            %% The session owns the socket now: wait it out, as for a
+            %% returned upgrade; `request_stop` fires when it ends.
+            ws_session_wait(S, Req2, Upgrade, MRef, SessPid, Span);
         {done, {Kind, Status, SentHeaders}, Req2} ->
             ok = roadrunner_event:request_stop(Span, Status, Kind),
             send_finish(S, Req2, Kind, SentHeaders);
@@ -1270,10 +1274,11 @@ crash_answer(_Sent, _Socket) -> ok.
 -spec send_finish(
     #loop_state{},
     roadrunner_req:request(),
-    buffered | stream | sendfile,
-    roadrunner_http:headers()
+    buffered | stream | sendfile | websocket,
+    roadrunner_http:headers() | rejected
 ) -> no_return().
-send_finish(S, Req, stream, _Headers) ->
+send_finish(S, Req, Kind, _Headers) when Kind =:= stream; Kind =:= websocket ->
+    %% A refused upgrade already answered and closes, as for a returned one.
     writer_finish(S, Req);
 send_finish(S, Req, _Kind, Headers) ->
     buffered_finish(S, Req, Headers).
@@ -1305,7 +1310,12 @@ send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
         ({sendfile, Status, Headers0, Spec}, Req) ->
             Headers = with_close_if_closing(S, Req, Headers0),
             #loop_state{} = dispatch_response(S, Handler, Req, {sendfile, Status, Headers, Spec}),
-            {ok, Status, Headers}
+            {ok, Status, Headers};
+        ({websocket, Mod, State, Opts} = Upgrade, Req) ->
+            case dispatch_websocket(S, Req, Mod, State, Opts) of
+                {ws_session, MRef, SessPid, _S} -> {ok, 101, {session, Upgrade, MRef, SessPid}};
+                #loop_state{} -> {{error, rejected}, 101, rejected}
+            end
     end.
 
 %% RFC 9110 §15.2: a server MUST NOT send a 1xx response to an HTTP/1.0

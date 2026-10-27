@@ -33,6 +33,9 @@ fun does.
     keeps_the_connection_alive/1,
     signals_close_at_the_keep_alive_ceiling/1,
     skips_interims_for_http10/1,
+    upgrades_from_the_fun/1,
+    refused_upgrade_answers/1,
+    upgrade_is_not_supported/1,
     within_the_client_limit_is_sent/1,
     inform_over_the_client_limit_is_not_sent/1,
     stream_over_the_client_limit_is_500/1,
@@ -78,11 +81,14 @@ http1() ->
     [
         keeps_the_connection_alive,
         signals_close_at_the_keep_alive_ceiling,
-        skips_interims_for_http10
+        skips_interims_for_http10,
+        upgrades_from_the_fun,
+        refused_upgrade_answers
     ].
 
 multiplexed() ->
     [
+        upgrade_is_not_supported,
         within_the_client_limit_is_sent,
         inform_over_the_client_limit_is_not_sent,
         stream_over_the_client_limit_is_500
@@ -157,7 +163,8 @@ routes(TestPid, File) ->
         {~"/unsafe-reply", ?H, {report, TestPid, unsafe_reply}},
         {~"/big-inform", ?H, {report, TestPid, big_inform}},
         {~"/big-stream", ?H, {report, TestPid, big_stream}},
-        {~"/until-reset", ?H, {report, TestPid, until_reset}}
+        {~"/until-reset", ?H, {report, TestPid, until_reset}},
+        {~"/upgrade", ?H, {report, TestPid, upgrade}}
     ].
 
 %% =============================================================================
@@ -255,9 +262,31 @@ skips_interims_for_http10(Config) ->
     ok = gen_tcp:send(Sock, ~"GET /inform HTTP/1.0\r\nhost: x\r\n\r\n"),
     ?assertMatch({[200], _, ~"after hints", complete}, h1_parse(h1_recv_all(Sock), ~"GET")).
 
+upgrades_from_the_fun(Config) ->
+    %% `websocket/4` from the fun: the 101, then the session echoes.
+    Sock = h1_connect(Config),
+    ok = gen_tcp:send(Sock, [
+        ~"GET /upgrade HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
+        ~"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    ]),
+    {ok, <<"HTTP/1.1 101", _/binary>>} = gen_tcp:recv(Sock, 0, 5000),
+    ?assertEqual(ok, result()),
+    Key = <<1, 2, 3, 4>>,
+    ok = gen_tcp:send(Sock, <<16#81, 16#82, Key/binary, (crypto:exor(~"hi", <<1, 2>>))/binary>>),
+    ?assertEqual({ok, <<16#81, 2, "hi">>}, gen_tcp:recv(Sock, 4, 5000)).
+
+refused_upgrade_answers(Config) ->
+    %% Without the handshake headers the upgrade is refused with a 400.
+    ?assertMatch({[400], _, _, complete}, get(Config, ~"/upgrade")),
+    ?assertEqual({error, rejected}, result()).
+
 %% =============================================================================
 %% HTTP/2 and HTTP/3
 %% =============================================================================
+
+upgrade_is_not_supported(Config) ->
+    ?assertMatch({[501], _, _, complete}, get(Config, ~"/upgrade")),
+    ?assertEqual({error, not_supported}, result()).
 
 within_the_client_limit_is_sent(Config) ->
     ?assertMatch({[103, 103, 200], _, ~"after hints", complete}, limited_get(Config, ~"/inform")),

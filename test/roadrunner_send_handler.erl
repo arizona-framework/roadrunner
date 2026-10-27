@@ -109,6 +109,13 @@ send_fun({report, Pid, until_reset}) ->
         ok = send_until_error(Send),
         Req
     end;
+send_fun({report, Pid, upgrade}) ->
+    fun(Req) ->
+        Pid !
+            {send_result,
+                roadrunner_send:websocket(roadrunner_ws_echo_handler, no_state, #{}, Req)},
+        Req
+    end;
 send_fun({report, Pid, big_stream}) ->
     fun(Req) ->
         Pid ! {send_result, roadrunner_send:stream(200, big_header(), Req)},
