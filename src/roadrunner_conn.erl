@@ -1682,6 +1682,14 @@ parse_loop(Buf, RecvFun) ->
     roadrunner_handler:response().
 final_response(_Protocol, _Handler, {websocket, _, _} = Response) ->
     Response;
+final_response(_Protocol, Handler, {websocket, _, _, Headers}) when is_list(Headers) ->
+    %% The 0.11 shape: the upgrade options became a map in 0.12. Named in
+    %% the log, so the upgrade fails loudly instead of as a bare crash.
+    logger:error(#{
+        msg => "roadrunner websocket upgrade options must be a map, as #{headers => Headers}",
+        handler => Handler
+    }),
+    {500, [{~"content-type", ~"text/plain"}], ~"Internal Server Error"};
 final_response(_Protocol, _Handler, {websocket, _, _, _} = Response) ->
     Response;
 final_response(Protocol, Handler, Response) ->
