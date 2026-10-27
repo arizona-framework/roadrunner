@@ -4,23 +4,28 @@ Behaviour for WebSocket handlers.
 
 After a successful upgrade — signaled by a regular `roadrunner_handler`
 returning `{websocket, Module, State}` (or `{websocket, Module, State,
-Headers}` to add headers to the 101) — the connection process
+Opts}` with `t:upgrade_opts/0`) — the session
 drives a frame loop that calls `handle_frame/2` for each non-control
 frame received from the client.
 
-Control frames (`ping`/`close`) are auto-handled by the connection
-layer and **never** reach the user callback. The handler may reply
+Control frames are handled by the session: it answers a `ping` with a
+`pong` and a `close` with the closing handshake. A handler that exports
+the optional `handle_control/2` also sees each `ping` and `pong`; a
+`close` never reaches the handler (`terminate/2` reports it). The handler may reply
 with zero or more frames (each `{Opcode, Payload}` — always
 `Fin = true`) or signal close to terminate the session gracefully:
 
 - `{close, State}` sends an empty close frame (RFC 6455 §5.5.1
   permits this).
 - `{close, Code, Reason, State}` sends a close frame carrying the
-  status code and reason text. `Code` must be a code the spec
-  permits the server to send (1000-1003, 1007-1011, 1014, or
-  3000-4999 per RFC 6455 §7.4). `Reason` is iodata that must be
+  status code and reason text. `Code` must be a code a server may
+  send: 1000-1003, 1007-1014 (RFC 6455 §7.4 and the IANA registry:
+  1012 service restart, 1013 try again later, 1014 bad gateway), or
+  3000-4999. `Reason` is iodata that must be
   valid UTF-8. The framework crashes the session on invalid
   `Code` / `Reason` rather than emit a malformed close frame.
+- `{close, Code, Reason, Frames, State}` sends `Frames`, then that
+  close frame, in the same write.
 
 State is passed through unchanged by the framework.
 
@@ -80,9 +85,11 @@ Unified return shape for all `roadrunner_ws_handler` callbacks.
 - `{ok, NewState, Opts}` — same, with an opt list.
 - `{close, NewState}` — send an empty close frame and terminate.
 - `{close, Code, Reason, NewState}` — send a close frame carrying
-  `Code` (RFC 6455 §7.4 server-permitted code) and UTF-8 `Reason`.
+  `Code` (a server-permitted code, see the module docs) and UTF-8 `Reason`.
   The framework crashes the session if `Code` / `Reason` is invalid
   rather than emit a malformed close.
+- `{close, Code, Reason, Frames, NewState}` — emit `Frames`, then that
+  close frame, and terminate.
 """.
 -type result() ::
     {reply, Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term()}
@@ -90,7 +97,9 @@ Unified return shape for all `roadrunner_ws_handler` callbacks.
     | {ok, NewState :: term()}
     | {ok, NewState :: term(), [opt()]}
     | {close, NewState :: term()}
-    | {close, Code :: roadrunner_ws:close_code(), Reason :: iodata(), NewState :: term()}.
+    | {close, Code :: roadrunner_ws:close_code(), Reason :: iodata(), NewState :: term()}
+    | {close, Code :: roadrunner_ws:close_code(), Reason :: iodata(),
+        Frames :: [{roadrunner_ws:opcode(), iodata()}], NewState :: term()}.
 
 -doc """
 Optional. Runs once in the session process after the 101 has been
@@ -204,6 +213,15 @@ It is not called when a callback crashes, or when the session is killed
 """.
 -callback terminate(Reason :: terminate_reason(), State :: term()) -> term().
 
--optional_callbacks([init/1, handle_info/2, handle_drain/2, terminate/2]).
+-doc """
+Optional. Gets each `ping` and `pong` frame the client sends, as a
+`#{opcode := ping | pong, payload := Payload}` frame map, after the
+session answered a `ping` with its `pong`. Returns the same shape as
+`handle_frame/2`. Handlers that don't export it never see control
+frames.
+""".
+-callback handle_control(Frame :: roadrunner_ws:frame(), State :: term()) -> result().
+
+-optional_callbacks([init/1, handle_info/2, handle_drain/2, handle_control/2, terminate/2]).
 
 -export_type([opt/0, result/0, terminate_reason/0, upgrade_opts/0]).

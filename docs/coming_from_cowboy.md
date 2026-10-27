@@ -592,7 +592,7 @@ Notable differences:
 
 - `handle_frame/2` gets a map such as `#{opcode := text, payload := Bin}`.
   Fragmented messages arrive whole, and ping, pong, and close are handled for
-  you, so they never reach the handler
+  you; export the optional `handle_control/2` to also see each ping and pong
 - To refuse the upgrade, return a normal response from `handle/1` instead
 - Cowboy's per-upgrade options go in a map: `{websocket, Mod, State, Opts}`.
   `headers` adds headers to the `101` (a `sec-websocket-protocol` or a

@@ -112,6 +112,7 @@
     has_init :: boolean(),
     has_handle_info :: boolean(),
     has_handle_drain :: boolean(),
+    has_handle_control :: boolean(),
     has_terminate :: boolean(),
     %% permessage-deflate (RFC 7692) state. `pmd_params = undefined`
     %% means the extension was NOT negotiated; the session bypasses
@@ -415,6 +416,7 @@ init_session(
                 has_init = erlang:function_exported(Mod, init, 1),
                 has_handle_info = erlang:function_exported(Mod, handle_info, 2),
                 has_handle_drain = erlang:function_exported(Mod, handle_drain, 2),
+                has_handle_control = erlang:function_exported(Mod, handle_control, 2),
                 has_terminate = erlang:function_exported(Mod, terminate, 2),
                 pmd_params = PmdParams,
                 inflate_z = InflateZ,
@@ -802,11 +804,12 @@ handle_frame(#{opcode := close, payload := P}, Data, _Hibernate) ->
     %% MUST close with 1002 (protocol error) instead of echoing.
     Reply = close_reply(P),
     flush_and_exit(remote, queue_frame(Data, close, Reply));
-handle_frame(#{opcode := ping, payload := P}, Data, Hibernate) ->
-    process_buffer(queue_frame(Data, pong, P), Hibernate);
-handle_frame(#{opcode := pong}, Data, Hibernate) ->
-    %% Server is not pinging clients yet — pong from client is dropped.
-    process_buffer(Data, Hibernate);
+handle_frame(#{opcode := ping, payload := P} = Frame, Data, Hibernate) ->
+    %% The pong is the session's (RFC 6455 §5.5.2); the handler only sees
+    %% the ping, if it asked to.
+    control_frame(Frame, queue_frame(Data, pong, P), Hibernate);
+handle_frame(#{opcode := pong} = Frame, Data, Hibernate) ->
+    control_frame(Frame, Data, Hibernate);
 handle_frame(
     #{fin := true, rsv1 := false, opcode := Op, payload := P} = Frame,
     #data{msg_acc = undefined, utf8_pending = Pending, max_message_size = MaxMsg} = Data,
@@ -1222,9 +1225,11 @@ close_reply(<<Code:16, Reason/binary>>) ->
 close_reply(_) ->
     close_protocol_error().
 
-%% Per RFC 6455 §7.4.1 / §7.4.2:
-%%   - 1000-1011 + 1014: assigned, may appear on the wire (1004/1005/1006
-%%     are reserved, MUST NOT appear).
+%% Per RFC 6455 §7.4.1 / §7.4.2 and the IANA WebSocket Close Code
+%% Number Registry:
+%%   - 1000-1003, 1007-1014: assigned, may appear on the wire (1004/1005/1006
+%%     are reserved, MUST NOT appear; 1012 service restart, 1013 try again
+%%     later and 1014 bad gateway are IANA-registered after RFC 6455).
 %%   - 3000-4999: registered (3xxx) or application-private (4xxx) ranges.
 %% Anything else is invalid.
 -spec is_valid_close_code(non_neg_integer()) -> boolean().
@@ -1238,6 +1243,8 @@ is_valid_close_code(1008) -> true;
 is_valid_close_code(1009) -> true;
 is_valid_close_code(1010) -> true;
 is_valid_close_code(1011) -> true;
+is_valid_close_code(1012) -> true;
+is_valid_close_code(1013) -> true;
 is_valid_close_code(1014) -> true;
 is_valid_close_code(_) -> false.
 
@@ -1249,6 +1256,17 @@ is_valid_utf8(Bin) ->
         Out when is_binary(Out) -> true;
         _ -> false
     end.
+
+%% A ping or pong, to the optional `handle_control/2`; dropped without it.
+-spec control_frame(roadrunner_ws:frame(), #data{}, boolean()) -> no_return().
+control_frame(
+    Frame, #data{has_handle_control = true, mod = Mod, mod_state = State} = Data, Hibernate
+) ->
+    apply_handler_result(
+        Mod:handle_control(Frame, State), Data, Hibernate, fun process_buffer/2, normal
+    );
+control_frame(_Frame, #data{has_handle_control = false} = Data, Hibernate) ->
+    process_buffer(Data, Hibernate).
 
 -spec dispatch_data_frame(roadrunner_ws:frame(), #data{}, boolean()) -> no_return().
 dispatch_data_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate) ->
@@ -1309,7 +1327,11 @@ apply_handler_result(Result, Data, Hibernate, Continue, CloseReason) ->
             flush_and_exit(
                 CloseReason,
                 queue_frame(Data#data{mod_state = NewState}, close, close_payload(Code, Reason))
-            )
+            );
+        {close, Code, Reason, OutFrames, NewState} ->
+            %% The frames, then the close, in the same write.
+            Queued = queue_frames(Data#data{mod_state = NewState}, OutFrames),
+            flush_and_exit(CloseReason, queue_frame(Queued, close, close_payload(Code, Reason)))
     end.
 
 %% Build the wire payload for a handler-driven close. RFC 6455 §5.5.1
