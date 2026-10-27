@@ -49,7 +49,7 @@ threading `Req` through the entire request lifecycle.
 - `{send, Headers, Fun}` — the handler sends the response itself, as
   it runs. The connection calls `Fun(Req)`, which sends it with
   `roadrunner_send` (interim 1xx responses, then a complete, streamed
-  or file response) and returns the request. `Headers` are added to the
+  or file response, or a WebSocket upgrade) and returns the request. `Headers` are added to the
   final response; middlewares add theirs there. See `roadrunner_send`.
 
 If the handler did not call `roadrunner_req:read_body/1,2`, just thread

@@ -239,7 +239,15 @@ send_emit(Worker, Conn, StreamId, Handler) ->
         ({stream, Status, Headers}, Req) ->
             ok = roadrunner_conn:continue_before_stream(Req),
             {Result, Sent} = Worker:start_stream(Conn, StreamId, Handler, Status, Headers),
-            {Result, Sent, Headers}
+            {Result, Sent, Headers};
+        ({websocket, _Mod, _State, _Opts} = Upgrade, _Req) ->
+            %% No WebSocket over HTTP/2 or HTTP/3: the 501 a returned
+            %% upgrade gets.
+            {
+                {error, not_supported},
+                Worker:emit_handler_response(Conn, StreamId, Handler, Upgrade),
+                []
+            }
     end.
 
 %% RFC 9110 §5.5: a response header name or value containing CR, LF or

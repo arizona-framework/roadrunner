@@ -31,18 +31,22 @@
     | {reply, roadrunner_http:status(), roadrunner_http:headers(), iodata()}
     | {stream, roadrunner_http:status(), roadrunner_http:headers()}
     | {sendfile, roadrunner_http:status(), roadrunner_http:headers(),
-        roadrunner_handler:sendfile_spec()}.
+        roadrunner_handler:sendfile_spec()}
+    | {websocket, module(), term(), roadrunner_ws_handler:upgrade_opts()}.
 
 %% A protocol's writer for each call, given the request the fun holds then.
 %% `inform` returns the call's result; a final response returns it with the
 %% status and headers that went out (a 500 in place of a response the
 %% protocol could not send, the headers the HTTP/1.1 keep-alive decision
-%% reads).
+%% reads). A WebSocket upgrade returns what its protocol needs to finish
+%% the request in place of the headers.
 -type emit() :: fun((op(), roadrunner_req:request()) -> term()).
 
--type kind() :: buffered | stream | sendfile.
+-type kind() :: buffered | stream | sendfile | websocket.
 
--type sent() :: {kind(), roadrunner_http:status(), roadrunner_http:headers()}.
+-type sent() ::
+    {buffered | stream | sendfile, roadrunner_http:status(), roadrunner_http:headers()}
+    | {websocket, roadrunner_http:status(), term()}.
 
 -type outcome() ::
     {done, sent(), roadrunner_req:request()}
@@ -65,6 +69,12 @@ inform(Status, Headers, #{send := #writer{emit = Emit}} = Req) ->
 %% The final response, with the tuple's headers added: sent, or answered
 %% 500 when a header is unsafe.
 -spec final(kind(), op(), roadrunner_req:request()) -> result().
+final(websocket, Op, #{send := #writer{emit = Emit}} = Req) ->
+    %% A 101 carries the upgrade options' headers, never the tuple's: the
+    %% middlewares leave a returned `{websocket, ...}` alone too.
+    ok = unsent(),
+    {Result, Status, Session} = Emit(Op, Req),
+    record(websocket, Result, Status, Session);
 final(Kind, Op0, #{send := #writer{emit = Emit, headers = Extra}} = Req) ->
     ok = unsent(),
     Op = with_headers(Op0, Extra),

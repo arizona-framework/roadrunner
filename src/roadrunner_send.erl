@@ -27,9 +27,11 @@ Use it when the response can only be decided while the handler runs:
 - `stream/3` sends the status and headers and returns the same `Send`
   fun a `{stream, ...}` response gets, to write the body as it goes
 - `file/4` sends a file, as a `{sendfile, ...}` response does
+- `websocket/4` upgrades the connection to a WebSocket session, as a
+  `{websocket, Module, State, Opts}` response does
 
-The fun sends one final response (`reply/2,4`, `stream/3` or `file/4`); a
-second one raises `already_sent`. The calls take the request the fun
+The fun sends one final response (`reply/2,4`, `stream/3`, `file/4` or
+`websocket/4`); a second one raises `already_sent`. The calls take the request the fun
 holds now, so pass the one returned by `roadrunner_req:read_body/1,2`,
 and return the last one from the fun, as `handle/1` does. The calls work
 only inside the fun.
@@ -56,7 +58,7 @@ request gets no body from `reply/2,4` or `file/4`. An interim response
 to an HTTP/1.0 client is skipped, as RFC 9110 §15.2 asks.
 """.
 
--export([inform/3, reply/2, reply/4, stream/3, file/4]).
+-export([inform/3, reply/2, reply/4, stream/3, file/4, websocket/4]).
 
 -export_type([sender/0]).
 
@@ -136,3 +138,18 @@ file(Status, Headers, {_File, Offset, Length} = Spec, Req) when
     Length >= 0
 ->
     roadrunner_send_writer:final(sendfile, {sendfile, Status, Headers, Spec}, Req).
+
+-doc """
+Upgrade the connection to a WebSocket session run by `Module` (a
+`roadrunner_ws_handler`) from `State`, with the upgrade options `Opts`
+(`t:roadrunner_ws_handler:upgrade_opts/0`), as a `{websocket, Module,
+State, Opts}` response does. On HTTP/1.1 it sends the `101` and the
+session takes the connection; the request ends when the session does.
+Returns `ok` once the session runs, or `{error, Reason}` when the upgrade
+was refused: an invalid handshake (answered `400` or `426`), or HTTP/2 and
+HTTP/3, which answer `501`.
+""".
+-spec websocket(module(), term(), roadrunner_ws_handler:upgrade_opts(), roadrunner_req:request()) ->
+    ok | {error, term()}.
+websocket(Module, State, Opts, Req) when is_atom(Module), is_map(Opts) ->
+    roadrunner_send_writer:final(websocket, {websocket, Module, State, Opts}, Req).
