@@ -97,6 +97,33 @@
     atom(), roadrunner_event_handler:peer(), binary() | undefined
 }.
 
+%% Cached results of `erlang:function_exported/3` for the optional
+%% callbacks. Computed once in `init/1` and read on every event so the BIF
+%% call doesn't run on the hot path (handle_info can fire per pubsub
+%% message; caching turns a ~50ns BIF into a record read). They live in
+%% their own record, held in one `#data{}` field, so the per-frame
+%% `Data#data{...}` updates don't copy them.
+-record(callbacks, {
+    init :: boolean(),
+    handle_info :: boolean(),
+    handle_drain :: boolean(),
+    handle_control :: boolean(),
+    terminate :: boolean()
+}).
+
+%% Idle timeout (the `idle_timeout` upgrade / listener opt). When set, a
+%% timer fires every interval and the session closes if the socket's
+%% received-byte count (`roadrunner_transport:recv_count/1`) did not move
+%% since the last fire (`recv`): nothing runs per frame. `timer` is the
+%% armed timer's reference, `undefined` with no timeout, so the
+%% `recv_loop/1` clause matching it never fires. Its own record, like
+%% `#callbacks{}`, keeps the per-frame `#data{}` copies small.
+-record(idle, {
+    timeout :: pos_integer() | infinity,
+    timer :: reference() | undefined,
+    recv = 0 :: non_neg_integer()
+}).
+
 -record(data, {
     socket :: roadrunner_transport:socket(),
     buffer :: binary(),
@@ -104,16 +131,7 @@
     mod_state :: term(),
     %% The event handler's WebSocket span, from `ws_upgrade`.
     span :: roadrunner_event_handler:span(),
-    %% Cached results of `erlang:function_exported/3` for the optional
-    %% callbacks. Computed once in `init/1` and read on every event so
-    %% the BIF call doesn't run on the hot path (handle_info can fire
-    %% per pubsub message — caching turns a ~50ns BIF into a record
-    %% read).
-    has_init :: boolean(),
-    has_handle_info :: boolean(),
-    has_handle_drain :: boolean(),
-    has_handle_control :: boolean(),
-    has_terminate :: boolean(),
+    callbacks :: #callbacks{},
     %% permessage-deflate (RFC 7692) state. `pmd_params = undefined`
     %% means the extension was NOT negotiated; the session bypasses
     %% all compression machinery on the hot path.
@@ -151,15 +169,7 @@
     %% recv_loop's `after` clause dead by the receive's own semantics —
     %% the timer never arms, so the default costs nothing per message.
     hibernate_after :: pos_integer() | infinity,
-    %% Idle timeout (the `idle_timeout` upgrade / listener opt). When set,
-    %% a timer fires every interval and the session closes if the socket's
-    %% received-byte count (`roadrunner_transport:recv_count/1`) did not
-    %% move since the last fire: nothing runs per frame. `idle_timer` is
-    %% the armed timer's reference, `undefined` with no timeout, so the
-    %% `recv_loop/1` clause matching it never fires.
-    idle_timeout :: pos_integer() | infinity,
-    idle_timer :: reference() | undefined,
-    idle_recv = 0 :: non_neg_integer(),
+    idle :: #idle{},
     msg_size = 0 :: non_neg_integer(),
     %% Trailing UTF-8 bytes carried over from a previous fragment that
     %% form the start of a multi-byte sequence whose continuation
@@ -413,18 +423,20 @@ init_session(
                 %% launcher has the ack, so the upgrade fires here: the
                 %% session owns the span its frame events carry.
                 span = roadrunner_event:ws_upgrade(ListenerName, Peer, RequestId, Mod),
-                has_init = erlang:function_exported(Mod, init, 1),
-                has_handle_info = erlang:function_exported(Mod, handle_info, 2),
-                has_handle_drain = erlang:function_exported(Mod, handle_drain, 2),
-                has_handle_control = erlang:function_exported(Mod, handle_control, 2),
-                has_terminate = erlang:function_exported(Mod, terminate, 2),
+                callbacks = #callbacks{
+                    init = erlang:function_exported(Mod, init, 1),
+                    handle_info = erlang:function_exported(Mod, handle_info, 2),
+                    handle_drain = erlang:function_exported(Mod, handle_drain, 2),
+                    handle_control = erlang:function_exported(Mod, handle_control, 2),
+                    terminate = erlang:function_exported(Mod, terminate, 2)
+                },
                 pmd_params = PmdParams,
                 inflate_z = InflateZ,
                 deflate_z = DeflateZ,
                 max_frame_size = MaxFrame,
                 max_message_size = MaxMsg,
                 hibernate_after = HibernateAfter,
-                idle_timeout = IdleTimeout,
+                idle = #idle{timeout = IdleTimeout},
                 msg_acc = undefined,
                 msg_opcode = undefined,
                 msg_compressed = false,
@@ -468,7 +480,7 @@ init_pmd({permessage_deflate, Params, _ResponseValue}) ->
 %% the old gen_statem `[postpone]`, and it keeps `init/1` firing once,
 %% before any frame.
 -spec awaiting_socket(#data{}) -> no_return().
-awaiting_socket(#data{has_init = true, mod = Mod, mod_state = State} = Data) ->
+awaiting_socket(#data{callbacks = #callbacks{init = true}, mod = Mod, mod_state = State} = Data) ->
     receive
         socket_ready ->
             apply_handler_result(
@@ -483,7 +495,7 @@ awaiting_socket(Data) ->
 %% Arm the idle timer from the socket's received-byte count now (the
 %% session owns the socket once `socket_ready` arrives).
 -spec arm_idle(#data{}) -> #data{}.
-arm_idle(#data{idle_timeout = infinity} = Data) ->
+arm_idle(#data{idle = #idle{timeout = infinity}} = Data) ->
     Data;
 arm_idle(#data{socket = Socket} = Data) ->
     case roadrunner_transport:recv_count(Socket) of
@@ -492,13 +504,15 @@ arm_idle(#data{socket = Socket} = Data) ->
     end.
 
 -spec rearm_idle(non_neg_integer(), #data{}) -> #data{}.
-rearm_idle(Count, #data{idle_timeout = Timeout} = Data) ->
-    Data#data{idle_recv = Count, idle_timer = erlang:start_timer(Timeout, self(), ws_idle)}.
+rearm_idle(Count, #data{idle = #idle{timeout = Timeout} = Idle} = Data) ->
+    Data#data{
+        idle = Idle#idle{recv = Count, timer = erlang:start_timer(Timeout, self(), ws_idle)}
+    }.
 
 %% The idle timer fired: close with 1001 if the client sent nothing since
 %% the last fire, else wait another interval.
 -spec idle_check(#data{}) -> no_return().
-idle_check(#data{socket = Socket, idle_recv = Last} = Data) ->
+idle_check(#data{socket = Socket, idle = #idle{recv = Last}} = Data) ->
     case roadrunner_transport:recv_count(Socket) of
         {ok, Last} -> flush_and_exit(timeout, queue_frame(Data, close, <<1001:16>>));
         {ok, Count} -> recv_loop(rearm_idle(Count, Data));
@@ -526,7 +540,9 @@ enter_frame_loop(Data, Hibernate) ->
 %% per session, captured in `#data.socket` at init.
 -spec recv_loop(#data{}) -> no_return().
 recv_loop(
-    #data{socket = Socket, hibernate_after = HibernateAfter, idle_timer = IdleTimer} = Data
+    #data{
+        socket = Socket, hibernate_after = HibernateAfter, idle = #idle{timer = IdleTimer}
+    } = Data
 ) ->
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
     receive
@@ -581,10 +597,10 @@ exit_clean(Reason, #data{inflate_z = InflateZ, deflate_z = DeflateZ} = Data) ->
     exit(normal).
 
 -spec terminate(roadrunner_ws_handler:terminate_reason(), #data{}) -> ok.
-terminate(Reason, #data{has_terminate = true, mod = Mod, mod_state = State}) ->
+terminate(Reason, #data{callbacks = #callbacks{terminate = true}, mod = Mod, mod_state = State}) ->
     _ = Mod:terminate(Reason, State),
     ok;
-terminate(_Reason, #data{has_terminate = false}) ->
+terminate(_Reason, #data{callbacks = #callbacks{terminate = false}}) ->
     ok.
 
 -spec close_zlib(zlib:zstream() | undefined) -> ok.
@@ -1260,12 +1276,14 @@ is_valid_utf8(Bin) ->
 %% A ping or pong, to the optional `handle_control/2`; dropped without it.
 -spec control_frame(roadrunner_ws:frame(), #data{}, boolean()) -> no_return().
 control_frame(
-    Frame, #data{has_handle_control = true, mod = Mod, mod_state = State} = Data, Hibernate
+    Frame,
+    #data{callbacks = #callbacks{handle_control = true}, mod = Mod, mod_state = State} = Data,
+    Hibernate
 ) ->
     apply_handler_result(
         Mod:handle_control(Frame, State), Data, Hibernate, fun process_buffer/2, normal
     );
-control_frame(_Frame, #data{has_handle_control = false} = Data, Hibernate) ->
+control_frame(_Frame, #data{callbacks = #callbacks{handle_control = false}} = Data, Hibernate) ->
     process_buffer(Data, Hibernate).
 
 -spec dispatch_data_frame(roadrunner_ws:frame(), #data{}, boolean()) -> no_return().
@@ -1275,21 +1293,27 @@ dispatch_data_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate
     ).
 
 -spec handle_info_msg(term(), #data{}, boolean()) -> no_return().
-handle_info_msg(Msg, #data{has_handle_info = true, mod = Mod, mod_state = State} = Data, Hibernate) ->
+handle_info_msg(
+    Msg,
+    #data{callbacks = #callbacks{handle_info = true}, mod = Mod, mod_state = State} = Data,
+    Hibernate
+) ->
     apply_handler_result(Mod:handle_info(Msg, State), Data, Hibernate, fun arm_and_recv/2, normal);
-handle_info_msg(_Msg, #data{has_handle_info = false} = Data, _Hibernate) ->
+handle_info_msg(_Msg, #data{callbacks = #callbacks{handle_info = false}} = Data, _Hibernate) ->
     arm_and_recv(Data, false).
 
 -spec handle_drain_msg(integer(), #data{}, boolean()) -> no_return().
 handle_drain_msg(
     Deadline,
-    #data{has_handle_drain = true, mod = Mod, mod_state = State} = Data,
+    #data{callbacks = #callbacks{handle_drain = true}, mod = Mod, mod_state = State} = Data,
     Hibernate
 ) ->
     apply_handler_result(
         Mod:handle_drain(Deadline, State), Data, Hibernate, fun arm_and_recv/2, shutdown
     );
-handle_drain_msg(_Deadline, #data{has_handle_drain = false} = Data, _Hibernate) ->
+handle_drain_msg(
+    _Deadline, #data{callbacks = #callbacks{handle_drain = false}} = Data, _Hibernate
+) ->
     arm_and_recv(Data, false).
 
 %% Apply a handler callback's return. `Continue` is the next step on a
