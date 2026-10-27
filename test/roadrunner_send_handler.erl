@@ -138,6 +138,27 @@ send_fun({report, Pid, read_then_reply}) ->
         ok = roadrunner_send:reply(200, [], ~"late", Req0),
         Req
     end;
+send_fun({report, Pid, other_process}) ->
+    %% Another process's calls raise; the fun's own reply goes out.
+    fun(Req) ->
+        Self = self(),
+        _ = spawn(fun() ->
+            Self ! {other, raised(fun() -> roadrunner_send:reply(200, [], ~"other", Req) end)},
+            Self ! {other, raised(fun() -> roadrunner_send:inform(103, [], Req) end)}
+        end),
+        Pid !
+            {send_result,
+                receive
+                    {other, R1} -> R1
+                end},
+        Pid !
+            {send_result,
+                receive
+                    {other, R2} -> R2
+                end},
+        ok = roadrunner_send:reply(200, [], ~"own", Req),
+        Req
+    end;
 send_fun({report, Pid, big_reply}) ->
     fun(Req) ->
         Pid ! {send_result, roadrunner_send:reply(200, big_header(), ~"ok", Req)},

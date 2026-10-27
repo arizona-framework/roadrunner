@@ -7,7 +7,9 @@
 %% the calls write the wire from the process running the handler: the
 %% connection on HTTP/1.1, the stream worker on HTTP/2 and HTTP/3. What
 %% went out is kept in that process's dictionary, so a second final
-%% response is refused and `run/5` can finish what the fun left open.
+%% response is refused and `run/5` can finish what the fun left open. A
+%% call from any other process raises `not_in_send_fun`: it would write
+%% the wire behind that dictionary's back.
 
 -include_lib("kernel/include/file.hrl").
 
@@ -17,7 +19,8 @@
 
 -record(writer, {
     emit :: emit(),
-    headers :: roadrunner_http:headers()
+    headers :: roadrunner_http:headers(),
+    owner :: pid()
 }).
 
 %% The response so far: `undefined` before a final response, `emitting`
@@ -58,7 +61,9 @@
 
 -spec inform(roadrunner_http:status(), roadrunner_http:headers(), roadrunner_req:request()) ->
     ok | {error, term()}.
-inform(Status, Headers, #{send := #writer{emit = Emit}} = Req) ->
+inform(Status, Headers, #{send := #writer{emit = Emit, owner = Owner}} = Req) when
+    Owner =:= self()
+->
     ok = unsent(),
     case roadrunner_http:unsafe_header(Headers) of
         none ->
@@ -66,7 +71,9 @@ inform(Status, Headers, #{send := #writer{emit = Emit}} = Req) ->
         Kind ->
             ok = log_unsafe(Kind),
             {error, unsafe_header}
-    end.
+    end;
+inform(_Status, _Headers, #{send := #writer{}}) ->
+    error(not_in_send_fun).
 
 %% The final response, with the tuple's headers added: sent, or answered
 %% 500 when it cannot be (`check/1`). A protocol's writer can crash once
@@ -74,13 +81,18 @@ inform(Status, Headers, #{send := #writer{emit = Emit}} = Req) ->
 %% head), so the response counts as started while the writer runs: a crash
 %% then cuts it, as one in an open stream does, and no 500 follows a head.
 -spec final(kind(), op(), roadrunner_req:request()) -> result().
-final(websocket, Op, #{send := #writer{emit = Emit}} = Req) ->
+final(websocket, Op, #{send := #writer{emit = Emit, owner = Owner}} = Req) when
+    Owner =:= self()
+->
     %% A 101 carries the upgrade options' headers, never the tuple's: the
     %% middlewares leave a returned `{websocket, ...}` alone too.
     ok = unsent(),
+    _ = put(?KEY, emitting),
     {Result, Status, Session} = Emit(Op, Req),
     record(websocket, Result, Status, Session);
-final(Kind, Op0, #{send := #writer{emit = Emit, headers = Extra}} = Req) ->
+final(Kind, Op0, #{send := #writer{emit = Emit, headers = Extra, owner = Owner}} = Req) when
+    Owner =:= self()
+->
     ok = unsent(),
     Op = with_headers(Op0, Extra),
     case check(Op) of
@@ -91,7 +103,9 @@ final(Kind, Op0, #{send := #writer{emit = Emit, headers = Extra}} = Req) ->
         {error, _} = Error ->
             ok = internal_error(Emit, Req),
             Error
-    end.
+    end;
+final(_Kind, _Op, #{send := #writer{}}) ->
+    error(not_in_send_fun).
 
 %% What keeps a final response from going out, found before any of it
 %% does: a header with CR/LF/NUL, or a file that is not there or shorter
@@ -198,7 +212,7 @@ log_unsafe(Kind) ->
 ) -> outcome().
 run(Handler, Fun, Headers, Req, Emit) ->
     _ = erase(?KEY),
-    try Fun(Req#{send => #writer{emit = Emit, headers = Headers}}) of
+    try Fun(Req#{send => #writer{emit = Emit, headers = Headers, owner = self()}}) of
         #{} = Req2 ->
             Req3 = maps:remove(send, Req2),
             {done, finish(Handler, Emit, Req3), Req3}

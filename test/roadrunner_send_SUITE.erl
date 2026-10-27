@@ -31,6 +31,7 @@ fun does.
     unsafe_inform_is_not_sent/1,
     unsafe_reply_is_500/1,
     missing_file_is_500/1,
+    calls_from_another_process_raise/1,
     reply_before_reading_sends_no_continue/1,
     continue_goes_before_a_reply_after_reading/1,
     short_file_is_500/1,
@@ -84,6 +85,7 @@ common() ->
         unsafe_reply_is_500,
         missing_file_is_500,
         short_file_is_500,
+        calls_from_another_process_raise,
         reply_before_reading_sends_no_continue,
         continue_goes_before_a_reply_after_reading
     ].
@@ -181,6 +183,7 @@ routes(TestPid, File) ->
         {~"/big-stream", ?H, {report, TestPid, big_stream}},
         {~"/big-reply", ?H, {report, TestPid, big_reply}},
         {~"/reply-then-read", ?H, {report, TestPid, reply_then_read}},
+        {~"/other-process", ?H, {report, TestPid, other_process}},
         {~"/read-then-reply", ?H, {report, TestPid, read_then_reply}},
         {~"/big-file", ?H, {report, TestPid, {big_file, File}}},
         {~"/until-reset", ?H, {report, TestPid, until_reset}},
@@ -273,6 +276,11 @@ short_file_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, get(Config, ~"/short-file")),
     ?assertEqual({error, file_too_short}, result()),
     ?assertEqual({500, buffered}, stopped()).
+
+calls_from_another_process_raise(Config) ->
+    ?assertMatch({[200], _, ~"own", complete}, get(Config, ~"/other-process")),
+    ?assertEqual({raised, not_in_send_fun}, result()),
+    ?assertEqual({raised, not_in_send_fun}, result()).
 
 reply_before_reading_sends_no_continue(Config) ->
     %% The client is answered before the fun reads the body it holds back

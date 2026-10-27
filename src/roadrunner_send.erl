@@ -34,7 +34,8 @@ The fun sends one final response (`reply/2,4`, `stream/3`, `file/4` or
 `websocket/4`); a second one raises `already_sent`. The calls take the request the fun
 holds now, so pass the one returned by `roadrunner_req:read_body/1,2`,
 and return the last one from the fun, as `handle/1` does. The calls work
-only inside the fun.
+only inside the fun, in its process: one made from any other process,
+such as one the fun spawns, raises `not_in_send_fun`.
 
 The framework finishes what the fun leaves open. A stream the fun did
 not end with `Send(Data, fin)` is ended when the fun returns. A fun that
