@@ -65,6 +65,7 @@
     stream_body_reader/5,
     with_body_reader/5,
     continue_before_stream/1,
+    skip_continue/1,
     send_body/4,
     send_body_error/3,
     drain_body/1,
@@ -1130,6 +1131,21 @@ continue_before_stream(#{body_reader := #{continue := {Conn, StreamId}}}) ->
     true = demonitor(MRef, [flush]),
     ok;
 continue_before_stream(_Req) ->
+    ok.
+
+%% A final response sent by a `roadrunner_send` fun while the 100 Continue
+%% is still owed: the fun may read the body after it, and an interim
+%% response goes before the final one, never after (RFC 9110 §15.2), so no
+%% later read sends it. On HTTP/1.1 the reader's flag is set; on HTTP/2 and
+%% HTTP/3 the connection is told, ahead of the reads it orders after it.
+-doc false.
+-spec skip_continue(roadrunner_req:request()) -> ok.
+skip_continue(#{body_reader := #{continue := {_Socket, _Deadline, _MinRate, Owed}}}) ->
+    atomics:put(Owed, 1, 1);
+skip_continue(#{body_reader := #{continue := {Conn, StreamId}}}) ->
+    _ = Conn ! {roadrunner_skip_continue, StreamId},
+    ok;
+skip_continue(_Req) ->
     ok.
 
 %% The HTTP/1.1 100 Continue a body reader owes, asked for by its first read

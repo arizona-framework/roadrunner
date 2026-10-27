@@ -366,6 +366,8 @@ loop(#h3{conn = Conn} = State) ->
             loop(handle_body_demand(State, Worker, StreamId));
         {roadrunner_continue, Worker, StreamId} ->
             loop(handle_continue(State, Worker, StreamId));
+        {roadrunner_skip_continue, StreamId} ->
+            loop(skip_continue(State, StreamId));
         {roadrunner_slot, StreamId, Outcome} ->
             loop(handle_slot(State, StreamId, Outcome));
         {roadrunner_drain, Deadline} ->
@@ -1037,6 +1039,19 @@ handle_continue(#h3{streams = Streams} = State, Worker, StreamId) ->
         end,
     _ = Worker ! {roadrunner_continued, StreamId},
     State1.
+
+%% A worker about to send a complete response while the 100 Continue is
+%% still owed (`roadrunner_conn:skip_continue/1`): the worker writes it
+%% straight to the QUIC connection, so a read after it would put the 100 on
+%% a stream already finished. No read sends it.
+-spec skip_continue(#h3{}, non_neg_integer()) -> #h3{}.
+skip_continue(#h3{streams = Streams} = State, StreamId) ->
+    case Streams of
+        #{StreamId := #{continue_owed := true} = Stream} ->
+            State#h3{streams = Streams#{StreamId := Stream#{continue_owed := false}}};
+        _ ->
+            State
+    end.
 
 %% A peer reset of a dispatched manual-mode stream ends its body: a waiting
 %% read fails, as does any later one, and a `discarding` marker has nothing

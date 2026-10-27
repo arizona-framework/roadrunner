@@ -615,6 +615,8 @@ recv_more(
             recv_more(handle_body_demand(State, Worker, StreamId));
         {roadrunner_continue, Worker, StreamId} ->
             recv_more(handle_continue(State, Worker, StreamId));
+        {roadrunner_skip_continue, StreamId} ->
+            recv_more(skip_continue(State, StreamId));
         {'DOWN', MonRef, process, _Pid, Reason} ->
             recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
         {roadrunner_slot, StreamId, Outcome} ->
@@ -1484,6 +1486,18 @@ handle_continue(#loop{streams = Streams} = State, Worker, StreamId) ->
         end,
     _ = Worker ! {roadrunner_continued, StreamId},
     State1.
+
+%% A worker about to send a complete response while the 100 Continue is
+%% still owed (`roadrunner_conn:skip_continue/1`): a read after it sends
+%% none, even while flow control still holds part of the response.
+-spec skip_continue(#loop{}, stream_id()) -> #loop{}.
+skip_continue(#loop{streams = Streams} = State, StreamId) ->
+    case Streams of
+        #{StreamId := #{continue_owed := true} = Stream} ->
+            update_stream(State, StreamId, Stream#{continue_owed := false});
+        _ ->
+            State
+    end.
 
 -spec refill_conn_window(#loop{}) -> #loop{}.
 refill_conn_window(State) ->

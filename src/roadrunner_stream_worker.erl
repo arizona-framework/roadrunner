@@ -224,18 +224,23 @@ crash_answer(open, _Worker, _Conn, _StreamId) ->
 %% `roadrunner_send`'s writer for this stream. A complete or file response
 %% goes through the shapes' own send path (`emit_handler_response/4`), so it
 %% gets their HEAD and header-limit handling: a status other than the one
-%% asked for is the 500 that answered headers over the client's limit.
+%% asked for is the 500 that answered headers over the client's limit. A
+%% complete one answers the client, so a 100 Continue still owed is not
+%% sent after it (`roadrunner_conn:skip_continue/1`); a stream sends it
+%% first.
 -spec send_emit(module(), h2 | h3, pid(), non_neg_integer(), module()) ->
     roadrunner_send_writer:emit().
 send_emit(Worker, Protocol, Conn, StreamId, Handler) ->
     fun
         ({inform, Status, Headers}, _Req) ->
             Worker:send_interim(Conn, StreamId, Status, Headers);
-        ({reply, Status, Headers, Body}, #{method := Method}) ->
+        ({reply, Status, Headers, Body}, #{method := Method} = Req) ->
+            ok = roadrunner_conn:skip_continue(Req),
             Response = roadrunner_conn:head_response({Status, Headers, Body}, Method),
             Sent = Worker:emit_handler_response(Conn, StreamId, Handler, Response),
             {sent(Protocol, Status, Sent), Sent, Headers};
-        ({sendfile, Status, Headers, Spec}, #{method := Method}) ->
+        ({sendfile, Status, Headers, Spec}, #{method := Method} = Req) ->
+            ok = roadrunner_conn:skip_continue(Req),
             Response = roadrunner_conn:head_response({sendfile, Status, Headers, Spec}, Method),
             Sent = Worker:emit_handler_response(Conn, StreamId, Handler, Response),
             {sent(Protocol, Status, Sent), Sent, Headers};

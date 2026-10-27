@@ -122,6 +122,22 @@ send_fun({report, Pid, {file, Spec}}) ->
         Pid ! {send_result, roadrunner_send:file(200, Headers, Spec, Req)},
         Req
     end;
+send_fun({report, Pid, reply_then_read}) ->
+    fun(Req0) ->
+        ok = roadrunner_send:reply(200, [], ~"early", Req0),
+        {ok, Body, Req} = roadrunner_req:read_body(Req0),
+        Pid ! {send_result, Body},
+        Req
+    end;
+send_fun({report, Pid, read_then_reply}) ->
+    %% The reply takes the request from before the read, whose continue is
+    %% already sent.
+    fun(Req0) ->
+        {ok, Body, Req} = roadrunner_req:read_body(Req0),
+        Pid ! {send_result, Body},
+        ok = roadrunner_send:reply(200, [], ~"late", Req0),
+        Req
+    end;
 send_fun({report, Pid, big_reply}) ->
     fun(Req) ->
         Pid ! {send_result, roadrunner_send:reply(200, big_header(), ~"ok", Req)},

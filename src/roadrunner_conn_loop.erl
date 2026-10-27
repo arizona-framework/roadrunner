@@ -1286,13 +1286,17 @@ send_finish(S, Req, _Kind, Headers) ->
 %% `roadrunner_send`'s writer for this connection. Each final response
 %% goes out at once, `Connection: close` added when the server closes after
 %% it (`with_close_if_closing/3`, on the request the fun holds then), and
-%% reports the headers it went out with for the keep-alive decision.
+%% reports the headers it went out with for the keep-alive decision. A
+%% complete one answers the client, so a 100 Continue still owed is not
+%% sent after it (`roadrunner_conn:skip_continue/1`); a stream sends it
+%% first.
 -spec send_emit(#loop_state{}, module()) -> roadrunner_send_writer:emit().
 send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
     fun
         ({inform, Status, Headers}, Req) ->
             send_interim(Socket, Status, Headers, AltSvc, Req);
         ({reply, Status, Headers0, Body}, #{method := Method} = Req) ->
+            ok = roadrunner_conn:skip_continue(Req),
             Headers = with_close_if_closing(S, Req, Headers0),
             Resp = roadrunner_http1:response(
                 Status, framed(Status, Headers, Body), reply_body(Method, Body), AltSvc
@@ -1308,6 +1312,7 @@ send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
             ),
             {roadrunner_send_writer:started(Result, Send), Status, Headers};
         ({sendfile, Status, Headers0, Spec}, Req) ->
+            ok = roadrunner_conn:skip_continue(Req),
             Headers = with_close_if_closing(S, Req, Headers0),
             #loop_state{} = dispatch_response(S, Handler, Req, {sendfile, Status, Headers, Spec}),
             {ok, Status, Headers};

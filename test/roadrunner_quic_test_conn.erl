@@ -960,7 +960,10 @@ deliver_stream(#conn{recv_streams = Streams, owner = Owner} = Conn, StreamId, Of
         {ok, Deliverable, FinReached, Stream1} ->
             maybe_deliver(Owner, StreamId, Deliverable, FinReached),
             Conn#conn{recv_streams = Streams#{StreamId => Stream1}};
-        {error, _Reason} ->
+        {error, Reason} ->
+            %% Data past the stream's end: not delivered, but told, so a
+            %% test can catch a server writing after its FIN.
+            _ = Owner ! {quic_test_stream_error, self(), StreamId, Reason},
             Conn
     end.
 
