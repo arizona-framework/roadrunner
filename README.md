@@ -468,7 +468,8 @@ type. Beyond `port`,
   `max_header_count`, `linger_timeout`
 - **HTTP/2 tunables**: Under the `{http2, Opts}` entry in `protocols`:
   `conn_window`, `stream_window`, `window_refill_threshold`,
-  `max_concurrent_streams`, `max_header_block`, `max_header_list_size`
+  `max_concurrent_streams`, `max_header_block`, `max_header_list_size`,
+  `active` (socket read mode)
 - **HTTP/3 tunables**: Under the `{http3, Opts}` entry in `protocols`:
   `listeners` (reuseport pool size), `max_header_block`, `max_streams_bidi`,
   `max_field_section_size`, `secret` (the key behind QUIC stateless resets

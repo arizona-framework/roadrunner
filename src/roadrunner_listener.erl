@@ -656,6 +656,14 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   cap lifts this one too unless set explicitly. The other way round,
   response headers are kept within the limit a client sends in its own
   `SETTINGS_MAX_HEADER_LIST_SIZE` (see `t:roadrunner_handler:response/0`).
+- `active`: how the connection reads its socket: `once` or an integer
+  in `1..32767`. With `N`, the socket delivers up to `N` reads before
+  the connection asks for more, which saves a socket call per read (on
+  TLS each one is a call into the TLS connection process). With `once`,
+  it asks after every read. A connection can hold up to `N` unread
+  reads in its mailbox (each up to `recv_buffer` bytes on plain TCP),
+  so a lower `N` bounds that memory more tightly. Default `16`. Change
+  it only if you measure a reason to.
 """.
 -type http2_opts() :: #{
     conn_window => 1..16#7FFFFFFF,
@@ -663,7 +671,8 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
     window_refill_threshold => 1..16#7FFFFFFF,
     max_concurrent_streams => 1..16#7FFFFFFF,
     max_header_block => 1..16#7FFFFFFF,
-    max_header_list_size => 1..16#7FFFFFFF
+    max_header_list_size => 1..16#7FFFFFFF,
+    active => once | 1..32767
 }.
 
 -doc """
@@ -1997,7 +2006,8 @@ http2_defaults() ->
         max_header_block => 16384,
         %% Placeholder: resolved to `2 * max_header_block` when not set
         %% explicitly (see `resolve_max_header_list_size/2`).
-        max_header_list_size => 32768
+        max_header_list_size => 32768,
+        active => 16
     }.
 
 -spec validate_http2_opts(map(), term()) -> http2_opts().
@@ -2009,6 +2019,7 @@ validate_http2_opts(Opts, Raw) ->
             %% each window refills at half its own peak.
             case K =:= window_refill_threshold orelse is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
+                true when K =:= active -> Acc#{K => validate_http2_active(V, Raw)};
                 true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
             end
@@ -2017,6 +2028,17 @@ validate_http2_opts(Opts, Raw) ->
         Opts
     ),
     resolve_max_header_list_size(Merged, Opts).
+
+%% `true` is rejected: an always-active socket has no bound on unread
+%% data, so a fast peer could fill the mailbox. `32767` is the largest
+%% count `inet:setopts/2` and `ssl:setopts/2` accept.
+-spec validate_http2_active(term(), term()) -> once | 1..32767.
+validate_http2_active(once, _Raw) ->
+    once;
+validate_http2_active(N, _Raw) when is_integer(N), N >= 1, N =< 32767 ->
+    N;
+validate_http2_active(_, Raw) ->
+    error({invalid_listener_opt, protocols, Raw}).
 
 %% MAX_HEADER_LIST_SIZE defaults to 2x the resolved encoded-block cap so
 %% raising `max_header_block` lifts both gates together; an explicit value
@@ -2041,14 +2063,16 @@ flatten_http2_opts(Entries) ->
                 stream_window := Stream,
                 max_concurrent_streams := MaxStreams,
                 max_header_block := MaxHeaderBlock,
-                max_header_list_size := MaxHeaderListSize
+                max_header_list_size := MaxHeaderListSize,
+                active := Active
             } = Http2} ->
             Flat = #{
                 http2_conn_window => Conn,
                 http2_stream_window => Stream,
                 http2_max_concurrent_streams => MaxStreams,
                 http2_max_header_block => MaxHeaderBlock,
-                http2_max_header_list_size => MaxHeaderListSize
+                http2_max_header_list_size => MaxHeaderListSize,
+                http2_active => Active
             },
             case Http2 of
                 #{window_refill_threshold := Threshold} ->

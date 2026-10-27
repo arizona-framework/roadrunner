@@ -341,6 +341,11 @@ messages_returns_per_transport_atom_triples_test() ->
         roadrunner_transport:messages({fake, self()})
     ).
 
+passive_message_returns_per_transport_tag_test() ->
+    ?assertEqual(tcp_passive, roadrunner_transport:passive_message({gen_tcp, dummy})),
+    ?assertEqual(ssl_passive, roadrunner_transport:passive_message({ssl, dummy})),
+    ?assertEqual(roadrunner_fake_passive, roadrunner_transport:passive_message({fake, self()})).
+
 setopts_on_real_ssl_socket_test() ->
     %% Drive the `ssl:setopts` branch through a real handshake so the
     %% wrapper is exercised end-to-end, not just typechecked.

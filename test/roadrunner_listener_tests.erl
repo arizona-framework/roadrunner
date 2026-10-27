@@ -501,6 +501,44 @@ listener_http2_max_header_list_size_threads_into_proto_opts_test() ->
     ?assertEqual(131072, maps:get(http2_max_header_list_size, PO2)),
     ok = roadrunner_listener:stop(Derived).
 
+listener_http2_active_threads_into_proto_opts_test() ->
+    %% Bare `http2` defaults the read mode to `16`; `once` and an
+    %% explicit count flatten through verbatim.
+    lists:foreach(
+        fun({Http2, Expected}) ->
+            Name = listener_test_h2_active,
+            {ok, Pid} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                protocols => [Http2],
+                routes => roadrunner_hello_handler
+            }),
+            ?assertEqual(Expected, maps:get(http2_active, element(4, sys:get_state(Pid)))),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        [
+            {http2, 16},
+            {{http2, #{active => once}}, once},
+            {{http2, #{active => 1}}, 1},
+            {{http2, #{active => 32767}}, 32767}
+        ]
+    ).
+
+listener_rejects_invalid_http2_active_test() ->
+    %% `true` (no bound on unread data), zero, negatives, counts past
+    %% what setopts accepts, and non-integers reject at `init/1`.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_h2_active_invalid, #{
+                port => 0,
+                protocols => [{http2, #{active => Bad}}],
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
+        end,
+        [true, false, 0, -1, 32768, 1.5, ~"16"]
+    ).
+
 listener_http1_defaults_thread_into_proto_opts_test() ->
     %% Bare `http1` (no tuple) fills the default limits into proto_opts.
     Name = listener_test_http1_defaults,
