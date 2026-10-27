@@ -24,12 +24,22 @@ fun does.
     head_reply_has_no_body/1,
     head_sendfile_has_no_body/1,
     no_response_is_500/1,
+    shutdown_after_the_reply_is_quiet/1,
+    shutdown_before_a_response_is_500/1,
+    shutdown_in_a_stream_ends_it/1,
+    shutdown_closes_the_connection/1,
     crash_before_the_response_is_500/1,
     crash_after_the_response_keeps_it/1,
     crash_in_an_open_stream_cuts_it/1,
     second_final_response_raises/1,
     unsafe_inform_is_not_sent/1,
     unsafe_reply_is_500/1,
+    missing_file_is_500/1,
+    calls_from_another_process_raise/1,
+    reply_before_reading_sends_no_continue/1,
+    continue_goes_before_a_reply_after_reading/1,
+    short_file_is_500/1,
+    file_failing_after_the_head_is_cut/1,
     keeps_the_connection_alive/1,
     signals_close_at_the_keep_alive_ceiling/1,
     skips_interims_for_http10/1,
@@ -39,6 +49,8 @@ fun does.
     within_the_client_limit_is_sent/1,
     inform_over_the_client_limit_is_not_sent/1,
     stream_over_the_client_limit_is_500/1,
+    reply_over_the_client_limit_is_500/1,
+    file_over_the_client_limit_is_500/1,
     client_reset_ends_the_fun/1
 ]).
 
@@ -69,17 +81,26 @@ common() ->
         head_reply_has_no_body,
         head_sendfile_has_no_body,
         no_response_is_500,
+        shutdown_after_the_reply_is_quiet,
+        shutdown_before_a_response_is_500,
+        shutdown_in_a_stream_ends_it,
         crash_before_the_response_is_500,
         crash_after_the_response_keeps_it,
         crash_in_an_open_stream_cuts_it,
         second_final_response_raises,
         unsafe_inform_is_not_sent,
-        unsafe_reply_is_500
+        unsafe_reply_is_500,
+        missing_file_is_500,
+        short_file_is_500,
+        calls_from_another_process_raise,
+        reply_before_reading_sends_no_continue,
+        continue_goes_before_a_reply_after_reading
     ].
 
 http1() ->
     [
         keeps_the_connection_alive,
+        shutdown_closes_the_connection,
         signals_close_at_the_keep_alive_ceiling,
         skips_interims_for_http10,
         upgrades_from_the_fun,
@@ -91,7 +112,10 @@ multiplexed() ->
         upgrade_is_not_supported,
         within_the_client_limit_is_sent,
         inform_over_the_client_limit_is_not_sent,
-        stream_over_the_client_limit_is_500
+        stream_over_the_client_limit_is_500,
+        reply_over_the_client_limit_is_500,
+        file_over_the_client_limit_is_500,
+        file_failing_after_the_head_is_cut
     ].
 
 init_per_suite(Config) ->
@@ -143,6 +167,8 @@ listener_opts(http3) ->
     #{protocols => [http3], tls => roadrunner_test_certs:server_opts()}.
 
 extra(signals_close_at_the_keep_alive_ceiling) -> #{max_keep_alive_requests => 1};
+extra(reply_before_reading_sends_no_continue) -> #{body_buffering => manual};
+extra(continue_goes_before_a_reply_after_reading) -> #{body_buffering => manual};
 extra(_Case) -> #{}.
 
 routes(TestPid, File) ->
@@ -155,6 +181,9 @@ routes(TestPid, File) ->
         {~"/trailers", ?H, stream_trailers},
         {~"/file", ?H, {sendfile, File}},
         {~"/nothing", ?H, nothing},
+        {~"/shutdown-after-reply", ?H, shutdown_after_reply},
+        {~"/shutdown-before", ?H, shutdown_before},
+        {~"/shutdown-stream", ?H, shutdown_open_stream},
         {~"/crash-before", ?H, crash_before},
         {~"/crash-after", ?H, crash_after},
         {~"/crash-open", ?H, crash_open},
@@ -163,9 +192,20 @@ routes(TestPid, File) ->
         {~"/unsafe-reply", ?H, {report, TestPid, unsafe_reply}},
         {~"/big-inform", ?H, {report, TestPid, big_inform}},
         {~"/big-stream", ?H, {report, TestPid, big_stream}},
+        {~"/big-reply", ?H, {report, TestPid, big_reply}},
+        {~"/reply-then-read", ?H, {report, TestPid, reply_then_read}},
+        {~"/other-process", ?H, {report, TestPid, other_process}},
+        {~"/read-then-reply", ?H, {report, TestPid, read_then_reply}},
+        {~"/big-file", ?H, {report, TestPid, {big_file, File}}},
         {~"/until-reset", ?H, {report, TestPid, until_reset}},
-        {~"/upgrade", ?H, {report, TestPid, upgrade}}
+        {~"/upgrade", ?H, {report, TestPid, upgrade}},
+        {~"/missing-file", ?H, {report, TestPid, {file, {missing_file(File), 0, 4}}}},
+        {~"/short-file", ?H, {report, TestPid, {file, {File, 6, 4}}}},
+        {~"/empty-device", ?H, {report, TestPid, {file, {"/dev/null", 0, 4}}}}
     ].
+
+missing_file(File) ->
+    filename:join(filename:dirname(File), "missing.txt").
 
 %% =============================================================================
 %% Every protocol
@@ -208,6 +248,23 @@ no_response_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, get(Config, ~"/nothing")),
     ?assertEqual({500, buffered}, stopped()).
 
+shutdown_after_the_reply_is_quiet(Config) ->
+    %% A `{shutdown, _}` exit stops on purpose: the reply stands, the request
+    %% reports a stop with its status, and no exception.
+    ?assertMatch({[403], _, ~"nope", complete}, get(Config, ~"/shutdown-after-reply")),
+    ?assertEqual({403, buffered}, stopped()),
+    ok = no_exception().
+
+shutdown_before_a_response_is_500(Config) ->
+    ?assertMatch({[500], _, _, complete}, get(Config, ~"/shutdown-before")),
+    ?assertEqual({500, buffered}, stopped()),
+    ok = no_exception().
+
+shutdown_in_a_stream_ends_it(Config) ->
+    ?assertMatch({[200], _, ~"part", complete}, get(Config, ~"/shutdown-stream")),
+    ?assertEqual({200, stream}, stopped()),
+    ok = no_exception().
+
 crash_before_the_response_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, get(Config, ~"/crash-before")),
     ?assertEqual(boom, crashed()).
@@ -236,6 +293,34 @@ unsafe_reply_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, get(Config, ~"/unsafe-reply")),
     ?assertEqual({error, unsafe_header}, result()).
 
+missing_file_is_500(Config) ->
+    %% Checked before anything is sent: no head goes out ahead of the 500.
+    ?assertMatch({[500], _, _, complete}, get(Config, ~"/missing-file")),
+    ?assertEqual({error, enoent}, result()),
+    ?assertEqual({500, buffered}, stopped()).
+
+short_file_is_500(Config) ->
+    %% The range ends past the file's 8 bytes.
+    ?assertMatch({[500], _, _, complete}, get(Config, ~"/short-file")),
+    ?assertEqual({error, file_too_short}, result()),
+    ?assertEqual({500, buffered}, stopped()).
+
+calls_from_another_process_raise(Config) ->
+    ?assertMatch({[200], _, ~"own", complete}, get(Config, ~"/other-process")),
+    ?assertEqual({raised, not_in_send_fun}, result()),
+    ?assertEqual({raised, not_in_send_fun}, result()).
+
+reply_before_reading_sends_no_continue(Config) ->
+    %% The client is answered before the fun reads the body it holds back
+    %% for a 100 Continue: no 100 goes out after the final response.
+    ?assertMatch({[200], _, ~"early", complete}, continue_request(Config, ~"/reply-then-read")),
+    ?assertEqual(~"hello", iolist_to_binary(result())),
+    ok = nothing_more(Config).
+
+continue_goes_before_a_reply_after_reading(Config) ->
+    ?assertMatch({[100, 200], _, ~"late", complete}, continue_request(Config, ~"/read-then-reply")),
+    ?assertEqual(~"hello", iolist_to_binary(result())).
+
 %% =============================================================================
 %% HTTP/1.1
 %% =============================================================================
@@ -248,6 +333,12 @@ keeps_the_connection_alive(Config) ->
     ?assertMatch({[200], _, ~"replied", complete}, h1_parse(First, ~"GET")),
     ok = gen_tcp:send(Sock, h1_request(~"GET", ~"/reply", [{~"connection", ~"close"}], <<>>)),
     ?assertMatch({[200], _, ~"replied", complete}, h1_parse(h1_recv_all(Sock), ~"GET")).
+
+shutdown_closes_the_connection(Config) ->
+    %% A keep-alive request: the connection still closes after the stop.
+    Sock = h1_connect(Config),
+    ok = gen_tcp:send(Sock, h1_request(~"GET", ~"/shutdown-after-reply", [], <<>>)),
+    ?assertMatch({[403], _, ~"nope", complete}, h1_parse(h1_recv_all(Sock), ~"GET")).
 
 signals_close_at_the_keep_alive_ceiling(Config) ->
     %% The server closes after the connection's last request, and says so.
@@ -294,11 +385,27 @@ within_the_client_limit_is_sent(Config) ->
 
 inform_over_the_client_limit_is_not_sent(Config) ->
     ?assertMatch({[200], _, ~"ok", complete}, limited_get(Config, ~"/big-inform")),
-    ?assertMatch({error, _}, result()).
+    ?assertEqual({error, limit_error(Config)}, result()).
 
 stream_over_the_client_limit_is_500(Config) ->
     ?assertMatch({[500], _, _, complete}, limited_get(Config, ~"/big-stream")),
-    ?assertMatch({error, _}, result()).
+    ?assertEqual({error, limit_error(Config)}, result()).
+
+reply_over_the_client_limit_is_500(Config) ->
+    ?assertMatch({[500], _, _, complete}, limited_get(Config, ~"/big-reply")),
+    ?assertEqual({error, limit_error(Config)}, result()).
+
+file_over_the_client_limit_is_500(Config) ->
+    ?assertMatch({[500], _, _, complete}, limited_get(Config, ~"/big-file")),
+    ?assertEqual({error, limit_error(Config)}, result()).
+
+file_failing_after_the_head_is_cut(Config) ->
+    %% `/dev/null` passes the check (a device has no size to hold the range
+    %% to) and ends before the range does, so the read fails after the
+    %% HEADERS: the stream is reset, no 500 follows the 200.
+    {[200], _, <<>>, End} = get(Config, ~"/empty-device"),
+    ?assertMatch({reset, _}, End),
+    ?assertMatch({badmatch, eof}, crashed()).
 
 client_reset_ends_the_fun(Config) ->
     %% The stream reset under a write ends the worker as for the `stream`
@@ -362,12 +469,119 @@ request(http3, Config, Method, Path, Body, Limit) ->
         _ = roadrunner_quic_test_h3:close(Conn)
     end.
 
+%% A POST of `hello` whose client holds the body back for a 100 Continue,
+%% sending it once the first response bytes arrive. The connection is kept
+%% for `nothing_more/1`.
+continue_request(Config, Path) ->
+    continue_request(?config(protocol, Config), Config, Path).
+
+continue_request(http1, Config, Path) ->
+    Sock = h1_connect(Config),
+    ok = gen_tcp:send(Sock, [
+        ~"POST ",
+        Path,
+        ~" HTTP/1.1\r\nhost: x\r\ncontent-length: 5\r\nexpect: 100-continue\r\n",
+        ~"connection: close\r\n\r\n"
+    ]),
+    {ok, First} = gen_tcp:recv(Sock, 0, 5000),
+    ok = gen_tcp:send(Sock, ~"hello"),
+    h1_parse(<<First/binary, (h1_recv_all(Sock))/binary>>, ~"POST");
+continue_request(http2, Config, Path) ->
+    %% A 2-byte stream window holds the response body back, so the stream
+    %% is still open when the fun reads; it opens once the final HEADERS
+    %% are in.
+    C0 = h2_open(Config, [{4, 2}]),
+    C1 = h2_send_headers(C0, 1, ~"POST", Path, false, [{~"expect", ~"100-continue"}]),
+    C2 = h2_send_data(C1, 1, ~"hello"),
+    h2_windowed_response(C2, [], <<>>);
+continue_request(http3, Config, Path) ->
+    %% As on HTTP/2, an 8-byte stream window holds the response back until
+    %% the first bytes are in.
+    {ok, Conn} = roadrunner_quic_test_h3:connect(
+        {127, 0, 0, 1}, ?config(port, Config), #{stream_window => 8}
+    ),
+    Fields = [
+        {~":method", ~"POST"},
+        {~":scheme", ~"https"},
+        {~":authority", ~"localhost"},
+        {~":path", Path},
+        {~"expect", ~"100-continue"}
+    ],
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, Fields, false),
+    put(h3_stream, {Conn, StreamId}),
+    receive
+        {quic_test_stream, Conn, StreamId, First, Fin} ->
+            ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"hello", true),
+            ok = roadrunner_quic_test_conn:grant_stream_credit(Conn, StreamId, 100000),
+            case Fin of
+                true -> h3_frames(First, [], [], <<>>, complete);
+                false -> h3_response(Conn, StreamId, First)
+            end
+    after 5000 -> ct:fail(no_response)
+    end.
+
+%% No bytes follow the response, once the fun has read the body.
+nothing_more(Config) ->
+    case ?config(protocol, Config) of
+        http3 ->
+            {Conn, StreamId} = erase(h3_stream),
+            receive
+                {quic_test_stream, Conn, StreamId, Bytes, _} -> ct:fail({after_response, Bytes});
+                {quic_test_stream_error, Conn, StreamId, Reason} -> ct:fail({after_fin, Reason})
+            after 500 -> ok
+            end,
+            _ = roadrunner_quic_test_h3:close(Conn),
+            ok;
+        _ ->
+            %% HTTP/1.1 read to the close and HTTP/2 to the stream's end.
+            ok
+    end.
+
+%% The response on stream 1, its window opened once the final HEADERS are
+%% in.
+h2_windowed_response(C, Statuses, Body) ->
+    case h2_next_frame(C) of
+        {{headers, 1, Flags, Fields}, C1} ->
+            {_, Code} = lists:keyfind(~":status", 1, Fields),
+            Status = binary_to_integer(Code),
+            C2 =
+                case Status >= 200 of
+                    true -> h2_window_update(C1, 1, 1000);
+                    false -> C1
+                end,
+            h2_windowed_ended(C2, Flags, [Status | Statuses], Body);
+        {{data, 1, Flags, Data, _}, C1} ->
+            h2_windowed_ended(C1, Flags, Statuses, <<Body/binary, Data/binary>>);
+        {_Other, C1} ->
+            h2_windowed_response(C1, Statuses, Body)
+    end.
+
+h2_windowed_ended(_C, Flags, Statuses, Body) when Flags band 16#01 =/= 0 ->
+    {lists:reverse(Statuses), [], Body, complete};
+h2_windowed_ended(C, _Flags, Statuses, Body) ->
+    h2_windowed_response(C, Statuses, Body).
+
+%% What a call over the client's header limit returns.
+limit_error(Config) ->
+    case ?config(protocol, Config) of
+        http2 -> header_list_too_large;
+        http3 -> field_section_too_large
+    end.
+
 %% The status and kind of the next request stop event.
 stopped() ->
     receive
         {telemetry_event, [roadrunner, request, stop], #{status := Status, response_kind := Kind}} ->
             {Status, Kind}
     after 5000 -> ct:fail(no_request_stop)
+    end.
+
+%% No request exception event came (they fire before the stop that was
+%% just received, on the same process).
+no_exception() ->
+    receive
+        {telemetry_event, [roadrunner, request, exception], _} -> ct:fail(exception_reported)
+    after 0 -> ok
     end.
 
 %% The reason of the next request exception event.
@@ -475,12 +689,16 @@ h2_open(Config, Settings) ->
         dec => roadrunner_http2_hpack:new_decoder(4096)
     }.
 
-h2_send_headers(#{sock := Sock, enc := Enc} = C, StreamId, Method, Path, EndStream) ->
+h2_send_headers(C, StreamId, Method, Path, EndStream) ->
+    h2_send_headers(C, StreamId, Method, Path, EndStream, []).
+
+h2_send_headers(#{sock := Sock, enc := Enc} = C, StreamId, Method, Path, EndStream, Extra) ->
     Fields = [
         {~":method", Method},
         {~":scheme", ~"http"},
         {~":authority", ~"x"},
         {~":path", Path}
+        | Extra
     ],
     {Block, Enc1} = roadrunner_http2_hpack:encode(Fields, Enc),
     Flags =
@@ -495,6 +713,12 @@ h2_send_headers(#{sock := Sock, enc := Enc} = C, StreamId, Method, Path, EndStre
 
 h2_send_data(#{sock := Sock} = C, StreamId, Body) ->
     ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({data, StreamId, 16#01, Body})),
+    C.
+
+h2_window_update(#{sock := Sock} = C, StreamId, Increment) ->
+    ok = gen_tcp:send(
+        Sock, roadrunner_http2_frame:encode({window_update, StreamId, Increment})
+    ),
     C.
 
 h2_response(C, StreamId) ->

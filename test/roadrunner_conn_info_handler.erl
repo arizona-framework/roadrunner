@@ -3,13 +3,19 @@
 
 %% Test handler for `roadrunner_conn_info_SUITE`: answers with what
 %% `roadrunner_req:sockname/1`, `peercert/1` and `tls_info/1` return, as an
-%% external term (the TLS info cut to its protocol and cipher suite).
+%% external term (the TLS info cut to its protocol and cipher suite). A
+%% `{report, Pid}` route state also sends `Pid` the request.
 
 -behaviour(roadrunner_handler).
 
 -export([handle/1]).
 
 handle(Req) ->
+    _ =
+        case roadrunner_req:state(Req) of
+            {report, Pid} -> Pid ! {req, Req};
+            _ -> ok
+        end,
     Info = #{
         sockname => roadrunner_req:sockname(Req),
         peercert => roadrunner_req:peercert(Req),

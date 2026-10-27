@@ -364,22 +364,21 @@ stream_send(Conn, StreamId, Data, {fin, Trailers}) ->
 
 %% `{sendfile, ...}` response. There is no kernel sendfile over QUIC
 %% (the stream bytes are encrypted), so read the file in chunks and feed
-%% the streaming machinery, mirroring the h2 sendfile path. A file-open
-%% failure crashes the worker; the conn loop resets the stream.
+%% the streaming machinery, mirroring the h2 sendfile path. The file is
+%% opened and positioned before the HEADERS, so a failure there crashes the
+%% worker with nothing sent and the conn loop resets the stream; a read
+%% failing after them crashes it the same way, mid-response.
 -spec send_sendfile(
     pid(), non_neg_integer(), roadrunner_http:headers(), roadrunner_handler:sendfile_spec()
 ) -> ok.
 send_sendfile(Conn, StreamId, Fields, {File, Offset, Length}) ->
-    Fun = fun(Send) ->
-        {ok, IoDev} = file:open(File, [read, raw, binary]),
-        try
-            {ok, _} = file:position(IoDev, Offset),
-            sendfile_loop(IoDev, Length, Send)
-        after
-            _ = file:close(IoDev)
-        end
-    end,
-    send_stream(Conn, StreamId, Fields, Fun).
+    {ok, IoDev} = file:open(File, [read, raw, binary]),
+    try
+        {ok, _} = file:position(IoDev, Offset),
+        send_stream(Conn, StreamId, Fields, fun(Send) -> sendfile_loop(IoDev, Length, Send) end)
+    after
+        _ = file:close(IoDev)
+    end.
 
 %% Stream `Length` bytes from the open file as DATA chunks, FIN on the
 %% last (or an immediate empty FIN for a zero-length range).

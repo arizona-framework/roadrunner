@@ -366,6 +366,8 @@ loop(#h3{conn = Conn} = State) ->
             loop(handle_body_demand(State, Worker, StreamId));
         {roadrunner_continue, Worker, StreamId} ->
             loop(handle_continue(State, Worker, StreamId));
+        {roadrunner_skip_continue, StreamId} ->
+            loop(skip_continue(State, StreamId));
         {roadrunner_slot, StreamId, Outcome} ->
             loop(handle_slot(State, StreamId, Outcome));
         {roadrunner_drain, Deadline} ->
@@ -385,13 +387,23 @@ loop(#h3{conn = Conn} = State) ->
 %% span keeps the handshake address.
 %% The connection queries for HTTP/3: the local address is the listener's
 %% UDP socket's and the TLS session the QUIC connection's. The server asks
-%% no client certificate over QUIC.
+%% no client certificate over QUIC. A request can outlive its connection
+%% (a handler that keeps it), and a query then fails as it does on a closed
+%% HTTP/1.1 or HTTP/2 socket, instead of exiting the caller.
 -spec conn_info(pid()) -> roadrunner_req:conn_info().
 conn_info(Conn) ->
     fun
-        (sockname) -> roadrunner_quic:sockname(Conn);
+        (sockname) -> while_up(fun roadrunner_quic:sockname/1, Conn);
         (peercert) -> {error, no_peercert};
-        (tls_info) -> roadrunner_quic:tls_info(Conn)
+        (tls_info) -> while_up(fun roadrunner_quic:tls_info/1, Conn)
+    end.
+
+-spec while_up(fun((pid()) -> {ok, T} | {error, term()}), pid()) -> {ok, T} | {error, term()}.
+while_up(Query, Conn) ->
+    try
+        Query(Conn)
+    catch
+        exit:{quic_conn_down, _} -> {error, closed}
     end.
 
 -spec peer_changed(#h3{}, {inet:ip_address(), inet:port_number()}) -> #h3{}.
@@ -1037,6 +1049,19 @@ handle_continue(#h3{streams = Streams} = State, Worker, StreamId) ->
         end,
     _ = Worker ! {roadrunner_continued, StreamId},
     State1.
+
+%% A worker about to send a complete response while the 100 Continue is
+%% still owed (`roadrunner_conn:skip_continue/1`): the worker writes it
+%% straight to the QUIC connection, so a read after it would put the 100 on
+%% a stream already finished. No read sends it.
+-spec skip_continue(#h3{}, non_neg_integer()) -> #h3{}.
+skip_continue(#h3{streams = Streams} = State, StreamId) ->
+    case Streams of
+        #{StreamId := #{continue_owed := true} = Stream} ->
+            State#h3{streams = Streams#{StreamId := Stream#{continue_owed := false}}};
+        _ ->
+            State
+    end.
 
 %% A peer reset of a dispatched manual-mode stream ends its body: a waiting
 %% read fails, as does any later one, and a `discarding` marker has nothing

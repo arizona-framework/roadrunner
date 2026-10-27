@@ -52,3 +52,46 @@ send_tuple_has_no_returned_kind_test() ->
         roadrunner_conn:response_kind({send, [], fun(Req) -> Req end})
     ),
     ?assertEqual(buffered, roadrunner_conn:response_kind({200, [], <<>>})).
+
+crash_in_the_protocol_writer_cuts_the_response_test() ->
+    %% Part of the response may be out when the writer crashes: no 500 is
+    %% sent after it, and the response counts as open, to be cut.
+    Emit = fun({reply, _, _, _}, _Req) -> error(wire_failed) end,
+    Fun = fun(Req) ->
+        ok = roadrunner_send:reply(200, [], ~"b", Req),
+        Req
+    end,
+    ?assertMatch(
+        {crashed, error, wire_failed, _, open},
+        roadrunner_send_writer:run(?MODULE, Fun, [], #{method => ~"GET"}, Emit)
+    ).
+
+shutdown_inside_the_protocol_writer_is_a_crash_test() ->
+    %% A `{shutdown, _}` exit is a quiet stop only from the fun: raised inside
+    %% the protocol's writer, part of the response may be out, so it is cut.
+    Emit = fun({reply, _, _, _}, _Req) -> exit({shutdown, wire_gone}) end,
+    Fun = fun(Req) ->
+        ok = roadrunner_send:reply(200, [], ~"b", Req),
+        Req
+    end,
+    ?assertMatch(
+        {crashed, exit, {shutdown, wire_gone}, _, open},
+        roadrunner_send_writer:run(?MODULE, Fun, [], #{method => ~"GET"}, Emit)
+    ).
+
+caught_writer_crash_is_a_handler_bug_test() ->
+    %% A fun that swallows the writer's crash and returns leaves a response
+    %% in an unknown state: the caller crashes, which cuts it.
+    Emit = fun({reply, _, _, _}, _Req) -> error(wire_failed) end,
+    Fun = fun(Req) ->
+        try
+            roadrunner_send:reply(200, [], ~"b", Req)
+        catch
+            error:wire_failed -> ok
+        end,
+        Req
+    end,
+    ?assertError(
+        unfinished_response,
+        roadrunner_send_writer:run(?MODULE, Fun, [], #{method => ~"GET"}, Emit)
+    ).

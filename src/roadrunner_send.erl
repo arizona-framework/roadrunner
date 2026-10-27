@@ -34,14 +34,23 @@ The fun sends one final response (`reply/2,4`, `stream/3`, `file/4` or
 `websocket/4`); a second one raises `already_sent`. The calls take the request the fun
 holds now, so pass the one returned by `roadrunner_req:read_body/1,2`,
 and return the last one from the fun, as `handle/1` does. The calls work
-only inside the fun.
+only inside the fun, in its process: one made from any other process,
+such as one the fun spawns, raises `not_in_send_fun`.
+
+A fun that exits with `{shutdown, Reason}` stops the request on purpose,
+the OTP way: the response ends as far as it went (an open stream is
+ended, no response at all is answered `500`), nothing is logged, and the
+request reports a normal stop. On HTTP/1.1 the connection then closes,
+since how much of the body the fun read is unknown; on HTTP/2 and HTTP/3
+only the stream ends.
 
 The framework finishes what the fun leaves open. A stream the fun did
 not end with `Send(Data, fin)` is ended when the fun returns. A fun that
 returns without a final response gets a `500` sent for it. A fun that
 crashes before a final response is answered `500`; one that crashes
 after it closes the connection (HTTP/1.1) or resets the stream (HTTP/2,
-HTTP/3) when the body was still open.
+HTTP/3) when the body was still open. A file that fails to read once its
+response has started cuts the response the same way.
 
 `Headers` in the `{send, Headers, Fun}` tuple is where middlewares add
 their headers (`roadrunner_cors`, `roadrunner_security_headers`). They
@@ -119,7 +128,10 @@ stream(Status, Headers, Req) when
 Send bytes `[Offset, Offset + Length)` of a file as the response body, as
 a `{sendfile, ...}` response does: the headers must carry its
 `content-length` and `content-type`. Returns `ok` once it is sent, or
-`{error, Reason}` when it could not be.
+`{error, Reason}` when it could not be. A file that is not there, or is
+shorter than the range, is answered `500` before anything is sent, and
+the call returns `{error, enoent}`, `{error, file_too_short}` or the
+like.
 """.
 -spec file(
     roadrunner_http:status(),

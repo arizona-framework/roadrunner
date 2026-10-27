@@ -294,18 +294,18 @@ emit(ConnPid, StreamId, _Handler, {sendfile, Status, Headers, {File, Offset, Len
     %% h2 has no kernel sendfile path. Wrap the file-read loop in a
     %% stream_fun so the existing streaming machinery handles
     %% HEADERS, DATA framing, MAX_FRAME_SIZE chunking, and per-stream
-    %% / conn-level flow control. File-open failures crash the worker;
-    %% the conn process RST_STREAM-s the stream, matching h1.
-    Fun = fun(Send) ->
-        {ok, IoDev} = file:open(File, [read, raw, binary]),
-        try
-            {ok, _} = file:position(IoDev, Offset),
-            sendfile_loop(IoDev, Length, Send)
-        after
-            _ = file:close(IoDev)
-        end
+    %% / conn-level flow control. The file is opened and positioned
+    %% before the HEADERS, so a failure there crashes the worker with
+    %% nothing sent and the conn process RST_STREAM-s the stream; a read
+    %% failing after them crashes it the same way, mid-response.
+    {ok, IoDev} = file:open(File, [read, raw, binary]),
+    try
+        {ok, _} = file:position(IoDev, Offset),
+        Fun = fun(Send) -> sendfile_loop(IoDev, Length, Send) end,
+        ok = roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun)
+    after
+        _ = file:close(IoDev)
     end,
-    ok = roadrunner_http2_stream_response:run(ConnPid, StreamId, Status, Headers, Fun),
     Status.
 
 %% File-read block per worker->conn round-trip. Decoupled from the
