@@ -339,6 +339,15 @@ oldest_ack_eliciting_test() ->
     Mixed = ?M:on_packet_sent(2, 100, true, d2, 2, ?M:on_packet_sent(1, 100, true, d1, 1, AckOnly)),
     ?assertEqual([d1], ?M:oldest_ack_eliciting(Mixed)).
 
+%% RFC 9002 §6.2.4: a handshake probe can carry every unacknowledged
+%% ack-eliciting packet's data, oldest first, skipping ACK-only packets.
+unacked_ack_eliciting_test() ->
+    ?assertEqual([], ?M:unacked_ack_eliciting(?M:new(#{}))),
+    AckOnly = ?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(#{})),
+    ?assertEqual([], ?M:unacked_ack_eliciting(AckOnly)),
+    Mixed = ?M:on_packet_sent(2, 100, true, d2, 2, ?M:on_packet_sent(1, 100, true, d1, 1, AckOnly)),
+    ?assertEqual([d1, d2], ?M:unacked_ack_eliciting(Mixed)).
+
 send_run(First, Last, Loss) ->
     lists:foldl(
         fun(PN, Acc) -> ?M:on_packet_sent(PN, 100, true, PN, PN, Acc) end,
