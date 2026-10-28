@@ -1669,17 +1669,22 @@ amplification_blocked_ack_arms_no_timer_test() ->
     %% client to send more (RFC 9000 §8.1), and no ACK or probe timeout is
     %% armed meanwhile (RFC 9002 §6.2.2.1): one already due would fire again
     %% at once, starving the path validation's own timer. The next datagram
-    %% from the client lets the ACK out.
+    %% from the client lets the ACK out. The first packet's ACK rides with
+    %% the challenge; the second's finds the budget spent.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
-    {State1, Effects1} = ?M:handle_datagram(
+    {State0, Effects0} = ?M:handle_datagram(
         ?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State
+    ),
+    ?assertNotEqual([], [F || {ack, _, _, _, _, _} = F <- sent_app_frames(Effects0, ServerApSecret)]),
+    {State1, Effects1} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([ping], 1, ClientApSecret), State0
     ),
     [AckAt] = [At || {arm_timer, ack, At} <- Effects1],
     {State2, Effects2} = ?M:handle_timeout(AckAt, ack, State1),
     ?assertEqual([], sends(Effects2)),
     ?assertMatch([{arm_timer, path, _}], [T || {arm_timer, _, _} = T <- Effects2]),
     {_State3, Effects3} = ?M:handle_datagram(
-        AckAt, ?PEER2, to_scid([ping | padding(200)], 1, ClientApSecret), State2
+        AckAt, ?PEER2, to_scid([ping | padding(200)], 2, ClientApSecret), State2
     ),
     ?assertNotEqual([], sends(Effects3)),
     ?assertNotEqual([], [F || {ack, _, _, _, _, _} = F <- sent_app_frames(Effects3, ServerApSecret)]).
