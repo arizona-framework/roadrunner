@@ -1183,6 +1183,48 @@ pmd_inflates_compressed_inbound_text_message_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
+pmd_large_compressed_frame_inflates_test() ->
+    %% A single compressed frame over 64 KB (64-bit length) takes the
+    %% general path and is inflated as a one-fragment message. Base64 of
+    %% random bytes is valid text that still compresses to over 64 KB.
+    Self = self(),
+    Tag = make_ref(),
+    Payload = base64:encode(crypto:strong_rand_bytes(90000)),
+    Compressed = pmd_compress(Payload),
+    Mask = <<5, 6, 7, 8>>,
+    Frame =
+        <<16#C1, (16#80 bor 127), (byte_size(Compressed)):64, Mask/binary,
+            (mask(Compressed, Mask))/binary>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Frame}]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    <<16#c1, 127, Len:64, Body/binary>> = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertEqual(Len, byte_size(Body)),
+    ?assertEqual(Payload, pmd_decompress(Body)),
+    Sink ! stop,
+    ok = stop_ws_session(Pid).
+
 pmd_concatenates_compressed_fragments_before_inflate_test() ->
     %% Compressed message split across two fragments — first has
     %% RSV1=1 FIN=0, continuation has RSV1=0 FIN=1. Server must
