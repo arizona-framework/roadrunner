@@ -40,8 +40,9 @@ called, and the connection closes and releases its listener slot.
 
 An exit signal is different: a linked process that dies, a
 `max_heap_size` kill or `exit(Pid, kill)` takes the connection down
-with it, and its listener slot comes back through the listener's slot
-reconciliation rather than at once. A handler that links to workers it
+with it: no `request_stop` or connection close event fires, and its
+listener slot comes back through the listener's slot reconciliation
+rather than at once. A handler that links to workers it
 does not want to share a fate with should turn `trap_exit` on: their
 exits then arrive in `handle_info/2` as `{'EXIT', Pid, Reason}`. The
 listener's hard drain kills with `exit(Pid, kill)`, which trapping

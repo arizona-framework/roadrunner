@@ -955,22 +955,14 @@ admit(#loop_state{request_slot = {idle, Max, Counter, Overload}} = S, Req, Deadl
     end.
 
 %% Hand the request's in-flight slot back once it has ended: before the
-%% next request on a kept-alive connection, or on the way out.
+%% next request on a kept-alive connection, on the way out, or as a
+%% WebSocket session starts.
 -spec release_request_slot(#loop_state{}) -> #loop_state{}.
-release_request_slot(#loop_state{request_slot = {held, Max, Counter, Overload} = Slot} = S) ->
-    ok = release_held_slot(Slot),
+release_request_slot(#loop_state{request_slot = {held, Max, Counter, Overload}} = S) ->
+    ok = roadrunner_conn:release_request_slot(Max, Counter, Overload),
     S#loop_state{request_slot = {idle, Max, Counter, Overload}};
 release_request_slot(S) ->
     S.
-
--spec release_held_slot(
-    undefined
-    | {idle | held, pos_integer(), counters:counters_ref(), roadrunner_conn:overload()}
-) -> ok.
-release_held_slot({held, Max, Counter, Overload}) ->
-    roadrunner_conn:release_request_slot(Max, Counter, Overload);
-release_held_slot(_Slot) ->
-    ok.
 
 %% Over its rate (429) or shed (503): queued pipelined responses go out
 %% first so the response + close cannot overtake them, and the close
@@ -1209,7 +1201,7 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
                     %% `ws_finish/4` builds. `request_stop` fires there, so
                     %% its timing (response writer finished) matches the
                     %% other writer-owned shapes.
-                    Run(ws_finish(S3, Req2, Span, Response));
+                    Run(ws_finish(release_request_slot(S3), Req2, Span, Response));
                 #loop_state{} = S3 ->
                     ok = roadrunner_event:request_stop(
                         Span,
@@ -1254,7 +1246,7 @@ send_phase(S0, Handler, Req, Headers, Fun, Span) ->
         {done, {websocket, _Status, {session, Upgrade, Run}}, Req2} ->
             %% The fun answered with an upgrade: run the session here, as
             %% for a returned one; `request_stop` fires when it ends.
-            Run(ws_finish(S, Req2, Span, Upgrade));
+            Run(ws_finish(release_request_slot(S), Req2, Span, Upgrade));
         {done, {Kind, Status, SentHeaders}, Req2} ->
             ok = roadrunner_event:request_stop(Span, Status, Kind),
             send_finish(S, Req2, Kind, SentHeaders);
@@ -1698,9 +1690,12 @@ buffered_finish(S0, Req, Headers) ->
     end.
 
 %% The close path a WebSocket session runs in this process once it ends:
-%% the websocket finishing path (`request_stop`, the in-flight slot back,
-%% any unread manual-mode body drained or lingered over, then the
-%% connection's own exit). It captures only what that path reads, so the
+%% the websocket finishing path (`request_stop`, any unread manual-mode
+%% body drained or lingered over, then the connection's own exit). The
+%% upgrade's in-flight slot is already back: a session is a connection,
+%% which `max_clients` bounds, and an exit signal that kills it would
+%% skip this path and leave a held slot taken for good. It captures only
+%% what that path reads, so the
 %% session does not keep the connection state, the upgrade request and
 %% the full listener options live for its whole lifetime: those were most
 %% of the process's live data, and every full-sweep collection would
@@ -1716,8 +1711,7 @@ ws_finish(
         socket = Socket,
         proto_opts = ProtoOpts,
         conn_span = ConnSpan,
-        requests_served = Served,
-        request_slot = Slot
+        requests_served = Served
     },
     Req,
     Span,
@@ -1730,7 +1724,6 @@ ws_finish(
     Reader = maps:get(body_reader, Req, none),
     fun() ->
         ok = roadrunner_event:request_stop(Span, Status, Kind),
-        ok = release_held_slot(Slot),
         case drain_reader(Reader) of
             {ok, _Leftover} -> ok;
             {error, _} -> ok = roadrunner_conn:linger(Socket, Linger)
