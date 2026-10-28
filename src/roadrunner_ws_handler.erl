@@ -200,8 +200,9 @@ name (`t:roadrunner_listener:ws_opts/0`):
   garbage collection settings. The session runs in its connection's
   process, which takes them for the session's lifetime
   (`erlang:process_flag/2`); they default to the listener's
-  `handler_spawn` options. A larger `min_heap_size` trades memory per
-  session for fewer collections.
+  `handler_spawn` options, and `min_heap_size` to 610 words when those
+  do not set it either. A larger `min_heap_size` trades memory per
+  session for fewer collections, a smaller one the other way.
 
 The values are the application's to get right, as the rest of a
 response is: they are not checked at the upgrade, and a key not listed

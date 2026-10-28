@@ -23,6 +23,7 @@ timeout, size caps and the session process's GC settings. The handler is
     tls_closed_before_arm_exits_cleanly/1,
     upgrade_frame_cap/1,
     upgrade_gc_settings/1,
+    default_session_min_heap/1,
     every_option_accepted/1
 ]).
 
@@ -45,6 +46,7 @@ all() ->
         tls_closed_before_arm_exits_cleanly,
         upgrade_frame_cap,
         upgrade_gc_settings,
+        default_session_min_heap,
         every_option_accepted
     ].
 
@@ -89,7 +91,7 @@ upgrade_opts(tcp_echo_past_active_window) ->
 upgrade_opts(upgrade_frame_cap) ->
     #{max_frame_size => 4};
 upgrade_opts(upgrade_gc_settings) ->
-    #{fullsweep_after => 7, max_heap_size => 1000000};
+    #{fullsweep_after => 7, min_heap_size => 987, max_heap_size => 1000000};
 upgrade_opts(every_option_accepted) ->
     #{
         headers => [{~"x-session", ~"1"}],
@@ -262,7 +264,14 @@ upgrade_gc_settings(Config) ->
     ?assertEqual(
         7, proplists:get_value(fullsweep_after, element(2, process_info(Pid, garbage_collection)))
     ),
-    ?assertMatch({max_heap_size, #{size := 1000000}}, process_info(Pid, max_heap_size)).
+    ?assertMatch({max_heap_size, #{size := 1000000}}, process_info(Pid, max_heap_size)),
+    ?assertMatch({min_heap_size, 987}, process_info(Pid, min_heap_size)).
+
+default_session_min_heap(Config) ->
+    %% No `min_heap_size` from the upgrade or the listener: the session
+    %% takes its own 610-word minimum.
+    {_Sock, _Head, Pid} = upgrade(Config, []),
+    ?assertMatch({min_heap_size, 610}, process_info(Pid, min_heap_size)).
 
 every_option_accepted(Config) ->
     {Sock, Head, _Pid} = upgrade(Config, deflate_offer()),

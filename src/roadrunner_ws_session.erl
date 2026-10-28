@@ -242,6 +242,16 @@
 %% the cap (this is ~2x the actual cons-cell cost, a safe over-estimate).
 -define(WS_FRAGMENT_OVERHEAD, 64).
 
+%% Minimum heap (words) a session takes when neither the upgrade nor the
+%% listener's `handler_spawn` options set `min_heap_size`. Sessions run
+%% with `{fullsweep_after, 0}`, so the heap is resized from the live data
+%% after every collection; a session's live data is small, so the default
+%% minimum left it collecting about once per message. 610 words keeps the
+%% collections fewer: per-message work and reconnects got cheaper while a
+%% session still holds less memory than when it ran in a process of its
+%% own.
+-define(WS_MIN_HEAP_SIZE, 610).
+
 -doc """
 Answer a WebSocket upgrade and hand back the session to run. Checks the
 handshake and the handler, applies `ws.recv_buffer`, fires
@@ -453,7 +463,8 @@ serve(
     begin_session(arm_active(arm_idle(Data))).
 
 %% Apply the session's garbage collection settings to the running
-%% process: `process_flag/2` takes the same keys a spawn would.
+%% process: `process_flag/2` takes the same keys a spawn would. Without a
+%% `min_heap_size` of its own, the session takes `?WS_MIN_HEAP_SIZE`.
 -spec apply_gc_settings([proc_lib:start_spawn_option()]) -> ok.
 apply_gc_settings(SpawnOpts) ->
     _ = [
@@ -461,6 +472,11 @@ apply_gc_settings(SpawnOpts) ->
      || {Flag, Value} <- SpawnOpts,
         Flag =:= fullsweep_after orelse Flag =:= min_heap_size orelse Flag =:= max_heap_size
     ],
+    _ =
+        case lists:keymember(min_heap_size, 1, SpawnOpts) of
+            true -> ok;
+            false -> process_flag(min_heap_size, ?WS_MIN_HEAP_SIZE)
+        end,
     ok.
 
 %% Set up the inflate / deflate contexts when permessage-deflate was
