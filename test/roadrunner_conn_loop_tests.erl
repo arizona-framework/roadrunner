@@ -2206,14 +2206,9 @@ active_n_streaming_handler_reads_a_body_queued_at_disarm_test() ->
     Pid ! {roadrunner_fake_data, x, ~"world"},
     true = erlang:resume_process(Pid),
     [{active, false}] = expect_setopts(Tag),
-    Sent = iolist_to_binary(collect_sends(Tag, 200)),
-    ?assertNotEqual(nomatch, binary:match(Sent, ~"helloworld")),
-    %% The conn then drains the request's own reader, which the handler's
-    %% read did not advance, until the request deadline: stop it here.
-    exit(Pid, kill),
-    receive
-        {'DOWN', Ref, process, Pid, killed} -> ok
-    end.
+    ok = await_normal_exit(Ref, Pid),
+    Sent = iolist_to_binary(collect_sends(Tag, 100)),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"helloworld")).
 
 active_once_hibernating_conn_treats_a_passive_message_as_stray_test() ->
     %% Only an `{active, N}` socket goes passive: on an `{active, once}`

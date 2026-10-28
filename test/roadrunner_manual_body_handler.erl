@@ -11,6 +11,7 @@ picks what the handler does with the body:
 - `{gated, Name}`: register as `Name`, wait for `go`, then `read`
 - `{report, Pid}`: read it and send `Pid` the outcome, `{read_result, _}`
 - `{gated_report, Name, Pid}`: `{gated, Name}`, then `{report, Pid}`
+- `{announce_report, Pid}`: send `Pid` `reading`, then `{report, Pid}`
 - `{gated_pieces, Name, Pid}`: register as `Name`, wait for `go`, read
   100000 bytes and send `Pid` `first_piece`, then read the rest and answer
   with the total
@@ -69,6 +70,9 @@ behave({report, Pid}, Req) ->
         end,
     Pid ! {read_result, Result},
     {roadrunner_resp:text(200, ~"ok"), Req};
+behave({announce_report, Pid}, Req) ->
+    Pid ! reading,
+    behave({report, Pid}, Req);
 behave({gated_report, Name, Pid}, Req) ->
     true = register(Name, self()),
     receive
