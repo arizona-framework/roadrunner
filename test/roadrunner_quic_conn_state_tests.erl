@@ -552,7 +552,7 @@ assert_handshake_crypto_closes(Wrap, CloseLevel) ->
         server_ap_secret := ServerApSecret,
         cf_framed := ClientFinished
     } = connect(),
-    {State1b, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, 0, State1),
+    {State2a, _} = ?M:handle_call(self(), make_ref(), {set_owner, self()}, 0, State1),
     Datagram = ?TC:seal(
         handshake,
         0,
@@ -561,7 +561,7 @@ assert_handshake_crypto_closes(Wrap, CloseLevel) ->
         ?DCID,
         ?SCID
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State1b),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State2a),
     ?assertMatch({emit, _, {closed, {local, unexpected_message}}}, lists:last(emits(Effects))),
     ?assertNotEqual(connected, ?M:phase(State2)),
     Secrets = #{handshake => ServerHsSecret, application => ServerApSecret},
@@ -1248,8 +1248,9 @@ nat_rebinding_moves_to_new_address_test() ->
     %% connection there: the effects lead with {migrate, NewPeer}. The
     %% client still addresses the server's handshake id, so the server keeps
     %% addressing the client's (§9.5 MAY). The new address is challenged
-    %% within three times what it sent (§8.2.1, §9.3.1), and the old path is
-    %% challenged too, in a datagram filling 1200 bytes (§9.3.3, §8.2.1).
+    %% within three times what it sent (§8.2.1, §9.3.1), in a bare datagram
+    %% since that is short of 1200 bytes, and the old path is challenged
+    %% too, in a datagram filling 1200 bytes (§9.3.3, §8.2.1).
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     Ping = to_scid([ping], 0, ClientApSecret),
     {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Ping, State),
@@ -1258,7 +1259,7 @@ nat_rebinding_moves_to_new_address_test() ->
     %% The owner hears of the move on it, before validation completes.
     ?assertEqual([{emit, self(), {peer_changed, ?PEER2}}], emits(Effects)),
     [NewPath] = path_datagrams(sends(Effects), ServerApSecret),
-    ?assertEqual(3 * byte_size(Ping), byte_size(NewPath)),
+    ?assert(byte_size(NewPath) =< 50),
     ?assertEqual([?CLIENT_SCID], short_header_dcids([{send, NewPath}])),
     ?assertMatch([{path_challenge, _}], path_frames([NewPath], ServerApSecret)),
     [OldPath] = sends_to(?PEER, Effects),
@@ -1351,13 +1352,13 @@ probing_packet_answered_on_its_path_test() ->
     ?assertEqual([?CLIENT_SPARE], short_header_dcids([{send, Answer2}])).
 
 probe_answer_within_amplification_limit_test() ->
-    %% RFC 9000 §8.2.2: the answer to a small probe is expanded only as far
-    %% as three times what the address sent.
+    %% RFC 9000 §8.2.2: the answer to a small probe, which three times what
+    %% the address sent cannot expand to 1200 bytes, goes bare.
     {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
     Probe = app_datagram_to(CID1, [{path_challenge, ~"probe-01"}], 2, ClientApSecret),
     {_State1, Effects} = ?M:handle_datagram(?NOW, ?PEER2, Probe, State),
     [Answer] = sends_to(?PEER2, Effects),
-    ?assertEqual(3 * byte_size(Probe), byte_size(Answer)),
+    ?assert(byte_size(Answer) =< 50),
     ?assertEqual([{path_response, ~"probe-01"}], path_frames([Answer], ServerApSecret)).
 
 probe_without_client_id_dropped_test() ->
@@ -1501,6 +1502,58 @@ failed_validation_returns_to_old_path_test() ->
     ?assertMatch([{migrate, ?PEER2} | _], BackEffects),
     ?assertEqual({ok, ?PEER2}, ?M:peername(Back)),
     ?assertEqual([?CLIENT_SPARE], lists:usort(short_header_dcids(BackEffects))).
+
+challenge_after_a_small_datagram_leaves_room_to_retry_test() ->
+    %% RFC 9000 §8.1, §8.2.1: a challenge the anti-amplification limit keeps
+    %% under 1200 bytes goes bare rather than spending the whole budget on
+    %% padding that cannot validate the path MTU anyway, so a lost one can
+    %% still be sent again from what the client's packet allowed.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, Effects1} = ?M:handle_datagram(
+        ?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State
+    ),
+    [First] = path_datagrams(sends(Effects1), ServerApSecret),
+    ?assert(byte_size(First) =< 50),
+    {_State2, Effects2} = ?M:handle_timeout(?RECHALLENGE_AT, path, State1),
+    ?assertMatch([_], challenge_data(sends(Effects2), ServerApSecret)).
+
+data_leaves_room_for_challenges_test() ->
+    %% RFC 9000 §8.1: data waiting on a path still being validated spends
+    %% the anti-amplification budget only down to what the validation's
+    %% remaining challenges need. A client that stops receiving stops
+    %% sending, so data spending all of it would leave a lost challenge no
+    %% retry.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, padded_ping(0, ClientApSecret), State),
+    {State2, Sent} = ?M:handle_send(
+        self(), make_ref(), 0, binary:copy(~"x", 100000), false, ?NOW, State1
+    ),
+    ?assertNotEqual([], sent_stream_frames(Sent, ServerApSecret)),
+    {State3, Effects3} = ?M:handle_timeout(?RECHALLENGE_AT, path, State2),
+    ?assertMatch([_], challenge_data(sends(Effects3), ServerApSecret)),
+    {_State4, Effects4} = ?M:handle_timeout(?RECHALLENGE_AT + 1100, path, State3),
+    ?assertMatch([_], challenge_data(sends(Effects4), ServerApSecret)).
+
+stranded_client_is_challenged_on_probe_timeout_test() ->
+    %% A validation given up under loss returns to the old path, but a
+    %% client that really moved and only receives sends nothing more from
+    %% its new address. A probe timeout challenges that address too: the
+    %% client must acknowledge the challenge, a non-probing packet that
+    %% moves the connection back (RFC 9000 §9.3). Back there, the address is
+    %% no longer one to rescue.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    Move = app_datagram_to(CID1, [ping | padding(1100)], 2, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER2, Move, State),
+    {State2, _} = ?M:handle_timeout(?RECHALLENGE_AT, path, State1),
+    {Reverted, _} = ?M:handle_timeout(?ABANDON_AT, path, State2),
+    ?assertEqual({ok, ?PEER}, ?M:peername(Reverted)),
+    {Probed, Effects} = ?M:handle_timeout(?ABANDON_AT + 1000, pto, Reverted),
+    ?assertMatch([_], challenge_data(sends_to(?PEER2, Effects), ServerApSecret)),
+    Ack = app_datagram_to(CID1, [{ack, 0, 0, 0, [], undefined}], 3, ClientApSecret),
+    {Back, BackEffects} = ?M:handle_datagram(?ABANDON_AT + 1000, ?PEER2, Ack, Probed),
+    ?assertMatch([{migrate, ?PEER2} | _], BackEffects),
+    {_Later, LaterEffects} = ?M:handle_timeout(?ABANDON_AT + 3000, pto, Back),
+    ?assertEqual([], [S || {send_to, _, _} = S <- LaterEffects]).
 
 return_to_validated_path_retires_left_id_test() ->
     %% RFC 9000 §9.3: a client back on the last validated path left the new
@@ -1709,13 +1762,16 @@ client_retires_probing_id_test() ->
 challenge_retransmit_blocked_by_amplification_limit_test() ->
     %% A challenge that would exceed what the unvalidated address allows is
     %% not sent, and the validation carries on: a response to the first
-    %% challenge still validates the address.
+    %% challenge still validates the address. Three times a bare PING is
+    %% room for two bare challenges, not a third.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),
     {State1, Effects1} = ?M:handle_datagram(
         ?NOW, ?PEER2, to_scid([ping], 0, ClientApSecret), State
     ),
     [Data] = challenge_data(sends(Effects1), ServerApSecret),
-    {State2, Effects2} = ?M:handle_timeout(?RECHALLENGE_AT, path, State1),
+    {State2a, Effects2a} = ?M:handle_timeout(?RECHALLENGE_AT, path, State1),
+    ?assertMatch([_], challenge_data(sends(Effects2a), ServerApSecret)),
+    {State2, Effects2} = ?M:handle_timeout(?RECHALLENGE_AT + 1100, path, State2a),
     ?assertEqual([], challenge_data(sends(Effects2), ServerApSecret)),
     Response = to_scid([{path_response, Data}], 1, ClientApSecret),
     {_State3, Effects3} = ?M:handle_datagram(?RECHALLENGE_AT, ?PEER2, Response, State2),
@@ -2038,7 +2094,7 @@ owner_set_in_handshaking_gets_connected_on_completion_test() ->
     #{state1 := State1, client_hs_secret := ClientHsSecret, cf_framed := ClientFinished} = connect(),
     Owner = self(),
     Ref = make_ref(),
-    {State1b, Installed} = ?M:handle_call(Owner, Ref, {set_owner, Owner}, 0, State1),
+    {State2a, Installed} = ?M:handle_call(Owner, Ref, {set_owner, Owner}, 0, State1),
     ?assertEqual([{reply, Owner, Ref, ok}], Installed),
     Datagram = ?TC:seal(
         handshake,
@@ -2048,7 +2104,7 @@ owner_set_in_handshaking_gets_connected_on_completion_test() ->
         ?DCID,
         ?SCID
     ),
-    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State1b),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State2a),
     ?assertEqual(connected, ?M:phase(State2)),
     ?assertEqual([{emit, Owner, {connected, expected_info()}}], emits(Effects)).
 
@@ -2073,7 +2129,7 @@ connected_not_re_emitted_on_later_datagram_test() ->
         client_ap_secret := ClientApSecret
     } = connect(),
     Owner = self(),
-    {State1b, _} = ?M:handle_call(Owner, make_ref(), {set_owner, Owner}, 0, State1),
+    {State2a, _} = ?M:handle_call(Owner, make_ref(), {set_owner, Owner}, 0, State1),
     Finished = ?TC:seal(
         handshake,
         0,
@@ -2082,7 +2138,7 @@ connected_not_re_emitted_on_later_datagram_test() ->
         ?DCID,
         ?SCID
     ),
-    {State2, FirstEffects} = ?M:handle_datagram(?NOW, ?PEER, Finished, State1b),
+    {State2, FirstEffects} = ?M:handle_datagram(?NOW, ?PEER, Finished, State2a),
     ?assertEqual([{emit, Owner, {connected, expected_info()}}], emits(FirstEffects)),
     %% A processed 1-RTT packet once connected: still exactly zero re-emits.
     AppPing = ?TC:seal(
@@ -2321,7 +2377,7 @@ connected_precedes_stream_events_in_coalesced_datagram_test() ->
         client_ap_secret := ClientApSecret
     } = connect(),
     Owner = self(),
-    {State1b, _} = ?M:handle_call(Owner, make_ref(), {set_owner, Owner}, 0, State1),
+    {State2a, _} = ?M:handle_call(Owner, make_ref(), {set_owner, Owner}, 0, State1),
     Finished = ?TC:seal(
         handshake,
         0,
@@ -2332,7 +2388,7 @@ connected_precedes_stream_events_in_coalesced_datagram_test() ->
     ),
     Request = app_datagram([{stream, 0, 0, ~"hi", true}], 0, ClientApSecret),
     {_State2, Effects} = ?M:handle_datagram(
-        ?NOW, ?PEER, <<Finished/binary, Request/binary>>, State1b
+        ?NOW, ?PEER, <<Finished/binary, Request/binary>>, State2a
     ),
     ?assertEqual(
         [
