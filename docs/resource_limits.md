@@ -63,6 +63,7 @@ e.g. `ws => #{max_frame_size => N, max_message_size => N}`.
 |---|---|---|
 | `ws.max_frame_size` | 10 MB | one frame's declared payload, checked on the frame header before the body is buffered |
 | `ws.max_message_size` | 10 MB | a reassembled message: the running total across fragments, and the decompressed size when permessage-deflate is negotiated |
+| `ws.active` | `once` on plain TCP, 16 on TLS | unread socket reads a session can hold in its mailbox |
 
 Notes:
 
