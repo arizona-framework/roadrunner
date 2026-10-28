@@ -436,6 +436,55 @@ disabled, a 42-46% regression, and throughput fell about 30%. At true
 saturation, where a scheduler always has another process ready to run,
 the spin never triggers and the flags do nothing either way.
 
+## Many cores: I/O poll threads
+
+The emulator watches sockets from I/O poll threads, and by default it
+starts one. On plain TCP, roadrunner reads HTTP/1.1 and WebSocket
+connections with `{active, once}`: after each request or message the
+connection re-arms its socket, and when the peer's next bytes arrive,
+the poll thread sees the socket turn readable and hands the read to a
+scheduler, waking it if it sleeps. A server at full load mostly skips
+that step, because by the time a connection re-arms, the next bytes are
+often already waiting. A server with spare capacity does not: every
+request and every message then passes through that one thread. With
+many schedulers the thread becomes the limit, and throughput stops
+growing while the schedulers still have time to spare.
+
+On a machine with many cores, give the emulator one poll thread, each
+with its own pollset, per eight schedulers. In `vm.args`:
+
+```
++IOPt 13
++IOPp 100
+```
+
+`+IOPt 13` sets the poll threads to 13% of the schedulers, rounded
+down: 8 threads for 64 schedulers, 2 for 16, and the default single
+thread below 16. `+IOPp 100` gives each thread a pollset of its own.
+The OTP documentation for `+IOt` gives the test for whether a node
+needs more: microstate accounting shows the poll thread busy. Run
+`msacc:start(1000), msacc:print().` under load and read the `poll` row.
+
+Measured on a 24-thread machine, one message or request in flight per
+connection. With the load generator on the same cores, the single poll
+thread was the limit: it was busy for 86% of each run while getting
+about a third of a core, and the schedulers spent 20-29% of their time
+spinning for work. With `+IOPt 13 +IOPp 100` (three poll threads at 24
+schedulers), a 512-connection WebSocket echo went from 3.9M to 5.2M
+messages in 6 seconds (+33%), and HTTP/1.1 keep-alive from 3.6M to 4.7M
+requests (+30%). Four poll threads gave +50% for the echo at both 512
+and 4000 connections, with the schedulers' spin down to about 5%. Where
+the poll thread was not the limit (the server on cores of its own, or 16
+messages in flight per connection), throughput stayed within run-to-run
+noise, a few percent either way.
+
+The gain grows with the core count. On a 64-core server, with 64
+schedulers and the load generator on cores of its own, the same
+one-message-in-flight echo was capped at about 330K messages per second
+with the single poll thread, while the schedulers sat partly idle. With
+`+IOPt 13 +IOPp 100` (eight poll threads) it reached about 2M per second
+at 512, 4096 and 16384 connections, with the schedulers busy.
+
 ## Cold start: the first requests after a deploy
 
 Outside a release the emulator runs in interactive mode, where a module
