@@ -911,10 +911,24 @@ arm_and_recv(#data{socket = Socket} = Data0, Hibernate) ->
     %% in one write before the park — see `flush_out/1`.
     Data = flush_out(Data0),
     case roadrunner_transport:setopts(Socket, [{active, once}]) of
-        ok when Hibernate -> erlang:hibernate(?MODULE, recv_loop, [Data]);
-        ok -> recv_loop(Data);
+        ok -> wait(Data, Hibernate);
         {error, Reason} -> exit_clean({error, Reason}, Data)
     end.
+
+%% Flush and wait WITHOUT re-arming, after a message that did not come
+%% from the socket (`handle_info/2`, `handle_drain/2`, a dropped stray).
+%% Only an inbound data message uses up the active-once, and the session
+%% only reaches `recv_loop/1` with the socket armed, so it is still armed
+%% here; a second `setopts` would be a wasted driver call on every
+%% server push.
+-spec flush_and_wait(#data{}, boolean()) -> no_return().
+flush_and_wait(Data, Hibernate) ->
+    wait(flush_out(Data), Hibernate).
+
+%% Back to `recv_loop/1`, hibernating first when a handler asked.
+-spec wait(#data{}, boolean()) -> no_return().
+wait(Data, true) -> erlang:hibernate(?MODULE, recv_loop, [Data]);
+wait(Data, false) -> recv_loop(Data).
 
 -spec handle_frame(roadrunner_ws:frame(), #data{}, boolean()) -> no_return().
 handle_frame(#{opcode := close, payload := P}, Data, _Hibernate) ->
@@ -1394,9 +1408,11 @@ handle_info_msg(
     #data{callbacks = #callbacks{handle_info = true}, mod = Mod, mod_state = State} = Data,
     Hibernate
 ) ->
-    apply_handler_result(Mod:handle_info(Msg, State), Data, Hibernate, fun arm_and_recv/2, normal);
+    apply_handler_result(
+        Mod:handle_info(Msg, State), Data, Hibernate, fun flush_and_wait/2, normal
+    );
 handle_info_msg(_Msg, #data{callbacks = #callbacks{handle_info = false}} = Data, _Hibernate) ->
-    arm_and_recv(Data, false).
+    recv_loop(Data).
 
 -spec handle_drain_msg(integer(), #data{}, boolean()) -> no_return().
 handle_drain_msg(
@@ -1405,17 +1421,18 @@ handle_drain_msg(
     Hibernate
 ) ->
     apply_handler_result(
-        Mod:handle_drain(Deadline, State), Data, Hibernate, fun arm_and_recv/2, shutdown
+        Mod:handle_drain(Deadline, State), Data, Hibernate, fun flush_and_wait/2, shutdown
     );
 handle_drain_msg(
     _Deadline, #data{callbacks = #callbacks{handle_drain = false}} = Data, _Hibernate
 ) ->
-    arm_and_recv(Data, false).
+    recv_loop(Data).
 
 %% Apply a handler callback's return. `Continue` is the next step on a
 %% non-close return: `fun process_buffer/2` after handle_frame (drain any
-%% more buffered frames), `fun arm_and_recv/2` after handle_info/drain
-%% (re-arm and wait), `fun enter_frame_loop/2` after the optional init/1.
+%% more buffered frames), `fun flush_and_wait/2` after handle_info/drain
+%% (the socket is still armed), `fun enter_frame_loop/2` after the
+%% optional init/1.
 %% `CloseReason` is what `terminate/2` gets on a `close` return: `shutdown`
 %% from `handle_drain/2`, `normal` otherwise.
 -spec apply_handler_result(
