@@ -237,11 +237,12 @@ pseudo_connect_test() ->
 %% --- check_fields/1 ---
 
 check_fields_name_every_byte_test() ->
-    %% RFC 9113 §8.2.1: a field name holds no byte in 0x00-0x20, 0x41-0x5A
-    %% or 0x7F-0xFF, and no `:` outside a pseudo-header's leading colon.
-    %% Every byte value at the start, middle and end of a name.
+    %% RFC 9110 §5.1 and RFC 9113 §8.2.1: a field name is a token
+    %% without uppercase letters. Every byte value at the start, middle
+    %% and end of a name.
     Allowed = fun(B) ->
-        B > 16#20 andalso B < 16#7F andalso not (B >= $A andalso B =< $Z) andalso B =/= $:
+        (B >= $a andalso B =< $z) orelse (B >= $0 andalso B =< $9) orelse
+            lists:member(B, "!#$%&'*+-.^_`|~")
     end,
     [
         ?assertEqual(
