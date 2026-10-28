@@ -2218,7 +2218,9 @@ path_packet(Now, Path, Frames, #state{scid = SCID, sealed = Sealed} = State) ->
             none;
         {DCID, Budget} ->
             #space{next_pn = PN} = Space = space(application, State),
-            Entry = (entry(application, Frames, PN, State))#{pad_to => path_pad(Budget)},
+            Entry = (entry(application, Frames, PN, State))#{
+                pad_to => path_pad(Budget, pad_keep(Path, Frames, State))
+            },
             {Datagram, [Sent]} = roadrunner_quic_send:datagram(#{application => Entry}, DCID, SCID),
             case byte_size(Datagram) =< Budget of
                 true ->
@@ -2232,12 +2234,28 @@ path_packet(Now, Path, Frames, #state{scid = SCID, sealed = Sealed} = State) ->
     end.
 
 %% A probing packet fills a 1200-byte datagram when the anti-amplification
-%% limit allows it (RFC 9000 §8.2.1 MUST) and otherwise goes bare: a smaller
+%% limit allows it (RFC 9000 §8.2.1 MUST) beside the challenges the path
+%% still has to send (`pad_keep/3`), and otherwise goes bare: a smaller
 %% datagram cannot validate the path MTU anyway, and the budget it would
 %% spend is what lets a lost challenge be sent again.
--spec path_pad(non_neg_integer() | infinity) -> non_neg_integer().
-path_pad(Budget) when Budget >= ?MIN_PATH_DATAGRAM -> ?MIN_PATH_DATAGRAM;
-path_pad(_Budget) -> 0.
+-spec path_pad(non_neg_integer() | infinity, non_neg_integer()) -> non_neg_integer().
+path_pad(infinity, _Keep) -> ?MIN_PATH_DATAGRAM;
+path_pad(Budget, Keep) when Budget - Keep >= ?MIN_PATH_DATAGRAM -> ?MIN_PATH_DATAGRAM;
+path_pad(_Budget, _Keep) -> 0.
+
+%% The budget a probing packet leaves for the challenges after it: on the
+%% path being validated, those of its validation and of a stranded client
+%% (`reserve/1`), this challenge being one of them; at a stranded client's
+%% address, the next of its own.
+-spec pad_keep(path(), [roadrunner_quic_frame:frame()], t()) -> non_neg_integer().
+pad_keep(current, [{path_challenge, _Data}], State) ->
+    max(0, reserve(State) - ?BARE_CHALLENGE);
+pad_keep(current, _Frames, State) ->
+    reserve(State);
+pad_keep(probe, _Frames, #state{stranded = Addr, probe_path = {Addr, _Seq, _Amp}}) ->
+    ?BARE_CHALLENGE;
+pad_keep(_Path, _Frames, _State) ->
+    0.
 
 %% The client id and anti-amplification budget for a path's probing packet.
 -spec path_target(path(), t()) -> {binary(), non_neg_integer() | infinity} | none.

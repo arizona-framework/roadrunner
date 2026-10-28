@@ -1592,6 +1592,28 @@ stranded_client_is_challenged_on_probe_timeout_test() ->
     {_Later, LaterEffects} = ?M:handle_timeout(?ABANDON_AT + 3000, pto, Back),
     ?assertEqual([], [S || {send_to, _, _} = S <- LaterEffects]).
 
+expanded_challenges_leave_room_for_a_stranded_client_test() ->
+    %% Challenges filling 1200-byte datagrams spend the anti-amplification
+    %% budget only down to what the challenges after them need (RFC 9000
+    %% §8.1): the last one of a validation goes bare, and the address it
+    %% leaves can still be challenged once the validation fails.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    %% Three times this is room for three expanded challenges and the ACK
+    %% sent beside them, but not for a bare challenge more.
+    Move = app_datagram_to(CID1, [ping | padding(1188)], 2, ClientApSecret),
+    ?assertEqual(1215, byte_size(Move)),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER2, Move, State),
+    {State2, Effects2} = ?M:handle_timeout(?RECHALLENGE_AT, path, State1),
+    {State3, Effects3} = ?M:handle_timeout(?RECHALLENGE_AT + 1100, path, State2),
+    Sizes = [
+        byte_size(D)
+     || D <- path_datagrams(sends(Effects1 ++ Effects2 ++ Effects3), ServerApSecret)
+    ],
+    ?assertMatch([1200, 1200, Bare] when Bare =< 50, Sizes),
+    {Reverted, _} = ?M:handle_timeout(?ABANDON_AT, path, State3),
+    {_Probed, Effects} = ?M:handle_timeout(?ABANDON_AT + 1000, pto, Reverted),
+    ?assertMatch([_], challenge_data(sends_to(?PEER2, Effects), ServerApSecret)).
+
 return_to_validated_path_retires_left_id_test() ->
     %% RFC 9000 §9.3: a client back on the last validated path left the new
     %% one, whose client id is retired (§5.1.2). The client repeating the
