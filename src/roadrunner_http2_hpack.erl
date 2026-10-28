@@ -24,8 +24,8 @@
 %%
 %% Each literal field is checked as it is decoded against RFC 9113
 %% §8.2.1 (`roadrunner_http:valid_field_name/1` and
-%% `valid_field_value/1`): a name outside visible lowercase US-ASCII, or
-%% with a `:` past a pseudo-header's leading one, is `bad_header_name`; a
+%% `valid_field_value/1`): a name that is not a lowercase RFC 9110 token
+%% after a pseudo-header's leading `:` is `bad_header_name`; a
 %% value with NUL, CR or LF, or leading or trailing SP or HTAB, is
 %% `bad_header_value`. Fields from the static table are valid, and a
 %% dynamic-table field was checked when its literal arrived, so a field

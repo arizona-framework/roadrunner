@@ -22,7 +22,7 @@
 %% - Pseudo-headers other than the four defined are rejected.
 %% - `:path` is an origin-form (`/`, then US-ASCII without CTL, SP or DEL),
 %%   or `*` for OPTIONS; a well-formed CONNECT is a 501.
-%% - Field names are visible US-ASCII without uppercase or `:`, and values
+%% - Field names are lowercase RFC 9110 tokens, and values
 %%   hold no NUL, CR or LF and no leading or trailing SP or HTAB (RFC 9114
 %%   §4.2, `roadrunner_http:check_fields/1`).
 %% - Connection-specific headers MUST NOT appear (RFC 9114 §4.2).

@@ -501,13 +501,14 @@ check_fields([{Name, Value} | Rest]) ->
 check_fields([]) ->
     ok.
 
-%% A field name is visible US-ASCII without uppercase letters or `:`,
-%% after a pseudo-header's leading colon (which pseudo-headers are known
-%% is `request_pseudo_headers/1`'s call). Both clauses match the binary
-%% and hand the rest to functions that only match it, so the compiler
-%% passes one match context down the chain instead of building
-%% sub-binaries: this runs for every decoded HTTP/2 and HTTP/3 field, on
-%% the long-lived connection process.
+%% A field name is an RFC 9110 token without uppercase letters, after a
+%% pseudo-header's leading colon (which pseudo-headers are known is
+%% `request_pseudo_headers/1`'s call), so HTTP/2 and HTTP/3 take the same
+%% names HTTP/1.1 does. Both clauses match the binary and hand the rest
+%% to functions that only match it, so the compiler passes one match
+%% context down the chain instead of building sub-binaries: this runs for
+%% every decoded HTTP/2 and HTTP/3 field, on the long-lived connection
+%% process.
 -doc false.
 -spec valid_field_name(binary()) -> boolean().
 valid_field_name(<<$:, Name/binary>>) -> field_name(Name);
@@ -515,21 +516,47 @@ valid_field_name(<<Name/binary>>) -> field_name(Name).
 
 %% The first byte of a name: an empty name is invalid.
 -spec field_name(binary()) -> boolean().
-field_name(<<C, Rest/binary>>) when C >= $a, C =< $z; C =:= $- ->
+field_name(<<C, Rest/binary>>) when C >= $a, C =< $z; C =:= $-; C >= $0, C =< $9 ->
     field_name_bytes(Rest);
-field_name(<<C, _/binary>>) when C >= $A, C =< $Z; C =:= $: ->
-    false;
-field_name(<<C, Rest/binary>>) when C > 16#20, C < 16#7F ->
+field_name(<<C, Rest/binary>>) when
+    C =:= $!;
+    C =:= $#;
+    C =:= $$;
+    C =:= $%;
+    C =:= $&;
+    C =:= $';
+    C =:= $*;
+    C =:= $+;
+    C =:= $.;
+    C =:= $^;
+    C =:= $_;
+    C =:= $`;
+    C =:= $|;
+    C =:= $~
+->
     field_name_bytes(Rest);
 field_name(_) ->
     false.
 
 -spec field_name_bytes(binary()) -> boolean().
-field_name_bytes(<<C, Rest/binary>>) when C >= $a, C =< $z; C =:= $- ->
+field_name_bytes(<<C, Rest/binary>>) when C >= $a, C =< $z; C =:= $-; C >= $0, C =< $9 ->
     field_name_bytes(Rest);
-field_name_bytes(<<C, _/binary>>) when C >= $A, C =< $Z; C =:= $: ->
-    false;
-field_name_bytes(<<C, Rest/binary>>) when C > 16#20, C < 16#7F ->
+field_name_bytes(<<C, Rest/binary>>) when
+    C =:= $!;
+    C =:= $#;
+    C =:= $$;
+    C =:= $%;
+    C =:= $&;
+    C =:= $';
+    C =:= $*;
+    C =:= $+;
+    C =:= $.;
+    C =:= $^;
+    C =:= $_;
+    C =:= $`;
+    C =:= $|;
+    C =:= $~
+->
     field_name_bytes(Rest);
 field_name_bytes(<<>>) ->
     true;
