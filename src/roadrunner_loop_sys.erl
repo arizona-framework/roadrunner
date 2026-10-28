@@ -22,8 +22,9 @@
 -export([system_continue/3, system_terminate/4, system_get_state/1, system_replace_state/2]).
 
 %% Closure that re-enters the calling loop with a (possibly replaced)
-%% handler state. The loops return ok when the handler stops.
--type resume() :: fun((State :: term()) -> ok).
+%% handler state. What the loop returns when it stops is the loop's own
+%% (a WebSocket session returns `finished` to its guard).
+-type resume() :: fun((State :: term()) -> term()).
 %% sys Misc payload: the loop resume closure paired with the handler state
 %% exposed via system_get_state/1.
 -type misc() :: {resume(), State :: term()}.
@@ -48,11 +49,11 @@ handle_system(Req, From, State, Resume) ->
 gen_call_unsupported(From) ->
     gen:reply(From, {error, not_supported}).
 
-%% Resume the loop. Spec is `ok` (the loop returns when the handler stops),
-%% though the sys behaviour declares `no_return()` for gen_* loops that never
-%% return normally; we are not a `-behaviour(sys)`, so the narrower type holds.
+%% Resume the loop, returning whatever the loop returns when it stops,
+%% though the sys behaviour declares `no_return()` for gen_* loops that
+%% never return normally; we are not a `-behaviour(sys)`, so this holds.
 -doc false.
--spec system_continue(pid(), [sys:dbg_opt()], misc()) -> ok.
+-spec system_continue(pid(), [sys:dbg_opt()], misc()) -> term().
 system_continue(_Parent, _Debug, {Resume, State}) ->
     Resume(State).
 

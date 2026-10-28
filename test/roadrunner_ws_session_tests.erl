@@ -2483,8 +2483,9 @@ loop_sys_handles_system_and_gen_messages_test() ->
 %% --- helpers ---
 
 %% Run a session in a process of its own, as the conn would run it in
-%% its own process: `serve/2` with a `Finish` that just exits normally, so
-%% a test sees the session end as a `normal` 'DOWN'. The process waits for
+%% its own process: `serve/2` with a `Finish` that tells the test
+%% (`{ws_finished, Pid}`) and exits normally, so a test sees the session
+%% end through its finish as that message then a `normal` 'DOWN'. The process waits for
 %% `socket_ready` before it starts, so a test can queue messages (a drain,
 %% a sys request) ahead of the session. The 101 is `start/7`'s, covered
 %% through `start_upgrade/7`; here the handler is assumed valid and no 101
@@ -2494,6 +2495,7 @@ start_ws_session(
     {Socket, Mod, State, {ListenerName, Peer, RequestId}, Negotiated, Buffered, ProtoOpts},
     SpawnOpts
 ) ->
+    Test = self(),
     Pid = proc_lib:spawn_opt(
         fun() ->
             receive
@@ -2503,8 +2505,12 @@ start_ws_session(
             %% relies on that to see the optional callbacks.
             {module, Mod} = code:ensure_loaded(Mod),
             Span = roadrunner_event:ws_upgrade(ListenerName, Peer, RequestId, Mod),
+            Self = self(),
             roadrunner_ws_session:serve(
-                fun() -> exit(normal) end,
+                fun() ->
+                    Test ! {ws_finished, Self},
+                    exit(normal)
+                end,
                 {Socket, Mod, State, {ListenerName, Span}, Negotiated, Buffered, ProtoOpts}
             )
         end,
@@ -3299,10 +3305,16 @@ crash_session(Mod, State, Script) ->
     ),
     {Pid, monitor(process, Pid), Sink}.
 
+%% The session ended through its finish (sent before the exit) and the
+%% process exited normally.
 await_normal_down(Ref, Pid) ->
     receive
         {'DOWN', Ref, process, Pid, Reason} -> ?assertEqual(normal, Reason)
     after 2000 -> error(session_did_not_exit)
+    end,
+    receive
+        {ws_finished, Pid} -> ok
+    after 0 -> error(finish_not_run)
     end.
 
 pmd_corrupt_fragmented_payload_ends_session_test() ->
@@ -3363,7 +3375,20 @@ passive_rearm_on_a_closed_socket_ends_session_test() ->
         {sent, Tag, _} -> ok
     after 2000 -> error(no_echo)
     end,
+    SinkRef = monitor(process, Sink),
     exit(Sink, kill),
-    erlang:demonitor(monitor(process, Sink), [flush]),
+    receive
+        {'DOWN', SinkRef, process, Sink, _} -> ok
+    end,
     Pid ! {roadrunner_fake_passive, Sink},
     ok = await_normal_down(Ref, Pid).
+
+sys_terminate_ends_session_through_finish_test() ->
+    %% `sys:terminate/2` exits the session with the given reason from
+    %% inside the loop; the session ends through its finish like any
+    %% other end, without logging a crash for `shutdown`.
+    {Pid, Ref, Sink} = crash_session(roadrunner_ws_echo_handler, undefined, []),
+    Pid ! socket_ready,
+    ok = sys:terminate(Pid, shutdown),
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.

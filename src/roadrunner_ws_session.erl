@@ -667,10 +667,11 @@ exit_clean(Reason, #data{inflate_z = InflateZ, deflate_z = DeflateZ} = Data) ->
     close_zlib(DeflateZ),
     finished.
 
-%% Something raised while the session ran (`guarded/2`). A handler that
-%% ends its session on purpose with `exit(normal)` or `exit({shutdown, _})`
-%% is not logged, as such an exit was quiet when the session had a
-%% process of its own; anything else is logged like an HTTP handler crash.
+%% Something raised while the session ran (`guarded/2`). An exit with
+%% `normal`, `shutdown` or `{shutdown, _}` (a handler ending its session on
+%% purpose, or `sys:terminate/2`) is not logged, as such an exit was quiet
+%% when the session had a process of its own; anything else is logged like
+%% an HTTP handler crash.
 -spec session_crashed(error | exit | throw, term(), list(), #data{}) -> ok.
 session_crashed(Class, Reason, Stack, #data{mod = Mod, inflate_z = InflateZ, deflate_z = DeflateZ}) ->
     ok = log_crash(Class, Reason, Stack, Mod),
@@ -679,6 +680,8 @@ session_crashed(Class, Reason, Stack, #data{mod = Mod, inflate_z = InflateZ, def
 
 -spec log_crash(error | exit | throw, term(), list(), module()) -> ok.
 log_crash(exit, normal, _Stack, _Mod) ->
+    ok;
+log_crash(exit, shutdown, _Stack, _Mod) ->
     ok;
 log_crash(exit, {shutdown, _}, _Stack, _Mod) ->
     ok;
