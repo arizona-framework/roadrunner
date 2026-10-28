@@ -494,8 +494,9 @@ ops-tuning rationale.
     %% roadrunner owns process linkage. `start_timeout` is the `proc_lib:start`
     %% `Time`: how long to wait for a started process to ack init before
     %% killing it with `{error, timeout}` (default `infinity`); it applies to
-    %% the connection process and the WebSocket session (the fire-and-forget
-    %% HTTP/3 conn and stream-worker spawns have no init handshake).
+    %% the connection process, which also runs a WebSocket session (the
+    %% fire-and-forget HTTP/3 conn and stream-worker spawns have no init
+    %% handshake).
     handler_spawn => #{
         opts => [proc_lib:start_spawn_option()],
         start_timeout => timeout()
@@ -869,7 +870,9 @@ Graceful shutdown. Closes the listen socket immediately so no new
 connections are accepted, broadcasts `{roadrunner_drain, Deadline}` to
 every active conn, and then polls the live-connection counter until it
 hits zero or `Timeout` milliseconds elapse. Conns still alive at the
-deadline are hard-killed via `exit(Pid, shutdown)`.
+deadline are hard-killed via `exit(Pid, kill)`, which a conn running
+a handler that traps exits (a WebSocket session does, if its handler
+turns `trap_exit` on) cannot turn into a message and outlive.
 
 An idle HTTP/1.1 conn closes, and an HTTP/2 or HTTP/3 conn sends GOAWAY,
 refuses new requests and closes once its in-flight requests finish. The
@@ -2526,7 +2529,7 @@ wait_for_drain(Counter, Deadline, Table) ->
             Remaining = Deadline - erlang:monotonic_time(millisecond),
             case Remaining =< 0 of
                 true ->
-                    _ = [exit(Pid, shutdown) || {Pid} <- ets:tab2list(Table)],
+                    _ = [exit(Pid, kill) || {Pid} <- ets:tab2list(Table)],
                     {timeout, N};
                 false ->
                     timer:sleep(min(50, Remaining)),

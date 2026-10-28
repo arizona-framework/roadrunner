@@ -1044,10 +1044,10 @@ close_with_empty_reason_emits_only_code_test() ->
     ?assertEqual(<<16#88, 2, 1000:16>>, Sent),
     Sink ! stop.
 
-close_with_invalid_code_crashes_session_test() ->
+close_with_invalid_code_ends_session_without_sending_it_test() ->
     %% Code 5000 isn't in any RFC 6455 §7.4 / §7.4.1 valid range —
-    %% session refuses to emit the malformed close and crashes the
-    %% handler with `{invalid_close_payload, _, _}`.
+    %% the session refuses to emit the malformed close; the raise is
+    %% caught and the session ends cleanly.
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink(Self, Tag, []),
@@ -1068,12 +1068,15 @@ close_with_invalid_code_crashes_session_test() ->
     Ref = monitor(process, Pid),
     Pid ! socket_ready,
     receive
-        {'DOWN', Ref, process, Pid, {{invalid_close_payload, 5000, _}, _}} -> ok
+        {'DOWN', Ref, process, Pid, normal} -> ok
     after 500 -> ?assert(false)
     end,
+    %% The session ends through its finish, and the malformed close is
+    %% never written.
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(collect_sends(Tag, 50)), <<16#88>>)),
     Sink ! stop.
 
-close_with_invalid_utf8_reason_crashes_session_test() ->
+close_with_invalid_utf8_reason_ends_session_without_sending_it_test() ->
     %% A bare 0xFF byte isn't valid UTF-8 — session refuses to emit
     %% the malformed close and crashes.
     Self = self(),
@@ -1096,12 +1099,15 @@ close_with_invalid_utf8_reason_crashes_session_test() ->
     Ref = monitor(process, Pid),
     Pid ! socket_ready,
     receive
-        {'DOWN', Ref, process, Pid, {{invalid_close_payload, 1000, _}, _}} -> ok
+        {'DOWN', Ref, process, Pid, normal} -> ok
     after 500 -> ?assert(false)
     end,
+    %% The session ends through its finish, and the malformed close is
+    %% never written.
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(collect_sends(Tag, 50)), <<16#88>>)),
     Sink ! stop.
 
-handler_close_with_overlong_reason_crashes_session_test() ->
+handler_close_with_overlong_reason_ends_session_without_sending_it_test() ->
     %% A reason over 123 bytes would make a close frame over the 125-byte
     %% control-frame limit: refused like any other malformed close.
     Self = self(),
@@ -1124,9 +1130,12 @@ handler_close_with_overlong_reason_crashes_session_test() ->
     Ref = monitor(process, Pid),
     Pid ! socket_ready,
     receive
-        {'DOWN', Ref, process, Pid, {{invalid_close_payload, 1000, _}, _}} -> ok
+        {'DOWN', Ref, process, Pid, normal} -> ok
     after 500 -> ?assert(false)
     end,
+    %% The session ends through its finish, and the malformed close is
+    %% never written.
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(collect_sends(Tag, 50)), <<16#88>>)),
     Sink ! stop.
 
 %% =============================================================================
@@ -3242,6 +3251,45 @@ terminate_crash_still_ends_session_through_finish_test() ->
     ok = await_normal_down(Ref, Pid),
     Sink ! stop.
 
+bad_return_ends_session_through_finish_test() ->
+    {Pid, Ref, Sink} = crash_session(
+        roadrunner_ws_lifecycle_handler, #{on_frame => bad_return}, [{recv, frame(text, ~"x")}]
+    ),
+    Pid ! socket_ready,
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+handler_exit_normal_ends_session_through_finish_test() ->
+    {Pid, Ref, Sink} = crash_session(
+        roadrunner_ws_lifecycle_handler, #{on_frame => exit_normal}, [{recv, frame(text, ~"x")}]
+    ),
+    Pid ! socket_ready,
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+handler_exit_shutdown_ends_session_through_finish_test() ->
+    {Pid, Ref, Sink} = crash_session(
+        roadrunner_ws_lifecycle_handler, #{on_frame => exit_shutdown}, [{recv, frame(text, ~"x")}]
+    ),
+    Pid ! socket_ready,
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+crash_after_hibernating_ends_session_through_finish_test() ->
+    %% A session that hibernated resumes through `resume/1`, which guards
+    %% the rest of the session again: a crash after the wake still ends
+    %% it through its finish.
+    {Pid, Ref, Sink} = crash_session(
+        roadrunner_ws_lifecycle_handler,
+        #{on_init => ok_hibernate, on_info => crash},
+        []
+    ),
+    Pid ! socket_ready,
+    ?assert(is_hibernating(Pid, 500)),
+    Pid ! {push, ~"boom"},
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
 crash_session(Mod, State, Script) ->
     Sink = spawn_active_sink(self(), make_ref(), Script),
     {ok, Pid} = start_ws_session(
@@ -3256,3 +3304,66 @@ await_normal_down(Ref, Pid) ->
         {'DOWN', Ref, process, Pid, Reason} -> ?assertEqual(normal, Reason)
     after 2000 -> error(session_did_not_exit)
     end.
+
+pmd_corrupt_fragmented_payload_ends_session_test() ->
+    %% A compressed message in two fragments whose bytes do not inflate:
+    %% the reassembly path closes the session (1002) and it ends through
+    %% its finish.
+    Self = self(),
+    Tag = make_ref(),
+    Chunk = <<
+        (pmd_frame_fragment(text, <<255, 254, 253>>, false, true))/binary,
+        (pmd_frame_fragment(continuation, <<252, 251>>, true, false))/binary
+    >>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Chunk}]),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            pmd_negotiated(),
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    ok = await_normal_down(Ref, Pid),
+    Sent = iolist_to_binary(collect_sends(Tag, 50)),
+    ?assertEqual(<<16#88, 2, 1002:16>>, Sent),
+    Sink ! stop.
+
+passive_rearm_on_a_closed_socket_ends_session_test() ->
+    %% A session reading with `{active, N}` re-arms on the passive
+    %% message; if the socket died meanwhile the re-arm fails and the
+    %% session ends cleanly.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, [{recv, frame(text, ~"hi")}]),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            (ws_proto_opts())#{ws_active := 2}
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    %% The echo shows the initial `{active, N}` arm went through.
+    receive
+        {sent, Tag, _} -> ok
+    after 2000 -> error(no_echo)
+    end,
+    exit(Sink, kill),
+    erlang:demonitor(monitor(process, Sink), [flush]),
+    Pid ! {roadrunner_fake_passive, Sink},
+    ok = await_normal_down(Ref, Pid).

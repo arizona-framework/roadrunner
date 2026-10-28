@@ -31,10 +31,21 @@ with zero or more frames (each `{Opcode, Payload}` — always
 State is passed through unchanged by the framework.
 
 The session runs in the connection's own process, the one that served
-the upgrade request, so `self()` in a callback is the connection: a
-process the handler links to or monitors is tied to the connection's
-lifetime. A callback that raises ends the session: the crash is
-logged, `terminate/2` is not called, and the connection closes.
+the upgrade request, so `self()` in a callback is the connection.
+Anything that raises while the session runs, in a callback or in what
+the session does with a callback's return (an unknown return shape, an
+invalid close code), ends the session: it is logged (unless the handler
+called `exit(normal)` or `exit({shutdown, _})`), `terminate/2` is not
+called, and the connection closes and releases its listener slot.
+
+An exit signal is different: a linked process that dies, a
+`max_heap_size` kill or `exit(Pid, kill)` takes the connection down
+with it, and its listener slot comes back through the listener's slot
+reconciliation rather than at once. A handler that links to workers it
+does not want to share a fate with should turn `trap_exit` on: their
+exits then arrive in `handle_info/2` as `{'EXIT', Pid, Reason}`. The
+listener's hard drain kills with `exit(Pid, kill)`, which trapping
+cannot catch, so it still ends the session at the deadline.
 
 The 4-tuple `{reply, Frames, NewState, Opts}` and 3-tuple
 `{ok, NewState, Opts}` variants accept an opt list. Currently
@@ -156,8 +167,8 @@ Returns the same shape as `handle_frame/2`: push final frames, keep
 the session open, or close gracefully (typically `{close, 1000, ~"",
 NewState}` so the client reconnects to the new server version).
 Handlers that don't export this callback let the session keep
-running until the deadline expires; the listener then sends
-`exit(Pid, shutdown)`.
+running until the deadline expires; the listener then kills the
+connection with `exit(Pid, kill)`.
 """.
 -callback handle_drain(Deadline :: integer(), State :: term()) -> result().
 

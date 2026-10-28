@@ -26,6 +26,9 @@ Usage: pass a state map of the form
     close                            -> {close, State}
     {close, Code, Reason}            -> {close, Code, Reason, State}
     crash                            -> raises `error(handler_crash)`
+    bad_return                       -> `{noreply, State}`, not a valid result
+    exit_normal                      -> `exit(normal)`
+    exit_shutdown                    -> `exit({shutdown, bye})`
 """.
 
 -behaviour(roadrunner_ws_handler).
@@ -72,7 +75,10 @@ resolve({reply, Frames}, State) -> {reply, Frames, State};
 resolve({reply_hibernate, Frames}, State) -> {reply, Frames, State, [hibernate]};
 resolve(close, State) -> {close, State};
 resolve({close, Code, Reason}, State) -> {close, Code, Reason, State};
-resolve(crash, _State) -> error(handler_crash).
+resolve(crash, _State) -> error(handler_crash);
+resolve(bad_return, State) -> {noreply, State};
+resolve(exit_normal, _State) -> exit(normal);
+resolve(exit_shutdown, _State) -> exit({shutdown, bye}).
 
 notify(#{sink := Pid}, Tag) when is_pid(Pid) -> Pid ! {event, Tag};
 notify(_, _) -> ok.
