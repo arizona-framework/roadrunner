@@ -64,6 +64,7 @@
     scheme/1,
     conn_info/1,
     make_body_reader/5,
+    latest_reader/1,
     stream_body_reader/5,
     with_body_reader/5,
     continue_before_stream/1,
@@ -794,6 +795,10 @@ disarmed() ->
     _ = put(?ACTIVE_PDKEY, queued),
     ok.
 
+%% The manual-mode body reader of the request in flight, as its last read
+%% left it (`remember_reader/1`).
+-define(READER_PDKEY, {?MODULE, body_reader}).
+
 %% Drain-detection cap when in passive recv. Each recv call is bounded
 %% to at most this many ms so the conn re-checks its mailbox for
 %% `{roadrunner_drain, _}` between blocks. Trade-off: shorter = lower
@@ -1176,6 +1181,7 @@ expects_continue(Req) ->
     {pos_integer(), pos_integer(), pos_integer()}
 ) -> roadrunner_req:body_reader().
 make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits) ->
+    _ = erase(?READER_PDKEY),
     #{
         framing => Framing,
         buffered => Buffered,
@@ -1454,9 +1460,22 @@ read_chunked(Buf, RecvFun, MaxCL, Body, TrailerLimits) ->
 -doc false.
 -spec drain_reader(roadrunner_req:body_reader()) -> {ok, binary()} | {error, term()}.
 drain_reader(BS) ->
-    case consume_body_reader(BS, all) of
+    case consume_reader(BS, all) of
         {ok, _Bytes, #{buffered := Leftover}} -> {ok, Leftover};
         {error, _} = E -> E
+    end.
+
+%% The request's body reader as its last read left it, or `BS` when it was
+%% never read: a handler that read its body inside a stream, or handed
+%% back an older request, leaves the connection a copy that does not know
+%% what was read, and draining that copy would wait for bytes already
+%% taken.
+-doc false.
+-spec latest_reader(roadrunner_req:body_reader()) -> roadrunner_req:body_reader().
+latest_reader(BS) ->
+    case erase(?READER_PDKEY) of
+        undefined -> BS;
+        Latest -> Latest
     end.
 
 -doc """
@@ -1475,36 +1494,64 @@ full read).
     {ok, iodata(), roadrunner_req:body_reader()}
     | {more, iodata(), roadrunner_req:body_reader()}
     | {error, term()}.
-consume_body_reader(#{continue := {Socket, Deadline, MinRate, Owed}} = BS, Mode) ->
+consume_body_reader(BS, Mode) ->
+    remember_reader(consume_reader(BS, Mode)).
+
+%% The reader as the handler last left it, so the connection drains from
+%% there (`latest_reader/1`) even when the request the handler hands
+%% back, or none at all for a stream, still holds an older copy. One
+%% reader per HTTP/1 connection process at a time; `make_body_reader/5`
+%% clears it for the next request.
+-spec remember_reader(
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
+    | {error, term()}
+) ->
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
+    | {error, term()}.
+remember_reader({error, _} = E) ->
+    E;
+remember_reader({_, _Bytes, BS} = Result) ->
+    _ = put(?READER_PDKEY, BS),
+    Result.
+
+-spec consume_reader(
+    roadrunner_req:body_reader(), all | next_chunk | {length, non_neg_integer()}
+) ->
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
+    | {error, term()}.
+consume_reader(#{continue := {Socket, Deadline, MinRate, Owed}} = BS, Mode) ->
     %% The client is holding its body back for a 100 Continue the conn left
     %% to this first read (`roadrunner_conn_loop:read_body/8`): send it,
     %% then read with a recv whose slow-client rate window starts now, as the
     %% client can only start sending now.
     ok = send_continue_once(Owed, Socket),
     Recv = make_recv(Socket, Deadline, MinRate),
-    consume_body_reader(maps:remove(continue, BS#{recv := Recv}), Mode);
-consume_body_reader(#{framing := stream} = BS, all) ->
+    consume_reader(maps:remove(continue, BS#{recv := Recv}), Mode);
+consume_reader(#{framing := stream} = BS, all) ->
     stream_collect(BS, infinity, [], 0);
-consume_body_reader(#{framing := stream} = BS, {length, N}) ->
+consume_reader(#{framing := stream} = BS, {length, N}) ->
     stream_collect(BS, N, [], 0);
-consume_body_reader(#{framing := stream} = BS, next_chunk) ->
+consume_reader(#{framing := stream} = BS, next_chunk) ->
     stream_next(BS);
-consume_body_reader(#{framing := none} = BS, _Mode) ->
+consume_reader(#{framing := none} = BS, _Mode) ->
     %% Per RFC 9112 §6.3: no framing means the body is empty.
     %% Any `buffered` bytes are pipelined-next-request leftovers —
     %% preserve them in the body_reader's `buffered` field so
     %% `roadrunner_conn_loop`'s finishing phase can thread them into
     %% the next `reading_request` parse for full pipelining support.
     {ok, <<>>, BS};
-consume_body_reader(
+consume_reader(
     #{framing := {content_length, N}, bytes_read := Read} = BS, _Mode
 ) when Read >= N ->
     {ok, <<>>, BS};
-consume_body_reader(#{framing := {content_length, N}, max := Max}, _Mode) when N > Max ->
+consume_reader(#{framing := {content_length, N}, max := Max}, _Mode) when N > Max ->
     %% A declared length over the cap fails every read, one of a piece as
     %% much as one of the whole body, before any of it is read.
     {error, content_length_too_large};
-consume_body_reader(
+consume_reader(
     #{framing := {content_length, N}, bytes_read := Read, buffered := Buf, recv := Recv} = BS,
     Mode
 ) ->
@@ -1526,15 +1573,15 @@ consume_body_reader(
         {error, _} = E ->
             E
     end;
-consume_body_reader(#{framing := chunked} = BS, all) ->
+consume_reader(#{framing := chunked} = BS, all) ->
     %% Drain everything left: any pending decoded bytes plus all
     %% remaining chunks, accumulated in one return. Iodata stays unflattened
     %% so callers that only need `iolist_size/1` or want to forward via
     %% `gen_tcp:send/2` skip a flatten.
     chunked_collect(BS, infinity);
-consume_body_reader(#{framing := chunked} = BS, {length, N}) ->
+consume_reader(#{framing := chunked} = BS, {length, N}) ->
     chunked_collect(BS, N);
-consume_body_reader(#{framing := chunked} = BS, next_chunk) ->
+consume_reader(#{framing := chunked} = BS, next_chunk) ->
     next_chunk(BS).
 %% Non-chunked framing (none, content_length) is handled by the
 %% earlier clauses above — `next_chunk` is treated as a full drain

@@ -1811,12 +1811,16 @@ drain_body_if_manual(_Req) ->
 -spec drain_reader(roadrunner_req:body_reader() | none) -> {ok, binary()} | {error, term()}.
 drain_reader(none) ->
     {ok, <<>>};
-drain_reader(#{continue := _}) ->
+drain_reader(Reader) ->
+    drain_latest(roadrunner_conn:latest_reader(Reader)).
+
+-spec drain_latest(roadrunner_req:body_reader()) -> {ok, binary()} | {error, term()}.
+drain_latest(#{continue := _}) ->
     %% The handler answered without asking for the body (`read_body/8`):
     %% no 100 went out and the client is holding the body back, so there is
     %% nothing to drain, and the connection closes.
     {error, body_not_requested};
-drain_reader(Reader) ->
+drain_latest(Reader) ->
     roadrunner_conn:drain_reader(Reader).
 
 %% 413 + close for a body over its cap, after any queued pipelined
