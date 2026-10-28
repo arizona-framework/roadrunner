@@ -726,7 +726,13 @@ listener_rejects_invalid_ws_opt_test() ->
             #{compress => yes},
             #{idle_timeout => 0},
             #{idle_timeout => bad},
-            #{idle_timeout => 16#80000000}
+            #{idle_timeout => 16#80000000},
+            %% `active` is `once` or a read count `inet:setopts/2` takes;
+            %% `true` (unbounded unread data) rejects.
+            #{active => true},
+            #{active => 0},
+            #{active => 32768},
+            #{active => bad}
         ]
     ).
 
@@ -737,7 +743,11 @@ listener_accepts_ws_session_opts_test() ->
     {ok, Pid} = roadrunner_listener:start_link(listener_test_ws_session_opts_ok, #{
         port => 0,
         ws => #{
-            recv_buffer => 2048, hibernate_after => 15000, compress => false, idle_timeout => 30000
+            recv_buffer => 2048,
+            hibernate_after => 15000,
+            compress => false,
+            idle_timeout => 30000,
+            active => once
         },
         routes => roadrunner_hello_handler
     }),

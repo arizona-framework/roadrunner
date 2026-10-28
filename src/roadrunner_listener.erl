@@ -786,6 +786,17 @@ WebSocket session tunables (under `ws` in the listener opts).
   gets `timeout`. The session checks once per interval, so a silent
   client is closed between one and two intervals after its last bytes.
   Unset (the default) never closes on idle.
+- `active` — how a session reads its socket: `once` or an integer in
+  `1..32767`. With `N`, the socket delivers up to `N` reads before the
+  session asks for more, which saves a socket call per message (on TLS
+  each one is a call into the TLS connection process). With `once`, it
+  asks after every message. A session can hold up to `N` unread reads
+  in its mailbox (each up to `recv_buffer` bytes on plain TCP), so a
+  lower `N` bounds that memory more tightly. Unset (the default), a
+  plain TCP session reads with `once`, where the gap between arms lets
+  several frames gather into one delivery and the socket keeps the
+  quickest wake-up, and a TLS session with `16`. A value set here
+  applies to both.
 
 An upgrade can set each of these for its own session
 (`t:roadrunner_ws_handler:upgrade_opts/0`).
@@ -796,7 +807,8 @@ An upgrade can set each of these for its own session
     recv_buffer => 1..16#7FFFFFFF,
     hibernate_after => 1..16#7FFFFFFF,
     compress => boolean(),
-    idle_timeout => 1..16#7FFFFFFF
+    idle_timeout => 1..16#7FFFFFFF,
+    active => once | 1..32767
 }.
 
 -record(state, {
@@ -1676,7 +1688,8 @@ build_proto_opts(Opts, ListenerName) ->
         recv_buffer := WsBuffer,
         hibernate_after := WsHibernateAfter,
         compress := WsCompress,
-        idle_timeout := WsIdleTimeout
+        idle_timeout := WsIdleTimeout,
+        active := WsActive
     } =
         validate_ws_opts(maps:get(ws, Opts, #{})),
     %% Flatten the nested `handler_spawn` opt to top-level proto_opts keys the
@@ -1694,6 +1707,7 @@ build_proto_opts(Opts, ListenerName) ->
             ws_hibernate_after => WsHibernateAfter,
             ws_compress => WsCompress,
             ws_idle_timeout => WsIdleTimeout,
+            ws_active => WsActive,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             tls_handshake_timeout =>
                 maps:get(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT),
@@ -2178,7 +2192,8 @@ flatten_http3_opts(Entries) ->
         recv_buffer := undefined,
         hibernate_after := infinity,
         compress := true,
-        idle_timeout := infinity
+        idle_timeout := infinity,
+        active := undefined
     }.
 ws_defaults() ->
     #{
@@ -2193,7 +2208,10 @@ ws_defaults() ->
         hibernate_after => infinity,
         compress => true,
         %% `infinity` = no idle timer is armed.
-        idle_timeout => infinity
+        idle_timeout => infinity,
+        %% `undefined` = per transport: `once` on plain TCP, `16` on TLS
+        %% (`roadrunner_ws_session:read_mode/2`).
+        active => undefined
     }.
 
 %% Resolve the `ws` opts map against defaults, rejecting unknown keys
@@ -2208,7 +2226,8 @@ ws_defaults() ->
         recv_buffer := pos_integer() | undefined,
         hibernate_after := pos_integer() | infinity,
         compress := boolean(),
-        idle_timeout := pos_integer() | infinity
+        idle_timeout := pos_integer() | infinity,
+        active := once | 1..32767 | undefined
     }.
 validate_ws_opts(Opts) when is_map(Opts) ->
     Defaults = ws_defaults(),
@@ -2232,17 +2251,23 @@ validate_ws_opts(Other) ->
 %% Per-key range check for the `ws` sub-opts. The size caps allow 0
 %% (reject every frame / message); `recv_buffer` and `hibernate_after`
 %% are a buffer size and an idle interval, so zero is meaningless and
-%% rejected for both.
+%% rejected for both. `active` takes what HTTP/2's does: `true` is
+%% rejected (an always-active socket has no bound on unread data), and
+%% `32767` is the largest count `inet:setopts/2` and `ssl:setopts/2`
+%% accept.
 -spec valid_ws_opt(
     max_frame_size
     | max_message_size
     | recv_buffer
     | hibernate_after
     | compress
-    | idle_timeout,
+    | idle_timeout
+    | active,
     term()
 ) ->
     boolean().
+valid_ws_opt(active, V) ->
+    V =:= once orelse (is_integer(V) andalso V >= 1 andalso V =< 32767);
 valid_ws_opt(compress, V) ->
     is_boolean(V);
 valid_ws_opt(idle_timeout, V) ->

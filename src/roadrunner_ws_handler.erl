@@ -188,7 +188,7 @@ name (`t:roadrunner_listener:ws_opts/0`):
   checked once per interval, so within two of them. `infinity` turns off
   a listener-wide one for this session.
 - `max_frame_size`, `max_message_size`, `recv_buffer`,
-  `hibernate_after` — as the listener's (`hibernate_after` also takes
+  `hibernate_after`, `active` — as the listener's (`hibernate_after` also takes
   `infinity`, to turn the listener's off for this session).
 - `fullsweep_after`, `max_heap_size` — the session process's garbage
   collection settings (`erlang:spawn_opt/4`).
@@ -205,6 +205,7 @@ here crashes it.
     max_message_size => 0..16#7FFFFFFF,
     recv_buffer => 1..16#7FFFFFFF,
     hibernate_after => pos_integer() | infinity,
+    active => once | 1..32767,
     fullsweep_after => non_neg_integer(),
     max_heap_size => erlang:max_heap_size()
 }.

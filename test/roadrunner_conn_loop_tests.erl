@@ -2001,6 +2001,7 @@ fake_opts(ListenerName) ->
         ws_hibernate_after => infinity,
         ws_compress => true,
         ws_idle_timeout => infinity,
+        ws_active => undefined,
         request_timeout => 5000,
         keep_alive_timeout => 5000,
         max_keep_alive_requests => 100,

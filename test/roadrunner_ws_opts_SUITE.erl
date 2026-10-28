@@ -19,6 +19,7 @@ timeout, size caps and the session process's GC settings. The handler is
     listener_idle_timeout/1,
     tls_idle_session_closes/1,
     tls_echo_past_active_window/1,
+    tcp_echo_past_active_window/1,
     tls_closed_before_arm_exits_cleanly/1,
     upgrade_frame_cap/1,
     upgrade_gc_settings/1,
@@ -40,6 +41,7 @@ all() ->
         listener_idle_timeout,
         tls_idle_session_closes,
         tls_echo_past_active_window,
+        tcp_echo_past_active_window,
         tls_closed_before_arm_exits_cleanly,
         upgrade_frame_cap,
         upgrade_gc_settings,
@@ -82,6 +84,8 @@ upgrade_opts(Case) when
     Case =:= tls_idle_session_closes
 ->
     #{idle_timeout => 100};
+upgrade_opts(tcp_echo_past_active_window) ->
+    #{active => 4};
 upgrade_opts(upgrade_frame_cap) ->
     #{max_frame_size => 4};
 upgrade_opts(upgrade_gc_settings) ->
@@ -95,6 +99,7 @@ upgrade_opts(every_option_accepted) ->
         max_message_size => 4096,
         recv_buffer => 2048,
         hibernate_after => 60000,
+        active => once,
         fullsweep_after => 10,
         max_heap_size => 1000000
     };
@@ -203,7 +208,8 @@ tls_closed_before_arm_exits_cleanly(_Config) ->
         ws_max_frame_size => 1024,
         ws_max_message_size => 1024,
         ws_hibernate_after => infinity,
-        ws_idle_timeout => infinity
+        ws_idle_timeout => infinity,
+        ws_active => undefined
     },
     {ok, Pid} = proc_lib:start(roadrunner_ws_session, init_session, [
         self(),
@@ -225,6 +231,19 @@ tls_closed_before_arm_exits_cleanly(_Config) ->
     end,
     Client ! stop,
     ok = ssl:close(LSock).
+
+tcp_echo_past_active_window(Config) ->
+    %% An upgrade reading with `{active, 4}`: more echoes than one arm
+    %% allows make the socket passive, and the session re-arms it and
+    %% keeps answering.
+    {Sock, _Head, _Pid} = upgrade(Config, []),
+    ok = lists:foreach(
+        fun(_) ->
+            ok = gen_tcp:send(Sock, masked(16#81, ~"hi")),
+            ?assertEqual(<<16#81, 2, "hi">>, recv_frame(Sock, 1000))
+        end,
+        lists:seq(1, 10)
+    ).
 
 %% =============================================================================
 %% Size caps and process settings

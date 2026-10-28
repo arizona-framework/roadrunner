@@ -156,6 +156,10 @@ deadline in milliseconds. The shed form answers it `503` with the
     %% Ms of client silence after which a WebSocket session closes;
     %% `infinity` (the default) never does.
     ws_idle_timeout := pos_integer() | infinity,
+    %% How a WebSocket session reads its socket: `once`, or up to `N`
+    %% reads per arm (the listener's `ws.active`); `undefined` (the
+    %% default) is `once` on plain TCP and `16` on TLS.
+    ws_active := once | 1..32767 | undefined,
     request_timeout := non_neg_integer(),
     %% Bound on the TLS handshake in the accept path; see the
     %% `tls_handshake_timeout` listener opt.
