@@ -32,6 +32,7 @@
     pto_deadline/1,
     on_pto_expired/1,
     oldest_ack_eliciting/1,
+    unacked_ack_eliciting/1,
     smoothed_rtt/1,
     rtt_var/1,
     latest_rtt/1,
@@ -401,6 +402,14 @@ oldest_ack_eliciting(#loss{sent = Sent}) ->
         {value, #sent{data = Data}} -> [Data];
         false -> []
     end.
+
+-doc """
+The caller data of every unacknowledged ack-eliciting packet, oldest first,
+which a probe can carry again (RFC 9002 §6.2.4): `[]` if none is in flight.
+""".
+-spec unacked_ack_eliciting(t()) -> [term()].
+unacked_ack_eliciting(#loss{sent = Sent}) ->
+    [Data || #sent{ack_eliciting = true, data = Data} <- queue:to_list(Sent)].
 
 -doc "Record a PTO expiry, which doubles the next probe timeout.".
 -spec on_pto_expired(t()) -> t().

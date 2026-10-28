@@ -3556,22 +3556,32 @@ on_pto(Now, Level, #state{probes = Probes, cc = Cc} = State) ->
     State1 = State#state{cc = apply_cc_signal(roadrunner_quic_loss:cc_signal(Loss1), Now, Cc)},
     case roadrunner_quic_loss:bytes_in_flight(Loss0) of
         0 -> put_space(Level, Space1, State1);
-        _ -> put_space(Level, probe(Space1, State1), State1#state{probes = Probes + 1})
+        _ -> put_space(Level, probe(Level, Space1, State1), State1#state{probes = Probes + 1})
     end.
 
-%% With nothing found lost, probe with the oldest unacknowledged data rather
-%% than a PING (RFC 9002 §6.2.4): if that packet was lost, the probe already
-%% carries what the peer is missing, instead of only drawing the ACK that
-%% shows it lost and costing a round trip more. A PING only when no such data
-%% is in flight.
--spec probe(#space{}, t()) -> #space{}.
-probe(#space{pending = [], loss = Loss} = Space, State) ->
-    case retransmittable(roadrunner_quic_loss:oldest_ack_eliciting(Loss), State) of
+%% With nothing found lost, probe with unacknowledged data rather than a
+%% PING (RFC 9002 §6.2.4): if that data was lost, the probe already carries
+%% what the peer is missing, instead of only drawing the ACK that shows it
+%% lost and costing a round trip more. A handshake space sends all of it: its
+%% flight is a few KB of CRYPTO data, the client can finish the handshake
+%% only with every byte, and the ACKs that would show which packets were
+%% lost are themselves lost under the same loss, so resending only the
+%% oldest packet leaves the rest of the flight one backed-off probe timeout
+%% each, which can outlast the idle timeout. The application space sends
+%% the oldest packet's, its later losses left to the ACKs of the data it
+%% keeps sending. A PING only when no such data is in flight.
+-spec probe(level(), #space{}, t()) -> #space{}.
+probe(Level, #space{pending = [], loss = Loss} = Space, State) ->
+    case retransmittable(probe_data(Level, Loss), State) of
         [] -> Space#space{pending = [ping]};
         Resend -> Space#space{pending = Resend}
     end;
-probe(Space, _State) ->
+probe(_Level, Space, _State) ->
     Space.
+
+-spec probe_data(level(), roadrunner_quic_loss:t()) -> [term()].
+probe_data(application, Loss) -> roadrunner_quic_loss:oldest_ack_eliciting(Loss);
+probe_data(_Handshake, Loss) -> roadrunner_quic_loss:unacked_ack_eliciting(Loss).
 
 %% Arm ONE timer at the nearest deadline: the earliest per-space probe timeout
 %% (across spaces with ack-eliciting bytes in flight) or the always-present

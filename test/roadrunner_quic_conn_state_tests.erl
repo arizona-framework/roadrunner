@@ -1141,6 +1141,43 @@ pto_sends_a_probe_test() ->
         )
     ).
 
+handshake_pto_probe_resends_the_whole_flight_test() ->
+    %% A handshake flight spanning several packets, none acknowledged: the
+    %% probe timeout resends all of it, not only its oldest packet. The
+    %% client finishes only with every byte, and under loss the ACKs that
+    %% would show which packets were lost are lost too, so a probe per lost
+    %% packet, each a backed-off timeout later, can outlast the idle timeout.
+    {State0, Ctx} = new_conn([binary:copy(~"c", 2000)], #{}),
+    #{client_priv := ClientPriv} = Ctx,
+    {Hello, HelloFramed} = client_hello_datagram(Ctx, #{}),
+    {State1, Effects1} = ?M:handle_datagram(?NOW, ?PEER, Hello, State0),
+    #{
+        server_hs_secret := HsSecret,
+        client_hs_secret := ClientHsSecret,
+        aead := Aead
+    } = finish_handshake(State1, Effects1, HelloFramed, ClientPriv),
+    Keys = #{handshake => roadrunner_quic_keys:traffic_keys(Aead, HsSecret)},
+    ?assert(length([F || {crypto, _, _} = F <- hs_frames(sends(Effects1), Keys)]) > 1),
+    %% A client Handshake packet acknowledging nothing, a probe of its own:
+    %% it validates the address (RFC 9000 §8.1), so the anti-amplification
+    %% limit is not what holds the resend back.
+    Ping = ?TC:seal(
+        handshake, 0, roadrunner_quic_keys:traffic_keys(Aead, ClientHsSecret), [ping], ?DCID, ?SCID
+    ),
+    {State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, Ping, State1),
+    %% The rest of the flight, which the limit held back until then.
+    Flight = lists:max([
+        Off + byte_size(D)
+     || {crypto, Off, D} <- hs_frames(sends(Effects1 ++ Effects2), Keys)
+    ]),
+    {_State3, Effects3} = ?M:handle_timeout(?NOW + 5000, pto, State2),
+    Resent = [{Off, byte_size(D)} || {crypto, Off, D} <- hs_frames(sends(Effects3), Keys)],
+    ?assertEqual(Flight, lists:max([Off + Len || {Off, Len} <- Resent])),
+    ?assertEqual(Flight, lists:sum([Len || {_, Len} <- Resent])).
+
+hs_frames(Datagrams, Keys) ->
+    ?TC:frames(Datagrams, handshake, Keys, byte_size(?DCID)).
+
 pto_probe_passes_a_full_congestion_window_test() ->
     %% Probes MUST NOT be blocked by the congestion controller (RFC 9002
     %% §7.5): with the window full of unacknowledged data, the probe still
