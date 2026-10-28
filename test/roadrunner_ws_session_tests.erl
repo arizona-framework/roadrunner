@@ -487,6 +487,58 @@ frame_loop_processes_multiple_frames_in_one_chunk_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
+frame_loop_ok_mid_chunk_keeps_draining_test() ->
+    %% The echo handler answers a binary frame with `{ok, State}`; the
+    %% text frame after it in the same chunk must still be handled, and
+    %% only its echo goes out.
+    Self = self(),
+    Tag = make_ref(),
+    Chunk = <<(frame(binary, ~"quiet"))/binary, (frame(text, ~"loud"))/binary>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Chunk}]),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    ?assertEqual(<<16#81, 4, "loud">>, iolist_to_binary(collect_sends(Tag, 200))),
+    Sink ! stop,
+    ok = stop_ws_session(Pid).
+
+frame_loop_echoes_16bit_length_frame_test() ->
+    %% A 200-byte text frame carries the 16-bit extended length.
+    Self = self(),
+    Tag = make_ref(),
+    Payload = binary:copy(~"x", 200),
+    Sink = spawn_active_sink(Self, Tag, [{recv, frame16(text, Payload)}]),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    ?assertEqual(
+        <<16#81, 126, 200:16, Payload/binary>>, iolist_to_binary(collect_sends(Tag, 200))
+    ),
+    Sink ! stop,
+    ok = stop_ws_session(Pid).
+
 frame_loop_drops_unexpected_info_event_test() ->
     %% A stray info message that doesn't match any of the transport
     %% tags gets dropped and the session re-arms the socket; verified
@@ -2088,6 +2140,65 @@ incomplete_utf8_at_fin_closes_with_1007_test() ->
     ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 100))),
     Sink ! stop.
 
+split_incomplete_utf8_at_fin_closes_with_1007_test() ->
+    %% The same frame split across two reads: the first part is
+    %% validated as it arrives, and FIN finds the sequence still
+    %% incomplete.
+    Self = self(),
+    Tag = make_ref(),
+    F = uncompressed_fragment(text, <<"hello", 16#C3>>, true),
+    {Head, Tail} = split_binary(F, 2 + 4 + 3),
+    Sink = spawn_active_sink(Self, Tag, [{recv, Head}, {recv, Tail}]),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(no_close)
+    end,
+    ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
+empty_text_start_fragment_then_continuation_echoes_test() ->
+    %% A message opened by an empty non-final text frame and finished
+    %% by a continuation is dispatched whole.
+    Self = self(),
+    Tag = make_ref(),
+    Chunk = <<
+        (uncompressed_fragment(text, <<>>, false))/binary,
+        (uncompressed_fragment(continuation, ~"hi", true))/binary
+    >>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Chunk}]),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    ?assertEqual(<<16#81, 2, "hi">>, iolist_to_binary(collect_sends(Tag, 200))),
+    Sink ! stop,
+    ok = stop_ws_session(Pid).
+
 pmd_compressed_text_with_invalid_utf8_closes_1007_test() ->
     %% Compressed text message whose INFLATED payload is not valid
     %% UTF-8. PMD frames bypass per-fragment UTF-8 checks (wire bytes
@@ -2401,6 +2512,11 @@ frame(Opcode, Payload) ->
             close -> 16#88
         end,
     <<OpcodeByte, (16#80 bor Len), 1, 2, 3, 4, Masked/binary>>.
+
+%% Like `frame/2`, for a 126..65535-byte payload (16-bit extended length).
+frame16(text, Payload) ->
+    Masked = mask(Payload, <<1, 2, 3, 4>>),
+    <<16#81, (16#80 bor 126), (byte_size(Payload)):16, 1, 2, 3, 4, Masked/binary>>.
 
 mask(Bin, Key) ->
     KeyBin = binary:copy(Key, (byte_size(Bin) div 4) + 1),

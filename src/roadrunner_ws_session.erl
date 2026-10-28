@@ -554,7 +554,7 @@ recv_loop(
         {'$gen_cast', _Request} ->
             recv_loop(Data);
         {DataTag, _Sock, Bytes} ->
-            process_buffer(append_buffer(Data, Bytes), false);
+            process_input(Data, Bytes);
         {ClosedTag, _Sock} ->
             exit_clean({error, closed}, Data);
         {ErrorTag, _Sock, Reason} ->
@@ -622,10 +622,95 @@ close_zlib(Z) -> zlib:close(Z).
 %% validated frame always has its bytes in the buffer, so an empty
 %% buffer implies clean per-frame state and re-arming directly is
 %% behavior-identical.
+%%
+%% With no message in progress, a complete data frame at the head of
+%% the buffer takes `dispatch_whole_frame/6`: one match, one unmask and
+%% validation pass, and one `#data{}` update per frame. The general
+%% path (`process_partial/2`) builds the peek header, validates
+%% incrementally and updates the record at each step, which allocated
+%% enough per small frame to force a garbage collection on most of them.
 -spec process_buffer(#data{}, boolean()) -> no_return().
 process_buffer(#data{buffer = <<>>} = Data, HibernateAcc) ->
     arm_and_recv(Data, HibernateAcc);
-process_buffer(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
+process_buffer(#data{buffer = Buf, msg_acc = undefined, frame_validated = 0} = Data, HibernateAcc) ->
+    case whole_frame(Buf, Data) of
+        {Opcode, MaskKey, Masked, Rest} ->
+            dispatch_whole_frame(Opcode, MaskKey, Masked, Rest, Data, HibernateAcc);
+        partial ->
+            process_partial(Data, HibernateAcc)
+    end;
+process_buffer(Data, HibernateAcc) ->
+    process_partial(Data, HibernateAcc).
+
+%% Bytes just delivered by the socket. With nothing buffered and no
+%% message in progress they are tried as a whole frame straight away, so
+%% the common one-frame delivery never stores them in `#data.buffer`.
+-spec process_input(#data{}, binary()) -> no_return().
+process_input(#data{buffer = <<>>, msg_acc = undefined, frame_validated = 0} = Data, Bytes) ->
+    case whole_frame(Bytes, Data) of
+        {Opcode, MaskKey, Masked, Rest} ->
+            dispatch_whole_frame(Opcode, MaskKey, Masked, Rest, Data, false);
+        partial ->
+            process_partial(Data#data{buffer = Bytes}, false)
+    end;
+process_input(Data, Bytes) ->
+    process_buffer(append_buffer(Data, Bytes), false).
+
+%% A whole data frame at the head of `Buf` (`roadrunner_ws:match_data_frame/1`)
+%% within both size caps. An oversize frame is `partial` so the general
+%% path closes it with 1009 exactly as before.
+-spec whole_frame(binary(), #data{}) ->
+    {text | binary, 0..16#FFFFFFFF, binary(), binary()} | partial.
+whole_frame(Buf, #data{max_message_size = MaxMsg} = Data) ->
+    case roadrunner_ws:match_data_frame(Buf) of
+        {_Opcode, _MaskKey, Masked, _Rest} = Whole when byte_size(Masked) =< MaxMsg ->
+            case frame_within_cap(byte_size(Masked), Data) of
+                true -> Whole;
+                false -> partial
+            end;
+        _ ->
+            partial
+    end.
+
+%% Unmask and validate a whole frame in one pass and hand it to the
+%% handler. No message is in progress (`msg_acc = undefined`,
+%% `frame_validated = 0`), so the per-message fields already hold their
+%% reset values and are left untouched. When the reply is the only
+%% output and nothing else is buffered, it goes out directly instead of
+%% through `#data.out`.
+-spec dispatch_whole_frame(
+    text | binary, 0..16#FFFFFFFF, binary(), binary(), #data{}, boolean()
+) -> no_return().
+dispatch_whole_frame(Opcode, MaskKey, Masked, Rest, Data, Hibernate) ->
+    Payload = roadrunner_ws:unmask_words(Masked, MaskKey),
+    case Opcode =:= binary orelse is_valid_utf8(Payload) of
+        true ->
+            #data{socket = Socket, span = Span, mod = Mod, mod_state = State, out = Out} = Data,
+            ok = roadrunner_event:ws_frame_in(Span, Opcode, byte_size(Payload)),
+            Frame = #{fin => true, rsv1 => false, opcode => Opcode, payload => Payload},
+            case Mod:handle_frame(Frame, State) of
+                {reply, [_ | _] = OutFrames, NewState} when Rest =:= <<>>, Out =:= [] ->
+                    _ = roadrunner_transport:send(Socket, encode_frames(Data, Span, OutFrames)),
+                    arm_and_recv(Data#data{buffer = <<>>, mod_state = NewState}, Hibernate);
+                {reply, OutFrames, NewState} ->
+                    %% More frames buffered (a pipelining client) or output
+                    %% already queued: queue the reply in the same update
+                    %% that advances the buffer, and keep draining.
+                    process_buffer(queue_reply(Data, Rest, OutFrames, NewState), Hibernate);
+                {ok, NewState} ->
+                    %% Same single update as above, without a reply.
+                    process_buffer(Data#data{buffer = Rest, mod_state = NewState}, Hibernate);
+                Result ->
+                    apply_handler_result(
+                        Result, Data#data{buffer = Rest}, Hibernate, fun process_buffer/2, normal
+                    )
+            end;
+        false ->
+            close_with(close_invalid_payload(), Data#data{buffer = Rest})
+    end.
+
+-spec process_partial(#data{}, boolean()) -> no_return().
+process_partial(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
     Opts =
         case Pmd of
             undefined -> #{};
@@ -833,9 +918,10 @@ handle_frame(
 ) when
     (Op =:= text orelse Op =:= binary), byte_size(P) =< MaxMsg
 ->
-    %% Fast path for the dominant case: a complete, unfragmented,
-    %% uncompressed data message delivered in one frame, with no message
-    %% already in progress. The parsed `Frame` is already byte-identical
+    %% A complete, unfragmented, uncompressed data message delivered in
+    %% one frame, with no message already in progress, that missed
+    %% `dispatch_whole_frame/6` (it arrived over several reads, or is
+    %% over 64 KB). The parsed `Frame` is already byte-identical
     %% to what the reassembly path would synthesize, so dispatch it
     %% directly and skip the fragment machinery (classify, the `[P]`
     %% cons, `finalize_message`, and the synthesized map). Wire-level
@@ -1045,11 +1131,15 @@ fragment_validate_fin(Op, Compressed, Pending, P, _Data) ->
 %% Compressed messages need their inflated payload validated; their
 %% wire bytes are deflate, so per-fragment UTF-8 validation was
 %% skipped. Uncompressed messages were validated incrementally and
-%% don't need a redundant full-message check.
+%% don't need a redundant full-message check. RFC 6455 §8.1: text
+%% payloads MUST be valid UTF-8; binary ones have no constraint.
 -spec post_finalize_validate(text | binary, boolean(), binary()) ->
     ok | invalid_utf8.
 post_finalize_validate(text, true, Payload) ->
-    validate_text_payload(text, Payload);
+    case is_valid_utf8(Payload) of
+        true -> ok;
+        false -> invalid_utf8
+    end;
 post_finalize_validate(_Op, _Compressed, _Payload) ->
     ok.
 
@@ -1165,17 +1255,6 @@ bounded_inflate({finished, Output}, _Z, Max, Total, Acc) ->
     case Final > Max of
         true -> {error, {message_too_big, Final}};
         false -> {ok, iolist_to_binary([Acc, Output])}
-    end.
-
-%% RFC 6455 §8.1: text-message payloads MUST be valid UTF-8. Binary
-%% payloads have no encoding constraint.
-%% Only called for `text` opcodes via `post_finalize_validate`. The
-%% `binary` case short-circuits earlier (no encoding constraint).
--spec validate_text_payload(text, binary()) -> ok | invalid_utf8.
-validate_text_payload(text, Payload) ->
-    case unicode:characters_to_binary(Payload, utf8, utf8) of
-        Payload -> ok;
-        _ -> invalid_utf8
     end.
 
 %% RFC 6455 §7.4: 1002 = protocol error.
@@ -1332,10 +1411,10 @@ handle_drain_msg(
 apply_handler_result(Result, Data, Hibernate, Continue, CloseReason) ->
     case Result of
         {reply, OutFrames, NewState} ->
-            Continue((queue_frames(Data, OutFrames))#data{mod_state = NewState}, Hibernate);
+            Continue(queue_reply(Data, Data#data.buffer, OutFrames, NewState), Hibernate);
         {reply, OutFrames, NewState, Opts} when is_list(Opts) ->
             Continue(
-                (queue_frames(Data, OutFrames))#data{mod_state = NewState},
+                queue_reply(Data, Data#data.buffer, OutFrames, NewState),
                 Hibernate orelse lists:member(hibernate, Opts)
             );
         {ok, NewState} ->
@@ -1413,6 +1492,18 @@ queue_frame(#data{span = Span, out = Out} = Data, Opcode, Payload) ->
 -spec queue_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) -> #data{}.
 queue_frames(#data{span = Span, out = Out} = Data, OutFrames) ->
     Data#data{out = [Out | encode_frames(Data, Span, OutFrames)]}.
+
+%% Queue a handler's `{reply, ...}` and take its new state, with the
+%% buffer the session continues from, in a single `#data{}` update: on
+%% a small-frame stream each extra record copy is a large share of what
+%% the session allocates per message.
+-spec queue_reply(#data{}, binary(), [{roadrunner_ws:opcode(), iodata()}], term()) -> #data{}.
+queue_reply(#data{span = Span, out = Out} = Data, Buffer, OutFrames, NewState) ->
+    Data#data{
+        buffer = Buffer,
+        mod_state = NewState,
+        out = [Out | encode_frames(Data, Span, OutFrames)]
+    }.
 
 %% Write everything queued since the last flush in ONE `send` and reset
 %% the accumulator. Called before every park (`arm_and_recv/2`) and
