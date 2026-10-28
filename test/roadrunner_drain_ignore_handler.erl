@@ -2,7 +2,7 @@
 -moduledoc """
 Test fixture — `{loop, ...}` handler that pushes a "started" chunk
 and then ignores **everything**, including `{roadrunner_drain, _}`. Used
-to verify `roadrunner_listener:drain/2` falls back to `exit(Pid, shutdown)`
+to verify `roadrunner_listener:drain/2` falls back to `exit(Pid, kill)`
 once the timeout elapses.
 """.
 

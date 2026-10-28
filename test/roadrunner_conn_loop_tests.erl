@@ -1908,6 +1908,42 @@ websocket_close_lingers_over_an_unrequested_body_test() ->
     ?assertEqual(0, counters:get(Counter, 1)),
     Sink ! stop.
 
+websocket_bad_return_closes_conn_and_releases_slot_test() ->
+    %% A handler result the session does not understand raises in the
+    %% session's own code, after the callback returned; it still ends
+    %% through the conn's close path with the slot released.
+    ws_failure_releases_slot(fun roadrunner_ws_crash_upgrade_handler:bad_return/1).
+
+websocket_invalid_close_code_closes_conn_and_releases_slot_test() ->
+    %% `{close, 5000, _, _}` is refused when the close payload is built,
+    %% in the session's own code; same clean end.
+    ws_failure_releases_slot(fun roadrunner_ws_crash_upgrade_handler:bad_close/1).
+
+ws_failure_releases_slot(Upgrade) ->
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_ws_sink(Self, Tag, upgrade_request_bytes()),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
+    Opts = (fake_opts(ws_failure))#{
+        client_counter := Counter,
+        dispatch := {handler, roadrunner_ws_crash_upgrade_handler, Upgrade, undefined}
+    },
+    {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    ConnRef = monitor(process, ConnPid),
+    ConnPid ! shoot,
+    receive
+        {Tag, ws_armed, ConnPid} -> ok
+    after 2000 -> error(no_session_arm)
+    end,
+    ConnPid ! {roadrunner_fake_data, undefined, masked_text_frame(~"go")},
+    receive
+        {'DOWN', ConnRef, process, ConnPid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    ?assertEqual(0, counters:get(Counter, 1)),
+    Sink ! stop.
+
 upgrade_request_bytes() ->
     <<
         "GET /ws HTTP/1.1\r\n"
