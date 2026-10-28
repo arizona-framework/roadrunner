@@ -1724,6 +1724,53 @@ size_cap_rejection_emits_frame_rejected_telemetry_test() ->
         telemetry:detach(HandlerId)
     end.
 
+text_frame_ending_mid_character_emits_frame_in_then_1007_test() ->
+    %% A whole text frame whose payload ends in a cut-off character takes
+    %% the general path: the frame is counted in (`ws_frame_in`, 4
+    %% bytes) and the session then closes with 1007.
+    {ok, _} = roadrunner_test_event_handler:start(),
+    Self = self(),
+    HandlerId = make_ref(),
+    ok = telemetry:attach(
+        HandlerId,
+        [roadrunner, ws, frame_in],
+        fun(Event, M, Md, _) -> Self ! {tev, Event, M, Md} end,
+        undefined
+    ),
+    try
+        Tag = make_ref(),
+        Sink = spawn_active_sink(Self, Tag, [{recv, frame(text, <<"ab", 16#E2, 16#82>>)}]),
+        {ok, Pid} = start_ws_session(
+            roadrunner_ws_session,
+            {
+                {fake, Sink},
+                roadrunner_ws_echo_handler,
+                undefined,
+                ws_ctx(),
+                none,
+                <<>>,
+                ws_proto_opts()
+            },
+            []
+        ),
+        Ref = monitor(process, Pid),
+        Pid ! socket_ready,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(no_close)
+        end,
+        receive
+            {tev, [roadrunner, ws, frame_in], M, Md} ->
+                ?assertEqual(text, maps:get(opcode, Md)),
+                ?assertEqual(4, maps:get(payload_size, M))
+        after 500 -> error(no_frame_in_event)
+        end,
+        ?assertEqual(<<16#88, 2, 1007:16>>, iolist_to_binary(collect_sends(Tag, 50))),
+        Sink ! stop
+    after
+        telemetry:detach(HandlerId)
+    end.
+
 permessage_deflate_inflate_bomb_closes_with_1009_test() ->
     %% A small compressed frame whose inflated payload exceeds
     %% `ws_max_message_size` must be rejected during inflate (RFC 6455
