@@ -1792,23 +1792,18 @@ sendfile_dispatch_closes_socket_on_error_test() ->
     end,
     Sink ! stop.
 
-websocket_conn_hibernates_forwards_drain_and_closes_test() ->
-    %% Full upgrade through the conn: dispatch spawns the session, the
-    %% conn parks in the hibernated `ws_session_wake/6` wait, forwards a
-    %% `{roadrunner_drain, _}` broadcast to the session, and once the
-    %% session ends (a close frame injected through the fake socket) the
-    %% conn wakes, runs the websocket finishing path, and exits normal.
+websocket_session_runs_in_the_conn_process_test() ->
+    %% Full upgrade through the conn: the session runs in the conn process
+    %% itself, takes a `{roadrunner_drain, _}` sent to that process, and
+    %% once it ends (a close frame injected through the fake socket) the
+    %% conn's close path runs: a normal exit with the listener slot back.
     Self = self(),
     Tag = make_ref(),
-    Sink = spawn_ws_sink(Self, Tag, <<
-        "GET /ws HTTP/1.1\r\n"
-        "Host: x\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-        "Sec-WebSocket-Version: 13\r\n\r\n"
-    >>),
-    Opts = (fake_opts(ws_hib))#{
+    Sink = spawn_ws_sink(Self, Tag, upgrade_request_bytes()),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
+    Opts = (fake_opts(ws_inline))#{
+        client_counter := Counter,
         dispatch :=
             {handler, roadrunner_ws_upgrade_handler, fun roadrunner_ws_upgrade_handler:handle/1,
                 undefined}
@@ -1817,32 +1812,111 @@ websocket_conn_hibernates_forwards_drain_and_closes_test() ->
     ConnRef = monitor(process, ConnPid),
     ConnPid ! shoot,
     %% The session's first active-once arm tells us the 101 handshake
-    %% completed and hands us the session pid for frame injection.
+    %% completed and which process runs the session.
     SessPid =
         receive
             {Tag, ws_armed, P} -> P
         after 2000 -> error(no_session_arm)
         end,
-    ?assertNotEqual(ConnPid, SessPid),
-    %% The conn has dispatched and parked — hibernated, tiny heap.
-    ?assert(is_hibernating(ConnPid, 1000)),
-    %% Drain broadcast to the conn is forwarded to the session (the echo
-    %% handler exports no handle_drain, so the session just keeps going —
-    %% liveness is the observable).
+    ?assertEqual(ConnPid, SessPid),
+    %% A drain reaches the session directly (the echo handler exports no
+    %% handle_drain, so the session just keeps going: liveness is the
+    %% observable).
     ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
-    ?assert(is_process_alive(SessPid)),
-    %% End the session: inject a masked close frame; the session replies
-    %% with a close frame and exits, waking the conn.
-    SessPid ! {roadrunner_fake_data, undefined, masked_close_frame()},
+    ?assert(is_process_alive(ConnPid)),
+    ConnPid ! {roadrunner_fake_data, undefined, masked_close_frame()},
     receive
         {'DOWN', ConnRef, process, ConnPid, normal} -> ok
     after 2000 -> error(no_normal_exit)
     end,
+    ?assertEqual(0, counters:get(Counter, 1)),
     Sent = iolist_to_binary(collect_sends(Tag, 100)),
     ?assertNotEqual(nomatch, binary:match(Sent, ~"101")),
     %% Close-frame reply: opcode byte 0x88.
     ?assertNotEqual(nomatch, binary:match(Sent, <<16#88>>)),
     Sink ! stop.
+
+websocket_handler_crash_closes_conn_and_releases_slot_test() ->
+    %% A WebSocket handler that raises ends the session through the conn's
+    %% close path: a normal exit and the listener slot released at once,
+    %% not left for the slot reaper.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_ws_sink(Self, Tag, upgrade_request_bytes()),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
+    Opts = (fake_opts(ws_crash))#{
+        client_counter := Counter,
+        dispatch :=
+            {handler, roadrunner_ws_crash_upgrade_handler,
+                fun roadrunner_ws_crash_upgrade_handler:handle/1, undefined}
+    },
+    {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    ConnRef = monitor(process, ConnPid),
+    ConnPid ! shoot,
+    receive
+        {Tag, ws_armed, ConnPid} -> ok
+    after 2000 -> error(no_session_arm)
+    end,
+    ConnPid ! {roadrunner_fake_data, undefined, masked_text_frame(~"boom")},
+    receive
+        {'DOWN', ConnRef, process, ConnPid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    ?assertEqual(0, counters:get(Counter, 1)),
+    Sink ! stop.
+
+websocket_close_lingers_over_an_unrequested_body_test() ->
+    %% Manual body mode, an upgrade request that announced a body and
+    %% waits for `100 Continue`: the handler upgrades without asking for
+    %% it, so when the session ends the close path lingers over the body
+    %% the client may still send, then exits normally.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_ws_sink(Self, Tag, <<
+        "GET /ws HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "Content-Length: 5\r\n"
+        "Expect: 100-continue\r\n\r\n"
+    >>),
+    Counter = counters:new(1, [write_concurrency]),
+    ok = counters:add(Counter, 1, 1),
+    Opts = (fake_opts(ws_linger))#{
+        client_counter := Counter,
+        body_buffering := manual,
+        http1_linger_timeout => 0,
+        dispatch :=
+            {handler, roadrunner_ws_upgrade_handler, fun roadrunner_ws_upgrade_handler:handle/1,
+                undefined}
+    },
+    {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
+    ConnRef = monitor(process, ConnPid),
+    ConnPid ! shoot,
+    receive
+        {Tag, ws_armed, ConnPid} -> ok
+    after 2000 -> error(no_session_arm)
+    end,
+    ConnPid ! {roadrunner_fake_data, undefined, masked_close_frame()},
+    receive
+        {'DOWN', ConnRef, process, ConnPid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    ?assertEqual(0, counters:get(Counter, 1)),
+    Sink ! stop.
+
+upgrade_request_bytes() ->
+    <<
+        "GET /ws HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    >>.
 
 websocket_upgrade_headers_reach_the_101_test() ->
     %% `{websocket, Mod, State, #{headers => Headers}}`: the handler's headers ride the
@@ -2079,29 +2153,9 @@ ws_sink_loop(Logger, Tag, UpgradeBytes, Delivered) ->
 masked_close_frame() ->
     <<16#88, (16#80 bor 2), 0, 0, 0, 0, 1000:16>>.
 
-%% A hibernated process is `waiting` with its heap shrunk to the
-%% OTP-configured minimum (+64 words slack) — mirrors the helper in
-%% `roadrunner_ws_session_tests`. Polls until `TimeoutMs` because the
-%% hibernate lands asynchronously after the dispatch.
-is_hibernating(Pid, TimeoutMs) ->
-    {min_heap_size, Min} = erlang:system_info(min_heap_size),
-    is_hibernating_loop(Pid, Min + 64, erlang:monotonic_time(millisecond) + TimeoutMs).
-
-is_hibernating_loop(Pid, Threshold, Deadline) ->
-    case process_info(Pid, [status, total_heap_size, message_queue_len]) of
-        [{status, waiting}, {total_heap_size, H}, {message_queue_len, 0}] when
-            H =< Threshold
-        ->
-            true;
-        _ ->
-            case erlang:monotonic_time(millisecond) >= Deadline of
-                true ->
-                    false;
-                false ->
-                    timer:sleep(10),
-                    is_hibernating_loop(Pid, Threshold, Deadline)
-            end
-    end.
+%% A masked client→server text frame, key 0 as above.
+masked_text_frame(Payload) ->
+    <<16#81, (16#80 bor byte_size(Payload)), 0, 0, 0, 0, Payload/binary>>.
 
 spawn_active_sink_with_send_log(Logger, Tag, Bytes) ->
     spawn(fun() -> active_sink_loop(Logger, Tag, Bytes, false) end).

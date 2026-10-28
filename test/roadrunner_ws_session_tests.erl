@@ -2,12 +2,10 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% `roadrunner_ws_session:start/7` must spawn the session **before** the
-%% 101 upgrade response is written. If `proc_lib:start/5` fails
-%% (here forced via an unknown handler module — `init_session/2` rejects
-%% it, turning into `{error, _}` from start), the 101 must never reach
-%% the wire and a 500 fallback must be sent instead, with `rejected`
-%% telling the caller no session exists to wait on.
+%% `roadrunner_ws_session:start/7` must check the handler **before** the
+%% 101 upgrade response is written. A module that cannot serve a session
+%% (here an unknown one) must never see a 101 on the wire: a 500 goes out
+%% instead, with `rejected` telling the caller there is no session to run.
 start_with_unloadable_handler_sends_500_and_no_101_test() ->
     Tag = make_ref(),
     Self = self(),
@@ -80,7 +78,7 @@ ws_buffer_opt_applied_before_101_test() ->
     Tag = make_ref(),
     Self = self(),
     Sink = spawn_events_sink(Self, Tag),
-    {session, Ref, Pid} = roadrunner_ws_session:start(
+    {session, Ref, Pid} = start_upgrade(
         {fake, Sink},
         upgrade_req(),
         roadrunner_ws_echo_handler,
@@ -116,7 +114,7 @@ ws_buffer_opt_unset_leaves_socket_buffer_alone_test() ->
     Tag = make_ref(),
     Self = self(),
     Sink = spawn_events_sink(Self, Tag),
-    {session, Ref, Pid} = roadrunner_ws_session:start(
+    {session, Ref, Pid} = start_upgrade(
         {fake, Sink},
         upgrade_req(),
         roadrunner_ws_echo_handler,
@@ -878,19 +876,17 @@ handle_drain_drops_when_handler_does_not_export_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
-start_hands_back_a_session_the_caller_drives_test() ->
+start_hands_back_a_session_the_caller_runs_test() ->
     %% `start/7`'s contract: the 101 is on the wire and the caller holds
-    %% `{session, MonitorRef, Pid}` — it owns the drain forwarding (in
-    %% production `roadrunner_conn_loop:ws_session_wake/6`, covered in
-    %% the conn-loop tests) and the wait for the session's 'DOWN'. Here
-    %% the test plays the caller: a drain sent to the session pid
-    %% dispatches handle_drain/2, whose `{close, _, _, _}` return ends
-    %% the session and fires the monitor.
+    %% the session to run in its own process (`start_upgrade/7` plays the
+    %% conn). A drain sent to that process dispatches handle_drain/2,
+    %% whose `{close, _, _, _}` return ends the session through the
+    %% caller's finish.
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink(Self, Tag, []),
     State = #{sink => Self, on_init => ok, on_drain => {close, 1000, ~"draining"}},
-    {session, Ref, Pid} = roadrunner_ws_session:start(
+    {session, Ref, Pid} = start_upgrade(
         {fake, Sink},
         upgrade_req(),
         roadrunner_ws_lifecycle_handler,
@@ -899,7 +895,7 @@ start_hands_back_a_session_the_caller_drives_test() ->
         <<>>,
         ws_proto_opts()
     ),
-    %% The lifecycle handler notifies init — the awaiting_socket →
+    %% The lifecycle handler notifies init — the session start →
     %% frame_loop transition is done, so the drain hits the steady-state
     %% dispatch and not the postpone path (covered separately below).
     receive
@@ -918,11 +914,10 @@ start_hands_back_a_session_the_caller_drives_test() ->
     ?assertNotEqual(nomatch, binary:match(Sent, <<16#88>>)),
     Sink ! stop.
 
-awaiting_socket_postpones_drain_until_frame_loop_test() ->
-    %% Race: drain forwarded by the conn before the session has processed
-    %% socket_ready. The awaiting_socket state postpones the event;
-    %% frame_loop's existing drain dispatch picks it up after the
-    %% state transition.
+drain_queued_before_the_session_starts_is_handled_test() ->
+    %% A drain that reaches the process before the session runs (the conn
+    %% is in the drain registry from its start) stays queued and is
+    %% dispatched once the frame loop receives.
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_active_sink(Self, Tag, []),
@@ -2478,14 +2473,55 @@ loop_sys_handles_system_and_gen_messages_test() ->
 
 %% --- helpers ---
 
-%% Start the session the way the production launcher (`start_session/8`)
-%% does — `proc_lib:start` into `init_session/2`, which validates the
-%% handler and `init_ack`s `{ok, Pid}` | `{error, {bad_handler, _}}`.
-%% Same 3-arity shape as the old `gen_statem:start/3` so call sites are a
-%% straight rename; the third arg (always `[]` here) maps to proc_lib's
-%% spawn options.
-start_ws_session(roadrunner_ws_session, InitArgs, SpawnOpts) ->
-    proc_lib:start(roadrunner_ws_session, init_session, [self(), InitArgs], infinity, SpawnOpts).
+%% Run a session in a process of its own, as the conn would run it in
+%% its own process: `serve/2` with a `Finish` that just exits normally, so
+%% a test sees the session end as a `normal` 'DOWN'. The process waits for
+%% `socket_ready` before it starts, so a test can queue messages (a drain,
+%% a sys request) ahead of the session. The 101 is `start/7`'s, covered
+%% through `start_upgrade/7`; here the handler is assumed valid and no 101
+%% is written, so a test's expected sends are the session's alone.
+start_ws_session(
+    roadrunner_ws_session,
+    {Socket, Mod, State, {ListenerName, Peer, RequestId}, Negotiated, Buffered, ProtoOpts},
+    SpawnOpts
+) ->
+    Pid = proc_lib:spawn_opt(
+        fun() ->
+            receive
+                socket_ready -> ok
+            end,
+            %% `start/7` loads the handler when it checks it; `serve/2`
+            %% relies on that to see the optional callbacks.
+            {module, Mod} = code:ensure_loaded(Mod),
+            Span = roadrunner_event:ws_upgrade(ListenerName, Peer, RequestId, Mod),
+            roadrunner_ws_session:serve(
+                fun() -> exit(normal) end,
+                {Socket, Mod, State, {ListenerName, Span}, Negotiated, Buffered, ProtoOpts}
+            )
+        end,
+        SpawnOpts
+    ),
+    {ok, Pid}.
+
+%% `start/7` in a process of its own, standing in for the conn: answer the
+%% upgrade and, when it is accepted, run the session there. Hands back the
+%% `{session, MonitorRef, Pid}` a test waits on.
+start_upgrade(Socket, Req, Mod, State, Opts, Buffered, ProtoOpts) ->
+    Self = self(),
+    {Pid, Ref} = spawn_monitor(fun() ->
+        case roadrunner_ws_session:start(Socket, Req, Mod, State, Opts, Buffered, ProtoOpts) of
+            {upgrade, Run} ->
+                Self ! {upgraded, self()},
+                Run(fun() -> exit(normal) end);
+            rejected ->
+                Self ! {upgraded, self()},
+                exit(rejected)
+        end
+    end),
+    receive
+        {upgraded, Pid} -> {session, Ref, Pid}
+    after 2000 -> error(no_upgrade)
+    end.
 
 %% Synchronously stop a session (the proc_lib analogue of
 %% `gen_statem:stop/1`). The session has no graceful-stop message, so
@@ -3132,4 +3168,91 @@ receive_control() ->
     receive
         {control, _, _} = Msg -> Msg
     after 1000 -> error(no_control)
+    end.
+
+%% =============================================================================
+%% Handler crashes: the session runs in the conn process, so a raising
+%% callback is caught and the session still ends through its `Finish`
+%% (here a normal exit), which in production closes the connection and
+%% releases its listener slot at once.
+%% =============================================================================
+
+init_crash_ends_session_through_finish_test() ->
+    {Pid, Ref, Sink} = crash_session(roadrunner_ws_lifecycle_handler, #{on_init => crash}, []),
+    Pid ! socket_ready,
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+handle_frame_crash_on_a_whole_frame_ends_session_test() ->
+    {Pid, Ref, Sink} = crash_session(
+        roadrunner_ws_lifecycle_handler, #{on_frame => crash}, [{recv, frame(text, ~"boom")}]
+    ),
+    Pid ! socket_ready,
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+handle_frame_crash_on_a_fragmented_message_ends_session_test() ->
+    %% The final fragment dispatches through the reassembly path.
+    Chunk = <<
+        (uncompressed_fragment(text, ~"bo", false))/binary,
+        (uncompressed_fragment(continuation, ~"om", true))/binary
+    >>,
+    {Pid, Ref, Sink} = crash_session(
+        roadrunner_ws_lifecycle_handler, #{on_frame => crash}, [{recv, Chunk}]
+    ),
+    Pid ! socket_ready,
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+handle_info_crash_ends_session_test() ->
+    {Pid, Ref, Sink} = crash_session(roadrunner_ws_lifecycle_handler, #{on_info => crash}, []),
+    Pid ! socket_ready,
+    Pid ! {push, ~"boom"},
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+handle_drain_crash_ends_session_test() ->
+    {Pid, Ref, Sink} = crash_session(roadrunner_ws_lifecycle_handler, #{on_drain => crash}, []),
+    Pid ! socket_ready,
+    Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 30000},
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+handle_control_crash_ends_session_test() ->
+    {Pid, Ref, Sink} = crash_session(
+        roadrunner_ws_control_handler, self(), [{recv, ping_frame(~"crash")}]
+    ),
+    Pid ! socket_ready,
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+terminate_crash_still_ends_session_through_finish_test() ->
+    %% `terminate/2` raising after the close: logged, and the session
+    %% still finishes normally.
+    {Pid, Ref, Sink} = crash_session(
+        roadrunner_ws_terminate_handler,
+        #{report => self(), crash_in_terminate => true},
+        [{recv, frame(close, <<1000:16>>)}]
+    ),
+    Pid ! socket_ready,
+    receive
+        {terminated, remote, _} -> ok
+    after 2000 -> error(no_terminate)
+    end,
+    ok = await_normal_down(Ref, Pid),
+    Sink ! stop.
+
+crash_session(Mod, State, Script) ->
+    Sink = spawn_active_sink(self(), make_ref(), Script),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {{fake, Sink}, Mod, State, ws_ctx(), none, <<>>, ws_proto_opts()},
+        []
+    ),
+    {Pid, monitor(process, Pid), Sink}.
+
+await_normal_down(Ref, Pid) ->
+    receive
+        {'DOWN', Ref, process, Pid, Reason} -> ?assertEqual(normal, Reason)
+    after 2000 -> error(session_did_not_exit)
     end.
