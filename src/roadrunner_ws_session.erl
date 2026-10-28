@@ -634,8 +634,8 @@ process_buffer(#data{buffer = <<>>} = Data, HibernateAcc) ->
     arm_and_recv(Data, HibernateAcc);
 process_buffer(#data{buffer = Buf, msg_acc = undefined, frame_validated = 0} = Data, HibernateAcc) ->
     case whole_frame(Buf, Data) of
-        {Opcode, MaskKey, Masked, Rest} ->
-            dispatch_whole_frame(Opcode, MaskKey, Masked, Rest, Data, HibernateAcc);
+        {Opcode, Compressed, MaskKey, Masked, Rest} ->
+            dispatch_whole_frame(Opcode, Compressed, MaskKey, Masked, Rest, Data, HibernateAcc);
         partial ->
             process_partial(Data, HibernateAcc)
     end;
@@ -648,65 +648,85 @@ process_buffer(Data, HibernateAcc) ->
 -spec process_input(#data{}, binary()) -> no_return().
 process_input(#data{buffer = <<>>, msg_acc = undefined, frame_validated = 0} = Data, Bytes) ->
     case whole_frame(Bytes, Data) of
-        {Opcode, MaskKey, Masked, Rest} ->
-            dispatch_whole_frame(Opcode, MaskKey, Masked, Rest, Data, false);
+        {Opcode, Compressed, MaskKey, Masked, Rest} ->
+            dispatch_whole_frame(Opcode, Compressed, MaskKey, Masked, Rest, Data, false);
         partial ->
             process_partial(Data#data{buffer = Bytes}, false)
     end;
 process_input(Data, Bytes) ->
     process_buffer(append_buffer(Data, Bytes), false).
 
-%% A whole data frame at the head of `Buf` (`roadrunner_ws:match_data_frame/1`)
-%% within both size caps. An oversize frame is `partial` so the general
-%% path closes it with 1009 exactly as before.
+%% A whole data frame at the head of `Buf` (`roadrunner_ws:match_data_frame/2`,
+%% compressed only once permessage-deflate is negotiated) within both
+%% size caps. An oversize frame is `partial` so the general path closes
+%% it with 1009 exactly as before; a compressed frame is charged against
+%% `max_message_size` as a single fragment, the same as on that path.
 -spec whole_frame(binary(), #data{}) ->
-    {text | binary, 0..16#FFFFFFFF, binary(), binary()} | partial.
-whole_frame(Buf, #data{max_message_size = MaxMsg} = Data) ->
-    case roadrunner_ws:match_data_frame(Buf) of
-        {_Opcode, _MaskKey, Masked, _Rest} = Whole when byte_size(Masked) =< MaxMsg ->
-            case frame_within_cap(byte_size(Masked), Data) of
+    {text | binary, boolean(), 0..16#FFFFFFFF, binary(), binary()} | partial.
+whole_frame(Buf, #data{pmd_params = Pmd, max_message_size = MaxMsg} = Data) ->
+    case roadrunner_ws:match_data_frame(Buf, Pmd =/= undefined) of
+        {_Opcode, Compressed, _MaskKey, Masked, _Rest} = Whole ->
+            Size = byte_size(Masked),
+            case frame_within_cap(Size, Data) andalso charged_size(Compressed, Size) =< MaxMsg of
                 true -> Whole;
                 false -> partial
             end;
-        _ ->
+        partial ->
             partial
     end.
 
-%% Unmask and validate a whole frame in one pass and hand it to the
-%% handler. No message is in progress (`msg_acc = undefined`,
+-spec charged_size(boolean(), non_neg_integer()) -> non_neg_integer().
+charged_size(false, Size) -> Size;
+charged_size(true, Size) -> max(Size, ?WS_FRAGMENT_OVERHEAD).
+
+%% Unmask and validate (or inflate, then validate) a whole frame and hand
+%% it to the handler. No message is in progress (`msg_acc = undefined`,
 %% `frame_validated = 0`), so the per-message fields already hold their
-%% reset values and are left untouched. When the reply is the only
-%% output and nothing else is buffered, it goes out directly instead of
-%% through `#data.out`.
+%% reset values and are left untouched. Events and closes match the
+%% general path: an uncompressed text frame is validated before its
+%% `ws_frame_in`, a compressed one fires it with the wire size first.
 -spec dispatch_whole_frame(
-    text | binary, 0..16#FFFFFFFF, binary(), binary(), #data{}, boolean()
+    text | binary, boolean(), 0..16#FFFFFFFF, binary(), binary(), #data{}, boolean()
 ) -> no_return().
-dispatch_whole_frame(Opcode, MaskKey, Masked, Rest, Data, Hibernate) ->
+dispatch_whole_frame(Opcode, false, MaskKey, Masked, Rest, Data, Hibernate) ->
     Payload = roadrunner_ws:unmask_words(Masked, MaskKey),
     case Opcode =:= binary orelse is_valid_utf8(Payload) of
         true ->
-            #data{socket = Socket, span = Span, mod = Mod, mod_state = State, out = Out} = Data,
-            ok = roadrunner_event:ws_frame_in(Span, Opcode, byte_size(Payload)),
-            Frame = #{fin => true, rsv1 => false, opcode => Opcode, payload => Payload},
-            case Mod:handle_frame(Frame, State) of
-                {reply, [_ | _] = OutFrames, NewState} when Rest =:= <<>>, Out =:= [] ->
-                    _ = roadrunner_transport:send(Socket, encode_frames(Data, Span, OutFrames)),
-                    arm_and_recv(Data#data{buffer = <<>>, mod_state = NewState}, Hibernate);
-                {reply, OutFrames, NewState} ->
-                    %% More frames buffered (a pipelining client) or output
-                    %% already queued: queue the reply in the same update
-                    %% that advances the buffer, and keep draining.
-                    process_buffer(queue_reply(Data, Rest, OutFrames, NewState), Hibernate);
-                {ok, NewState} ->
-                    %% Same single update as above, without a reply.
-                    process_buffer(Data#data{buffer = Rest, mod_state = NewState}, Hibernate);
-                Result ->
-                    apply_handler_result(
-                        Result, Data#data{buffer = Rest}, Hibernate, fun process_buffer/2, normal
-                    )
-            end;
+            ok = roadrunner_event:ws_frame_in(Data#data.span, Opcode, byte_size(Payload)),
+            dispatch_message(Opcode, Payload, Rest, Data, Hibernate);
         false ->
             close_with(close_invalid_payload(), Data#data{buffer = Rest})
+    end;
+dispatch_whole_frame(Opcode, true, MaskKey, Masked, Rest, Data, Hibernate) ->
+    ok = roadrunner_event:ws_frame_in(Data#data.span, Opcode, byte_size(Masked)),
+    Payload = complete_message(
+        Opcode, true, roadrunner_ws:unmask_words(Masked, MaskKey), Data
+    ),
+    dispatch_message(Opcode, Payload, Rest, Data, Hibernate).
+
+%% Hand a complete message to the handler. When the reply is the only
+%% output and nothing else is buffered, it goes out directly instead of
+%% through `#data.out`.
+-spec dispatch_message(text | binary, binary(), binary(), #data{}, boolean()) -> no_return().
+dispatch_message(Opcode, Payload, Rest, Data, Hibernate) ->
+    #data{socket = Socket, span = Span, mod = Mod, mod_state = State, out = Out} = Data,
+    Frame = #{fin => true, rsv1 => false, opcode => Opcode, payload => Payload},
+    case Mod:handle_frame(Frame, State) of
+        {reply, [_ | _] = OutFrames, NewState} when Rest =:= <<>>, Out =:= [] ->
+            _ = roadrunner_transport:send(Socket, encode_frames(Data, Span, OutFrames)),
+            arm_and_recv(Data#data{buffer = <<>>, mod_state = NewState}, Hibernate);
+        {reply, OutFrames, NewState} ->
+            %% More frames buffered (a pipelining client) or output
+            %% already queued: queue the reply in the same update that
+            %% advances the buffer, and keep draining.
+            process_buffer(queue_reply(Data, Rest, OutFrames, NewState), Hibernate);
+        {ok, NewState} ->
+            %% Same single update as above, without a reply.
+            process_buffer(Data#data{buffer = Rest, mod_state = NewState}, Hibernate);
+        Result ->
+            apply_handler_result(
+                Result, Data#data{buffer = Rest}, Hibernate, fun process_buffer/2, normal
+            )
     end.
 
 -spec process_partial(#data{}, boolean()) -> no_return().
@@ -1047,34 +1067,31 @@ accumulate_fragment(
                     _ -> [Acc, P]
                 end,
             Reset = reset_msg(Data),
-            case finalize_message(Reset, AssembledIolist, Compressed) of
-                {ok, Payload, Data1} ->
-                    %% For compressed messages, finalize_message inflated
-                    %% the bytes — UTF-8 must be checked on the inflated
-                    %% binary (the wire bytes are deflate-compressed, not
-                    %% UTF-8). For uncompressed messages, validation has
-                    %% already run incrementally above; skip redundant
-                    %% full-message revalidation.
-                    case post_finalize_validate(Op, Compressed, Payload) of
-                        ok ->
-                            Synthesized = #{
-                                fin => true,
-                                rsv1 => false,
-                                opcode => Op,
-                                payload => Payload
-                            },
-                            dispatch_data_frame(Synthesized, Data1, Hibernate);
-                        invalid_utf8 ->
-                            close_with(close_invalid_payload(), Data1)
-                    end;
-                {error, {message_too_big, Size}} ->
-                    %% Inflated payload would exceed `max_message_size`.
-                    close_oversize(max_message_size, Size, Reset);
-                {error, _} ->
-                    close_with(close_protocol_error(), Reset)
-            end;
+            Payload = complete_message(Op, Compressed, AssembledIolist, Reset),
+            Synthesized = #{fin => true, rsv1 => false, opcode => Op, payload => Payload},
+            dispatch_data_frame(Synthesized, Reset, Hibernate);
         invalid_utf8 ->
             close_with(close_invalid_payload(), reset_msg(Data))
+    end.
+
+%% Assemble a complete message's payload: inflate it when compressed and
+%% check the inflated bytes are UTF-8 for text (the wire bytes were
+%% deflate, so nothing was validated on the way in). Uncompressed text
+%% was already validated incrementally. Closes the session (1009 over
+%% `max_message_size` after inflating, 1002 for a corrupt stream, 1007
+%% for bad UTF-8) instead of returning when the message is unusable.
+-spec complete_message(text | binary, boolean(), iodata(), #data{}) -> binary().
+complete_message(Op, Compressed, Iolist, Data) ->
+    case finalize_message(Data, Iolist, Compressed) of
+        {ok, Payload} ->
+            case post_finalize_validate(Op, Compressed, Payload) of
+                ok -> Payload;
+                invalid_utf8 -> close_with(close_invalid_payload(), Data)
+            end;
+        {error, {message_too_big, Size}} ->
+            close_oversize(max_message_size, Size, Data);
+        {error, _} ->
+            close_with(close_protocol_error(), Data)
     end.
 
 %% Validate the FIN fragment's bytes against the carried pending
@@ -1207,21 +1224,21 @@ incomplete_is_provably_invalid(_) -> false.
 %% Returns either a plain assembled binary (when the message was
 %% uncompressed) or the inflated bytes (when RSV1 was set on the
 %% start frame).
--spec finalize_message(#data{}, iodata(), boolean()) ->
-    {ok, binary(), #data{}} | {error, term()}.
-finalize_message(Data, Iolist, false) ->
-    {ok, iolist_to_binary(Iolist), Data};
+-spec finalize_message(#data{}, iodata(), boolean()) -> {ok, binary()} | {error, term()}.
+finalize_message(_Data, Iolist, false) ->
+    {ok, iolist_to_binary(Iolist)};
 finalize_message(
-    #data{inflate_z = Z, pmd_params = Params, max_message_size = MaxMsg} = Data, Iolist, true
+    #data{inflate_z = Z, pmd_params = Params, max_message_size = MaxMsg}, Iolist, true
 ) ->
-    Compressed = iolist_to_binary([Iolist, ?PMD_TAIL]),
-    try bounded_inflate(Z, Compressed, MaxMsg) of
+    %% zlib takes iodata, so the deflate tail rides along without copying
+    %% the compressed payload into a new binary first.
+    try bounded_inflate(Z, [Iolist, ?PMD_TAIL], MaxMsg) of
         {ok, Inflated} ->
             case Params of
                 #{client_no_context_takeover := true} -> ok = zlib:inflateReset(Z);
                 #{} -> ok
             end,
-            {ok, Inflated, Data};
+            {ok, Inflated};
         {error, _} = Err ->
             %% Over the decompressed cap — the connection is about to be
             %% closed (1009), so the inflate stream isn't reset for reuse.
@@ -1236,7 +1253,7 @@ finalize_message(
 %% all of it at once. `zlib:safeInflate/2` yields one bounded chunk per
 %% call, so we stop and reject the moment the output would cross the cap
 %% rather than allocating the whole bomb.
--spec bounded_inflate(zlib:zstream(), binary(), non_neg_integer()) ->
+-spec bounded_inflate(zlib:zstream(), iodata(), non_neg_integer()) ->
     {ok, binary()} | {error, {message_too_big, non_neg_integer()}}.
 bounded_inflate(Z, Compressed, Max) ->
     bounded_inflate(zlib:safeInflate(Z, Compressed), Z, Max, 0, []).
