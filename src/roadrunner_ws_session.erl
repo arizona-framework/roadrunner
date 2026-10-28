@@ -554,7 +554,7 @@ recv_loop(
         {'$gen_cast', _Request} ->
             recv_loop(Data);
         {DataTag, _Sock, Bytes} ->
-            process_buffer(append_buffer(Data, Bytes), false);
+            process_input(Data, Bytes);
         {ClosedTag, _Sock} ->
             exit_clean({error, closed}, Data);
         {ErrorTag, _Sock, Reason} ->
@@ -622,10 +622,127 @@ close_zlib(Z) -> zlib:close(Z).
 %% validated frame always has its bytes in the buffer, so an empty
 %% buffer implies clean per-frame state and re-arming directly is
 %% behavior-identical.
+%%
+%% With no message in progress, a complete data frame at the head of
+%% the buffer takes `dispatch_whole_frame/6`: one match, one unmask and
+%% validation pass, and one `#data{}` update per frame. The general
+%% path (`process_partial/2`) builds the peek header, validates
+%% incrementally and updates the record at each step, which allocated
+%% enough per small frame to force a garbage collection on most of them.
 -spec process_buffer(#data{}, boolean()) -> no_return().
 process_buffer(#data{buffer = <<>>} = Data, HibernateAcc) ->
     arm_and_recv(Data, HibernateAcc);
-process_buffer(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
+process_buffer(#data{buffer = Buf, msg_acc = undefined, frame_validated = 0} = Data, HibernateAcc) ->
+    case whole_frame(Buf, Data) of
+        {Opcode, MaskKey, Masked, Rest} ->
+            dispatch_whole_frame(Opcode, MaskKey, Masked, Rest, Data, HibernateAcc);
+        partial ->
+            process_partial(Data, HibernateAcc)
+    end;
+process_buffer(Data, HibernateAcc) ->
+    process_partial(Data, HibernateAcc).
+
+%% Bytes just delivered by the socket. With nothing buffered and no
+%% message in progress they are tried as a whole frame straight away, so
+%% the common one-frame delivery never stores them in `#data.buffer`.
+-spec process_input(#data{}, binary()) -> no_return().
+process_input(#data{buffer = <<>>, msg_acc = undefined, frame_validated = 0} = Data, Bytes) ->
+    case whole_frame(Bytes, Data) of
+        {Opcode, MaskKey, Masked, Rest} ->
+            dispatch_whole_frame(Opcode, MaskKey, Masked, Rest, Data, false);
+        partial ->
+            process_partial(Data#data{buffer = Bytes}, false)
+    end;
+process_input(Data, Bytes) ->
+    process_buffer(append_buffer(Data, Bytes), false).
+
+%% Match a complete, final, uncompressed text or binary frame of up to
+%% 64 KB at the head of `Buf`, within both size caps. Everything else
+%% (control frames, fragments, RSV bits, a header or body still on the
+%% way, protocol errors, oversize frames) is `partial` and takes the
+%% general path, which reports it exactly as before.
+-spec whole_frame(binary(), #data{}) ->
+    {text | binary, 0..16#FFFFFFFF, binary(), binary()} | partial.
+whole_frame(<<1:1, 0:3, Op:4, 1:1, Len:7, MaskKey:32, Masked:Len/binary, Rest/binary>>, Data) when
+    Len < 126, (Op =:= 1 orelse Op =:= 2)
+->
+    whole_frame_within_caps(Op, MaskKey, Masked, Rest, Data);
+whole_frame(
+    <<1:1, 0:3, Op:4, 1:1, 126:7, Len:16, MaskKey:32, Masked:Len/binary, Rest/binary>>, Data
+) when
+    Op =:= 1 orelse Op =:= 2
+->
+    whole_frame_within_caps(Op, MaskKey, Masked, Rest, Data);
+whole_frame(_Buf, _Data) ->
+    partial.
+
+-spec whole_frame_within_caps(1 | 2, 0..16#FFFFFFFF, binary(), binary(), #data{}) ->
+    {text | binary, 0..16#FFFFFFFF, binary(), binary()} | partial.
+whole_frame_within_caps(
+    Op, MaskKey, Masked, Rest, #data{max_frame_size = MaxFrame, max_message_size = MaxMsg}
+) when byte_size(Masked) =< MaxFrame, byte_size(Masked) =< MaxMsg ->
+    {data_opcode(Op), MaskKey, Masked, Rest};
+whole_frame_within_caps(_Op, _MaskKey, _Masked, _Rest, _Data) ->
+    partial.
+
+-spec data_opcode(1 | 2) -> text | binary.
+data_opcode(1) -> text;
+data_opcode(2) -> binary.
+
+%% Unmask and validate a whole frame in one pass and hand it to the
+%% handler. No message is in progress (`msg_acc = undefined`,
+%% `frame_validated = 0`), so the per-message fields already hold their
+%% reset values and are left untouched. When the reply is the only
+%% output and nothing else is buffered, it goes out directly instead of
+%% through `#data.out`.
+-spec dispatch_whole_frame(
+    text | binary, 0..16#FFFFFFFF, binary(), binary(), #data{}, boolean()
+) -> no_return().
+dispatch_whole_frame(Opcode, MaskKey, Masked, Rest, Data, Hibernate) ->
+    Payload = roadrunner_ws:unmask_words(Masked, MaskKey),
+    case validate_whole(Opcode, Payload) of
+        ok ->
+            #data{socket = Socket, span = Span, mod = Mod, mod_state = State, out = Out} = Data,
+            ok = roadrunner_event:ws_frame_in(Span, Opcode, byte_size(Payload)),
+            Frame = #{fin => true, rsv1 => false, opcode => Opcode, payload => Payload},
+            case Mod:handle_frame(Frame, State) of
+                {reply, [_ | _] = OutFrames, NewState} when Rest =:= <<>>, Out =:= [] ->
+                    _ = roadrunner_transport:send(Socket, encode_frames(Data, Span, OutFrames)),
+                    arm_and_recv(Data#data{buffer = <<>>, mod_state = NewState}, Hibernate);
+                {reply, OutFrames, NewState} ->
+                    %% More frames buffered (a pipelining client) or output
+                    %% already queued: queue the reply in the same update
+                    %% that advances the buffer, and keep draining.
+                    process_buffer(
+                        Data#data{
+                            buffer = Rest,
+                            mod_state = NewState,
+                            out = [Out | encode_frames(Data, Span, OutFrames)]
+                        },
+                        Hibernate
+                    );
+                {ok, NewState} ->
+                    process_buffer(Data#data{buffer = Rest, mod_state = NewState}, Hibernate);
+                Result ->
+                    apply_handler_result(
+                        Result, Data#data{buffer = Rest}, Hibernate, fun process_buffer/2, normal
+                    )
+            end;
+        invalid_utf8 ->
+            close_with(close_invalid_payload(), Data#data{buffer = Rest})
+    end.
+
+-spec validate_whole(text | binary, binary()) -> ok | invalid_utf8.
+validate_whole(binary, _Payload) ->
+    ok;
+validate_whole(text, Payload) ->
+    case unicode:characters_to_binary(Payload, utf8, utf8) of
+        Bin when is_binary(Bin) -> ok;
+        _ -> invalid_utf8
+    end.
+
+-spec process_partial(#data{}, boolean()) -> no_return().
+process_partial(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
     Opts =
         case Pmd of
             undefined -> #{};
