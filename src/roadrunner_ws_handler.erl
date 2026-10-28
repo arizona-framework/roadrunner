@@ -34,8 +34,8 @@ The session runs in the connection's own process, the one that served
 the upgrade request, so `self()` in a callback is the connection.
 Anything that raises while the session runs, in a callback or in what
 the session does with a callback's return (an unknown return shape, an
-invalid close code), ends the session: it is logged (unless the handler
-called `exit(normal)` or `exit({shutdown, _})`), `terminate/2` is not
+invalid close code), ends the session: it is logged (unless it is an
+exit with `normal`, `shutdown` or `{shutdown, _}`), `terminate/2` is not
 called, and the connection closes and releases its listener slot.
 
 An exit signal is different: a linked process that dies, a
