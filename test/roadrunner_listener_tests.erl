@@ -539,6 +539,43 @@ listener_rejects_invalid_http2_active_test() ->
         [true, false, 0, -1, 32768, 1.5, ~"16"]
     ).
 
+listener_http1_active_threads_into_proto_opts_test() ->
+    %% Bare `http1` leaves the read mode to the connection (by transport);
+    %% `once` and an explicit count flatten through verbatim.
+    lists:foreach(
+        fun({Http1, Expected}) ->
+            Name = listener_test_h1_active,
+            {ok, Pid} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                protocols => [Http1],
+                routes => roadrunner_hello_handler
+            }),
+            ?assertEqual(Expected, maps:get(http1_active, element(4, sys:get_state(Pid)), unset)),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        [
+            {http1, unset},
+            {{http1, #{active => once}}, once},
+            {{http1, #{active => 1}}, 1},
+            {{http1, #{active => 32767}}, 32767}
+        ]
+    ).
+
+listener_rejects_invalid_http1_active_test() ->
+    %% The values HTTP/2's `active` rejects, rejected the same way.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_h1_active_invalid, #{
+                port => 0,
+                protocols => [{http1, #{active => Bad}}],
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
+        end,
+        [true, false, 0, -1, 32768, 1.5, ~"16"]
+    ).
+
 listener_http1_defaults_thread_into_proto_opts_test() ->
     %% Bare `http1` (no tuple) fills the default limits into proto_opts.
     Name = listener_test_http1_defaults,

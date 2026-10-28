@@ -476,7 +476,7 @@ ops-tuning rationale.
     %% long-lived keep-alive HTTP/1.1 connections that mostly sit
     %% idle between requests — drops process heap to ~1KB during
     %% the wait. Setting this routes `roadrunner_conn_loop`'s recv
-    %% through the active-mode `recv_with_hibernate/3` path so the
+    %% through the active-mode `recv_active/3` path so the
     %% receive's `after` clause has a window to call
     %% `erlang:hibernate/3`.
     hibernate_after => pos_integer(),
@@ -602,13 +602,25 @@ cookies / tracing metadata); lower them to tighten the attack surface.
   connection, which can wipe the response before the client reads it
   (RFC 9112 §9.6); lingering lets it through. It ends as soon as the
   client closes. `0` closes at once. Default `1000`.
+- `active` — how a connection reads its socket: `once` or an integer in
+  `1..32767`. With `N`, the socket delivers up to `N` reads before the
+  connection asks for more, which saves a socket call per request (on
+  TLS each one is a call into the TLS connection process). With `once`,
+  it asks before every request. Unset, it is `16` on TLS and `once` on
+  plain TCP, where `N` measured no faster. With `N`, the socket stays
+  armed while a handler runs, so a handler's mailbox can hold the
+  connection's own socket messages (the next pipelined request, a
+  close); a handler that receives only what it waits for, as
+  `gen_server:call/2` does, never sees them. Stream, loop and WebSocket
+  responses get a passive socket, as with `once`.
 """.
 -type http1_opts() :: #{
     max_request_line => 1..16#7FFFFFFF,
     max_header_line => 1..16#7FFFFFFF,
     max_header_block => 1..16#7FFFFFFF,
     max_header_count => 1..16#7FFFFFFF,
-    linger_timeout => 0..16#7FFFFFFF
+    linger_timeout => 0..16#7FFFFFFF,
+    active => once | 1..32767
 }.
 
 -doc """
@@ -1747,7 +1759,7 @@ build_proto_opts(Opts, ListenerName) ->
     WithHibernate =
         %% Optional `hibernate_after` — `roadrunner_conn_loop` reads it
         %% from proto_opts and routes the recv path through
-        %% `recv_with_hibernate/3` so the conn auto-hibernates after
+        %% `recv_active/3` so the conn auto-hibernates after
         %% Ms of idle time. Omitted by default because hibernation has
         %% a per-wake CPU cost (~tens of microseconds for the GC); only
         %% worth enabling for workloads with mostly-idle keep-alive
@@ -1979,8 +1991,11 @@ validate_http1_opts(Opts, Raw) ->
     Defaults = http1_defaults(),
     maps:fold(
         fun(K, V, Acc) ->
-            case is_map_key(K, Defaults) of
+            %% `active` has no default entry: unset, the connection picks
+            %% by transport (`roadrunner_conn_loop:read_mode/2`).
+            case K =:= active orelse is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
+                true when K =:= active -> Acc#{K => validate_http2_active(V, Raw)};
                 true when K =:= linger_timeout, V =:= 0 -> Acc#{K => V};
                 true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
@@ -1998,20 +2013,25 @@ flatten_http1_opts(Entries) ->
     case lists:keyfind(http1, 1, Entries) of
         false ->
             #{};
-        {http1, #{
-            max_request_line := ReqLine,
-            max_header_line := HdrLine,
-            max_header_block := HdrBlock,
-            max_header_count := HdrCount,
-            linger_timeout := Linger
-        }} ->
+        {http1,
             #{
+                max_request_line := ReqLine,
+                max_header_line := HdrLine,
+                max_header_block := HdrBlock,
+                max_header_count := HdrCount,
+                linger_timeout := Linger
+            } = Http1} ->
+            Flat = #{
                 http1_max_request_line => ReqLine,
                 http1_max_header_line => HdrLine,
                 http1_max_header_block => HdrBlock,
                 http1_max_header_count => HdrCount,
                 http1_linger_timeout => Linger
-            }
+            },
+            case Http1 of
+                #{active := Active} -> Flat#{http1_active => Active};
+                #{} -> Flat
+            end
     end.
 
 -spec http2_defaults() -> http2_opts().
@@ -2048,7 +2068,8 @@ validate_http2_opts(Opts, Raw) ->
 
 %% `true` is rejected: an always-active socket has no bound on unread
 %% data, so a fast peer could fill the mailbox. `32767` is the largest
-%% count `inet:setopts/2` and `ssl:setopts/2` accept.
+%% count `inet:setopts/2` and `ssl:setopts/2` accept. HTTP/1's `active`
+%% takes the same values.
 -spec validate_http2_active(term(), term()) -> once | 1..32767.
 validate_http2_active(once, _Raw) ->
     once;

@@ -21,7 +21,7 @@
 %% `recv/3`. This is what lets `erlang:hibernate/3` fire from a
 %% `receive ... after` clause — passive recv holds the process inside
 %% a NIF indefinitely, so hibernation has no window to run.
-%% `roadrunner_conn_loop`'s `recv_with_hibernate/3` and
+%% `roadrunner_conn_loop`'s `recv_active/3` and
 %% `roadrunner_ws_session` (gen_statem with `{hibernate_after, _}`)
 %% both rely on active mode for this reason. See `messages/1` for the
 %% per-transport tag triples.

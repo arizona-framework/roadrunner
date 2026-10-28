@@ -26,6 +26,12 @@ tuned under `{http1, #{...}}` in the `protocols` list, with the keys
 `max_header_count`. A chunked body's trailer block obeys the same header
 caps and is rejected the same way.
 
+The `http1` `active` key sets how many socket reads a connection takes
+before it asks the socket for more: `once` asks before every request.
+Unset, it is `16` on TLS, where each ask is a call into the TLS
+connection process, and `once` on plain TCP. A connection can hold up to
+that many unread reads in its mailbox.
+
 The body cap is enforced across all three protocols. For HTTP/1.1 it
 covers both `Content-Length` and `Transfer-Encoding: chunked` requests:
 the cap is checked as the body is read (a chunked body on its declared
