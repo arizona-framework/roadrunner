@@ -155,9 +155,10 @@
 %% left (`rechallenge_stranded/1`).
 -define(STRANDED_CHALLENGES, 2).
 %% The largest datagram of a bare PATH_CHALLENGE: a short header with a
-%% 20-byte connection id and a 4-byte packet number, the 9-byte frame and
-%% the AEAD tag.
--define(BARE_CHALLENGE, 50).
+%% 20-byte connection id and a 4-byte packet number, the 9-byte frame, the
+%% ACK of one range a challenge on the current path repeats (26 bytes at
+%% most) and the AEAD tag.
+-define(BARE_CHALLENGE, 76).
 %% A CRYPTO slice budget that leaves room for the packet header, an ACK
 %% frame, and the AEAD tag within the 1200-byte datagram (RFC 9000 §14).
 -define(CRYPTO_BUDGET, 1000).
@@ -2178,10 +2179,12 @@ queue_new_token(#state{token_key = Key, peer = {Ip, _Port}} = State) ->
     {t(), [effect()]}.
 send_path(Now, challenge, #state{validation = #validation{sent = Sent} = V} = State, Acc) ->
     Data = crypto:strong_rand_bytes(8),
-    case path_packet(Now, current, [{path_challenge, Data}], State) of
+    Ack = path_ack(Now, State),
+    case path_packet(Now, current, Ack ++ [{path_challenge, Data}], State) of
         {Datagram, State1} ->
             Expanded = byte_size(Datagram) >= ?MIN_PATH_DATAGRAM,
-            {State1#state{validation = V#validation{sent = [{Data, Expanded} | Sent]}}, [
+            State2 = ack_repeated(Ack, State1),
+            {State2#state{validation = V#validation{sent = [{Data, Expanded} | Sent]}}, [
                 {send, Datagram} | Acc
             ]};
         none ->
@@ -2192,6 +2195,34 @@ send_path(Now, {Path, Frames}, State, Acc) ->
         {Datagram, State1} -> {State1, [path_send(Path, Datagram, State1) | Acc]};
         none -> {State, Acc}
     end.
+
+%% An ACK of the client's latest packets, its first range only, for a
+%% challenge on the path being validated to repeat (RFC 9000 §13.2: an ACK
+%% may be sent again at any time). The client's answers to our challenges
+%% are ack-eliciting and fill 1200-byte datagrams, and the anti-amplification
+%% limit keeps the rest of what we send there small: a lost ACK for them
+%% leaves them in the client's bytes in flight, which can fill its
+%% congestion window and stop its answers, unless a probe timeout of its own
+%% resends them. Repeated with every challenge, a lost ACK is made good one
+%% challenge later.
+%% A validation starts on a client 1-RTT packet, so there is always one.
+-spec path_ack(integer(), t()) -> [roadrunner_quic_frame:frame()].
+path_ack(Now, State) ->
+    #space{ack = Ack} = space(application, State),
+    {Largest, FirstRange, _Ranges} = roadrunner_quic_ack:to_ack(Ack),
+    Delay = (roadrunner_quic_ack:ack_delay(Ack, Now) * 1000) bsr ?ACK_DELAY_EXPONENT,
+    [{ack, Largest, Delay, FirstRange, [], undefined}].
+
+%% A challenge carried the ACK: what it acknowledged no longer waits for
+%% one of its own, and a key update it completes is complete.
+-spec ack_repeated([roadrunner_quic_frame:frame()], t()) -> t().
+ack_repeated(AckFrames, State) ->
+    #space{ack = Ack} = Space = space(application, State),
+    ack_in_phase(
+        application,
+        AckFrames,
+        put_space(application, Space#space{ack = roadrunner_quic_ack:mark_ack_sent(Ack)}, State)
+    ).
 
 -spec path_send(path(), binary(), t()) -> effect().
 path_send(current, Datagram, _State) ->
@@ -2248,10 +2279,11 @@ path_pad(_Budget, _Keep) -> 0.
 %% (`reserve/1`), this challenge being one of them; at a stranded client's
 %% address, the next of its own.
 -spec pad_keep(path(), [roadrunner_quic_frame:frame()], t()) -> non_neg_integer().
-pad_keep(current, [{path_challenge, _Data}], State) ->
-    max(0, reserve(State) - ?BARE_CHALLENGE);
-pad_keep(current, _Frames, State) ->
-    reserve(State);
+pad_keep(current, Frames, State) ->
+    case lists:keymember(path_challenge, 1, Frames) of
+        true -> max(0, reserve(State) - ?BARE_CHALLENGE);
+        false -> reserve(State)
+    end;
 pad_keep(probe, _Frames, #state{stranded = Addr, probe_path = {Addr, _Seq, _Amp}}) ->
     ?BARE_CHALLENGE;
 pad_keep(_Path, _Frames, _State) ->
