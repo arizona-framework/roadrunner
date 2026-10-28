@@ -225,7 +225,9 @@ server directly, while the retry-safe refusal suits a proxy that can try
 another backend. In shed mode HTTP/1 requests count against the ceiling
 too, so it is one in-flight budget across every protocol; an HTTP/1
 request over it gets the 503 with `connection: close` before any of its
-body is read. A shed request emits `request_throttled` and increments
+body is read. A WebSocket upgrade holds its slot only until the `101`
+is out: the session after it is a connection, which `max_clients`
+bounds. A shed request emits `request_throttled` and increments
 `throttled`, like a refused one. Connections over `max_clients` are
 still closed without a response: answering them would cost a process,
 and on TLS a handshake, for clients the server is turning away. Setting

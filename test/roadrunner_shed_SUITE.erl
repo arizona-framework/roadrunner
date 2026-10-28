@@ -18,6 +18,7 @@ other ceiling cases in `roadrunner_http3_SUITE`.
     h1_slot_is_released_between_requests/1,
     h1_slot_is_released_on_close/1,
     h1_refuse_mode_leaves_http1_out/1,
+    h1_websocket_session_releases_its_slot/1,
     h2_stream_over_the_ceiling_gets_503/1
 ]).
 
@@ -33,6 +34,7 @@ all() ->
         h1_slot_is_released_between_requests,
         h1_slot_is_released_on_close,
         h1_refuse_mode_leaves_http1_out,
+        h1_websocket_session_releases_its_slot,
         h2_stream_over_the_ceiling_gets_503
     ].
 
@@ -60,6 +62,7 @@ end_per_testcase(_Case, Config) ->
     ok = roadrunner_listener:stop(?config(listener, Config)).
 
 case_opts(h1_refuse_mode_leaves_http1_out) -> #{overload_mode => refuse};
+case_opts(h1_websocket_session_releases_its_slot) -> #{routes => roadrunner_ws_upgrade_handler};
 case_opts(h2_stream_over_the_ceiling_gets_503) -> #{protocols => [http2]};
 case_opts(_Case) -> #{}.
 
@@ -156,6 +159,20 @@ h1_refuse_mode_leaves_http1_out(Config) ->
     ok = gen_tcp:close(First),
     ok = gen_tcp:close(Second).
 
+h1_websocket_session_releases_its_slot(Config) ->
+    %% A WebSocket session is a connection, not an in-flight request: its
+    %% upgrade hands the slot back, so with a ceiling of 1 a second
+    %% upgrade is admitted while the first session is still open.
+    First = connect(Config),
+    ok = gen_tcp:send(First, ws_upgrade_request()),
+    ?assertMatch(<<"HTTP/1.1 101 ", _/binary>>, recv_head(First, <<>>)),
+    Second = connect(Config),
+    ok = gen_tcp:send(Second, ws_upgrade_request()),
+    ?assertMatch(<<"HTTP/1.1 101 ", _/binary>>, recv_head(Second, <<>>)),
+    ?assertMatch(#{throttled := 0}, roadrunner_listener:info(?config(listener, Config))),
+    ok = gen_tcp:close(First),
+    ok = gen_tcp:close(Second).
+
 h2_stream_over_the_ceiling_gets_503(Config) ->
     %% Stream 1 holds the slot; stream 3 is answered 503 + Retry-After on
     %% its own stream (not REFUSED_STREAM), then reset with NO_ERROR.
@@ -184,6 +201,22 @@ connect(Config) ->
 
 get_request() ->
     ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n".
+
+ws_upgrade_request() ->
+    [
+        ~"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
+        ~"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    ].
+
+%% A response head, up to its blank line.
+recv_head(Sock, Acc) ->
+    case binary:split(Acc, ~"\r\n\r\n") of
+        [Head, _] ->
+            Head;
+        [_] ->
+            {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+            recv_head(Sock, <<Acc/binary, Data/binary>>)
+    end.
 
 expect_handler() ->
     receive

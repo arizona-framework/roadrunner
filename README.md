@@ -462,7 +462,7 @@ type. Beyond `port`,
 - **Per-conn hibernation**: `hibernate_after`
 - **Handler spawn opts**: `handler_spawn`
 - **WebSocket**: `ws`: `max_frame_size`, `max_message_size`, `recv_buffer`,
-  `hibernate_after`
+  `hibernate_after`, `idle_timeout`, `compress`, `active`
 - **HTTP/1 tunables**: Under the `{http1, Opts}` entry in `protocols`:
   `max_request_line`, `max_header_line`, `max_header_block`,
   `max_header_count`, `linger_timeout`
