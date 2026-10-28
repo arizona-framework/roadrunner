@@ -652,6 +652,24 @@ parse_frame_rsv1_default_rejected_test() ->
     ?assertEqual({error, bad_rsv}, roadrunner_ws:parse_frame(Frame, #{})),
     ?assertEqual({error, bad_rsv}, roadrunner_ws:parse_frame(Frame, #{allow_rsv1 => false})).
 
+parse_frame_rsv1_on_control_or_continuation_rejected_test() ->
+    %% RFC 7692 §6.1: only a message's first data frame may carry RSV1,
+    %% even once permessage-deflate is negotiated.
+    [
+        begin
+            Frame = <<1:1, 1:1, 0:2, Op:4, 1:1, 0:7, 1, 2, 3, 4>>,
+            ?assertEqual(
+                {error, bad_rsv}, roadrunner_ws:parse_frame(Frame, #{allow_rsv1 => true}), Op
+            ),
+            ?assertEqual(
+                {error, bad_rsv},
+                roadrunner_ws:peek_frame_header(Frame, #{allow_rsv1 => true}),
+                Op
+            )
+        end
+     || Op <- [0, 8, 9, 10]
+    ].
+
 parse_frame_rsv2_always_rejected_test() ->
     %% RSV2 set — no IETF extension uses it; reject even with
     %% allow_rsv1 => true.

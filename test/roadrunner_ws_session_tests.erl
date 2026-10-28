@@ -1353,6 +1353,33 @@ pmd_three_way_fragmented_compressed_message_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
+pmd_rsv1_on_ping_closes_1002_test() ->
+    %% RFC 7692 §6.1: RSV1 on a control frame fails the connection, even
+    %% with permessage-deflate negotiated.
+    Self = self(),
+    Tag = make_ref(),
+    Mask = <<5, 6, 7, 8>>,
+    Ping = <<16#C9, (16#80 bor 2), Mask/binary, (mask(~"hi", Mask))/binary>>,
+    Sink = spawn_active_sink(Self, Tag, [{recv, Ping}]),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            pmd_negotiated(),
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    ok = await_normal_down(Ref, Pid),
+    ?assertEqual(<<16#88, 2, 1002:16>>, iolist_to_binary(collect_sends(Tag, 100))),
+    Sink ! stop.
+
 pmd_corrupt_compressed_payload_stops_session_test() ->
     %% Garbage bytes in a frame with RSV1=1 — inflate fails. Session
     %% must terminate cleanly (no crash, no half-sent reply).
