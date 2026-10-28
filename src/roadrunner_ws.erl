@@ -18,7 +18,7 @@ frames.
 
 -export([accept_key/1, handshake_response/3]).
 -export([parse_frame/1, parse_frame/2]).
--export([parse_frame_known/3]).
+-export([parse_frame_known/3, match_data_frame/1]).
 -export([peek_frame_header/2]).
 -export([encode_frame/3, encode_frame/4]).
 -export([parse_extensions/1, negotiate_extensions/1]).
@@ -616,6 +616,31 @@ parse_frame_known(
 -spec known_payload(binary() | undefined, binary(), binary()) -> binary().
 known_payload(undefined, Payload, MaskKey) -> unmask(Payload, MaskKey);
 known_payload(Pre, _Payload, _MaskKey) -> Pre.
+
+%% Match a complete, final, uncompressed, masked text or binary frame of
+%% up to 64 KB (7- or 16-bit length) at the head of `Buf`, for
+%% `roadrunner_ws_session`'s one-step dispatch. Returns the payload
+%% still masked, with the mask key as an integer for `unmask_words/2`.
+%% Anything else, including every frame `parse_frame/2` would reject,
+%% is `partial`: the caller takes the general peek-and-parse path,
+%% which reports it.
+-doc false.
+-spec match_data_frame(binary()) ->
+    {text | binary, 0..16#FFFFFFFF, Masked :: binary(), Rest :: binary()} | partial.
+match_data_frame(<<1:1, 0:3, Op:4, 1:1, Len:7, MaskKey:32, Masked:Len/binary, Rest/binary>>) when
+    Len < 126, (Op =:= ?OP_TEXT orelse Op =:= ?OP_BINARY)
+->
+    {ok, Opcode} = decode_opcode(Op),
+    {Opcode, MaskKey, Masked, Rest};
+match_data_frame(
+    <<1:1, 0:3, Op:4, 1:1, 126:7, Len:16, MaskKey:32, Masked:Len/binary, Rest/binary>>
+) when
+    Op =:= ?OP_TEXT orelse Op =:= ?OP_BINARY
+->
+    {ok, Opcode} = decode_opcode(Op),
+    {Opcode, MaskKey, Masked, Rest};
+match_data_frame(_Buf) ->
+    partial.
 
 -spec do_parse_frame(binary(), boolean(), binary() | undefined) -> parse_result().
 do_parse_frame(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1, _Pre) when
