@@ -68,7 +68,8 @@
     skip_continue/1,
     send_body/4,
     send_body_error/3,
-    drain_body/1,
+    drain_reader/1,
+    close_opts/1,
     keep_alive_decision/2,
     send_request_timeout/1,
     send_bad_request/1,
@@ -100,8 +101,23 @@
 ]).
 
 -export_type([
-    proto_opts/0, dispatch/0, rate_limit/0, rate_limit_state/0, overload/0, resolved/0
+    proto_opts/0,
+    close_opts/0,
+    dispatch/0,
+    rate_limit/0,
+    rate_limit_state/0,
+    overload/0,
+    resolved/0
 ]).
+
+%% The part of `proto_opts()` a connection's close path reads
+%% (`release_slot/1`, `unregister_for_drain/1`): what a WebSocket session
+%% keeps for its whole lifetime instead of the full listener options.
+-type close_opts() :: #{
+    client_counter := counters:counters_ref(),
+    drain_table => ets:table(),
+    _ => _
+}.
 
 %% A request's routing outcome (`resolve_handler/2`): the handler, its
 %% bindings, pipeline and state, and the matched route's limits.
@@ -340,7 +356,7 @@ with `register_for_drain/1`. The listener owns the table, and `stop/1`
 does not wait for in-flight conns, so a conn that outlives its listener
 finds no registry to leave and that is fine.
 """.
--spec unregister_for_drain(proto_opts()) -> ok.
+-spec unregister_for_drain(close_opts()) -> ok.
 unregister_for_drain(#{drain_table := Table}) ->
     try ets:delete(Table, self()) of
         true -> ok
@@ -390,10 +406,16 @@ try_acquire_slot(#{client_counter := Ref, max_clients := Max}) ->
     end.
 
 -doc "Decrement the live-connection counter, paired with `try_acquire_slot/1`.".
--spec release_slot(proto_opts()) -> ok.
+-spec release_slot(close_opts()) -> ok.
 release_slot(#{client_counter := Ref}) ->
     ok = counters:sub(Ref, 1, 1),
     ok.
+
+%% The close-path slice of `ProtoOpts` (`close_opts()`).
+-doc false.
+-spec close_opts(proto_opts()) -> close_opts().
+close_opts(ProtoOpts) ->
+    maps:with([client_counter, drain_table], ProtoOpts).
 
 -doc """
 Try to bump the live in-flight-request counter under
@@ -1333,15 +1355,15 @@ read_chunked(Buf, RecvFun, MaxCL, Body, TrailerLimits) ->
             E
     end.
 
-%% Read and discard whatever the handler left in the manual-mode
-%% `body_reader`, returning any post-body leftover bytes that belong
-%% to a pipelined next request. Called only on the 4-tuple response
-%% path; `roadrunner_conn_loop`'s finishing phase threads `Leftover`
-%% forward into the next `reading_request` parse so pipelined
-%% clients get their N+1 request seen.
+%% Read and discard whatever the handler left in a manual-mode
+%% `body_reader`, returning any post-body leftover bytes that belong to a
+%% pipelined next request. `roadrunner_conn_loop`'s finishing phase
+%% threads `Leftover` forward into the next `reading_request` parse so
+%% pipelined clients get their N+1 request seen; a WebSocket session's
+%% close path, which keeps the reader but not the request, drains it too.
 -doc false.
--spec drain_body(roadrunner_req:request()) -> {ok, binary()} | {error, term()}.
-drain_body(#{body_reader := BS}) ->
+-spec drain_reader(roadrunner_req:body_reader()) -> {ok, binary()} | {error, term()}.
+drain_reader(BS) ->
     case consume_body_reader(BS, all) of
         {ok, _Bytes, #{buffered := Leftover}} -> {ok, Leftover};
         {error, _} = E -> E

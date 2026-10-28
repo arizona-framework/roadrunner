@@ -209,22 +209,24 @@ tls_closed_before_arm_exits_cleanly(_Config) ->
         ws_max_message_size => 1024,
         ws_hibernate_after => infinity,
         ws_idle_timeout => infinity,
-        ws_active => undefined
+        ws_active => undefined,
+        handler_spawn_opts => []
     },
-    {ok, Pid} = proc_lib:start(roadrunner_ws_session, init_session, [
-        self(),
-        {
-            {ssl, Sock},
-            roadrunner_ws_echo_handler,
-            undefined,
-            {?MODULE, undefined, undefined},
-            none,
-            <<>>,
-            ProtoOpts
-        }
-    ]),
-    Ref = monitor(process, Pid),
-    Pid ! socket_ready,
+    {module, _} = code:ensure_loaded(roadrunner_ws_echo_handler),
+    {Pid, Ref} = spawn_monitor(fun() ->
+        roadrunner_ws_session:serve(
+            fun() -> exit(normal) end,
+            {
+                {ssl, Sock},
+                roadrunner_ws_echo_handler,
+                undefined,
+                {?MODULE, undefined},
+                none,
+                <<>>,
+                ProtoOpts
+            }
+        )
+    end),
     receive
         {'DOWN', Ref, process, Pid, Reason} -> ?assertEqual(normal, Reason)
     after 5000 -> ct:fail(session_still_running)

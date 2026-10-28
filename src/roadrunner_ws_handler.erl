@@ -30,6 +30,12 @@ with zero or more frames (each `{Opcode, Payload}` — always
 
 State is passed through unchanged by the framework.
 
+The session runs in the connection's own process, the one that served
+the upgrade request, so `self()` in a callback is the connection: a
+process the handler links to or monitors is tied to the connection's
+lifetime. A callback that raises ends the session: the crash is
+logged, `terminate/2` is not called, and the connection closes.
+
 The 4-tuple `{reply, Frames, NewState, Opts}` and 3-tuple
 `{ok, NewState, Opts}` variants accept an opt list. Currently
 recognized opt:
@@ -190,8 +196,12 @@ name (`t:roadrunner_listener:ws_opts/0`):
 - `max_frame_size`, `max_message_size`, `recv_buffer`,
   `hibernate_after`, `active` — as the listener's (`hibernate_after` also takes
   `infinity`, to turn the listener's off for this session).
-- `fullsweep_after`, `max_heap_size` — the session process's garbage
-  collection settings (`erlang:spawn_opt/4`).
+- `fullsweep_after`, `min_heap_size`, `max_heap_size` — the session's
+  garbage collection settings. The session runs in its connection's
+  process, which takes them for the session's lifetime
+  (`erlang:process_flag/2`); they default to the listener's
+  `handler_spawn` options. A larger `min_heap_size` trades memory per
+  session for fewer collections.
 
 The values are the application's to get right, as the rest of a
 response is: they are not checked at the upgrade, and a key not listed
@@ -207,6 +217,7 @@ here crashes it.
     hibernate_after => pos_integer() | infinity,
     active => once | 1..32767,
     fullsweep_after => non_neg_integer(),
+    min_heap_size => non_neg_integer(),
     max_heap_size => erlang:max_heap_size()
 }.
 

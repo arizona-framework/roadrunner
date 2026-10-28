@@ -1,26 +1,27 @@
 -module(roadrunner_ws_session).
 -moduledoc false.
 
-%% Per-connection WebSocket session — runs the frame loop in its own
-%% hand-rolled `proc_lib` process (never a gen_statem, mirroring
-%% `roadrunner_conn_loop_http2` / `roadrunner_quic_connection`) after
-%% the conn's `{websocket, Mod, State}` dispatch hands the socket off.
+%% Per-connection WebSocket session — runs the frame loop in the
+%% connection's own process (a hand-rolled loop, never a gen_statem,
+%% mirroring `roadrunner_conn_loop_http2` / `roadrunner_quic_connection`)
+%% after the conn's `{websocket, Mod, State}` dispatch.
 %%
-%% The session owns the socket for its lifetime: the parent conn calls
-%% `start/7`, which spawns the session, transfers controlling-process,
-%% sends the `socket_ready` startup signal (mirroring the conn's `shoot`
-%% pattern), and hands the session's monitor back so the conn can park
-%% in a hibernated wait (`roadrunner_conn_loop:ws_session_wake/6`)
-%% until the session terminates. When the session exits — peer close
-%% frame, recv error, frame parse error, or handler-driven `{close, _}`
-%% — the conn wakes and its `listener_conn_close` event fires
-%% after.
+%% `start/7` answers the upgrade (handshake check, handler check, 101) and
+%% hands back `{upgrade, Run}`; the conn calls `Run(Finish)` and the
+%% session takes over the process, on the socket the conn already owns:
+%% no second process, no ownership transfer, no monitor. When the session
+%% ends — peer close frame, recv error, frame parse error, handler-driven
+%% `{close, _}` or a handler crash — it calls `Finish()`, the conn's own
+%% close path (`roadrunner_conn_loop:ws_finish/4`), which fires
+%% `request_stop` and `listener_conn_close`, releases the listener slot
+%% and exits. Handler callbacks run under `try`, so a crash still takes
+%% that path (`handler_crashed/5`) and the slot is released at once.
 %%
 %% Phases (plain functions, not gen_statem states):
-%% - `awaiting_socket/1` — a selective `receive socket_ready` that gates
-%%   the frame loop until controlling-process has transferred and the
-%%   launcher has sent `socket_ready`. A drain (or stray) arriving first
-%%   stays queued and is handled by `recv_loop` afterwards.
+%% - `serve/2` — set the process up for the session (label, GC
+%%   settings, state), then `begin_session/1` runs the optional handler
+%%   `init/1`. A drain (or stray) that arrived first stays queued and is
+%%   handled by `recv_loop` afterwards.
 %% - `recv_loop/1` — parse/dispatch frames as they arrive; the socket is
 %%   in active-once mode so bytes arrive as messages and the process is
 %%   back in its `receive` between frames.
@@ -77,7 +78,7 @@
 %% `terminate/2` runs once from `exit_clean/2`, the funnel every orderly
 %% end goes through, with the reason the session ended.
 %%
-%% `init/1` runs once on the awaiting_socket → frame_loop transition,
+%% `init/1` runs once as the session begins (`begin_session/1`),
 %% **before** the first inbound frame; the handler can push priming
 %% frames or refuse the session by returning `{close, _}`. `handle_info/2`
 %% receives any non-transport info message (a pubsub broadcast a handler
@@ -88,15 +89,24 @@
 %% each is exported is cached in `#data` at session start so the BIF
 %% check doesn't run on every event.
 %%
-%% Events: `ws_upgrade` fires from the session process once its
-%% handler is validated, just before the launcher writes the 101; its
+%% Events: `ws_upgrade` fires once the handler is validated, just
+%% before the 101 is written; its
 %% span then rides along on the `ws_frame_in` / `ws_frame_out` /
 %% `ws_frame_rejected` events the session fires for every frame.
 
 -export([start/7]).
--export([init_session/2]).
+-export([serve/2]).
+
+-export_type([run/0, finish/0]).
 -export([recv_loop/1]).
 -export([unmask_slice/3]).
+
+%% What the session calls when it ends: the connection's close path,
+%% which never returns.
+-type finish() :: fun(() -> no_return()).
+
+%% The session `start/7` hands back, run with the connection's `finish()`.
+-type run() :: fun((finish()) -> no_return()).
 
 -type ws_context() :: {
     atom(), roadrunner_event_handler:peer(), binary() | undefined
@@ -212,7 +222,10 @@
     %% How the socket is read: `once` re-arms after every message, `N`
     %% arms `{active, N}` and re-arms on the transport's passive message
     %% (the `active` option, `arm_active/1`).
-    active :: once | 1..32767
+    active :: once | 1..32767,
+    %% The connection's close path, called once the session has ended
+    %% (`exit_clean/2`, `handler_crashed/5`).
+    finish :: finish()
 }).
 
 %% Per-message DEFLATE trailer (RFC 7692 §7.2.1). Sender strips it
@@ -230,19 +243,19 @@
 -define(WS_FRAGMENT_OVERHEAD, 64).
 
 -doc """
-Start the WebSocket session: spawn the session process, write the
-101 upgrade response, and transfer socket ownership. The process is
-started **before** the 101 hits the wire so a start failure can
-fall back to 500 without leaving the upgrade response sent with no
-process owning the socket. Returns `{session, MonitorRef, Pid}`
-once the handoff is complete — the caller owns the wait for the
-session's `'DOWN'` and forwards `{roadrunner_drain, _}` broadcasts
-to `Pid` (see `roadrunner_conn_loop:ws_session_wake/6`). Returns
-`rejected` when the handshake check fails (no session started: 426
-for a `Sec-WebSocket-Version` other than 13, 400 otherwise) or the
-session couldn't start (500 sent); every one of these responses
-carries `connection: close`, so the caller just runs its normal
-close path.
+Answer a WebSocket upgrade and hand back the session to run. Checks the
+handshake and the handler, applies `ws.recv_buffer`, fires
+`ws_upgrade` and writes the 101, then returns `{upgrade, Run}`: the
+caller (the connection process) calls `Run(Finish)` when it is ready,
+and the session runs its frame loop **in the caller's process**, on the
+socket the caller owns, until the session ends and calls `Finish()`,
+the caller's own close path, which never returns.
+
+Returns `rejected` when the handshake check fails (426 for a
+`Sec-WebSocket-Version` other than 13, 400 otherwise) or the handler
+module cannot serve a session (not loadable, or no `handle_frame/2`:
+500), all sent before any 101 and carrying `connection: close`, so the
+caller just runs its normal close path.
 
 `Buffered` is any bytes the conn already read past the upgrade request
 (a client that pipelines its first frame in the handshake segment).
@@ -256,14 +269,14 @@ They seed the session buffer so the first frame isn't lost.
     roadrunner_ws_handler:upgrade_opts(),
     binary(),
     roadrunner_conn:proto_opts()
-) -> {session, reference(), pid()} | rejected.
+) -> {upgrade, run()} | rejected.
 start(Socket, Req, Mod, State, Opts, Buffered, ListenerOpts) ->
     #{ws_compress := Compress} = ProtoOpts = session_opts(Opts, ListenerOpts),
     Headers = roadrunner_req:headers(Req),
     case roadrunner_ws:handshake_response(Headers, maps:get(headers, Opts, []), Compress) of
         {ok, Status, RespHeaders, _, Negotiated} ->
             UpgradeResp = roadrunner_http1:response(Status, RespHeaders, ~""),
-            start_session(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts);
+            upgrade(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts);
         {error, unsupported_websocket_version} ->
             _ = send_upgrade_required(Socket),
             rejected;
@@ -300,7 +313,7 @@ session_opt(active, V, Opts) ->
 session_opt(hibernate_after, V, Opts) ->
     Opts#{ws_hibernate_after := V};
 session_opt(Flag, V, #{handler_spawn_opts := Spawn} = Opts) when
-    Flag =:= fullsweep_after; Flag =:= max_heap_size
+    Flag =:= fullsweep_after; Flag =:= min_heap_size; Flag =:= max_heap_size
 ->
     Opts#{handler_spawn_opts := lists:keystore(Flag, 1, Spawn, {Flag, V})}.
 
@@ -324,7 +337,7 @@ send_upgrade_required(Socket) ->
     ),
     roadrunner_transport:send(Socket, Resp).
 
--spec start_session(
+-spec upgrade(
     roadrunner_transport:socket(),
     roadrunner_req:request(),
     module(),
@@ -333,47 +346,25 @@ send_upgrade_required(Socket) ->
     roadrunner_ws:negotiated(),
     binary(),
     roadrunner_conn:proto_opts()
-) -> {session, reference(), pid()} | rejected.
-start_session(
-    Socket,
-    Req,
-    Mod,
-    State,
-    UpgradeResp,
-    Negotiated,
-    Buffered,
-    #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts
-) ->
-    ok = apply_ws_buffer(Socket, ProtoOpts),
-    Ctx = ws_context(Req),
-    %% Start the session **before** writing the 101 to the wire so a
-    %% start failure never leaves the upgrade response sent with no
-    %% process owning the socket. `proc_lib:start` (not `start_link`) —
-    %% the conn is intentionally unlinked from its children so a session
-    %% crash never propagates to the conn process; we synchronise via a
-    %% monitor instead. `init_session/2` validates the handler and
-    %% `init_ack`s `{ok, _}` | `{error, {bad_handler, _}}` before the 101,
-    %% so a bad handler still yields a 500 with no 101 on the wire.
+) -> {upgrade, run()} | rejected.
+upgrade(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) ->
+    %% The handler is checked **before** the 101 goes out, so a module
+    %% that cannot serve a session is answered 500 with no upgrade on the
+    %% wire.
     case
-        proc_lib:start(
-            ?MODULE,
-            init_session,
-            [self(), {Socket, Mod, State, Ctx, Negotiated, Buffered, ProtoOpts}],
-            StartTimeout,
-            SpawnOpts
-        )
+        code:ensure_loaded(Mod) =:= {module, Mod} andalso
+            erlang:function_exported(Mod, handle_frame, 2)
     of
-        {ok, Pid} ->
+        true ->
+            ok = apply_ws_buffer(Socket, ProtoOpts),
+            {ListenerName, Peer, RequestId} = ws_context(Req),
+            Span = roadrunner_event:ws_upgrade(ListenerName, Peer, RequestId, Mod),
             _ = roadrunner_event:response_send(
                 roadrunner_transport:send(Socket, UpgradeResp), websocket_upgrade_response
             ),
-            Ref = monitor(process, Pid),
-            ok = roadrunner_transport:controlling_process(Socket, Pid),
-            Pid ! socket_ready,
-            {session, Ref, Pid};
-        {error, _Reason} ->
-            %% Couldn't start the session — the 101 was never on the
-            %% wire, so we can fall back to 500 without a protocol leak.
+            Args = {Socket, Mod, State, {ListenerName, Span}, Negotiated, Buffered, ProtoOpts},
+            {upgrade, fun(Finish) -> serve(Finish, Args) end};
+        false ->
             _ = roadrunner_conn:send_internal_error(Socket),
             rejected
     end.
@@ -394,76 +385,83 @@ apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
     _ = roadrunner_transport:setopts(Socket, [{buffer, Buffer}]),
     ok.
 
-%% proc_lib entry (started via `proc_lib:start/5` from `start_session/8`).
-%% Validates the handler and `init_ack`s the outcome to the launcher
-%% BEFORE the 101 is written: `{ok, self()}` lets the launcher send the
-%% 101, `{error, {bad_handler, _}}` makes `proc_lib:start` return an
-%% error so the launcher's 500 fallback runs with no 101 on the wire.
--spec init_session(pid(), {
+%% Run the session in the calling process until it ends, then call
+%% `Finish()`. The process takes the session's label and its garbage
+%% collection settings (the listener's `handler_spawn` options with the
+%% upgrade's own `fullsweep_after`, `min_heap_size` and `max_heap_size`
+%% laid over them), so a session behaves as it would in a process of its
+%% own. The handler module is loaded and valid (`upgrade/8` checked it),
+%% which `erlang:function_exported/3` below relies on. Exported for the
+%% session tests, which run it in a process of their own with a `Finish`
+%% that just exits.
+-doc false.
+-spec serve(finish(), {
     roadrunner_transport:socket(),
     module(),
     term(),
-    ws_context(),
+    {atom(), roadrunner_event_handler:span()},
     roadrunner_ws:negotiated(),
     binary(),
     roadrunner_conn:proto_opts()
-}) -> ok | no_return().
-init_session(
-    Parent,
-    {Socket, Mod, State, {ListenerName, Peer, RequestId}, Negotiated, Buffered, ProtoOpts}
+}) -> no_return().
+serve(
+    Finish,
+    {Socket, Mod, State, {ListenerName, Span}, Negotiated, Buffered, ProtoOpts}
 ) ->
     proc_lib:set_label({?MODULE, ListenerName}),
-    case
-        code:ensure_loaded(Mod) =:= {module, Mod} andalso
-            erlang:function_exported(Mod, handle_frame, 2)
-    of
-        true ->
-            {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
-            #{
-                ws_max_frame_size := MaxFrame,
-                ws_max_message_size := MaxMsg,
-                ws_hibernate_after := HibernateAfter,
-                ws_idle_timeout := IdleTimeout,
-                ws_active := Active
-            } = ProtoOpts,
-            Data = #data{
-                socket = Socket,
-                buffer = Buffered,
-                mod = Mod,
-                mod_state = State,
-                %% The handler is valid and the 101 goes out once the
-                %% launcher has the ack, so the upgrade fires here: the
-                %% session owns the span its frame events carry.
-                span = roadrunner_event:ws_upgrade(ListenerName, Peer, RequestId, Mod),
-                callbacks = #callbacks{
-                    init = erlang:function_exported(Mod, init, 1),
-                    handle_info = erlang:function_exported(Mod, handle_info, 2),
-                    handle_drain = erlang:function_exported(Mod, handle_drain, 2),
-                    handle_control = erlang:function_exported(Mod, handle_control, 2),
-                    terminate = erlang:function_exported(Mod, terminate, 2)
-                },
-                pmd_params = PmdParams,
-                inflate_z = InflateZ,
-                deflate_z = DeflateZ,
-                max_frame_size = MaxFrame,
-                max_message_size = MaxMsg,
-                hibernate_after = HibernateAfter,
-                idle = #idle{timeout = IdleTimeout},
-                active = read_mode(Active, Socket),
-                msg_acc = undefined,
-                msg_opcode = undefined,
-                msg_compressed = false,
-                msg_size = 0,
-                utf8_pending = <<>>,
-                frame_validated = 0,
-                unmasked_buf = <<>>,
-                out = []
-            },
-            proc_lib:init_ack(Parent, {ok, self()}),
-            awaiting_socket(Data);
-        false ->
-            proc_lib:init_ack(Parent, {error, {bad_handler, Mod}})
-    end.
+    #{
+        handler_spawn_opts := SpawnOpts,
+        ws_max_frame_size := MaxFrame,
+        ws_max_message_size := MaxMsg,
+        ws_hibernate_after := HibernateAfter,
+        ws_idle_timeout := IdleTimeout,
+        ws_active := Active
+    } = ProtoOpts,
+    ok = apply_gc_settings(SpawnOpts),
+    {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
+    Data = #data{
+        socket = Socket,
+        buffer = Buffered,
+        mod = Mod,
+        mod_state = State,
+        span = Span,
+        callbacks = #callbacks{
+            init = erlang:function_exported(Mod, init, 1),
+            handle_info = erlang:function_exported(Mod, handle_info, 2),
+            handle_drain = erlang:function_exported(Mod, handle_drain, 2),
+            handle_control = erlang:function_exported(Mod, handle_control, 2),
+            terminate = erlang:function_exported(Mod, terminate, 2)
+        },
+        pmd_params = PmdParams,
+        inflate_z = InflateZ,
+        deflate_z = DeflateZ,
+        max_frame_size = MaxFrame,
+        max_message_size = MaxMsg,
+        hibernate_after = HibernateAfter,
+        idle = #idle{timeout = IdleTimeout},
+        active = read_mode(Active, Socket),
+        msg_acc = undefined,
+        msg_opcode = undefined,
+        msg_compressed = false,
+        msg_size = 0,
+        utf8_pending = <<>>,
+        frame_validated = 0,
+        unmasked_buf = <<>>,
+        out = [],
+        finish = Finish
+    },
+    begin_session(arm_active(arm_idle(Data))).
+
+%% Apply the session's garbage collection settings to the running
+%% process: `process_flag/2` takes the same keys a spawn would.
+-spec apply_gc_settings([proc_lib:start_spawn_option()]) -> ok.
+apply_gc_settings(SpawnOpts) ->
+    _ = [
+        process_flag(Flag, Value)
+     || {Flag, Value} <- SpawnOpts,
+        Flag =:= fullsweep_after orelse Flag =:= min_heap_size orelse Flag =:= max_heap_size
+    ],
+    ok.
 
 %% Set up the inflate / deflate contexts when permessage-deflate was
 %% negotiated. Inflate uses the client's max-window-bits (server's
@@ -486,24 +484,17 @@ init_pmd({permessage_deflate, Params, _ResponseValue}) ->
     ok = zlib:deflateInit(DeflateZ, default, deflated, -ServerWB, 8, default),
     {Params, InflateZ, DeflateZ}.
 
-%% Gate the loop until the launcher hands the socket over. A selective
-%% receive on `socket_ready` only: a `{roadrunner_drain, _}` (or any
-%% stray) that arrives first stays queued and is handled by `recv_loop`
-%% after the optional handler `init/1` runs — the proc_lib equivalent of
-%% the old gen_statem `[postpone]`, and it keeps `init/1` firing once,
-%% before any frame.
--spec awaiting_socket(#data{}) -> no_return().
-awaiting_socket(#data{callbacks = #callbacks{init = true}, mod = Mod, mod_state = State} = Data) ->
-    receive
-        socket_ready ->
-            apply_handler_result(
-                Mod:init(State), arm_active(arm_idle(Data)), false, fun enter_frame_loop/2, normal
-            )
+%% The optional handler `init/1` runs once, before any frame. A drain or
+%% stray message that arrived first stays queued for `recv_loop/1`.
+-spec begin_session(#data{}) -> no_return().
+begin_session(#data{callbacks = #callbacks{init = true}, mod = Mod, mod_state = State} = Data) ->
+    try Mod:init(State) of
+        Result -> apply_handler_result(Result, Data, false, fun enter_frame_loop/2, normal)
+    catch
+        Class:Reason:Stack -> handler_crashed(init, Class, Reason, Stack, Data)
     end;
-awaiting_socket(Data) ->
-    receive
-        socket_ready -> enter_frame_loop(arm_active(arm_idle(Data)), false)
-    end.
+begin_session(Data) ->
+    enter_frame_loop(Data, false).
 
 %% The `active` option for this session's socket. Unset, plain TCP reads
 %% with `once`: a re-arm there is a cheap port call, the gap between arms
@@ -530,8 +521,7 @@ arm_active(#data{socket = Socket, active = N} = Data) ->
         {error, Reason} -> exit_clean({error, Reason}, Data)
     end.
 
-%% Arm the idle timer from the socket's received-byte count now (the
-%% session owns the socket once `socket_ready` arrives).
+%% Arm the idle timer from the socket's received-byte count now.
 -spec arm_idle(#data{}) -> #data{}.
 arm_idle(#data{idle = #idle{timeout = infinity}} = Data) ->
     Data;
@@ -623,25 +613,58 @@ recv_loop(
     end.
 
 %% Run the handler's optional `terminate/2` with why the session ended,
-%% then release the permessage-deflate zlib contexts and exit normally.
-%% All normal termination paths funnel through here; a handler crash
-%% skips it (no `terminate/2`). The
-%% runtime would reclaim the zlib NIF resources on process exit anyway,
-%% but explicit release reclaims their working buffers immediately rather
-%% than waiting on GC. A crash skips this and relies on that GC. The
-%% conn's monitor sees `{'DOWN', _, _, _, normal}` and wakes from its
-%% hibernated wait to run the connection's close path.
+%% release the permessage-deflate zlib contexts, and hand over to the
+%% connection's close path (`#data.finish`), which closes the socket,
+%% releases the listener slot and exits. All normal termination paths
+%% funnel through here; a handler crash goes through `handler_crashed/5`
+%% instead (no `terminate/2`). Releasing the zlib contexts here frees
+%% their working buffers now, not when the process exits.
 -spec exit_clean(roadrunner_ws_handler:terminate_reason(), #data{}) -> no_return().
-exit_clean(Reason, #data{inflate_z = InflateZ, deflate_z = DeflateZ} = Data) ->
+exit_clean(Reason, #data{inflate_z = InflateZ, deflate_z = DeflateZ, finish = Finish} = Data) ->
     ok = terminate(Reason, Data),
     close_zlib(InflateZ),
     close_zlib(DeflateZ),
-    exit(normal).
+    Finish().
+
+%% A handler callback raised. The session runs in the connection process,
+%% so the crash is caught here rather than left to take the process down:
+%% that way the connection still closes its socket and releases its
+%% listener slot at once, as it did when the session had a process of its
+%% own and the connection saw it die. Logged like an HTTP handler crash;
+%% `terminate/2` is not called, as before.
+-spec handler_crashed(atom(), atom(), term(), list(), #data{}) -> no_return().
+handler_crashed(
+    Callback,
+    Class,
+    Reason,
+    Stack,
+    #data{mod = Mod, inflate_z = InflateZ, deflate_z = DeflateZ, finish = Finish}
+) ->
+    ok = log_handler_crash(Callback, Mod, Class, Reason, Stack),
+    close_zlib(InflateZ),
+    close_zlib(DeflateZ),
+    Finish().
+
+-spec log_handler_crash(atom(), module(), atom(), term(), list()) -> ok.
+log_handler_crash(Callback, Mod, Class, Reason, Stack) ->
+    logger:error(#{
+        msg => "roadrunner websocket handler crashed",
+        handler => Mod,
+        callback => Callback,
+        class => Class,
+        reason => Reason,
+        stacktrace => Stack
+    }).
 
 -spec terminate(roadrunner_ws_handler:terminate_reason(), #data{}) -> ok.
 terminate(Reason, #data{callbacks = #callbacks{terminate = true}, mod = Mod, mod_state = State}) ->
-    _ = Mod:terminate(Reason, State),
-    ok;
+    %% The session is ending anyway: a crash here is logged and the
+    %% connection still closes normally.
+    try Mod:terminate(Reason, State) of
+        _ -> ok
+    catch
+        Class:CrashReason:Stack -> log_handler_crash(terminate, Mod, Class, CrashReason, Stack)
+    end;
 terminate(_Reason, #data{callbacks = #callbacks{terminate = false}}) ->
     ok.
 
@@ -753,7 +776,7 @@ dispatch_whole_frame(Opcode, true, MaskKey, Masked, Rest, Data, Hibernate) ->
 dispatch_message(Opcode, Payload, Rest, Data, Hibernate) ->
     #data{socket = Socket, span = Span, mod = Mod, mod_state = State, out = Out} = Data,
     Frame = #{fin => true, rsv1 => false, opcode => Opcode, payload => Payload},
-    case Mod:handle_frame(Frame, State) of
+    try Mod:handle_frame(Frame, State) of
         {reply, [_ | _] = OutFrames, NewState} when Rest =:= <<>>, Out =:= [] ->
             _ = roadrunner_transport:send(Socket, encode_frames(Data, Span, OutFrames)),
             arm_and_recv(Data#data{buffer = <<>>, mod_state = NewState}, Hibernate);
@@ -769,6 +792,8 @@ dispatch_message(Opcode, Payload, Rest, Data, Hibernate) ->
             apply_handler_result(
                 Result, Data#data{buffer = Rest}, Hibernate, fun process_buffer/2, normal
             )
+    catch
+        Class:Reason:Stack -> handler_crashed(handle_frame, Class, Reason, Stack, Data)
     end.
 
 -spec process_partial(#data{}, boolean()) -> no_return().
@@ -1437,17 +1462,21 @@ control_frame(
     #data{callbacks = #callbacks{handle_control = true}, mod = Mod, mod_state = State} = Data,
     Hibernate
 ) ->
-    apply_handler_result(
-        Mod:handle_control(Frame, State), Data, Hibernate, fun process_buffer/2, normal
-    );
+    try Mod:handle_control(Frame, State) of
+        Result -> apply_handler_result(Result, Data, Hibernate, fun process_buffer/2, normal)
+    catch
+        Class:Reason:Stack -> handler_crashed(handle_control, Class, Reason, Stack, Data)
+    end;
 control_frame(_Frame, #data{callbacks = #callbacks{handle_control = false}} = Data, Hibernate) ->
     process_buffer(Data, Hibernate).
 
 -spec dispatch_data_frame(roadrunner_ws:frame(), #data{}, boolean()) -> no_return().
 dispatch_data_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate) ->
-    apply_handler_result(
-        Mod:handle_frame(Frame, State), Data, Hibernate, fun process_buffer/2, normal
-    ).
+    try Mod:handle_frame(Frame, State) of
+        Result -> apply_handler_result(Result, Data, Hibernate, fun process_buffer/2, normal)
+    catch
+        Class:Reason:Stack -> handler_crashed(handle_frame, Class, Reason, Stack, Data)
+    end.
 
 -spec handle_info_msg(term(), #data{}, boolean()) -> no_return().
 handle_info_msg(
@@ -1455,9 +1484,11 @@ handle_info_msg(
     #data{callbacks = #callbacks{handle_info = true}, mod = Mod, mod_state = State} = Data,
     Hibernate
 ) ->
-    apply_handler_result(
-        Mod:handle_info(Msg, State), Data, Hibernate, fun flush_and_wait/2, normal
-    );
+    try Mod:handle_info(Msg, State) of
+        Result -> apply_handler_result(Result, Data, Hibernate, fun flush_and_wait/2, normal)
+    catch
+        Class:Reason:Stack -> handler_crashed(handle_info, Class, Reason, Stack, Data)
+    end;
 handle_info_msg(_Msg, #data{callbacks = #callbacks{handle_info = false}} = Data, _Hibernate) ->
     recv_loop(Data).
 
@@ -1467,9 +1498,11 @@ handle_drain_msg(
     #data{callbacks = #callbacks{handle_drain = true}, mod = Mod, mod_state = State} = Data,
     Hibernate
 ) ->
-    apply_handler_result(
-        Mod:handle_drain(Deadline, State), Data, Hibernate, fun flush_and_wait/2, shutdown
-    );
+    try Mod:handle_drain(Deadline, State) of
+        Result -> apply_handler_result(Result, Data, Hibernate, fun flush_and_wait/2, shutdown)
+    catch
+        Class:Reason:Stack -> handler_crashed(handle_drain, Class, Reason, Stack, Data)
+    end;
 handle_drain_msg(
     _Deadline, #data{callbacks = #callbacks{handle_drain = false}} = Data, _Hibernate
 ) ->
