@@ -18,6 +18,8 @@ timeout, size caps and the session process's GC settings. The handler is
     traffic_keeps_session_open/1,
     listener_idle_timeout/1,
     tls_idle_session_closes/1,
+    tls_echo_past_active_window/1,
+    tls_closed_before_arm_exits_cleanly/1,
     upgrade_frame_cap/1,
     upgrade_gc_settings/1,
     every_option_accepted/1
@@ -37,6 +39,8 @@ all() ->
         traffic_keeps_session_open,
         listener_idle_timeout,
         tls_idle_session_closes,
+        tls_echo_past_active_window,
+        tls_closed_before_arm_exits_cleanly,
         upgrade_frame_cap,
         upgrade_gc_settings,
         every_option_accepted
@@ -56,7 +60,11 @@ init_per_testcase(Case, Config) ->
 end_per_testcase(_Case, _Config) ->
     ok = roadrunner_listener:stop(?MODULE).
 
-listener_tls(tls_idle_session_closes) ->
+listener_tls(Case) when
+    Case =:= tls_idle_session_closes;
+    Case =:= tls_echo_past_active_window;
+    Case =:= tls_closed_before_arm_exits_cleanly
+->
     {ok, _} = application:ensure_all_started(ssl),
     #{tls => roadrunner_test_certs:server_opts()};
 listener_tls(_Case) ->
@@ -153,6 +161,70 @@ tls_idle_session_closes(Config) ->
     ?assertMatch(<<"HTTP/1.1 101", _/binary>>, Bytes),
     _ = session(),
     ?assertEqual({terminated, timeout}, terminated()).
+
+tls_echo_past_active_window(Config) ->
+    %% A TLS session reads with `{active, N}`; more echoes than one arm
+    %% allows make ssl report the socket passive, and the session re-arms
+    %% it and keeps answering.
+    {ok, Sock} = ssl:connect(
+        {127, 0, 0, 1},
+        ?config(port, Config),
+        [binary, {active, false}, {verify, verify_none}],
+        5000
+    ),
+    ok = ssl:send(Sock, upgrade_request([])),
+    {ok, Bytes} = ssl:recv(Sock, 0, 5000),
+    ?assertMatch(<<"HTTP/1.1 101", _/binary>>, Bytes),
+    ok = lists:foreach(
+        fun(_) ->
+            ok = ssl:send(Sock, masked(16#81, ~"hi")),
+            ?assertEqual({ok, <<16#81, 2, "hi">>}, ssl:recv(Sock, 4, 1000))
+        end,
+        lists:seq(1, 20)
+    ).
+
+tls_closed_before_arm_exits_cleanly(_Config) ->
+    %% A TLS socket that is already closed when the session arms it for
+    %% `{active, N}` ends the session normally instead of crashing it.
+    {ok, LSock} = ssl:listen(0, [binary, {active, false} | roadrunner_test_certs:server_opts()]),
+    {ok, {_, Port}} = ssl:sockname(LSock),
+    Client = spawn_link(fun() ->
+        {ok, _} = ssl:connect(
+            {127, 0, 0, 1}, Port, [binary, {active, false}, {verify, verify_none}], 5000
+        ),
+        receive
+            stop -> ok
+        end
+    end),
+    {ok, Accepted} = ssl:transport_accept(LSock, 5000),
+    {ok, Sock} = ssl:handshake(Accepted, 5000),
+    ok = ssl:close(Sock),
+    ProtoOpts = #{
+        ws_max_frame_size => 1024,
+        ws_max_message_size => 1024,
+        ws_hibernate_after => infinity,
+        ws_idle_timeout => infinity
+    },
+    {ok, Pid} = proc_lib:start(roadrunner_ws_session, init_session, [
+        self(),
+        {
+            {ssl, Sock},
+            roadrunner_ws_echo_handler,
+            undefined,
+            {?MODULE, undefined, undefined},
+            none,
+            <<>>,
+            ProtoOpts
+        }
+    ]),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    receive
+        {'DOWN', Ref, process, Pid, Reason} -> ?assertEqual(normal, Reason)
+    after 5000 -> ct:fail(session_still_running)
+    end,
+    Client ! stop,
+    ok = ssl:close(LSock).
 
 %% =============================================================================
 %% Size caps and process settings

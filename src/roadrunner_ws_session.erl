@@ -32,6 +32,9 @@
 %% frames the process is idle in `receive` and an `erlang:hibernate/3`
 %% continuation can take effect. Without active mode we'd be blocked
 %% inside `roadrunner_transport:recv/3` and hibernation would be a no-op.
+%% A TLS session instead arms `{active, N}` once and re-arms only when
+%% ssl reports the socket passive (`arm_tls/1`): on TLS every re-arm is
+%% a synchronous call into the ssl connection process.
 %%
 %% ## Outbound coalescing
 %%
@@ -219,6 +222,10 @@
 %% least this much per fragment keeps real reassembly memory bounded by
 %% the cap (this is ~2x the actual cons-cell cost, a safe over-estimate).
 -define(WS_FRAGMENT_OVERHEAD, 64).
+
+%% Reads a TLS session takes per `{active, N}` arm (`arm_tls/1`), the same
+%% default HTTP/2 uses for its connections.
+-define(TLS_ACTIVE_N, 16).
 
 -doc """
 Start the WebSocket session: spawn the session process, write the
@@ -484,13 +491,28 @@ awaiting_socket(#data{callbacks = #callbacks{init = true}, mod = Mod, mod_state 
     receive
         socket_ready ->
             apply_handler_result(
-                Mod:init(State), arm_idle(Data), false, fun enter_frame_loop/2, normal
+                Mod:init(State), arm_tls(arm_idle(Data)), false, fun enter_frame_loop/2, normal
             )
     end;
 awaiting_socket(Data) ->
     receive
-        socket_ready -> enter_frame_loop(arm_idle(Data), false)
+        socket_ready -> enter_frame_loop(arm_tls(arm_idle(Data)), false)
     end.
+
+%% A TLS session reads with `{active, N}`: re-arming active-once on TLS
+%% is a synchronous call into the ssl connection process for every
+%% message, so the socket is armed for `?TLS_ACTIVE_N` reads here and
+%% re-armed only when ssl reports it passive (`recv_loop/1`). Plain TCP
+%% keeps active-once, whose re-arm is a cheap port call and whose gap
+%% lets several frames gather into one delivery.
+-spec arm_tls(#data{}) -> #data{}.
+arm_tls(#data{socket = {ssl, _} = Socket} = Data) ->
+    case roadrunner_transport:setopts(Socket, [{active, ?TLS_ACTIVE_N}]) of
+        ok -> Data;
+        {error, Reason} -> exit_clean({error, Reason}, Data)
+    end;
+arm_tls(Data) ->
+    Data.
 
 %% Arm the idle timer from the socket's received-byte count now (the
 %% session owns the socket once `socket_ready` arrives).
@@ -559,6 +581,9 @@ recv_loop(
             exit_clean({error, closed}, Data);
         {ErrorTag, _Sock, Reason} ->
             exit_clean({error, Reason}, Data);
+        {ssl_passive, _Sock} ->
+            %% A TLS session used up its `{active, N}` reads (`arm_tls/1`).
+            recv_loop(arm_tls(Data));
         {timeout, IdleTimer, ws_idle} ->
             idle_check(Data);
         {roadrunner_drain, Deadline} ->
@@ -906,6 +931,10 @@ append_buffer(#data{buffer = Buf} = Data, Bytes) ->
 %% (a peer-closed socket mid-frame is a normal end-of-session event, not a
 %% crash). Mirrors the conn-loop `arm_and_recv` + `recv_more_hib` pattern.
 -spec arm_and_recv(#data{}, boolean()) -> no_return().
+arm_and_recv(#data{socket = {ssl, _}} = Data, Hibernate) ->
+    %% TLS reads with `{active, N}` and stays armed until ssl reports it
+    %% passive (`arm_tls/1`), so there is nothing to re-arm per message.
+    flush_and_wait(Data, Hibernate);
 arm_and_recv(#data{socket = Socket} = Data0, Hibernate) ->
     %% Everything queued during the drain pass that led here goes out
     %% in one write before the park — see `flush_out/1`.
