@@ -140,6 +140,13 @@ application-private use.
 -define(OP_PING, 9).
 -define(OP_PONG, 10).
 
+%% RFC 7692 §6.1: RSV1 marks a compressed message only on its first data
+%% frame; a control frame or a continuation carrying it fails the
+%% connection.
+-define(RSV1_FORBIDDEN(Op),
+    (Op =:= ?OP_CONTINUATION orelse Op =:= ?OP_CLOSE orelse Op =:= ?OP_PING orelse Op =:= ?OP_PONG)
+).
+
 %% Compute the `Sec-WebSocket-Accept` value from a client-provided
 %% `Sec-WebSocket-Key` per RFC 6455 §4.2.2 step 5: SHA-1 of the key
 %% concatenated with the WebSocket GUID, base64-encoded.
@@ -540,8 +547,9 @@ format_pmd_kv(Name, Value, _Default) -> [~"; ", Name, ~"=", integer_to_binary(Va
 %% `fin`, `rsv1`, `opcode`, and (already-unmasked) `payload`. Returns
 %% `{more, undefined}` when more bytes are needed to complete the
 %% frame, or `{error, _}` for protocol violations:
-%% - `bad_rsv` — RSV2 or RSV3 set, or RSV1 set without an extension
-%%   permitting it (default: not permitted).
+%% - `bad_rsv` — RSV2 or RSV3 set, RSV1 set without an extension
+%%   permitting it (default: not permitted), or RSV1 on a control frame
+%%   or a continuation (RFC 7692 §6.1).
 %% - `bad_opcode` — opcode is reserved (3-7, 0xB-0xF).
 %% - `not_masked` — server-side requires the MASK bit on every client frame.
 %% - `fragmented_control` — control frame (close/ping/pong) with FIN=0,
@@ -654,6 +662,8 @@ do_parse_frame(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1, _Pre)
     {error, bad_rsv};
 do_parse_frame(<<_Fin:1, 1:1, 0:2, _:4, _/bitstring>>, false, _Pre) ->
     {error, bad_rsv};
+do_parse_frame(<<_Fin:1, 1:1, 0:2, Op:4, _/bitstring>>, true, _Pre) when ?RSV1_FORBIDDEN(Op) ->
+    {error, bad_rsv};
 do_parse_frame(<<Fin:1, Rsv1:1, 0:2, Op:4, Mask:1, Len7:7, Rest/binary>>, _AllowRsv1, Pre) ->
     case decode_opcode(Op) of
         {ok, Opcode} ->
@@ -693,6 +703,8 @@ peek_frame_header(Bin, Opts) ->
 do_peek(<<_Fin:1, _Rsv1:1, Rsv23:2, _:4, _/bitstring>>, _AllowRsv1) when Rsv23 =/= 0 ->
     {error, bad_rsv};
 do_peek(<<_Fin:1, 1:1, 0:2, _:4, _/bitstring>>, false) ->
+    {error, bad_rsv};
+do_peek(<<_Fin:1, 1:1, 0:2, Op:4, _/bitstring>>, true) when ?RSV1_FORBIDDEN(Op) ->
     {error, bad_rsv};
 do_peek(<<Fin:1, Rsv1:1, 0:2, Op:4, Mask:1, Len7:7, Rest/binary>>, _AllowRsv1) ->
     case decode_opcode(Op) of
