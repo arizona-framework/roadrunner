@@ -729,8 +729,8 @@ process_buffer(#data{buffer = <<>>} = Data, HibernateAcc) ->
     arm_and_recv(Data, HibernateAcc);
 process_buffer(#data{buffer = Buf, msg_acc = undefined, frame_validated = 0} = Data, HibernateAcc) ->
     case whole_frame(Buf, Data) of
-        {Opcode, Compressed, MaskKey, Masked, Rest} ->
-            dispatch_whole_frame(Opcode, Compressed, MaskKey, Masked, Rest, Data, HibernateAcc);
+        {Opcode, Compressed, Payload, Rest} ->
+            dispatch_whole_frame(Opcode, Compressed, Payload, Rest, Data, HibernateAcc);
         partial ->
             process_partial(Data, HibernateAcc)
     end;
@@ -743,8 +743,8 @@ process_buffer(Data, HibernateAcc) ->
 -spec process_input(#data{}, binary()) -> finished.
 process_input(#data{buffer = <<>>, msg_acc = undefined, frame_validated = 0} = Data, Bytes) ->
     case whole_frame(Bytes, Data) of
-        {Opcode, Compressed, MaskKey, Masked, Rest} ->
-            dispatch_whole_frame(Opcode, Compressed, MaskKey, Masked, Rest, Data, false);
+        {Opcode, Compressed, Payload, Rest} ->
+            dispatch_whole_frame(Opcode, Compressed, Payload, Rest, Data, false);
         partial ->
             process_partial(Data#data{buffer = Bytes}, false)
     end;
@@ -753,48 +753,58 @@ process_input(Data, Bytes) ->
 
 %% A whole data frame at the head of `Buf` (`roadrunner_ws:match_data_frame/2`,
 %% compressed only once permessage-deflate is negotiated) within both
-%% size caps. An oversize frame is `partial` so the general path closes
-%% it with 1009 exactly as before; a compressed frame is charged against
-%% `max_message_size` as a single fragment, the same as on that path.
+%% size caps, with its payload unmasked and, for uncompressed text, valid
+%% UTF-8. Anything else is `partial`, so the general path handles it
+%% exactly as before: an oversize frame closes with 1009 (a compressed
+%% frame is charged against `max_message_size` as a single fragment, the
+%% same as there), and invalid UTF-8 closes with 1007 after the events
+%% that path fires for it.
 -spec whole_frame(binary(), #data{}) ->
-    {text | binary, boolean(), 0..16#FFFFFFFF, binary(), binary()} | partial.
+    {text | binary, boolean(), binary(), binary()} | partial.
 whole_frame(Buf, #data{pmd_params = Pmd, max_message_size = MaxMsg} = Data) ->
     case roadrunner_ws:match_data_frame(Buf, Pmd =/= undefined) of
-        {_Opcode, Compressed, _MaskKey, Masked, _Rest} = Whole ->
+        {Opcode, Compressed, MaskKey, Masked, Rest} ->
             Size = byte_size(Masked),
             case frame_within_cap(Size, Data) andalso charged_size(Compressed, Size) =< MaxMsg of
-                true -> Whole;
-                false -> partial
+                true ->
+                    valid_whole(
+                        Opcode, Compressed, roadrunner_ws:unmask_words(Masked, MaskKey), Rest
+                    );
+                false ->
+                    partial
             end;
         partial ->
             partial
     end.
 
+-spec valid_whole(text | binary, boolean(), binary(), binary()) ->
+    {text | binary, boolean(), binary(), binary()} | partial.
+valid_whole(text, false, Payload, Rest) ->
+    case is_valid_utf8(Payload) of
+        true -> {text, false, Payload, Rest};
+        false -> partial
+    end;
+valid_whole(Opcode, Compressed, Payload, Rest) ->
+    {Opcode, Compressed, Payload, Rest}.
+
 -spec charged_size(boolean(), non_neg_integer()) -> non_neg_integer().
 charged_size(false, Size) -> Size;
 charged_size(true, Size) -> max(Size, ?WS_FRAGMENT_OVERHEAD).
 
-%% Unmask and validate (or inflate, then validate) a whole frame and hand
-%% it to the handler. No message is in progress (`msg_acc = undefined`,
+%% Hand a whole frame (`whole_frame/2`: unmasked, uncompressed text
+%% already valid UTF-8) to the handler, inflating and validating a
+%% compressed one first. No message is in progress (`msg_acc = undefined`,
 %% `frame_validated = 0`), so the per-message fields already hold their
-%% reset values and are left untouched. Events and closes match the
-%% general path: an uncompressed text frame is validated before its
-%% `ws_frame_in`, a compressed one fires it with the wire size first.
--spec dispatch_whole_frame(
-    text | binary, boolean(), 0..16#FFFFFFFF, binary(), binary(), #data{}, boolean()
-) -> finished.
-dispatch_whole_frame(Opcode, false, MaskKey, Masked, Rest, Data, Hibernate) ->
-    Payload = roadrunner_ws:unmask_words(Masked, MaskKey),
-    case Opcode =:= binary orelse is_valid_utf8(Payload) of
-        true ->
-            ok = roadrunner_event:ws_frame_in(Data#data.span, Opcode, byte_size(Payload)),
-            dispatch_message(Opcode, Payload, Rest, Data, Hibernate);
-        false ->
-            close_with(close_invalid_payload(), Data#data{buffer = Rest})
-    end;
-dispatch_whole_frame(Opcode, true, MaskKey, Masked, Rest, Data, Hibernate) ->
-    ok = roadrunner_event:ws_frame_in(Data#data.span, Opcode, byte_size(Masked)),
-    case complete_message(Opcode, true, roadrunner_ws:unmask_words(Masked, MaskKey), Data) of
+%% reset values and are left untouched. `ws_frame_in` reports the wire
+%% size, as on the general path.
+-spec dispatch_whole_frame(text | binary, boolean(), binary(), binary(), #data{}, boolean()) ->
+    finished.
+dispatch_whole_frame(Opcode, false, Payload, Rest, Data, Hibernate) ->
+    ok = roadrunner_event:ws_frame_in(Data#data.span, Opcode, byte_size(Payload)),
+    dispatch_message(Opcode, Payload, Rest, Data, Hibernate);
+dispatch_whole_frame(Opcode, true, Compressed, Rest, Data, Hibernate) ->
+    ok = roadrunner_event:ws_frame_in(Data#data.span, Opcode, byte_size(Compressed)),
+    case complete_message(Opcode, true, Compressed, Data) of
         {ok, Payload} -> dispatch_message(Opcode, Payload, Rest, Data, Hibernate);
         finished -> finished
     end.
@@ -1054,8 +1064,9 @@ handle_frame(
 ->
     %% A complete, unfragmented, uncompressed data message delivered in
     %% one frame, with no message already in progress, that missed
-    %% `dispatch_whole_frame/6` (it arrived over several reads, or is
-    %% over 64 KB). The parsed `Frame` is already byte-identical
+    %% `dispatch_whole_frame/6` (it arrived over several reads, is over
+    %% 64 KB, or is text that is not valid UTF-8). The parsed `Frame` is
+    %% already byte-identical
     %% to what the reassembly path would synthesize, so dispatch it
     %% directly and skip the fragment machinery (classify, the `[P]`
     %% cons, `finalize_message`, and the synthesized map). Wire-level
