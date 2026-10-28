@@ -51,6 +51,8 @@
 %% machinery directly through these functions.
 -export([
     make_recv/3,
+    armed/1,
+    disarmed/0,
     drain_check_interval_ms/0,
     rate_ok/3,
     body_framing/1,
@@ -272,6 +274,9 @@ deadline in milliseconds. The shed form answers it `503` with the
     http1_max_header_block => 1..16#7FFFFFFF,
     http1_max_header_count => 1..16#7FFFFFFF,
     http1_linger_timeout => 0..16#7FFFFFFF,
+    %% Set only when `{http1, #{active => ...}}` is given; unset, the
+    %% conn picks by transport.
+    http1_active => once | 1..32767,
     %% Optional fields the listener injects only when the user
     %% supplies them — see `roadrunner_listener:build_proto_opts/2`.
     %% Declared here so dialyzer accepts pattern matches like
@@ -765,6 +770,30 @@ set_request_logger_metadata(#{
 
 -define(RECV_BYTES_PDKEY, {?MODULE, recv_bytes}).
 
+%% The `N` an HTTP/1 connection armed its socket with (`{active, N}`),
+%% `queued` once it disarmed it with reads possibly still in the mailbox,
+%% or unset while it reads passively as it always has. Body reads run
+%% inside handler code, through closures that cannot see the loop state,
+%% so the connection records it here (`armed/1`, `disarmed/0`), once per
+%% connection rather than per request.
+-define(ACTIVE_PDKEY, {?MODULE, active}).
+
+%% Record that this HTTP/1 connection's socket is armed with
+%% `{active, N}`: body reads then take its reads from the mailbox.
+-doc false.
+-spec armed(pos_integer()) -> ok.
+armed(N) ->
+    _ = put(?ACTIVE_PDKEY, N),
+    ok.
+
+%% Record that the socket reads passively again, after reads it
+%% delivered while armed, which the mailbox may still hold.
+-doc false.
+-spec disarmed() -> ok.
+disarmed() ->
+    _ = put(?ACTIVE_PDKEY, queued),
+    ok.
+
 %% Drain-detection cap when in passive recv. Each recv call is bounded
 %% to at most this many ms so the conn re-checks its mailbox for
 %% `{roadrunner_drain, _}` between blocks. Trade-off: shorter = lower
@@ -816,6 +845,28 @@ make_recv(Socket, Deadline, MinRate) ->
 -spec recv_body_chunk(roadrunner_transport:socket(), integer(), non_neg_integer(), integer()) ->
     {ok, binary()} | {error, request_timeout | slow_client | drained | term()}.
 recv_body_chunk(Socket, Deadline, MinRate, Start) ->
+    case get(?ACTIVE_PDKEY) of
+        undefined -> recv_body_passive(Socket, Deadline, MinRate, Start);
+        queued -> recv_body_queued(Socket, Deadline, MinRate, Start);
+        N -> recv_body_active(Socket, Deadline, MinRate, Start, N)
+    end.
+
+%% A body read on a socket disarmed with reads still in the mailbox:
+%% those come first, in order, then the socket.
+-spec recv_body_queued(roadrunner_transport:socket(), integer(), non_neg_integer(), integer()) ->
+    {ok, binary()} | {error, request_timeout | slow_client | drained | term()}.
+recv_body_queued(Socket, Deadline, MinRate, Start) ->
+    {DataTag, _ClosedTag, _ErrorTag} = roadrunner_transport:messages(Socket),
+    receive
+        {DataTag, _Sock, Data} ->
+            rate_checked(Data, erlang:monotonic_time(millisecond) - Start, MinRate)
+    after 0 ->
+        recv_body_passive(Socket, Deadline, MinRate, Start)
+    end.
+
+-spec recv_body_passive(roadrunner_transport:socket(), integer(), non_neg_integer(), integer()) ->
+    {ok, binary()} | {error, request_timeout | slow_client | drained | term()}.
+recv_body_passive(Socket, Deadline, MinRate, Start) ->
     case drain_pending() of
         drain ->
             {error, drained};
@@ -825,18 +876,57 @@ recv_body_chunk(Socket, Deadline, MinRate, Start) ->
             ChunkTimeout = min(Remaining, ?DRAIN_CHECK_INTERVAL_MS),
             case roadrunner_transport:recv(Socket, 0, ChunkTimeout) of
                 {ok, Data} ->
-                    Total = atomics:add_get(recv_byte_counter(), 1, byte_size(Data)),
-                    case rate_ok(Now - Start, Total, MinRate) of
-                        true -> {ok, Data};
-                        false -> {error, slow_client}
-                    end;
+                    rate_checked(Data, Now - Start, MinRate);
                 {error, timeout} when Remaining =< ChunkTimeout ->
                     {error, request_timeout};
                 {error, timeout} ->
-                    recv_body_chunk(Socket, Deadline, MinRate, Start);
+                    recv_body_passive(Socket, Deadline, MinRate, Start);
                 {error, _} = E ->
                     E
             end
+    end.
+
+%% A body read on a socket armed with `{active, N}`: the bytes arrive as
+%% messages, so it waits in `receive`, which also sees a drain the moment
+%% it is sent (no `?DRAIN_CHECK_INTERVAL_MS` tick needed). It matches
+%% only socket messages and the drain, so the rest of the mailbox, which
+%% in manual body buffering may hold messages meant for the handler, is
+%% left alone. The socket's passive message arms it again.
+-spec recv_body_active(
+    roadrunner_transport:socket(), integer(), non_neg_integer(), integer(), pos_integer()
+) ->
+    {ok, binary()} | {error, request_timeout | slow_client | drained | term()}.
+recv_body_active(Socket, Deadline, MinRate, Start, N) ->
+    {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
+    PassiveTag = roadrunner_transport:passive_message(Socket),
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {DataTag, _Sock, Data} ->
+            rate_checked(Data, erlang:monotonic_time(millisecond) - Start, MinRate);
+        {PassiveTag, _Sock} ->
+            case roadrunner_transport:setopts(Socket, [{active, N}]) of
+                ok -> recv_body_active(Socket, Deadline, MinRate, Start, N);
+                {error, _} = E -> E
+            end;
+        {ClosedTag, _Sock} ->
+            {error, closed};
+        {ErrorTag, _Sock, Reason} ->
+            {error, Reason};
+        {roadrunner_drain, _DrainDeadline} ->
+            {error, drained}
+    after Remaining ->
+        {error, request_timeout}
+    end.
+
+%% A body read's bytes, counted toward the request's running rate after
+%% `Elapsed` ms of its window.
+-spec rate_checked(binary(), integer(), non_neg_integer()) ->
+    {ok, binary()} | {error, slow_client}.
+rate_checked(Data, Elapsed, MinRate) ->
+    Total = atomics:add_get(recv_byte_counter(), 1, byte_size(Data)),
+    case rate_ok(Elapsed, Total, MinRate) of
+        true -> {ok, Data};
+        false -> {error, slow_client}
     end.
 
 %% Zero-timeout look for a queued drain. Unlike
@@ -1934,6 +2024,13 @@ linger(_Socket, 0) ->
     ok;
 linger(Socket, Timeout) ->
     _ = roadrunner_transport:shutdown(Socket, write),
+    %% The reads below are passive: a socket armed with `{active, N}`
+    %% would fail them at once and close with input still unread.
+    _ =
+        case erase(?ACTIVE_PDKEY) of
+            N when is_integer(N) -> roadrunner_transport:setopts(Socket, [{active, false}]);
+            _Passive -> ok
+        end,
     linger_until(Socket, erlang:monotonic_time(millisecond) + Timeout).
 
 -spec linger_until(roadrunner_transport:socket(), integer()) -> ok.

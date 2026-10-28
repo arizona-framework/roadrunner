@@ -465,7 +465,7 @@ type. Beyond `port`,
   `hibernate_after`, `idle_timeout`, `compress`, `active`
 - **HTTP/1 tunables**: Under the `{http1, Opts}` entry in `protocols`:
   `max_request_line`, `max_header_line`, `max_header_block`,
-  `max_header_count`, `linger_timeout`
+  `max_header_count`, `linger_timeout`, `active` (socket read mode)
 - **HTTP/2 tunables**: Under the `{http2, Opts}` entry in `protocols`:
   `conn_window`, `stream_window`, `window_refill_threshold`,
   `max_concurrent_streams`, `max_header_block`, `max_header_list_size`,

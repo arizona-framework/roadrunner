@@ -34,7 +34,7 @@
 %% at saturation but dominates a mostly-idle server.
 %%
 %% When the listener sets `hibernate_after => Ms > 0`, the first-byte
-%% wait instead uses `recv_with_hibernate/3`, whose `after Ms` clause has
+%% wait instead uses `recv_active/3`, whose `after Ms` clause has
 %% a window to call `erlang:hibernate/3` between keep-alive iterations so
 %% the conn's heap GCs and shrinks — only `receive` supports hibernation;
 %% passive recv blocks the process inside a NIF.
@@ -127,9 +127,18 @@
     %% `auto` reads the full body synchronously; `manual` builds a
     %% body_reader the handler pulls from. Drives `read_body_phase/3`.
     body_buffering = auto :: auto | manual,
-    %% `proto_opts.hibernate_after`, or 0 when unset (the common case).
-    %% When > 0, `recv_request_bytes/2` takes the active+hibernate path.
-    hibernate_after = 0 :: non_neg_integer(),
+    %% How `recv_request_bytes/2` waits for bytes: the socket's read mode
+    %% (`read_mode/2`), paired with `proto_opts.hibernate_after` when that
+    %% is set. `once` arms the socket before each request and reads the
+    %% rest of one passively; with hibernation the whole request is read
+    %% in `receive`. `N` arms it with `{active, N}` once per connection,
+    %% takes every read from the mailbox, and arms it again on the passive
+    %% message, so a request costs no socket call: on TLS each is a call
+    %% into the TLS connection process. Writer-owned responses get a
+    %% passive socket (`disarm/1`). One field for both keeps the record,
+    %% copied on every update, at its size: an extra field measured as a
+    %% higher GC share and fewer requests per second on plain TCP.
+    recv_mode = once :: recv_mode(),
     %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
     %% Prepended to every response, by `roadrunner_http1:response/4` for
     %% the keep-alive shapes and `roadrunner_http:auto_headers/2` for
@@ -177,6 +186,9 @@
     %% between a queued response and that next socket boundary.
     out = [] :: iodata()
 }).
+
+-type recv_mode() ::
+    once | {once, pos_integer()} | 1..32767 | {1..32767, pos_integer()}.
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.
@@ -345,7 +357,10 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 request_timeout = RequestTimeout,
                 keep_alive_timeout = KeepAliveTimeout,
                 body_buffering = BodyBuffering,
-                hibernate_after = maps:get(hibernate_after, ProtoOpts, 0),
+                recv_mode = recv_mode(
+                    read_mode(maps:get(http1_active, ProtoOpts, undefined), Socket),
+                    maps:get(hibernate_after, ProtoOpts, 0)
+                ),
                 alt_svc = maps:get(alt_svc, ProtoOpts, undefined),
                 http1_limits = {
                     maps:get(http1_max_request_line, ProtoOpts, 8192),
@@ -357,8 +372,36 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
                 request_slot = request_slot(ProtoOpts)
             },
-            read_request_phase(S)
+            start_reading(S)
     end.
+
+%% `{http1, #{active => ...}}`, or by transport when unset: `{active, 16}`
+%% on TLS, where every arm is a call into the TLS connection process, and
+%% `once` on plain TCP, where `{active, N}` measured no faster.
+-spec read_mode(once | 1..32767 | undefined, roadrunner_transport:socket()) ->
+    once | 1..32767.
+read_mode(undefined, {ssl, _}) -> 16;
+read_mode(undefined, _Socket) -> once;
+read_mode(Mode, _Socket) -> Mode.
+
+-spec recv_mode(once | 1..32767, non_neg_integer()) -> recv_mode().
+recv_mode(Mode, 0) -> Mode;
+recv_mode(Mode, HibernateAfter) -> {Mode, HibernateAfter}.
+
+%% The socket's read mode, without the hibernation it may be paired with.
+-spec active_count(recv_mode()) -> once | 1..32767.
+active_count({Mode, _HibernateAfter}) -> Mode;
+active_count(Mode) -> Mode.
+
+%% `{active, N}` is armed once, here, and again only on the socket's
+%% passive message; `once` arms before each request instead.
+-spec start_reading(#loop_state{}) -> no_return().
+start_reading(#loop_state{recv_mode = Mode} = S) ->
+    case active_count(Mode) of
+        once -> ok;
+        N -> ok = arm_active_n(S, N)
+    end,
+    read_request_phase(S).
 
 %% HTTP/1 requests count against `max_concurrent_requests` only when the
 %% listener sheds over it: in `refuse` and `queue` modes the ceiling bounds
@@ -547,7 +590,7 @@ read_request_phase(#loop_state{buffered = Buf} = S) ->
     Deadline = Now + Timeout,
     %% Reset the per-request byte counter. The slowloris rate window is
     %% anchored at the first byte actually received (in `recv_passive/2`
-    %% and `recv_with_hibernate/3`), NOT at phase entry — so an idle
+    %% and `recv_active/3`), NOT at phase entry — so an idle
     %% keep-alive gap before a reused connection's next request is not
     %% counted as slow transmission. `recv_phase_bytes =:= 0` is the
     %% "no byte yet this request" signal those paths key off to anchor.
@@ -576,10 +619,7 @@ recv_request_bytes(S0, Deadline) ->
     %% About to block on the socket for the next request — everything
     %% queued during the pipelined drain goes out in one write first.
     case flush_out(S0) of
-        #loop_state{hibernate_after = Ms} = S when Ms > 0 ->
-            arm_active_once(S),
-            recv_with_hibernate(S, Deadline, Ms);
-        #loop_state{recv_phase_bytes = 0} = S ->
+        #loop_state{recv_mode = once, recv_phase_bytes = 0} = S ->
             %% Waiting for the first byte of a request: the conn may sit
             %% here for the whole keep-alive window, so block in `receive`
             %% rather than poll. Passive recv cannot see the mailbox, so
@@ -587,11 +627,20 @@ recv_request_bytes(S0, Deadline) ->
             %% to look for a drain — a cost per *connection* rather than
             %% per request, which idle keep-alive connections pay forever.
             recv_idle(S, Deadline);
-        S ->
+        #loop_state{recv_mode = once} = S ->
             %% Mid-request: the peer is already sending and the remaining
             %% bytes are in flight, so passive recv blocks briefly. A drain
             %% must not cut an in-flight request short anyway.
-            recv_passive(S, Deadline)
+            recv_passive(S, Deadline);
+        #loop_state{recv_mode = {once, Ms}} = S ->
+            arm_active_once(S),
+            recv_active(S, Deadline, Ms);
+        #loop_state{recv_mode = {_N, Ms}} = S ->
+            %% `{active, N}`: the socket is already armed, every read is a
+            %% message.
+            recv_active(S, Deadline, Ms);
+        S ->
+            recv_active(S, Deadline, infinity)
     end.
 
 %% Idle wait for the next request on a keep-alive connection. Armed
@@ -739,18 +788,20 @@ drain_mailbox_check() ->
         ok
     end.
 
-%% Recv path with hibernation. The receive's `after` covers both the
-%% hibernate trigger and the request/keep-alive deadline: it waits
-%% `min(HibernateAfter, Remaining)`, and on firing either times the conn
-%% out (the deadline came first) or hibernates. A busy conn therefore
+%% Recv path in `receive`: every read of an `{active, N}` socket, and
+%% every read of an `{active, once}` one when the conn hibernates. The
+%% receive's `after` covers both the hibernate trigger and the
+%% request/keep-alive deadline: it waits `min(HibernateAfter, Remaining)`,
+%% and on firing either times the conn out (the deadline came first) or
+%% hibernates (`infinity` never does). A busy conn therefore
 %% arms no timer per recv. Only a conn about to hibernate arms one, an
 %% absolute `start_timer` at the deadline, because a hibernated process
 %% only wakes on a message: without it an idle conn would outlive its
 %% `keep_alive_timeout` / `request_timeout` for as long as the peer
 %% stays silent. On wake the function re-enters via
 %% `recv_request_bytes_hib/3`, which drops that timer first.
--spec recv_with_hibernate(#loop_state{}, integer(), pos_integer()) -> no_return().
-recv_with_hibernate(
+-spec recv_active(#loop_state{}, integer(), pos_integer() | infinity) -> no_return().
+recv_active(
     #loop_state{
         socket = Socket,
         buffered = Buf,
@@ -762,6 +813,8 @@ recv_with_hibernate(
     HibernateAfter
 ) ->
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
+    PassiveTag = roadrunner_transport:passive_message(Socket),
+    Active = active_count(S#loop_state.recv_mode),
     Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
     receive
         {DataTag, _Sock, Bytes} ->
@@ -793,11 +846,15 @@ recv_with_hibernate(
             exit_normal(S, peer_closed);
         {ErrorTag, _Sock, Reason} ->
             exit_normal(S, {transport, Reason});
+        {PassiveTag, _Sock} when Active =/= once ->
+            %% Only an `{active, N}` socket goes passive.
+            ok = arm_active_n(S, Active),
+            recv_active(S, Deadline, HibernateAfter);
         {roadrunner_drain, _Deadline} ->
             exit_normal(S, drained);
         _Stray ->
-            arm_active_once(S),
-            recv_with_hibernate(S, Deadline, HibernateAfter)
+            ok = rearm_after_stray(S, Active),
+            recv_active(S, Deadline, HibernateAfter)
     after min(HibernateAfter, Remaining) ->
         case Remaining =< HibernateAfter of
             true ->
@@ -1312,6 +1369,7 @@ send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
             ),
             {Result, Status, Headers};
         ({stream, Status, Headers}, Req) ->
+            #loop_state{} = disarm(S),
             ok = roadrunner_conn:continue_before_stream(Req),
             {Result, Send} = roadrunner_stream_response:start(
                 Socket, Status, roadrunner_http:auto_headers(Headers, AltSvc)
@@ -1478,7 +1536,7 @@ dispatch_response(
     %% The stream writer owns the wire from here — flush queued
     %% responses ahead of its first bytes, and the 100 a client may still
     %% hold its body back for ahead of the head.
-    S = flush_out(S0),
+    S = flush_out(disarm(S0)),
     ok = roadrunner_conn:continue_before_stream(Req),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
@@ -1491,7 +1549,7 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    S = flush_out(S0),
+    S = flush_out(disarm(S0)),
     ok = roadrunner_conn:continue_before_stream(Req),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
@@ -1590,16 +1648,13 @@ has_framing([]) -> false.
     term(),
     roadrunner_ws_handler:upgrade_opts()
 ) -> #loop_state{} | {ws_upgrade, roadrunner_ws_session:run(), #loop_state{}}.
-dispatch_websocket(
-    #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts} = S0,
-    Req,
-    Mod,
-    State,
-    Opts
-) ->
+dispatch_websocket(S0, Req, Mod, State, Opts) ->
     %% Queued pipelined responses must precede the 101 (or the 400/500
-    %% reject) on the wire.
-    S = flush_out(S0),
+    %% reject) on the wire. The session arms the socket itself, so it
+    %% starts from a passive one, with what was already read in
+    %% `Buffered`.
+    #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts} =
+        S = flush_out(disarm(S0)),
     %% `start/7` returns right after the 101 with the session to run in
     %% this process (`Run`). A rejected upgrade (400/426/500 already sent,
     %% `connection: close`) falls through to the normal websocket
@@ -1795,6 +1850,54 @@ exit_unread(S, _Req) ->
 -spec rejection(#loop_state{}, atom()) -> ok.
 rejection(#loop_state{listener_name = ListenerName, peer = Peer}, Reason) ->
     roadrunner_event:request_rejected(ListenerName, Peer, Reason).
+
+%% Hand a writer-owned response (stream, loop, WebSocket) a passive
+%% socket, as `once` leaves it after a request: it reads the socket
+%% itself, or runs handler code that receives on the mailbox. Reads
+%% already queued stay queued, in order, for whoever reads next: a body
+%% reader takes them before the socket (`roadrunner_conn:disarmed/0`),
+%% and the WebSocket session and the loop response read socket messages
+%% themselves. Only the passive message goes, so it never reaches
+%% handler code. These responses close the connection after them, so
+%% the socket is never armed again.
+-spec disarm(#loop_state{}) -> #loop_state{}.
+disarm(#loop_state{recv_mode = Mode} = S) ->
+    case active_count(Mode) of
+        once -> S;
+        _N -> passive(S)
+    end.
+
+-spec passive(#loop_state{}) -> #loop_state{}.
+passive(#loop_state{socket = Socket} = S) ->
+    _ = roadrunner_transport:setopts(Socket, [{active, false}]),
+    ok = roadrunner_conn:disarmed(),
+    ok = drop_passive(roadrunner_transport:passive_message(Socket)),
+    S#loop_state{recv_mode = once}.
+
+-spec drop_passive(atom()) -> ok.
+drop_passive(PassiveTag) ->
+    receive
+        {PassiveTag, _Sock} -> drop_passive(PassiveTag)
+    after 0 ->
+        ok
+    end.
+
+%% Arm `{active, N}`: at the connection's start and on each passive
+%% message. A failed arm means the socket is gone.
+-spec arm_active_n(#loop_state{}, pos_integer()) -> ok.
+arm_active_n(#loop_state{socket = Socket} = S, N) ->
+    case roadrunner_transport:setopts(Socket, [{active, N}]) of
+        ok -> roadrunner_conn:armed(N);
+        {error, Reason} -> exit_normal(S, transport_reason(Reason))
+    end.
+
+%% A stray message did not use up an `{active, once}` arm, but arming
+%% again is how the hibernating `once` path has always resumed; an
+%% `{active, N}` socket is still armed, and arming it again would add
+%% `N` more unread reads.
+-spec rearm_after_stray(#loop_state{}, once | 1..32767) -> ok.
+rearm_after_stray(S, once) -> arm_active_once(S);
+rearm_after_stray(_S, _N) -> ok.
 
 -spec arm_active_once(#loop_state{}) -> ok.
 arm_active_once(#loop_state{socket = Socket} = S) ->

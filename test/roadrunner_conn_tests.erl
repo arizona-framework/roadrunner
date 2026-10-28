@@ -112,6 +112,26 @@ linger_reads_until_the_peer_closes_test() ->
     ),
     ?assertEqual(3, recv_calls(0)).
 
+linger_disarms_an_armed_socket_test_() ->
+    %% An HTTP/1 socket armed with `{active, N}` goes passive before the
+    %% reads, which would otherwise fail at once and close with input
+    %% unread. Its own process: the arm is process state.
+    {spawn, fun() ->
+        Self = self(),
+        Sink = spawn(fun() -> setopts_sink(Self, [{recv, ~"rest"}, {error, closed}]) end),
+        ok = roadrunner_conn:armed(16),
+        ok = roadrunner_conn:linger({fake, Sink}, 5000),
+        Sink ! stop,
+        ?assertEqual(
+            [{active, false}],
+            receive
+                {sink_setopts, Opts} -> Opts
+            after 1000 -> none
+            end
+        ),
+        ?assertEqual(2, recv_calls(0))
+    end}.
+
 linger_ends_at_its_deadline_test() ->
     %% A peer that never stops sending is cut off by the deadline.
     Sink = spawn(fun() -> endless_sink() end),
@@ -146,6 +166,13 @@ script_sink(Reporter, Script) ->
 shutdown_sink(Reporter, Script) ->
     receive
         {roadrunner_fake_shutdown, _ConnPid, How} -> Reporter ! {sink_shutdown, How}
+    end,
+    script_sink(Reporter, Script).
+
+%% A `script_sink/2` that reports the first setopts it is sent.
+setopts_sink(Reporter, Script) ->
+    receive
+        {roadrunner_fake_setopts, _ConnPid, Opts} -> Reporter ! {sink_setopts, Opts}
     end,
     script_sink(Reporter, Script).
 
@@ -1610,6 +1637,89 @@ make_recv_reports_drain_and_spares_other_messages_test_() ->
             after 0 -> none
             end,
         ?assertEqual(none, Leftover)
+    end}.
+
+%% With the socket armed (`armed/1`), body reads come from the mailbox:
+%% data, a close and an error as the transport's messages, the passive
+%% message arming it again, a drain at once, the deadline as a timeout.
+%% Other messages stay for the handler. Each case runs in its own
+%% process: the test drives its own mailbox.
+make_recv_armed_reads_socket_messages_test_() ->
+    Far = fun() -> erlang:monotonic_time(millisecond) + 5000 end,
+    Armed = fun(Deadline, MinRate) ->
+        ok = roadrunner_conn:armed(4),
+        roadrunner_conn:make_recv({fake, self()}, Deadline, MinRate)
+    end,
+    [
+        {spawn, fun() ->
+            Recv = Armed(Far(), 0),
+            self() ! {push, ~"for the handler"},
+            self() ! {roadrunner_fake_passive, x},
+            self() ! {roadrunner_fake_data, x, ~"body"},
+            ?assertEqual({ok, ~"body"}, Recv()),
+            ?assertEqual(
+                [{active, 4}],
+                receive
+                    {roadrunner_fake_setopts, _, Opts} -> Opts
+                after 0 -> none
+                end
+            ),
+            ?assertEqual(
+                ~"for the handler",
+                receive
+                    {push, B} -> B
+                after 0 -> none
+                end
+            )
+        end},
+        {spawn, fun() ->
+            Recv = Armed(Far(), 0),
+            self() ! {roadrunner_fake_closed, x},
+            ?assertEqual({error, closed}, Recv())
+        end},
+        {spawn, fun() ->
+            Recv = Armed(Far(), 0),
+            self() ! {roadrunner_fake_error, x, econnreset},
+            ?assertEqual({error, econnreset}, Recv())
+        end},
+        {spawn, fun() ->
+            Recv = Armed(Far(), 0),
+            self() ! {roadrunner_drain, infinity},
+            ?assertEqual({error, drained}, Recv())
+        end},
+        {spawn, fun() ->
+            Recv = Armed(erlang:monotonic_time(millisecond), 0),
+            ?assertEqual({error, request_timeout}, Recv())
+        end},
+        {spawn, fun() ->
+            %% A passive message on a socket that is gone.
+            Dead = spawn(fun() -> ok end),
+            Ref = monitor(process, Dead),
+            receive
+                {'DOWN', Ref, process, Dead, _} -> ok
+            end,
+            ok = roadrunner_conn:armed(4),
+            Recv = roadrunner_conn:make_recv({fake, Dead}, Far(), 0),
+            self() ! {roadrunner_fake_passive, x},
+            ?assertEqual({error, einval}, Recv())
+        end}
+    ].
+
+%% Disarmed with reads still queued (`disarmed/0`): those come first, in
+%% order, then the socket. Its own process: it drives its own mailbox.
+make_recv_disarmed_reads_queued_then_socket_test_() ->
+    {spawn, fun() ->
+        Sink = spawn(fun() -> script_sink(undefined, [{recv, ~"third"}]) end),
+        ok = roadrunner_conn:disarmed(),
+        Recv = roadrunner_conn:make_recv(
+            {fake, Sink}, erlang:monotonic_time(millisecond) + 5000, 0
+        ),
+        self() ! {roadrunner_fake_data, x, ~"first"},
+        self() ! {roadrunner_fake_data, x, ~"second"},
+        ?assertEqual({ok, ~"first"}, Recv()),
+        ?assertEqual({ok, ~"second"}, Recv()),
+        ?assertEqual({ok, ~"third"}, Recv()),
+        Sink ! stop
     end}.
 
 %% --- consume_body_reader/2 — pure unit tests ---

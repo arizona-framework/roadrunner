@@ -540,7 +540,7 @@ setopts_on_dead_socket_exits_silently_test() ->
     %%
     %% Phase A' default path uses passive recv (no setopts call) —
     %% so to exercise this code path the test opts into the
-    %% active-mode `recv_with_hibernate` branch via `hibernate_after`.
+    %% active-mode `recv_active` branch via `hibernate_after`.
     Self = self(),
     Tag = make_ref(),
     DeadSink = spawn(fun() -> ok end),
@@ -2096,6 +2096,216 @@ slot_released_after_parse_exit_test() ->
     Sink ! stop.
 
 %% --- helpers ---
+
+%% --- `{http1, #{active => N}}` reads ---
+
+active_n_arms_once_and_again_only_on_passive_test() ->
+    %% The socket is armed with `{active, N}` once, before the first
+    %% request; requests and a stray message re-arm nothing; the passive
+    %% message arms it again.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(Tag, size_opts(#{http1_active => 4})),
+    ?assertEqual([{active, 4}], expect_setopts(Tag)),
+    ok = request_roundtrip(Tag, Pid),
+    Pid ! stray,
+    ok = request_roundtrip(Tag, Pid),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_passive, x},
+    ?assertEqual([{active, 4}], expect_setopts(Tag)),
+    ok = request_roundtrip(Tag, Pid),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+active_n_reads_a_head_and_body_split_across_reads_test() ->
+    %% The rest of a head and its body arrive as later messages, read
+    %% from the mailbox like the first.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(Tag, size_opts(#{http1_active => 4})),
+    [{active, 4}] = expect_setopts(Tag),
+    Pid ! {roadrunner_fake_data, x, ~"POST / HTTP/1.1\r\nHost: x\r\n"},
+    Pid ! {roadrunner_fake_data, x, ~"Content-Length: 5\r\n\r\nab"},
+    Pid ! {roadrunner_fake_data, x, ~"cde"},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+active_n_hibernating_conn_reads_from_the_mailbox_test() ->
+    %% `hibernate_after` keeps the `{active, N}` reads: no arm per request.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(Tag, size_opts(#{http1_active => 4, hibernate_after => 60000})),
+    [{active, 4}] = expect_setopts(Tag),
+    ok = request_roundtrip(Tag, Pid),
+    ok = request_roundtrip(Tag, Pid),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+active_n_failed_first_arm_exits_test() ->
+    %% A socket gone before the first arm ends the conn cleanly.
+    Dead = spawn(fun() -> ok end),
+    DeadRef = monitor(process, Dead),
+    receive
+        {'DOWN', DeadRef, process, Dead, _} -> ok
+    end,
+    {ok, Pid} = roadrunner_conn_loop:start({fake, Dead}, size_opts(#{http1_active => 4})),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    ok = await_normal_exit(Ref, Pid).
+
+active_n_failed_rearm_exits_test() ->
+    %% A socket gone by the time its passive message asks for a re-arm.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(Tag, size_opts(#{http1_active => 4})),
+    [{active, 4}] = expect_setopts(Tag),
+    ok = request_roundtrip(Tag, Pid),
+    ok = stop_sink(Tag),
+    Pid ! {roadrunner_fake_passive, x},
+    ok = await_normal_exit(Ref, Pid).
+
+active_n_stream_response_gets_a_passive_socket_test() ->
+    %% A streamed response disarms the socket first, and drops a passive
+    %% message already queued.
+    Tag = make_ref(),
+    Opts = (fake_opts(active_n_stream))#{
+        dispatch :=
+            {handler, roadrunner_stream_handler, fun roadrunner_stream_handler:handle/1, undefined},
+        http1_active => 4
+    },
+    {Pid, Ref} = start_active_n(Tag, Opts),
+    [{active, 4}] = expect_setopts(Tag),
+    %% Suspended, so all three are queued before it reads the first.
+    true = erlang:suspend_process(Pid),
+    Pid ! {roadrunner_fake_data, x, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+    Pid ! {roadrunner_fake_data, x, ~"GET /next HTTP/1.1\r\n"},
+    Pid ! {roadrunner_fake_passive, x},
+    true = erlang:resume_process(Pid),
+    ?assertEqual([{active, false}], expect_setopts(Tag)),
+    ok = await_normal_exit(Ref, Pid),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, iolist_to_binary(collect_sends(Tag, 100))).
+
+active_n_streaming_handler_reads_a_body_queued_at_disarm_test() ->
+    %% A manual-mode handler that streams, then reads its body: body bytes
+    %% that came in while the socket was armed are still read, in order,
+    %% after the disarm.
+    Tag = make_ref(),
+    Opts = (fake_opts(active_n_stream_echo))#{
+        %% The handler picks its behaviour from the route state, which this
+        %% dispatch form does not set.
+        dispatch :=
+            {handler, roadrunner_manual_body_handler,
+                fun(Req) -> roadrunner_manual_body_handler:handle(Req#{state => stream_echo}) end,
+                undefined},
+        body_buffering => manual,
+        http1_active => 4
+    },
+    {Pid, Ref} = start_active_n(Tag, Opts),
+    [{active, 4}] = expect_setopts(Tag),
+    true = erlang:suspend_process(Pid),
+    Pid ! {roadrunner_fake_data, x, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n"},
+    Pid ! {roadrunner_fake_data, x, ~"hello"},
+    Pid ! {roadrunner_fake_data, x, ~"world"},
+    true = erlang:resume_process(Pid),
+    [{active, false}] = expect_setopts(Tag),
+    Sent = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertNotEqual(nomatch, binary:match(Sent, ~"helloworld")),
+    %% The conn then drains the request's own reader, which the handler's
+    %% read did not advance, until the request deadline: stop it here.
+    exit(Pid, kill),
+    receive
+        {'DOWN', Ref, process, Pid, killed} -> ok
+    end.
+
+active_once_hibernating_conn_treats_a_passive_message_as_stray_test() ->
+    %% Only an `{active, N}` socket goes passive: on an `{active, once}`
+    %% one the message is a stray, and the conn arms `once` as for any.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(Tag, size_opts(#{hibernate_after => 60000})),
+    [{active, once}] = expect_setopts(Tag),
+    Pid ! {roadrunner_fake_passive, x},
+    ?assertEqual([{active, once}], expect_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+size_opts(Extra) ->
+    maps:merge(
+        (fake_opts(active_n))#{
+            dispatch :=
+                {handler, roadrunner_body_size_handler, fun roadrunner_body_size_handler:handle/1,
+                    undefined}
+        },
+        Extra
+    ).
+
+start_active_n(Tag, Opts) ->
+    {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_log_sink(Tag)}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    {Pid, Ref}.
+
+%% Deliver one bodyless request as a socket message and wait for its
+%% response.
+request_roundtrip(Tag, Pid) ->
+    Pid ! {roadrunner_fake_data, x, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    ok.
+
+%% A sink that reports every arm and send to the test, tagged `Tag`, and
+%% registers itself for `stop_sink/1`.
+spawn_log_sink(Tag) ->
+    Self = self(),
+    Sink = spawn(fun() -> log_sink(Self, Tag) end),
+    Self ! {Tag, sink, Sink},
+    Sink.
+
+log_sink(Logger, Tag) ->
+    receive
+        stop ->
+            ok;
+        {roadrunner_fake_setopts, _ConnPid, Opts} ->
+            Logger ! {Tag, setopts, Opts},
+            log_sink(Logger, Tag);
+        {roadrunner_fake_send, _Pid, Data} ->
+            Logger ! {Tag, sent, Data},
+            log_sink(Logger, Tag);
+        _Other ->
+            log_sink(Logger, Tag)
+    end.
+
+%% Stop the sink, so the conn's next socket call fails.
+stop_sink(Tag) ->
+    Sink =
+        receive
+            {Tag, sink, S} -> S
+        end,
+    SinkRef = monitor(process, Sink),
+    Sink ! stop,
+    receive
+        {'DOWN', SinkRef, process, Sink, _} -> ok
+    end.
+
+expect_setopts(Tag) ->
+    receive
+        {Tag, setopts, Opts} -> Opts
+    after 2000 -> error(no_setopts)
+    end.
+
+take_setopts(Tag) ->
+    receive
+        {Tag, setopts, Opts} -> Opts
+    after 0 -> none
+    end.
+
+expect_sent(Tag) ->
+    receive
+        {Tag, sent, Data} -> iolist_to_binary(Data)
+    after 2000 -> error(nothing_sent)
+    end.
+
+await_normal_exit(Ref, Pid) ->
+    receive
+        {'DOWN', Ref, process, Pid, Reason} -> ?assertEqual(normal, Reason)
+    after 2000 -> error(no_exit)
+    end.
 
 fake_opts(ListenerName) ->
     #{

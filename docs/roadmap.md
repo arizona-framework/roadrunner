@@ -276,28 +276,6 @@ Revisit only if a real workload reports false `slow_client` drops.
 
 **Scope:** small.
 
-### Read HTTP/1.1 TLS sockets with `{active, N}`
-
-**What:** HTTP/2 connections read with `{active, N}` (the `{http2, #{active
-=> ...}}` option), but HTTP/1.1 still waits for each request with `{active,
-once}`. Over TLS every re-arm is a synchronous call into the ssl connection
-process, which `{active, N}` skips, as it does for HTTP/2. Plain TCP h1 is not
-part of this: measured there, `{active, N}` lowered p99 but raised p50 with no
-CPU saving.
-
-**Why deferred:** the h1 conn process does more with its socket than the h2
-loop does. It reads the rest of a request and its body with passive `recv`,
-which fails while the socket is active, so those reads would come from the
-mailbox instead. Loop and SSE handlers run in the conn process, so the socket
-must be disarmed before them or its data reaches the handler's mailbox. A
-WebSocket or upgrade handoff must forward any queued `{ssl, ...}` messages to
-the new owner, since they stay in the old process's mailbox. The gain is
-limited to small requests over TLS h1, which browsers rarely use once h2 is
-offered. The bench also needs an h1-over-TLS mode before the change can be
-measured.
-
-**Scope:** large.
-
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>
