@@ -1718,14 +1718,16 @@ dispatch_request(
                 roadrunner_conn:with_client_ip(Req0, State#loop.real_ip, Peer),
                 State
             ),
-            StateBuf = State#loop{req_id_buffer = NewBuf},
-            case rate_limit_refused(StateBuf, StreamId, Req) of
+            %% The new request-id buffer is stored by each branch's own final
+            %% update (no separate copy of the ~50-word state first): neither
+            %% the rate check nor the worker start reads it.
+            case rate_limit_refused(State, StreamId, Req) of
                 {refused, State1} ->
                     %% Per-peer rate exceeded: 429 + RST(no_error) sent,
                     %% no worker spawned. 429 (not REFUSED_STREAM) so the
                     %% client backs off per Retry-After instead of
                     %% retrying the stream immediately.
-                    frame_loop(remove_stream(State1, StreamId));
+                    frame_loop(remove_stream(State1#loop{req_id_buffer = NewBuf}, StreamId));
                 ok ->
                     case
                         roadrunner_conn:acquire_request_slot(
@@ -1733,14 +1735,15 @@ dispatch_request(
                         )
                     of
                         true ->
-                            {WorkerPid, MonRef} = start_worker(StateBuf, StreamId, Req),
+                            {WorkerPid, MonRef} = start_worker(State, StreamId, Req),
                             Stream1 = Stream#{
                                 worker_pid := WorkerPid,
                                 worker_ref := MonRef
                             },
-                            frame_loop(StateBuf#loop{
+                            frame_loop(State#loop{
+                                req_id_buffer = NewBuf,
                                 streams = Streams#{StreamId := Stream1},
-                                worker_refs = (StateBuf#loop.worker_refs)#{MonRef => StreamId}
+                                worker_refs = (State#loop.worker_refs)#{MonRef => StreamId}
                             });
                         queued ->
                             %% Over the ceiling, but this listener
@@ -1748,8 +1751,9 @@ dispatch_request(
                             %% assembled request and go back to the
                             %% frame loop; the grant arrives as a
                             %% message.
-                            Awaiting = StateBuf#loop.awaiting_slot,
-                            frame_loop(StateBuf#loop{
+                            Awaiting = State#loop.awaiting_slot,
+                            frame_loop(State#loop{
+                                req_id_buffer = NewBuf,
                                 streams = Streams#{StreamId := Stream},
                                 awaiting_slot = Awaiting#{StreamId => Req}
                             });
@@ -1757,6 +1761,7 @@ dispatch_request(
                             %% Listener-wide in-flight ceiling reached —
                             %% refuse with retry-safe REFUSED_STREAM, no
                             %% worker spawned.
+                            StateBuf = State#loop{req_id_buffer = NewBuf},
                             ok = throttle_stream(StateBuf, ListenerName),
                             _ = send_rst_stream(StateBuf, StreamId, refused_stream),
                             frame_loop(remove_stream(StateBuf, StreamId));
@@ -1764,6 +1769,7 @@ dispatch_request(
                             %% Over the ceiling on a shed listener: 503 +
                             %% Retry-After, no worker spawned, so the client
                             %% waits instead of retrying the stream at once.
+                            StateBuf = State#loop{req_id_buffer = NewBuf},
                             ok = throttle_stream(StateBuf, ListenerName),
                             State1 = retry_later(StateBuf, StreamId, 503, RetryAfter),
                             frame_loop(remove_stream(State1, StreamId))
@@ -1896,10 +1902,10 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
                 State#loop.inflight_counter,
                 State#loop.overload
             ),
-            State1 = State#loop{worker_refs = maps:remove(MonRef, Refs)},
+            Refs1 = maps:remove(MonRef, Refs),
             case Reason of
                 normal ->
-                    finish_stream(State1, StreamId);
+                    finish_stream(State, StreamId, Refs1);
                 stream_reset ->
                     %% The worker wrote to a stream whose response had
                     %% already ended (a stream fun sending after its `fin`):
@@ -1909,9 +1915,9 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
                     %% complete, so the stream ends as for a normal exit,
                     %% never with an RST_STREAM after its END_STREAM (RFC
                     %% 9113 §5.1: no frames on a closed stream).
-                    finish_stream(State1, StreamId);
+                    finish_stream(State, StreamId, Refs1);
                 _ ->
-                    abort_stream(State1, StreamId, internal_error)
+                    abort_stream(State#loop{worker_refs = Refs1}, StreamId, internal_error)
             end;
         #{} ->
             State
@@ -1933,19 +1939,23 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
 %% can end before the client's body does (a handler answering without
 %% reading it all); RFC 9113 §8.1 lets the server then ask the client to
 %% stop sending with RST_STREAM(NO_ERROR).
--spec finish_stream(#loop{}, stream_id()) -> #loop{}.
-finish_stream(#loop{streams = Streams} = State, StreamId) ->
+%%
+%% `Refs` is the worker-ref map without this worker's monitor; the common
+%% end (closed both ways, nothing queued) stores it in the same update
+%% that drops the stream.
+-spec finish_stream(#loop{}, stream_id(), #{reference() => stream_id()}) -> #loop{}.
+finish_stream(#loop{streams = Streams} = State, StreamId, Refs) ->
     #{StreamId := #{pending_sends := Pending} = Stream} = Streams,
     case {queue:is_empty(Pending), Stream} of
         {true, #{state := closed, end_stream_seen := true}} ->
-            remove_stream(State, StreamId);
+            remove_stream(State, StreamId, Refs);
         {true, #{state := closed}} ->
             _ = send_rst_stream(State, StreamId, no_error),
-            remove_stream(State, StreamId);
+            remove_stream(State, StreamId, Refs);
         {true, _} ->
-            abort_stream(State, StreamId, internal_error);
+            abort_stream(State#loop{worker_refs = Refs}, StreamId, internal_error);
         {false, _} ->
-            update_stream(State, StreamId, Stream#{
+            update_stream(State#loop{worker_refs = Refs}, StreamId, Stream#{
                 worker_pid := undefined, worker_ref := undefined
             })
     end.
@@ -1994,10 +2004,15 @@ encode_and_send_headers(
         end,
     Frame = roadrunner_http2_frame:encode({headers, StreamId, Flags, undefined, HpackBlock}),
     _ = send(State, Frame),
-    State1 = State#loop{hpack_enc = Enc1},
-    if
-        EndStream -> close_stream_send_side(State1, StreamId);
-        true -> State1
+    case EndStream of
+        true ->
+            #loop{streams = #{StreamId := Stream} = Streams, live_streams = Live0} = State,
+            {Closed, Live} = close_send(Stream, Live0),
+            State#loop{
+                hpack_enc = Enc1, streams = Streams#{StreamId := Closed}, live_streams = Live
+            };
+        false ->
+            State#loop{hpack_enc = Enc1}
     end.
 
 %% HEADERS + DATA (END_STREAM) packed into ONE `ssl:send/2`. Body
@@ -2025,9 +2040,18 @@ encode_and_send_response_atomic(
     ),
     DFrame = roadrunner_http2_frame:encode({data, StreamId, 16#01, Body}),
     _ = send(State, [HFrame, DFrame]),
-    State1 = State#loop{hpack_enc = Enc1},
-    State2 = consume_send_window(State1, StreamId, Stream, BodyLen),
-    close_stream_send_side(State2, StreamId).
+    %% The encoder, both send windows and the closed send side land in one
+    %% state update (and one stream update): this runs once per buffered
+    %% response, and each `#loop{}` copy is ~50 words.
+    #loop{conn_send_window = ConnW, live_streams = Live0} = State,
+    #{send_window := SW} = Stream,
+    {Closed, Live} = close_send(Stream, Live0, SW - BodyLen),
+    State#loop{
+        hpack_enc = Enc1,
+        conn_send_window = ConnW - BodyLen,
+        streams = Streams#{StreamId := Closed},
+        live_streams = Live
+    }.
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     %% Trailer names already lowercase per `roadrunner_handler:response/0`;
@@ -2051,17 +2075,26 @@ encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
 %% END_STREAM — before the worker's DOWN retires the map entry. If the
 %% peer is still sending (no END_STREAM yet), the stream is
 %% half-closed(local), keeps counting, and is uncounted on teardown.
-close_stream_send_side(#loop{streams = Streams} = State, StreamId) ->
+close_stream_send_side(#loop{streams = Streams, live_streams = Live0} = State, StreamId) ->
     #{StreamId := Stream} = Streams,
-    case Stream of
-        #{end_stream_seen := true, counted := true} ->
-            State#loop{
-                streams = Streams#{StreamId := Stream#{state := closed, counted := false}},
-                live_streams = State#loop.live_streams - 1
-            };
-        _ ->
-            State#loop{streams = Streams#{StreamId := Stream#{state := closed}}}
-    end.
+    {Closed, Live} = close_send(Stream, Live0),
+    State#loop{streams = Streams#{StreamId := Closed}, live_streams = Live}.
+
+%% A stream entry with its send side closed, and the live-stream count
+%% after it: a stream the peer already ended is closed both ways and
+%% stops counting. `close_send/3` also sets the stream's send window, so
+%% a response that spends it pays one stream-map update, not two.
+-spec close_send(map(), non_neg_integer()) -> {map(), non_neg_integer()}.
+close_send(#{end_stream_seen := true, counted := true} = Stream, Live) ->
+    {Stream#{state := closed, counted := false}, Live - 1};
+close_send(Stream, Live) ->
+    {Stream#{state := closed}, Live}.
+
+-spec close_send(map(), non_neg_integer(), integer()) -> {map(), non_neg_integer()}.
+close_send(#{end_stream_seen := true, counted := true} = Stream, Live, SendWindow) ->
+    {Stream#{state := closed, counted := false, send_window := SendWindow}, Live - 1};
+close_send(Stream, Live, SendWindow) ->
+    {Stream#{state := closed, send_window := SendWindow}, Live}.
 
 %% =============================================================================
 %% DATA send + flow control
@@ -2338,9 +2371,14 @@ abort_stream(State0, StreamId, ErrorCode) ->
 %% Drop a stream that needs no RST_STREAM: its response is complete
 %% (`finish_stream/2`, `retire_drained/2`), or the caller already sent
 %% one. Just drop state.
-remove_stream(State0, StreamId) ->
+remove_stream(#loop{worker_refs = Refs} = State, StreamId) ->
+    remove_stream(State, StreamId, Refs).
+
+%% Drop a stream and store `Refs` as the worker-ref map in the same update.
+-spec remove_stream(#loop{}, stream_id(), #{reference() => stream_id()}) -> #loop{}.
+remove_stream(State0, StreamId, Refs) ->
     #loop{streams = Streams} = State = withdraw_parked(uncount_stream(State0, StreamId), StreamId),
-    State#loop{streams = maps:remove(StreamId, Streams)}.
+    State#loop{streams = maps:remove(StreamId, Streams), worker_refs = Refs}.
 
 %% Withdraw a request parked for a slot. Every path that drops a stream
 %% goes through here, so `awaiting_slot` never outlives its stream entry
