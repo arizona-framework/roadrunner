@@ -148,6 +148,16 @@
 %% RFC 9000 §8.2.1 / §8.2.2: a datagram carrying PATH_CHALLENGE or
 %% PATH_RESPONSE is expanded to the smallest allowed maximum datagram size.
 -define(MIN_PATH_DATAGRAM, 1200).
+%% The PATH_CHALLENGEs a validation sends before it gives up (RFC 9000
+%% §8.2.4): one at its start and one each interval, abandoned after three.
+-define(VALIDATION_CHALLENGES, 3).
+%% Challenges kept for a client stranded at the address a failed validation
+%% left (`rechallenge_stranded/1`).
+-define(STRANDED_CHALLENGES, 2).
+%% The largest datagram of a bare PATH_CHALLENGE: a short header with a
+%% 20-byte connection id and a 4-byte packet number, the 9-byte frame and
+%% the AEAD tag.
+-define(BARE_CHALLENGE, 50).
 %% A CRYPTO slice budget that leaves room for the packet header, an ACK
 %% frame, and the AEAD tag within the 1200-byte datagram (RFC 9000 §14).
 -define(CRYPTO_BUDGET, 1000).
@@ -280,6 +290,9 @@
     %% anti-amplification account (§8.1).
     probe_path = undefined ::
         undefined | {address(), non_neg_integer(), roadrunner_quic_amp:t()},
+    %% The address a failed validation left (`keep_as_probe/1`), where the
+    %% client may still be, waiting on packets that now go elsewhere.
+    stranded = undefined :: undefined | address(),
     %% The validation of the current path in progress, or `undefined` once
     %% the path is validated.
     validation = undefined :: undefined | #validation{},
@@ -2020,7 +2033,7 @@ return_to_prev(#state{prev_path = {Addr, Seq, PathDcid}, peer_cid_seq = Left} = 
 %% retired unless another path uses it.
 -spec keep_as_probe(t()) -> t().
 keep_as_probe(#state{peer = Addr, peer_cid_seq = Seq, amp = Amp, probe_path = Old} = State) ->
-    Kept = State#state{probe_path = {Addr, Seq, Amp}},
+    Kept = State#state{probe_path = {Addr, Seq, Amp}, stranded = Addr},
     case Old of
         {_OldAddr, OldSeq, _OldAmp} -> release_peer_cid(OldSeq, Kept);
         undefined -> Kept
@@ -2205,9 +2218,7 @@ path_packet(Now, Path, Frames, #state{scid = SCID, sealed = Sealed} = State) ->
             none;
         {DCID, Budget} ->
             #space{next_pn = PN} = Space = space(application, State),
-            Entry = (entry(application, Frames, PN, State))#{
-                pad_to => min(?MIN_PATH_DATAGRAM, Budget)
-            },
+            Entry = (entry(application, Frames, PN, State))#{pad_to => path_pad(Budget)},
             {Datagram, [Sent]} = roadrunner_quic_send:datagram(#{application => Entry}, DCID, SCID),
             case byte_size(Datagram) =< Budget of
                 true ->
@@ -2219,6 +2230,14 @@ path_packet(Now, Path, Frames, #state{scid = SCID, sealed = Sealed} = State) ->
                     none
             end
     end.
+
+%% A probing packet fills a 1200-byte datagram when the anti-amplification
+%% limit allows it (RFC 9000 §8.2.1 MUST) and otherwise goes bare: a smaller
+%% datagram cannot validate the path MTU anyway, and the budget it would
+%% spend is what lets a lost challenge be sent again.
+-spec path_pad(non_neg_integer() | infinity) -> non_neg_integer().
+path_pad(Budget) when Budget >= ?MIN_PATH_DATAGRAM -> ?MIN_PATH_DATAGRAM;
+path_pad(_Budget) -> 0.
 
 %% The client id and anti-amplification budget for a path's probing packet.
 -spec path_target(path(), t()) -> {binary(), non_neg_integer() | infinity} | none.
@@ -3107,7 +3126,7 @@ drain_built(Now, Levels, State, Acc) ->
             CcOk =
                 not AckEliciting orelse Probes > 0 orelse
                     roadrunner_quic_cc_newreno:can_send(total_bytes_in_flight(State), Cc),
-            case {roadrunner_quic_amp:can_send(byte_size(Datagram), Amp), CcOk} of
+            case {roadrunner_quic_amp:can_send(byte_size(Datagram) + reserve(State), Amp), CcOk} of
                 {false, _} ->
                     %% The anti-amplification limit holds the datagram back
                     %% until the client sends more (RFC 9000 §8.1). An ACK it
@@ -3140,6 +3159,19 @@ drain_built(Now, Levels, State, Acc) ->
             end
     end.
 
+%% Budget the anti-amplification limit keeps from data and ACKs on a path
+%% still being validated (RFC 9000 §8.1): room for the challenges its
+%% validation has yet to send and for those a client stranded by its failure
+%% would draw (`rechallenge_stranded/1`). The limit grows only with what the
+%% client sends, and a client that stops receiving stops sending: data
+%% spending the whole budget would leave a lost challenge no retry and the
+%% validation failing on one loss.
+-spec reserve(t()) -> non_neg_integer().
+reserve(#state{validation = #validation{sent = Sent}}) ->
+    max(0, ?VALIDATION_CHALLENGES - length(Sent) + ?STRANDED_CHALLENGES) * ?BARE_CHALLENGE;
+reserve(#state{}) ->
+    0.
+
 %% The ACK-only packet for the first level with an ACK due, sent while the
 %% congestion window (RFC 9002 §7: ACK-only packets are not congestion
 %% controlled) or the anti-amplification limit holds back the data it would
@@ -3152,7 +3184,7 @@ send_ack_only(Now, Levels, State, Acc) ->
         {Entries, Built} ->
             #state{peer_scid = DCID, scid = SCID, amp = Amp} = State,
             {Datagram, Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
-            case roadrunner_quic_amp:can_send(byte_size(Datagram), Amp) of
+            case roadrunner_quic_amp:can_send(byte_size(Datagram) + reserve(State), Amp) of
                 true ->
                     Recorded = record_sent(Now, Sent, Built),
                     Amp1 = roadrunner_quic_amp:sent(byte_size(Datagram), Amp),
@@ -3476,7 +3508,7 @@ silently.
 -spec handle_timeout(integer(), atom(), t()) -> {t(), [effect()]}.
 handle_timeout(Now, pto, State) ->
     State1 = lists:foldl(fun(Level, S) -> on_pto(Now, Level, S) end, State, present_levels(State)),
-    {State2, Effects} = send_pass(Now, State1),
+    {State2, Effects} = send_pass(Now, rechallenge_stranded(State1)),
     {State2#state{probes = 0}, Effects};
 handle_timeout(_Now, idle, State) ->
     close_silently(idle_timeout, State);
@@ -3496,6 +3528,24 @@ handle_timeout(_Now, drain, State) ->
     %% The drain window elapsed (RFC 9000 §10.2): become closed so the shell
     %% tears the connection down. The owner already learned of the close on entry.
     {State#state{phase = closed}, []}.
+
+%% A probe timeout on the current path, while the address a failed
+%% validation left is still the one the client probes from, challenges that
+%% address as well. A client that really moved there, whose challenges or
+%% responses were lost, may only be receiving (a download) and so send
+%% nothing more from it: unanswered here, it would wait there until its idle
+%% timeout. The challenge is ack-eliciting, so such a client answers with a
+%% non-probing packet, which moves the connection back (RFC 9000 §9.3). The
+%% address's anti-amplification account bounds it (§8.1), which the failed
+%% validation left room in (`reserve/1`), and the probe timeout's backoff
+%% paces it.
+-spec rechallenge_stranded(t()) -> t().
+rechallenge_stranded(
+    #state{phase = connected, stranded = Addr, probe_path = {Addr, _Seq, _Amp}} = State
+) ->
+    queue_path(probe, [{path_challenge, crypto:strong_rand_bytes(8)}], State);
+rechallenge_stranded(State) ->
+    State.
 
 %% Close without a CONNECTION_CLOSE and surface the terminal `{closed, _}`
 %% event to the owner. Any parked send reply is released before the shell
