@@ -163,10 +163,11 @@ deadline in milliseconds. The shed form answers it `503` with the
     %% `roadrunner_listener:build_proto_opts/2` fills defaults.
     ws_max_frame_size := non_neg_integer(),
     ws_max_message_size := non_neg_integer(),
-    %% inet `buffer` applied to the socket on WebSocket upgrade;
-    %% `undefined` inherits the listener socket's `recv_buffer`
-    %% (64 KB default).
-    ws_buffer := pos_integer() | undefined,
+    %% inet `buffer` for a WebSocket session: a fixed size,
+    %% `{adaptive, Max}` (the default: from 8 KB up to `Max`, the
+    %% listener's `recv_buffer`), or `undefined` to keep the listener
+    %% socket's `recv_buffer`.
+    ws_buffer := pos_integer() | {adaptive, pos_integer()} | undefined,
     %% Idle ms after which a WebSocket session hibernates; `infinity`
     %% (the default) never hibernates on idle.
     ws_hibernate_after := pos_integer() | infinity,

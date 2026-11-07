@@ -144,6 +144,10 @@
     recv = 0 :: non_neg_integer()
 }).
 
+%% The inet `buffer` an adaptive session reads with between large frames:
+%% message-sized deliveries fit, and it is what each idle connection holds.
+-define(ADAPTIVE_BUFFER_BASE, 8192).
+
 -record(data, {
     socket :: roadrunner_transport:socket(),
     buffer :: binary(),
@@ -228,6 +232,13 @@
     %% arms `{active, N}` and re-arms on the transport's passive message
     %% (the `active` option, `arm_active/1`).
     active :: once | 1..32767,
+    %% The adaptive inet `buffer` (`arm_and_recv/2`): the size the session
+    %% falls back to, the cap it grows to, and the size set now. All
+    %% `undefined` when the buffer is fixed (an explicit `ws.recv_buffer`,
+    %% or a session reading with `{active, N}`).
+    buf_base :: pos_integer() | undefined,
+    buf_max :: pos_integer() | undefined,
+    buf_cur :: pos_integer() | undefined,
     %% The connection's close path, called by `guarded/2` once the
     %% session has ended.
     finish :: finish()
@@ -374,21 +385,37 @@ upgrade(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) -
             rejected
     end.
 
-%% Apply the `ws.recv_buffer` listener opt: resize the socket's inet
-%% `buffer` for the session's lifetime, before the 101 goes out. The
-%% conn still owns the socket here. `undefined` (the default) keeps the
-%% listener socket's inherited `recv_buffer` (64 KB default), sized
-%% for HTTP request flow; high-concurrency small-message deployments
-%% set it lower because the
-%% emulator holds a live buffer of this size per socket. A setopts
+%% Apply the `ws.recv_buffer` listener opt before the 101 goes out,
+%% while the conn still owns the socket: a fixed size for the session's
+%% lifetime, or, adaptive (the default), the base an `{active, once}`
+%% session starts from (`arm_and_recv/2` resizes it from there).
+%% `undefined` keeps the listener socket's `recv_buffer`. A setopts
 %% failure means the socket already died; the session discovers that on
 %% its first receive, so the result is ignored rather than special-cased.
 -spec apply_ws_buffer(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
 apply_ws_buffer(_Socket, #{ws_buffer := undefined}) ->
     ok;
+apply_ws_buffer(Socket, #{ws_buffer := {adaptive, Max} = WsBuffer, ws_active := Active}) ->
+    _ =
+        case adaptive_bounds(WsBuffer, read_mode(Active, Socket)) of
+            {Base, Max} -> roadrunner_transport:setopts(Socket, [{buffer, Base}]);
+            {undefined, undefined} -> ok
+        end,
+    ok;
 apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
     _ = roadrunner_transport:setopts(Socket, [{buffer, Buffer}]),
     ok.
+
+%% The adaptive buffer's base and cap for a session: only an `once`
+%% session adapts, since it re-arms per message and so can resize in the
+%% same call, and only below a listener `recv_buffer` larger than the
+%% base. Anything else keeps the buffer it has.
+-spec adaptive_bounds(pos_integer() | {adaptive, pos_integer()} | undefined, once | 1..32767) ->
+    {pos_integer(), pos_integer()} | {undefined, undefined}.
+adaptive_bounds({adaptive, Max}, once) when Max > ?ADAPTIVE_BUFFER_BASE ->
+    {?ADAPTIVE_BUFFER_BASE, Max};
+adaptive_bounds(_WsBuffer, _Mode) ->
+    {undefined, undefined}.
 
 %% Run the session in the calling process until it ends, then call
 %% `Finish()`. The process takes the session's label and its garbage
@@ -420,9 +447,12 @@ serve(
         ws_max_message_size := MaxMsg,
         ws_hibernate_after := HibernateAfter,
         ws_idle_timeout := IdleTimeout,
-        ws_active := Active
+        ws_active := Active,
+        ws_buffer := WsBuffer
     } = ProtoOpts,
     ok = apply_gc_settings(SpawnOpts),
+    Mode = read_mode(Active, Socket),
+    {BufBase, BufMax} = adaptive_bounds(WsBuffer, Mode),
     {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
     Data = #data{
         socket = Socket,
@@ -444,7 +474,10 @@ serve(
         max_message_size = MaxMsg,
         hibernate_after = HibernateAfter,
         idle = #idle{timeout = IdleTimeout},
-        active = read_mode(Active, Socket),
+        active = Mode,
+        buf_base = BufBase,
+        buf_max = BufMax,
+        buf_cur = BufBase,
         msg_acc = undefined,
         msg_opcode = undefined,
         msg_compressed = false,
@@ -822,14 +855,20 @@ dispatch_message(Opcode, Payload, Rest, Data, Hibernate) ->
     case Mod:handle_frame(Frame, State) of
         {reply, [_ | _] = OutFrames, NewState} when Rest =:= <<>>, Out =:= [] ->
             _ = roadrunner_transport:send(Socket, encode_frames(Data, Span, OutFrames)),
-            arm_and_recv(Data#data{buffer = <<>>, mod_state = NewState}, Hibernate);
+            arm_after_message(
+                byte_size(Payload), Data#data{buffer = <<>>, mod_state = NewState}, Hibernate
+            );
         {reply, OutFrames, NewState} ->
             %% More frames buffered (a pipelining client) or output
             %% already queued: queue the reply in the same update that
             %% advances the buffer, and keep draining.
             process_buffer(queue_reply(Data, Rest, OutFrames, NewState), Hibernate);
-        {ok, NewState} ->
+        {ok, NewState} when Rest =:= <<>> ->
             %% Same single update as above, without a reply.
+            arm_after_message(
+                byte_size(Payload), Data#data{buffer = <<>>, mod_state = NewState}, Hibernate
+            );
+        {ok, NewState} ->
             process_buffer(Data#data{buffer = Rest, mod_state = NewState}, Hibernate);
         Result ->
             apply_handler_result(
@@ -1019,14 +1058,54 @@ arm_and_recv(#data{active = N} = Data, Hibernate) when is_integer(N) ->
     %% transport reports it passive (`arm_active/1`), so there is nothing
     %% to re-arm per message.
     flush_and_wait(Data, Hibernate);
-arm_and_recv(#data{socket = Socket} = Data0, Hibernate) ->
+arm_and_recv(#data{buffer = <<>>} = Data, Hibernate) ->
+    arm_once([{active, once}], Data, Hibernate);
+arm_and_recv(#data{buf_base = undefined} = Data, Hibernate) ->
+    arm_once([{active, once}], Data, Hibernate);
+arm_and_recv(#data{buffer = Buf, buf_cur = Cur, buf_max = Max} = Data, Hibernate) ->
+    %% A frame is partly buffered: grow the buffer so the rest of it,
+    %% and the frames like it that follow, arrive in one read.
+    case frame_wire_size(Buf) of
+        Size when Size > Cur, Cur < Max ->
+            Want = min(round_up(Size), Max),
+            arm_once([{active, once}, {buffer, Want}], Data#data{buf_cur = Want}, Hibernate);
+        _Size ->
+            arm_once([{active, once}], Data, Hibernate)
+    end.
+
+%% Re-arm after dispatching a whole message of `Size` bytes that arrived
+%% with nothing else buffered. A buffer the session grew for large frames
+%% goes back to its base once a message smaller than the base arrives, so
+%% a connection that sent one upload does not keep the large buffer.
+-spec arm_after_message(non_neg_integer(), #data{}, boolean()) -> finished.
+arm_after_message(_Size, #data{buf_cur = Cur, buf_base = Cur} = Data, Hibernate) ->
+    arm_and_recv(Data, Hibernate);
+arm_after_message(Size, #data{buf_base = Base} = Data, Hibernate) when Size < Base ->
+    arm_once([{active, once}, {buffer, Base}], Data#data{buf_cur = Base}, Hibernate);
+arm_after_message(_Size, Data, Hibernate) ->
+    arm_and_recv(Data, Hibernate).
+
+-spec arm_once([gen_tcp:option()], #data{}, boolean()) -> finished.
+arm_once(Opts, #data{socket = Socket} = Data0, Hibernate) ->
     %% Everything queued during the drain pass that led here goes out
     %% in one write before the park — see `flush_out/1`.
     Data = flush_out(Data0),
-    case roadrunner_transport:setopts(Socket, [{active, once}]) of
+    case roadrunner_transport:setopts(Socket, Opts) of
         ok -> wait(Data, Hibernate);
         {error, Reason} -> exit_clean({error, Reason}, Data)
     end.
+
+%% The wire size of the client frame starting `Buf` (RFC 6455 §5.2: a
+%% client frame is always masked, so the 4-byte key is counted), or 0
+%% while its length is not buffered yet.
+-spec frame_wire_size(binary()) -> non_neg_integer().
+frame_wire_size(<<_:9, Len:7, _/binary>>) when Len < 126 -> 6 + Len;
+frame_wire_size(<<_:9, 126:7, Len:16, _/binary>>) -> 8 + Len;
+frame_wire_size(<<_:9, 127:7, Len:64, _/binary>>) -> 14 + Len;
+frame_wire_size(_Buf) -> 0.
+
+-spec round_up(non_neg_integer()) -> non_neg_integer().
+round_up(Size) -> (Size + 4095) band (bnot 4095).
 
 %% Flush and wait WITHOUT re-arming, after a message that did not come
 %% from the socket (`handle_info/2`, `handle_drain/2`, a dropped stray).
