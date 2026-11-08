@@ -88,8 +88,8 @@ stream, so there is no burst to be lenient about.
 
 ## HTTP/3 follow-ups
 
-h3 shipped experimentally (`protocols => [http3]`; QPACK decodes the
-client's dynamic table, responses use the static table). Remaining work:
+h3 is served with `protocols => [http3]` (QPACK decodes the client's
+dynamic table, responses use the static table). Remaining work:
 
 - WebSocket over h3 (`websocket` shape, still `501`) — RFC 9220
   Extended CONNECT; it reuses the stream I/O backend WebSocket over h2
