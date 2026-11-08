@@ -541,8 +541,8 @@ Build the final `tls` opts list from the listener's `protocols` atom
 list and the user-supplied TLS options.
 
 Derives `alpn_preferred_protocols` from `Protocols` (`http2` →
-`~"h2"`, `http1` → `~"http/1.1"`) in user-supplied order and
-prepends it to `UserOpts`, unless the user already supplied
+`~"h2"`, `http1` → `~"http/1.1"`), `h2` first whatever their order,
+and prepends it to `UserOpts`, unless the user already supplied
 `alpn_preferred_protocols` explicitly — in which case the explicit
 value wins and derivation is skipped. Then layers hardened defaults
 underneath via `apply_tls_defaults/1`.
@@ -560,15 +560,13 @@ build_tls_opts(Protocols, UserOpts) ->
         end,
     apply_tls_defaults(WithAlpn).
 
+%% The server picks the first protocol in its own list that the client
+%% offers, so `h2` leads: a client that speaks HTTP/2 gets it, as servers
+%% conventionally prefer, however `protocols` lists the two.
 -spec alpn_from_protocols([http1 | http2, ...]) -> [binary(), ...].
 alpn_from_protocols(Protocols) ->
-    [
-        case P of
-            http2 -> ~"h2";
-            http1 -> ~"http/1.1"
-        end
-     || P <- Protocols
-    ].
+    [~"h2" || lists:member(http2, Protocols)] ++
+        [~"http/1.1" || lists:member(http1, Protocols)].
 
 -doc """
 Return the ALPN protocol selected during the TLS handshake, or

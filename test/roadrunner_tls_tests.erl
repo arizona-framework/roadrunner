@@ -118,6 +118,23 @@ h2_alpn_dispatch_test_() ->
                 ),
                 ok = ssl:close(Sock)
             end},
+            {"a client offering h2 and http/1.1, as browsers do, gets h2", fun() ->
+                %% The listener lists `http1` before `http2`; the server
+                %% still prefers h2.
+                {ok, Sock} = ssl:connect(
+                    {127, 0, 0, 1},
+                    Port,
+                    ClientOpts ++
+                        [
+                            binary,
+                            {active, false},
+                            {alpn_advertised_protocols, [~"h2", ~"http/1.1"]}
+                        ],
+                    5000
+                ),
+                ?assertEqual({ok, ~"h2"}, ssl:negotiated_protocol(Sock)),
+                ok = ssl:close(Sock)
+            end},
             {"http/1.1 ALPN on the same listener still serves HTTP/1.1", fun() ->
                 {ok, Sock} = ssl:connect(
                     {127, 0, 0, 1},

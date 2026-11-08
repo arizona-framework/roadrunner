@@ -112,12 +112,18 @@ build_tls_opts_derives_alpn_from_protocols_h2_only_test() ->
     ).
 
 build_tls_opts_derives_alpn_from_protocols_h1_and_h2_test() ->
+    %% The server takes the first of its own protocols the client offers,
+    %% so `h2` leads in either order: a client that speaks HTTP/2 gets it.
     {ok, _} = application:ensure_all_started(ssl),
-    Result = roadrunner_transport:build_tls_opts([http1, http2], []),
-    ?assertEqual(
-        {alpn_preferred_protocols, [~"http/1.1", ~"h2"]},
-        lists:keyfind(alpn_preferred_protocols, 1, Result)
-    ).
+    [
+        ?assertEqual(
+            {alpn_preferred_protocols, [~"h2", ~"http/1.1"]},
+            lists:keyfind(
+                alpn_preferred_protocols, 1, roadrunner_transport:build_tls_opts(Protocols, [])
+            )
+        )
+     || Protocols <- [[http1, http2], [http2, http1]]
+    ].
 
 build_tls_opts_user_alpn_overrides_derivation_test() ->
     {ok, _} = application:ensure_all_started(ssl),
