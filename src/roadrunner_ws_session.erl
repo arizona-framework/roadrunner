@@ -148,6 +148,9 @@
 %% message-sized deliveries fit, and it is what each idle connection holds.
 -define(ADAPTIVE_BUFFER_BASE, 8192).
 
+%% The session's deflate stream (`deflate_stream/1`).
+-define(DEFLATE_PDKEY, {?MODULE, deflate}).
+
 -record(data, {
     socket :: roadrunner_transport:socket(),
     buffer :: binary(),
@@ -161,7 +164,6 @@
     %% all compression machinery on the hot path.
     pmd_params :: roadrunner_ws:permessage_deflate_params() | undefined,
     inflate_z :: zlib:zstream() | undefined,
-    deflate_z :: zlib:zstream() | undefined,
     %% In-progress message reassembly state. WebSocket data messages
     %% (text / binary) MAY span multiple fragments at the wire level
     %% (RFC 6455 §5.4). The session reassembles them before dispatch
@@ -452,7 +454,7 @@ serve(
     ok = apply_gc_settings(SpawnOpts),
     Mode = read_mode(Active, Socket),
     Buf = adaptive_buf(WsBuffer, Mode),
-    {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
+    {PmdParams, InflateZ} = init_pmd(Negotiated),
     Data = #data{
         socket = Socket,
         buffer = Buffered,
@@ -468,7 +470,6 @@ serve(
         },
         pmd_params = PmdParams,
         inflate_z = InflateZ,
-        deflate_z = DeflateZ,
         max_frame_size = MaxFrame,
         max_message_size = MaxMsg,
         hibernate_after = HibernateAfter,
@@ -541,21 +542,41 @@ apply_gc_settings(SpawnOpts) ->
 %% server's max-window-bits. RFC 7692 §7.2.1 specifies raw DEFLATE
 %% (no zlib header), so windowBits is negative in zlib's convention.
 -spec init_pmd(roadrunner_ws:negotiated()) ->
-    {undefined, undefined, undefined}
-    | {roadrunner_ws:permessage_deflate_params(), zlib:zstream(), zlib:zstream()}.
+    {undefined, undefined} | {roadrunner_ws:permessage_deflate_params(), zlib:zstream()}.
 init_pmd(none) ->
-    {undefined, undefined, undefined};
-init_pmd({permessage_deflate, Params, _ResponseValue}) ->
-    #{
-        client_max_window_bits := ClientWB,
-        server_max_window_bits := ServerWB,
-        mem_level := MemLevel
-    } = Params,
+    {undefined, undefined};
+init_pmd({permessage_deflate, #{client_max_window_bits := ClientWB} = Params, _ResponseValue}) ->
+    %% zlib allocates the inflate window on the first inflate; the deflate
+    %% stream, whose window and hash tables are allocated at
+    %% `deflateInit`, waits for the first compressed message out
+    %% (`deflate_stream/1`).
     InflateZ = zlib:open(),
     ok = zlib:inflateInit(InflateZ, -ClientWB),
-    DeflateZ = zlib:open(),
-    ok = zlib:deflateInit(DeflateZ, default, deflated, -ServerWB, MemLevel, default),
-    {Params, InflateZ, DeflateZ}.
+    {Params, InflateZ}.
+
+%% The session's deflate stream, opened on the first compressed message
+%% out: `deflateInit` allocates its window and hash tables at once (about
+%% 256 KB with a 15-bit window and memLevel 8), and a session that never
+%% sends a compressed message never pays for them. It lives in the
+%% process dictionary rather than `#data{}`, so the send paths that return
+%% only the encoded frames need not thread the record back, and is closed
+%% with the session (`close_deflate/0`).
+-spec deflate_stream(roadrunner_ws:permessage_deflate_params()) -> zlib:zstream().
+deflate_stream(Params) ->
+    case get(?DEFLATE_PDKEY) of
+        undefined ->
+            #{server_max_window_bits := ServerWB, mem_level := MemLevel} = Params,
+            Z = zlib:open(),
+            ok = zlib:deflateInit(Z, default, deflated, -ServerWB, MemLevel, default),
+            _ = put(?DEFLATE_PDKEY, Z),
+            Z;
+        Z ->
+            Z
+    end.
+
+-spec close_deflate() -> ok.
+close_deflate() ->
+    close_zlib(erase(?DEFLATE_PDKEY)).
 
 %% The optional handler `init/1` runs once, before any frame. A drain or
 %% stray message that arrived first stays queued for `recv_loop/1`.
@@ -692,10 +713,10 @@ recv_loop(
 %% Releasing the zlib contexts here frees their working buffers now, not
 %% when the process exits.
 -spec exit_clean(roadrunner_ws_handler:terminate_reason(), #data{}) -> finished.
-exit_clean(Reason, #data{inflate_z = InflateZ, deflate_z = DeflateZ} = Data) ->
+exit_clean(Reason, #data{inflate_z = InflateZ} = Data) ->
     ok = terminate(Reason, Data),
     close_zlib(InflateZ),
-    close_zlib(DeflateZ),
+    close_deflate(),
     finished.
 
 %% Something raised while the session ran (`guarded/2`). An exit with
@@ -704,10 +725,10 @@ exit_clean(Reason, #data{inflate_z = InflateZ, deflate_z = DeflateZ} = Data) ->
 %% when the session had a process of its own; anything else is logged like
 %% an HTTP handler crash.
 -spec session_crashed(error | exit | throw, term(), list(), #data{}) -> ok.
-session_crashed(Class, Reason, Stack, #data{mod = Mod, inflate_z = InflateZ, deflate_z = DeflateZ}) ->
+session_crashed(Class, Reason, Stack, #data{mod = Mod, inflate_z = InflateZ}) ->
     ok = log_crash(Class, Reason, Stack, Mod),
     close_zlib(InflateZ),
-    close_zlib(DeflateZ).
+    close_deflate().
 
 -spec log_crash(error | exit | throw, term(), list(), module()) -> ok.
 log_crash(exit, normal, _Stack, _Mod) ->
@@ -1793,7 +1814,8 @@ encode_outbound(Data, Opcode, Payload) ->
 %% trailing 4-byte deflate tail per RFC 7692 §7.2.1 — receivers
 %% append it back before inflating.
 -spec deflate_message(#data{}, iodata()) -> binary().
-deflate_message(#data{deflate_z = Z, pmd_params = Params}, Payload) ->
+deflate_message(#data{pmd_params = Params}, Payload) ->
+    Z = deflate_stream(Params),
     Iolist = zlib:deflate(Z, Payload, sync),
     case Params of
         #{server_no_context_takeover := true} -> ok = zlib:deflateReset(Z);

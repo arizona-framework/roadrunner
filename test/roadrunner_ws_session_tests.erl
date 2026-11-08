@@ -1318,6 +1318,47 @@ pmd_uses_the_negotiated_window_and_memory_level_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
+pmd_opens_the_deflate_stream_on_the_first_compressed_message_out_test() ->
+    %% A negotiated session holds no deflate stream (its window and hash
+    %% tables) until it sends a compressed message: here the echo of the
+    %% first inbound frame.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, [{recv, pmd_frame(text, pmd_compress(~"hello"))}]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false,
+                mem_level => 8
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    ?assertEqual(undefined, deflate_stream_of(Pid)),
+    Pid ! socket_ready,
+    <<16#c1, _/binary>> = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertNotEqual(undefined, deflate_stream_of(Pid)),
+    Sink ! stop,
+    ok = stop_ws_session(Pid).
+
+deflate_stream_of(Pid) ->
+    {dictionary, Dict} = erlang:process_info(Pid, dictionary),
+    proplists:get_value({roadrunner_ws_session, deflate}, Dict).
+
 pmd_inflates_compressed_inbound_text_message_test() ->
     %% Client sends a single-fragment compressed text "hello"; server
     %% inflates it and dispatches to the echo handler. Echo replies
