@@ -445,6 +445,74 @@ end_to_end_compresses_html_response_test_() ->
 
 %% --- helpers ---
 
+%% --- the functions for a response sent another way ---
+
+buffered_compresses_like_the_middleware_test() ->
+    %% Same rules as a `{Status, Headers, Body}` through `call/3`: the
+    %% body is gzipped, Content-Length follows it, Vary is added.
+    Body = binary:copy(~"hello world ", 200),
+    Req = req([{~"accept-encoding", ~"gzip"}]),
+    {Headers, Compressed} = roadrunner_compress:buffered(
+        Req, [{~"content-length", ~"2400"}], Body
+    ),
+    ?assertEqual(Body, zlib:gunzip(Compressed)),
+    ?assertEqual({~"content-encoding", ~"gzip"}, lists:keyfind(~"content-encoding", 1, Headers)),
+    ?assertEqual(
+        {~"content-length", integer_to_binary(byte_size(Compressed))},
+        lists:keyfind(~"content-length", 1, Headers)
+    ),
+    ?assertEqual({~"vary", ~"Accept-Encoding"}, lists:keyfind(~"vary", 1, Headers)),
+    {Status, MwHeaders, MwBody} = middleware(Req, {200, [{~"content-length", ~"2400"}], Body}),
+    ?assertEqual({200, Headers, Compressed}, {Status, MwHeaders, MwBody}).
+
+buffered_leaves_small_unaccepted_and_encoded_bodies_test() ->
+    Big = binary:copy(~"x", 2000),
+    %% Below the threshold: only Vary.
+    ?assertEqual(
+        {[{~"vary", ~"Accept-Encoding"}], ~"short"},
+        roadrunner_compress:buffered(req([{~"accept-encoding", ~"gzip"}]), [], ~"short")
+    ),
+    %% Not accepted: only Vary.
+    ?assertEqual(
+        {[{~"vary", ~"Accept-Encoding"}], Big}, roadrunner_compress:buffered(req([]), [], Big)
+    ),
+    %% Already encoded: untouched.
+    Encoded = [{~"content-encoding", ~"br"}],
+    ?assertEqual(
+        {Encoded, Big},
+        roadrunner_compress:buffered(req([{~"accept-encoding", ~"gzip"}]), Encoded, Big)
+    ).
+
+stream_headers_and_stream_deflate_compress_chunks_test() ->
+    Req = req([{~"accept-encoding", ~"deflate"}]),
+    {Headers, deflate} = roadrunner_compress:stream_headers(Req, [{~"x-a", ~"1"}]),
+    ?assertEqual({~"content-encoding", ~"deflate"}, lists:keyfind(~"content-encoding", 1, Headers)),
+    ?assertEqual({~"vary", ~"Accept-Encoding"}, lists:keyfind(~"vary", 1, Headers)),
+    ?assertEqual({~"x-a", ~"1"}, lists:keyfind(~"x-a", 1, Headers)),
+    Z = roadrunner_compress:stream_deflate(deflate),
+    Wire = iolist_to_binary([zlib:deflate(Z, ~"chunk one, ", none), zlib:deflate(Z, ~"two", finish)]),
+    ok = zlib:close(Z),
+    ?assertEqual(~"chunk one, two", zlib:uncompress(Wire)),
+    G = roadrunner_compress:stream_deflate(gzip),
+    Gz = iolist_to_binary(zlib:deflate(G, ~"gzipped", finish)),
+    ok = zlib:close(G),
+    ?assertEqual(~"gzipped", zlib:gunzip(Gz)).
+
+stream_headers_without_an_encoding_test() ->
+    %% Not accepted: Vary only, `none`. Already encoded: untouched, `none`.
+    ?assertEqual(
+        {[{~"vary", ~"Accept-Encoding"}], none}, roadrunner_compress:stream_headers(req([]), [])
+    ),
+    Encoded = [{~"content-encoding", ~"br"}],
+    ?assertEqual(
+        {Encoded, none},
+        roadrunner_compress:stream_headers(req([{~"accept-encoding", ~"gzip"}]), Encoded)
+    ).
+
+middleware(Req, Response) ->
+    {Result, _} = roadrunner_compress:call(Req, fun(R) -> {Response, R} end, undefined),
+    Result.
+
 req(Headers) ->
     #{
         method => ~"GET",
