@@ -43,6 +43,31 @@ apart (RFC 9110 §12.5.5).
 - Brotli (`br`) is not supported.
 - For static files, `roadrunner_static` serves precompressed `.br` / `.gz`
   files instead of compressing on the fly.
+
+## Compressing a response sent another way
+
+A handler or adapter that sends its response itself (`roadrunner_send`)
+gets the same rules from `buffered/3`, `stream_headers/2` and
+`stream_deflate/1`, so it compresses as the middleware would:
+
+```erlang
+%% A whole body.
+{Headers1, Body1} = roadrunner_compress:buffered(Req, Headers, Body),
+ok = roadrunner_send:reply(200, Headers1, Body1, Req).
+
+%% A body sent in chunks.
+case roadrunner_compress:stream_headers(Req, Headers) of
+    {Headers1, none} ->
+        {ok, Send} = roadrunner_send:stream(200, Headers1, Req),
+        ok = Send(Chunk, fin);
+    {Headers1, Encoding} ->
+        Z = roadrunner_compress:stream_deflate(Encoding),
+        {ok, Send} = roadrunner_send:stream(200, Headers1, Req),
+        ok = Send(zlib:deflate(Z, Chunk, none), nofin),
+        ok = Send(zlib:deflate(Z, Last, finish), fin),
+        zlib:close(Z)
+end.
+```
 """.
 
 %% Why gzip wins a qvalue tie: gzip has a more deterministic on-the-wire
@@ -57,6 +82,7 @@ apart (RFC 9110 §12.5.5).
 -on_load(init_patterns/0).
 
 -export([call/3]).
+-export([buffered/3, stream_headers/2, stream_deflate/1]).
 
 -define(THRESHOLD, 860).
 -define(COMMA_CP_KEY, {?MODULE, comma_cp}).
@@ -101,11 +127,26 @@ transform(_Req, Other) ->
     iodata()
 ) -> roadrunner_handler:response().
 transform_buffered(Req, Status, Headers, Body) ->
+    {Headers1, Body1} = buffered(Req, Headers, Body),
+    {Status, Headers1, Body1}.
+
+-doc """
+Apply the middleware's rules to a whole response body the caller sends
+itself: returns the headers and body to send. The body is compressed
+when the request accepts `gzip` or `deflate`, the headers carry no
+`Content-Encoding` and the body is at least 860 bytes; then
+`Content-Encoding` is added and any `Content-Length` set to the
+compressed size. Headers without a `Content-Encoding` get
+`Vary: Accept-Encoding` either way.
+""".
+-spec buffered(roadrunner_req:request(), roadrunner_http:headers(), iodata()) ->
+    {roadrunner_http:headers(), iodata()}.
+buffered(Req, Headers, Body) ->
     case has_header(~"content-encoding", Headers) of
         true ->
             %% Already encoded by the handler — pass through verbatim;
             %% don't add Vary on top of whatever the handler chose.
-            {Status, Headers, Body};
+            {Headers, Body};
         false ->
             HeadersWithVary = add_vary(Headers),
             case Body of
@@ -113,19 +154,19 @@ transform_buffered(Req, Status, Headers, Body) ->
                     %% A binary body's size is free to read, so a body below
                     %% the threshold skips `Accept-Encoding` negotiation
                     %% (~435 ns for `gzip, deflate, br, zstd`) outright.
-                    {Status, HeadersWithVary, Body};
+                    {HeadersWithVary, Body};
                 _ ->
                     case negotiate_encoding(Req) of
                         none ->
                             %% No encoding negotiated → skip the `iolist_size`
                             %% walk over the body entirely.
-                            {Status, HeadersWithVary, Body};
+                            {HeadersWithVary, Body};
                         Encoding ->
                             case iolist_size(Body) of
                                 Size when Size >= ?THRESHOLD ->
-                                    compress(Status, HeadersWithVary, Body, Size, Encoding);
+                                    compress(HeadersWithVary, Body, Size, Encoding);
                                 _ ->
-                                    {Status, HeadersWithVary, Body}
+                                    {HeadersWithVary, Body}
                             end
                     end
             end
@@ -138,19 +179,48 @@ transform_buffered(Req, Status, Headers, Body) ->
     roadrunner_handler:stream_fun()
 ) -> roadrunner_handler:response().
 transform_stream(Req, Status, Headers, Fun) ->
+    case stream_headers(Req, Headers) of
+        {Headers1, none} -> {stream, Status, Headers1, Fun};
+        {Headers1, Encoding} -> wrap_stream(Status, Headers1, Fun, Encoding)
+    end.
+
+-doc """
+The headers for a response body the caller sends in chunks, and the
+encoding to compress the chunks with (`stream_deflate/1`), or `none`.
+Headers that already carry a `Content-Encoding` come back as they are,
+with `none`. Otherwise they get `Vary: Accept-Encoding`, and, when the
+request accepts `gzip` or `deflate`, `Content-Encoding`. A chunked body
+is compressed whatever its size, as the middleware does.
+""".
+-spec stream_headers(roadrunner_req:request(), roadrunner_http:headers()) ->
+    {roadrunner_http:headers(), gzip | deflate | none}.
+stream_headers(Req, Headers) ->
     case has_header(~"content-encoding", Headers) of
         true ->
             %% Handler set its own Content-Encoding — don't double-wrap.
-            {stream, Status, Headers, Fun};
+            {Headers, none};
         false ->
             HeadersWithVary = add_vary(Headers),
             case negotiate_encoding(Req) of
                 none ->
-                    {stream, Status, HeadersWithVary, Fun};
+                    {HeadersWithVary, none};
                 Encoding ->
-                    wrap_stream(Status, HeadersWithVary, Fun, Encoding)
+                    {[{~"content-encoding", encoding_token(Encoding)} | HeadersWithVary], Encoding}
             end
     end.
+
+-doc """
+A zlib stream that compresses chunks into `Encoding`'s format (the gzip
+or zlib wrapper RFC 9110 §8.4.1 names): pass each chunk through
+`zlib:deflate(Z, Chunk, none)`, the last through
+`zlib:deflate(Z, Last, finish)`, and close the stream with
+`zlib:close/1` when the body is done or abandoned.
+""".
+-spec stream_deflate(gzip | deflate) -> zlib:zstream().
+stream_deflate(Encoding) ->
+    Z = zlib:open(),
+    ok = zlib:deflateInit(Z, default, deflated, window_bits(Encoding), 8, default),
+    Z.
 
 %% Wrap a stream response: each chunk passes through a deflate context
 %% configured for the negotiated encoding. The user's `Fun` sees a
@@ -165,13 +235,11 @@ transform_stream(Req, Status, Headers, Fun) ->
 ) ->
     roadrunner_handler:response().
 wrap_stream(Status, Headers, Fun, Encoding) ->
-    %% Vary is already on `Headers` — added by the caller
-    %% (`transform_stream/4`) before this wrap fires.
-    NewHeaders = [{~"content-encoding", encoding_token(Encoding)} | Headers],
+    %% Vary and Content-Encoding are already on `Headers` — added by
+    %% `stream_headers/2` before this wrap fires.
     WrappedFun = fun(Send) ->
-        Z = zlib:open(),
+        Z = stream_deflate(Encoding),
         try
-            ok = zlib:deflateInit(Z, default, deflated, window_bits(Encoding), 8, default),
             Send2 = fun(Data, FinFlag) ->
                 %% `{fin, Trailers}` is the same deflate-side action as
                 %% `fin` — finish flushing — but the trailers themselves
@@ -191,24 +259,19 @@ wrap_stream(Status, Headers, Fun, Encoding) ->
             zlib:close(Z)
         end
     end,
-    {stream, Status, NewHeaders, WrappedFun}.
+    {stream, Status, Headers, WrappedFun}.
 
--spec compress(
-    roadrunner_http:status(),
-    roadrunner_http:headers(),
-    iodata(),
-    pos_integer(),
-    gzip | deflate
-) -> roadrunner_handler:response().
-compress(Status, Headers, Body, Size, Encoding) ->
+-spec compress(roadrunner_http:headers(), iodata(), pos_integer(), gzip | deflate) ->
+    {roadrunner_http:headers(), binary()}.
+compress(Headers, Body, Size, Encoding) ->
     Compressed = compress_body(Body, Size, Encoding),
     NewLength = integer_to_binary(byte_size(Compressed)),
     %% Replace any existing Content-Length, then prepend
     %% Content-Encoding. Vary is already on `Headers` — added by
-    %% the caller (`transform_buffered/4`) before this fires.
+    %% the caller (`buffered/3`) before this fires.
     Headers1 = lists:keystore(~"content-length", 1, Headers, {~"content-length", NewLength}),
     Headers2 = [{~"content-encoding", encoding_token(Encoding)} | Headers1],
-    {Status, Headers2, Compressed}.
+    {Headers2, Compressed}.
 
 %% A whole buffered body in one deflate call, with the window sized to the
 %% body: deflate never looks further back than the bytes it has, so a
