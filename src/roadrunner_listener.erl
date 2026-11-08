@@ -508,9 +508,10 @@ ops-tuning rationale.
     %% Default `[http1]`.
     %%
     %% On TLS listeners the list drives `alpn_preferred_protocols`
-    %% automatically (`http1` → `~"http/1.1"`, `http2` → `~"h2"`).
-    %% An explicit `alpn_preferred_protocols` inside `tls` overrides
-    %% the derivation.
+    %% automatically (`http1` → `~"http/1.1"`, `http2` → `~"h2"`),
+    %% `h2` first whatever the order, so a client that speaks HTTP/2
+    %% gets it. An explicit `alpn_preferred_protocols` inside `tls`
+    %% overrides the derivation.
     %%
     %% On plain TCP, `[http1]` serves HTTP/1.1 only; `[http2]` serves
     %% h2c prior-knowledge (client sends the h2 connection preface
@@ -565,7 +566,9 @@ live under `t:http1_opts/0`, HTTP/2 under `t:http2_opts/0`, and HTTP/3
 under `t:http3_opts/0`.
 
 On TLS the list drives `alpn_preferred_protocols` for the TCP
-protocols. On plain TCP, `[http2]` means prior-knowledge h2c (client
+protocols, `h2` before `http/1.1` whatever their order here, so a
+client that speaks HTTP/2 gets it. An explicit
+`alpn_preferred_protocols` in `tls` sets another preference. On plain TCP, `[http2]` means prior-knowledge h2c (client
 sends the h2 preface directly); `[http1, http2]` on plain TCP is
 rejected at `init/1` since there's no `Upgrade: h2c` implementation.
 
