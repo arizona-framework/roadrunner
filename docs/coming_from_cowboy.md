@@ -600,8 +600,8 @@ Notable differences:
   `headers` adds headers to the `101` (a `sec-websocket-protocol` or a
   cookie); `compress`, `idle_timeout`, `max_frame_size`, `max_message_size`
   and the rest override the listener's `ws` options for this session
-- `permessage-deflate` is used when the client asks for it, unless
-  `compress` is `false`
+- `permessage-deflate` is off by default, as in Cowboy; set `compress` to
+  `true`, or to a map of zlib settings, to accept a client's offer
 - An optional `handle_drain/2` callback runs when the listener drains
 - The upgrade runs over HTTP/1.1
 

@@ -21,7 +21,8 @@ frames.
 -export([parse_frame_known/3, match_data_frame/2]).
 -export([peek_frame_header/2]).
 -export([encode_frame/3, encode_frame/4]).
--export([parse_extensions/1, negotiate_extensions/1]).
+-export([parse_extensions/1, negotiate_extensions/1, negotiate_extensions/2]).
+-export([compress_config/1]).
 -export([unmask_words/2]).
 
 -export_type([
@@ -31,6 +32,9 @@ frames.
     encode_opts/0,
     permessage_deflate_params/0,
     negotiated/0,
+    compress/0,
+    compress_opts/0,
+    compress_config/0,
     close_code/0
 ]).
 
@@ -97,13 +101,58 @@ Encode-side options for `encode_frame/4`.
 Negotiated permessage-deflate parameters per RFC 7692 §7.1.
 Window-bits values are zlib's (8..15). The `*_no_context_takeover`
 flags mirror the request; when `true`, the corresponding zlib
-context is reset after every message.
+context is reset after every message. `mem_level` is the server's
+zlib `memLevel` for its deflate stream.
 """.
 -type permessage_deflate_params() :: #{
     server_max_window_bits := 8..15,
     client_max_window_bits := 8..15,
     server_no_context_takeover := boolean(),
-    client_no_context_takeover := boolean()
+    client_no_context_takeover := boolean(),
+    mem_level := 1..9
+}.
+
+-doc """
+The `compress` WebSocket option: whether to accept a client's
+permessage-deflate offer (RFC 7692), and with which zlib settings.
+
+- `false` declines every offer
+- `true` accepts with the largest windows and zlib's default memory
+  level: `#{server_window_bits => 15, client_window_bits => 15, mem_level => 8}`
+- a map accepts with the settings given, each missing one as for `true`
+
+A compressed connection holds a zlib deflate stream of
+`2^(server_window_bits + 2) + 2^(mem_level + 9)` bytes and an inflate
+stream of `2^client_window_bits` bytes for its lifetime, about 290 KB
+with `true`. Smaller values save memory: `server_window_bits => 12` and
+`mem_level => 4` hold about 24 KB for deflate, at a lower ratio on
+traffic that repeats content more than 4 KB back.
+""".
+-type compress() :: boolean() | compress_opts().
+
+%% `compress_opts()` with every setting present (`compress_config/1`).
+-type compress_config() :: #{
+    server_window_bits := 9..15,
+    client_window_bits := 8..15,
+    mem_level := 1..9
+}.
+
+-doc """
+zlib settings for an accepted permessage-deflate offer (`t:compress/0`):
+
+- `server_window_bits` — the window the server compresses with, 9..15.
+  The server uses this or the client's `server_max_window_bits`,
+  whichever is smaller, and announces it
+- `client_window_bits` — the window the server asks the client to
+  compress with, 8..15. RFC 7692 lets the server ask only when the
+  client's offer carries `client_max_window_bits` (browsers' offers do);
+  otherwise the client keeps 15
+- `mem_level` — zlib's `memLevel` for the server's deflate stream, 1..9
+""".
+-type compress_opts() :: #{
+    server_window_bits => 9..15,
+    client_window_bits => 8..15,
+    mem_level => 1..9
 }.
 
 -doc """
@@ -169,8 +218,9 @@ accept_key(Key) when is_binary(Key) ->
 %% The session uses this to set up zlib state. The agreed extension's
 %% response header is already in `Headers`.
 %%
-%% `Compress` is the session's `compress` setting: `false` declines any
-%% extension offer (`Negotiated` is `none`) without parsing it.
+%% `Compress` is the session's `compress` setting (`compress_config/1`):
+%% `false` declines any extension offer (`Negotiated` is `none`) without
+%% parsing it.
 %%
 %% `Extra` are the handler's own 101 headers (the upgrade options'
 %% `headers`). They become the tail of
@@ -181,7 +231,9 @@ accept_key(Key) when is_binary(Key) ->
 %% `content-length` and `transfer-encoding`, which a server MUST NOT send
 %% in a 1xx response (RFC 9110 §8.6, RFC 9112 §6.1).
 -doc false.
--spec handshake_response(roadrunner_http:headers(), roadrunner_http:headers(), boolean()) ->
+-spec handshake_response(
+    roadrunner_http:headers(), roadrunner_http:headers(), false | compress_config()
+) ->
     {ok, roadrunner_http:status(), roadrunner_http:headers(), iodata(), negotiated()}
     | {error,
         missing_websocket_upgrade
@@ -200,11 +252,23 @@ handshake_response(Headers, Extra, Compress) when is_list(Headers) ->
             Err
     end.
 
--spec negotiated(boolean(), roadrunner_http:headers()) -> negotiated().
+-spec negotiated(false | compress_config(), roadrunner_http:headers()) -> negotiated().
 negotiated(false, _Headers) ->
     none;
-negotiated(true, Headers) ->
-    negotiate_extensions(parse_extensions(header_lookup(~"sec-websocket-extensions", Headers))).
+negotiated(Config, Headers) ->
+    negotiate_extensions(
+        parse_extensions(header_lookup(~"sec-websocket-extensions", Headers)), Config
+    ).
+
+-doc false.
+-spec compress_config(compress()) -> false | compress_config().
+compress_config(false) -> false;
+compress_config(true) -> default_compress_config();
+compress_config(Opts) when is_map(Opts) -> maps:merge(default_compress_config(), Opts).
+
+-spec default_compress_config() -> compress_config().
+default_compress_config() ->
+    #{server_window_bits => 15, client_window_bits => 15, mem_level => 8}.
 
 -spec build_handshake_headers(binary(), negotiated(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
@@ -409,10 +473,15 @@ unquote(V) ->
 %% unrecognised offers are silently skipped.
 -doc false.
 -spec negotiate_extensions([extension()]) -> negotiated().
-negotiate_extensions([]) ->
+negotiate_extensions(Offers) ->
+    negotiate_extensions(Offers, default_compress_config()).
+
+-doc false.
+-spec negotiate_extensions([extension()], compress_config()) -> negotiated().
+negotiate_extensions([], _Config) ->
     none;
-negotiate_extensions([{~"permessage-deflate", Params} | _Rest]) ->
-    case negotiate_permessage_deflate(Params) of
+negotiate_extensions([{~"permessage-deflate", Params} | _Rest], Config) ->
+    case negotiate_permessage_deflate(Params, Config) of
         {ok, Negotiated, ResponseValue} ->
             {permessage_deflate, Negotiated, ResponseValue};
         invalid ->
@@ -421,34 +490,58 @@ negotiate_extensions([{~"permessage-deflate", Params} | _Rest]) ->
             %% offer; clients aren't supposed to send more than one.
             none
     end;
-negotiate_extensions([_Other | Rest]) ->
-    negotiate_extensions(Rest).
+negotiate_extensions([_Other | Rest], Config) ->
+    negotiate_extensions(Rest, Config).
 
 %% Walk the offer's parameter list and either return a fully-resolved
 %% set of negotiated values + the response header echo, or `invalid`
 %% if any parameter is out of spec. Defaults: window bits 15
-%% (max history), context takeover ON (most efficient).
--spec negotiate_permessage_deflate([{binary(), binary() | true}]) ->
+%% (max history), context takeover ON (most efficient). The server's
+%% `Config` then caps the windows: the server window always (RFC 7692
+%% §7.1.2.1 lets the server pick any smaller one), the client window
+%% only when the offer carried `client_max_window_bits` (§7.1.2.2).
+-spec negotiate_permessage_deflate([{binary(), binary() | true}], compress_config()) ->
     {ok, permessage_deflate_params(), binary()} | invalid.
-negotiate_permessage_deflate(Params) ->
+negotiate_permessage_deflate(Params, Config) ->
     case parse_pmd_params(Params, default_pmd()) of
-        {ok, Negotiated} ->
+        {ok, Offer} ->
+            Negotiated = apply_compress_config(Offer, Config),
             {ok, Negotiated, format_pmd_response(Negotiated)};
         invalid ->
             invalid
     end.
 
--spec default_pmd() -> permessage_deflate_params().
+-spec apply_compress_config(map(), compress_config()) -> permessage_deflate_params().
+apply_compress_config(
+    #{
+        server_max_window_bits := ServerWB,
+        client_max_window_bits := ClientWB,
+        client_window_offered := ClientOffered
+    } = Offer,
+    #{server_window_bits := ServerCap, client_window_bits := ClientCap, mem_level := MemLevel}
+) ->
+    Client =
+        case ClientOffered of
+            true -> min(ClientWB, ClientCap);
+            false -> ClientWB
+        end,
+    (maps:remove(client_window_offered, Offer))#{
+        server_max_window_bits := min(ServerWB, ServerCap),
+        client_max_window_bits := Client,
+        mem_level => MemLevel
+    }.
+
+-spec default_pmd() -> map().
 default_pmd() ->
     #{
         server_max_window_bits => 15,
         client_max_window_bits => 15,
+        client_window_offered => false,
         server_no_context_takeover => false,
         client_no_context_takeover => false
     }.
 
--spec parse_pmd_params([{binary(), binary() | true}], permessage_deflate_params()) ->
-    {ok, permessage_deflate_params()} | invalid.
+-spec parse_pmd_params([{binary(), binary() | true}], map()) -> {ok, map()} | invalid.
 parse_pmd_params([], Acc) ->
     {ok, Acc};
 parse_pmd_params([{~"server_no_context_takeover", true} | Rest], Acc) ->
@@ -470,11 +563,13 @@ parse_pmd_params([{~"server_max_window_bits", Value} | Rest], Acc) ->
 parse_pmd_params([{~"client_max_window_bits", true} | Rest], Acc) ->
     %% Bare `client_max_window_bits` (no value) means the client
     %% accepts any value the server picks. Default to 15 (max).
-    parse_pmd_params(Rest, Acc);
+    parse_pmd_params(Rest, Acc#{client_window_offered => true});
 parse_pmd_params([{~"client_max_window_bits", Value} | Rest], Acc) ->
     case window_bits(Value) of
-        {ok, N} -> parse_pmd_params(Rest, Acc#{client_max_window_bits => N});
-        invalid -> invalid
+        {ok, N} ->
+            parse_pmd_params(Rest, Acc#{client_max_window_bits => N, client_window_offered => true});
+        invalid ->
+            invalid
     end;
 parse_pmd_params([{_Other, _} | Rest], Acc) ->
     %% Unknown parameter — skip. RFC 7692 §7 allows future extension
@@ -504,6 +599,8 @@ format_pmd_response(#{
     server_no_context_takeover := SNCT,
     client_no_context_takeover := CNCT
 }) ->
+    %% A client window below 15 is only ever the client's own value or
+    %% one asked for because it offered `client_max_window_bits`.
     Tail = [
         format_pmd_flag(~"server_no_context_takeover", SNCT),
         format_pmd_flag(~"client_no_context_takeover", CNCT),

@@ -314,7 +314,7 @@ session_opts(Opts, ListenerOpts) ->
 session_opt(headers, _Headers, Opts) ->
     Opts;
 session_opt(compress, V, Opts) ->
-    Opts#{ws_compress := V};
+    Opts#{ws_compress := roadrunner_ws:compress_config(V)};
 session_opt(idle_timeout, V, Opts) ->
     Opts#{ws_idle_timeout := V};
 session_opt(max_frame_size, V, Opts) ->
@@ -548,12 +548,13 @@ init_pmd(none) ->
 init_pmd({permessage_deflate, Params, _ResponseValue}) ->
     #{
         client_max_window_bits := ClientWB,
-        server_max_window_bits := ServerWB
+        server_max_window_bits := ServerWB,
+        mem_level := MemLevel
     } = Params,
     InflateZ = zlib:open(),
     ok = zlib:inflateInit(InflateZ, -ClientWB),
     DeflateZ = zlib:open(),
-    ok = zlib:deflateInit(DeflateZ, default, deflated, -ServerWB, 8, default),
+    ok = zlib:deflateInit(DeflateZ, default, deflated, -ServerWB, MemLevel, default),
     {Params, InflateZ, DeflateZ}.
 
 %% The optional handler `init/1` runs once, before any frame. A drain or

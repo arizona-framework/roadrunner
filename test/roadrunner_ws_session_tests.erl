@@ -1281,6 +1281,43 @@ handler_close_with_overlong_reason_ends_session_without_sending_it_test() ->
 %% permessage-deflate (RFC 7692) — end-to-end through the session.
 %% =============================================================================
 
+pmd_uses_the_negotiated_window_and_memory_level_test() ->
+    %% A session negotiated with a 12-bit server window and memLevel 4
+    %% deflates its replies with them; a client inflating with its usual
+    %% 15-bit window reads them, as RFC 7692 allows any smaller window.
+    Self = self(),
+    Tag = make_ref(),
+    Sink = spawn_active_sink(Self, Tag, [{recv, pmd_frame(text, pmd_compress(~"hello"))}]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 12,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false,
+                mem_level => 4
+            },
+            ~"permessage-deflate; server_max_window_bits=12"},
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    <<16#c1, Len, Body/binary>> = iolist_to_binary(collect_sends(Tag, 200)),
+    ?assertEqual(Len, byte_size(Body)),
+    ?assertEqual(~"hello", pmd_decompress(Body)),
+    Sink ! stop,
+    ok = stop_ws_session(Pid).
+
 pmd_inflates_compressed_inbound_text_message_test() ->
     %% Client sends a single-fragment compressed text "hello"; server
     %% inflates it and dispatches to the echo handler. Echo replies
@@ -1297,7 +1334,8 @@ pmd_inflates_compressed_inbound_text_message_test() ->
                 server_max_window_bits => 15,
                 client_max_window_bits => 15,
                 server_no_context_takeover => false,
-                client_no_context_takeover => false
+                client_no_context_takeover => false,
+                mem_level => 8
             },
             ~"permessage-deflate"},
     {ok, Pid} = start_ws_session(
@@ -1345,7 +1383,8 @@ pmd_large_compressed_frame_inflates_test() ->
                 server_max_window_bits => 15,
                 client_max_window_bits => 15,
                 server_no_context_takeover => false,
-                client_no_context_takeover => false
+                client_no_context_takeover => false,
+                mem_level => 8
             },
             ~"permessage-deflate"},
     {ok, Pid} = start_ws_session(
@@ -1389,7 +1428,8 @@ pmd_concatenates_compressed_fragments_before_inflate_test() ->
                 server_max_window_bits => 15,
                 client_max_window_bits => 15,
                 server_no_context_takeover => false,
-                client_no_context_takeover => false
+                client_no_context_takeover => false,
+                mem_level => 8
             },
             ~"permessage-deflate"},
     {ok, Pid} = start_ws_session(
@@ -1427,7 +1467,8 @@ pmd_uncompressed_frame_passes_through_when_pmd_negotiated_test() ->
                 server_max_window_bits => 15,
                 client_max_window_bits => 15,
                 server_no_context_takeover => false,
-                client_no_context_takeover => false
+                client_no_context_takeover => false,
+                mem_level => 8
             },
             ~"permessage-deflate"},
     {ok, Pid} = start_ws_session(
@@ -1567,7 +1608,8 @@ pmd_no_context_takeover_resets_inflate_after_each_message_test() ->
                 server_max_window_bits => 15,
                 client_max_window_bits => 15,
                 server_no_context_takeover => true,
-                client_no_context_takeover => true
+                client_no_context_takeover => true,
+                mem_level => 8
             },
             ~"permessage-deflate; server_no_context_takeover; client_no_context_takeover"},
     {ok, Pid} = start_ws_session(
@@ -2634,7 +2676,8 @@ pmd_control_frames_stay_uncompressed_test() ->
                 server_max_window_bits => 15,
                 client_max_window_bits => 15,
                 server_no_context_takeover => false,
-                client_no_context_takeover => false
+                client_no_context_takeover => false,
+                mem_level => 8
             },
             ~"permessage-deflate"},
     {ok, Pid} = start_ws_session(
@@ -2798,7 +2841,7 @@ ws_proto_opts(MaxFrame, MaxMsg) ->
         ws_max_message_size => MaxMsg,
         ws_buffer => undefined,
         ws_hibernate_after => infinity,
-        ws_compress => true,
+        ws_compress => roadrunner_ws:compress_config(true),
         ws_idle_timeout => infinity,
         ws_active => undefined,
         handler_spawn_opts => [{fullsweep_after, 0}],
@@ -3018,7 +3061,8 @@ pmd_negotiated() ->
             server_max_window_bits => 15,
             client_max_window_bits => 15,
             server_no_context_takeover => false,
-            client_no_context_takeover => false
+            client_no_context_takeover => false,
+            mem_level => 8
         },
         ~"permessage-deflate"}.
 

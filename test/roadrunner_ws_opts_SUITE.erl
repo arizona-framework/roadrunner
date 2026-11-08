@@ -11,7 +11,9 @@ timeout, size caps and the session process's GC settings. The handler is
 
 -export([suite/0, all/0, init_per_testcase/2, end_per_testcase/2]).
 -export([
-    compress_by_default/1,
+    compress_off_by_default/1,
+    listener_accepts_compression/1,
+    listener_compression_settings/1,
     upgrade_declines_compression/1,
     listener_declines_compression/1,
     idle_session_closes/1,
@@ -33,7 +35,9 @@ suite() ->
 
 all() ->
     [
-        compress_by_default,
+        compress_off_by_default,
+        listener_accepts_compression,
+        listener_compression_settings,
         upgrade_declines_compression,
         listener_declines_compression,
         idle_session_closes,
@@ -72,9 +76,18 @@ listener_tls(Case) when
 listener_tls(_Case) ->
     #{}.
 
-listener_ws(listener_declines_compression) -> #{compress => false};
-listener_ws(listener_idle_timeout) -> #{idle_timeout => 100};
-listener_ws(_Case) -> #{}.
+listener_ws(listener_declines_compression) ->
+    #{compress => false};
+listener_ws(Case) when
+    Case =:= listener_accepts_compression; Case =:= upgrade_declines_compression
+->
+    #{compress => true};
+listener_ws(listener_compression_settings) ->
+    #{compress => #{server_window_bits => 12, client_window_bits => 12, mem_level => 4}};
+listener_ws(listener_idle_timeout) ->
+    #{idle_timeout => 100};
+listener_ws(_Case) ->
+    #{}.
 
 upgrade_opts(upgrade_declines_compression) ->
     #{compress => false};
@@ -110,9 +123,28 @@ upgrade_opts(_Case) ->
 %% Compression
 %% =============================================================================
 
-compress_by_default(Config) ->
+compress_off_by_default(Config) ->
+    {_Sock, Head, _Pid} = upgrade(Config, deflate_offer()),
+    ?assertEqual(nomatch, binary:match(Head, ~"sec-websocket-extensions")).
+
+listener_accepts_compression(Config) ->
     {_Sock, Head, _Pid} = upgrade(Config, deflate_offer()),
     ?assertNotEqual(nomatch, binary:match(Head, ~"sec-websocket-extensions: permessage-deflate")).
+
+listener_compression_settings(Config) ->
+    %% A browser-style offer (`client_max_window_bits` bare): the 101
+    %% announces both smaller windows.
+    {_Sock, Head, _Pid} = upgrade(
+        Config,
+        [~"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n"]
+    ),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(
+            Head,
+            ~"sec-websocket-extensions: permessage-deflate; server_max_window_bits=12; client_max_window_bits=12"
+        )
+    ).
 
 upgrade_declines_compression(Config) ->
     {_Sock, Head, _Pid} = upgrade(Config, deflate_offer()),

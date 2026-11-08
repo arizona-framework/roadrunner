@@ -200,7 +200,8 @@ name (`t:roadrunner_listener:ws_opts/0`):
   `sec-websocket-accept`, `sec-websocket-extensions`) win: an entry
   naming one of them is dropped, as is a `content-length` or
   `transfer-encoding`, which a 1xx response must not carry.
-- `compress` — whether to accept the client's permessage-deflate offer.
+- `compress` — whether to accept the client's permessage-deflate offer,
+  and with which zlib settings (`t:roadrunner_ws:compress/0`).
 - `idle_timeout` — close the session (code 1001, `terminate/2` gets
   `timeout`) when the client sent nothing for this many milliseconds;
   checked once per interval, so within two of them. `infinity` turns off
@@ -221,7 +222,7 @@ here crashes it.
 """.
 -type upgrade_opts() :: #{
     headers => roadrunner_http:headers(),
-    compress => boolean(),
+    compress => roadrunner_ws:compress(),
     idle_timeout => pos_integer() | infinity,
     max_frame_size => 0..16#7FFFFFFF,
     max_message_size => 0..16#7FFFFFFF,
