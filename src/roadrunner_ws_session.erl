@@ -1787,11 +1787,10 @@ encode_outbound(Data, Opcode, Payload) ->
     Compressed = deflate_message(Data, Payload),
     roadrunner_ws:encode_frame(Opcode, Compressed, true, #{rsv1 => true}).
 
-%% Deflate a full message payload. Reads inside `try` so a zlib
-%% failure (e.g. context corruption) gives a clean session exit
-%% rather than a bare badmatch in the calling shape. Strips the
-%% trailing 4-byte deflate tail per RFC 7692 §7.2.1 — receivers
-%% append it back before inflating.
+%% Deflate a full message payload. A zlib failure raises, and the
+%% session's `guarded/2` ends it as a crash, closing the zlib streams.
+%% Strips the trailing 4-byte deflate tail per RFC 7692 §7.2.1 —
+%% receivers append it back before inflating.
 -spec deflate_message(#data{}, iodata()) -> binary().
 deflate_message(#data{deflate_z = Z, pmd_params = Params}, Payload) ->
     Iolist = zlib:deflate(Z, Payload, sync),
