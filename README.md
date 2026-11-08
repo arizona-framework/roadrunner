@@ -25,7 +25,7 @@ A small, fast HTTP core you can trust on the hot path.
   100% h2spec, 100% h3spec and 100% Autobahn (no exclusions), tested against
   request-smuggling cases, and listed on Http11Probe. See
   [Conformance](#conformance).
-- **Every HTTP version, one server**: HTTP/1.1, HTTP/2, HTTP/3 (experimental),
+- **Every HTTP version, one server**: HTTP/1.1, HTTP/2, HTTP/3,
   and WebSocket served from one listener; browsers upgrade to h3 over the same
   port via `Alt-Svc`.
 - **Pure Erlang, no dependencies**: No runtime deps,
@@ -339,7 +339,7 @@ roadrunner:start_listener(my_tls_listener, #{
 }).
 ```
 
-HTTP/1.1 and HTTP/2 share the TCP port. HTTP/3 (experimental) serves over UDP
+HTTP/1.1 and HTTP/2 share the TCP port. HTTP/3 serves over UDP
 on the same port number. When the listener also serves HTTP/1.1 or HTTP/2 on a
 fixed port (not `port => 0`), their responses advertise HTTP/3 in `Alt-Svc` so
 browsers upgrade. For HTTP/2 over plain TCP (prior knowledge), use
@@ -519,7 +519,7 @@ Standards conformance:
 - **HTTP/2**: RFC 9113 (frames + multiplexing) + RFC 7541 (HPACK).
   Conformance harness: [`scripts/h2spec.sh`](https://github.com/arizona-framework/roadrunner/blob/main/scripts/h2spec.sh) (drives
   [h2spec](https://github.com/summerwind/h2spec)).
-- **HTTP/3 (experimental)**: RFC 9114 over QUIC with QPACK (RFC 9204)
+- **HTTP/3**: RFC 9114 over QUIC with QPACK (RFC 9204)
   header compression, the client's dynamic table included, over
   Roadrunner's own pure-Erlang QUIC transport (TLS 1.3 required).
   Conformance harness:
@@ -530,7 +530,8 @@ Standards conformance:
   [quiche](https://github.com/cloudflare/quiche) and
   [ngtcp2](https://github.com/ngtcp2/ngtcp2) clients and headless
   Chrome, plus a key update in the middle of an ngtcp2 download, with
-  and without packet loss).
+  and without packet loss). Not yet supported: WebSocket over HTTP/3
+  (RFC 9220; browsers open WebSockets over HTTP/1.1) and 0-RTT.
 - **Content-Encoding (RFC 9110 §8.4.1)**: gzip + deflate with
   qvalue-aware `Accept-Encoding` negotiation (RFC 9110 §12.5.3),
   works unchanged over HTTP/2.
