@@ -145,11 +145,12 @@ Optional middleware and timing knobs (durations in milliseconds):
   `t:ws_opts/0`): `max_frame_size` (per-frame payload cap) and
   `max_message_size` (reassembled + decompressed message cap), both
   defaulting to 10 MB with over-cap closing the connection with code
-  1009, plus `recv_buffer` (per-session inet `buffer` override — bounds
-  per-connection memory at high WebSocket concurrency; inherits the
-  listener's `recv_buffer` when unset), `hibernate_after` (idle-session
-  hibernation timeout in milliseconds; off when unset), `compress`
-  (accept permessage-deflate; default `true`) and `idle_timeout` (close
+  1009, plus `recv_buffer` (per-session inet `buffer` — bounds
+  per-connection memory at high WebSocket concurrency; adapts between
+  8 KB and the listener's `recv_buffer` when unset), `hibernate_after`
+  (idle-session hibernation timeout in milliseconds; off when unset),
+  `compress` (accept permessage-deflate, and with which zlib settings;
+  default `false`) and `idle_timeout` (close
   a session whose client sent nothing for that many milliseconds; off
   when unset). An upgrade can set each for its own session
   (`t:roadrunner_ws_handler:upgrade_opts/0`).
@@ -793,7 +794,14 @@ WebSocket session tunables (under `ws` in the listener opts).
   Unset (the default) never hibernates on idle; handlers can still
   opt in per event via the `hibernate` return option.
 - `compress` — whether to accept a client's permessage-deflate offer
-  (RFC 7692). Default `true`.
+  (RFC 7692), and with which zlib settings (`t:roadrunner_ws:compress/0`):
+  `false` (the default), `true`, or a map of `server_window_bits`,
+  `client_window_bits` and `mem_level`. Compression shrinks text
+  traffic several times over, but every compressed connection holds
+  zlib state for its lifetime, about 290 KB with `true`, and browsers
+  offer it on every connection. `#{server_window_bits => 12,
+  client_window_bits => 12, mem_level => 4}` holds about 50 KB, at a
+  lower ratio on traffic that repeats content more than 4 KB back.
 - `idle_timeout` — close a session whose client sent nothing for this
   many milliseconds, with close code 1001; the handler's `terminate/2`
   gets `timeout`. The session checks once per interval, so a silent
@@ -819,7 +827,7 @@ An upgrade can set each of these for its own session
     max_message_size => 0..16#7FFFFFFF,
     recv_buffer => 1..16#7FFFFFFF,
     hibernate_after => 1..16#7FFFFFFF,
-    compress => boolean(),
+    compress => roadrunner_ws:compress(),
     idle_timeout => 1..16#7FFFFFFF,
     active => once | 1..32767
 }.
@@ -1720,7 +1728,7 @@ build_proto_opts(Opts, ListenerName) ->
             ws_max_message_size => WsMsg,
             ws_buffer => ws_buffer(WsBuffer, validate_recv_buffer(Opts)),
             ws_hibernate_after => WsHibernateAfter,
-            ws_compress => WsCompress,
+            ws_compress => roadrunner_ws:compress_config(WsCompress),
             ws_idle_timeout => WsIdleTimeout,
             ws_active => WsActive,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
@@ -2223,7 +2231,7 @@ ws_buffer(WsBuffer, _ListenerBuffer) -> WsBuffer.
         max_message_size := non_neg_integer(),
         recv_buffer := undefined,
         hibernate_after := infinity,
-        compress := true,
+        compress := false,
         idle_timeout := infinity,
         active := undefined
     }.
@@ -2237,7 +2245,9 @@ ws_defaults() ->
         %% hibernate — the `after infinity` clause is dead by the
         %% receive's own semantics, so the default costs nothing.
         hibernate_after => infinity,
-        compress => true,
+        %% Off: a compressed connection holds zlib state for its
+        %% lifetime, and whether that pays depends on the traffic.
+        compress => false,
         %% `infinity` = no idle timer is armed.
         idle_timeout => infinity,
         %% `undefined` = per transport: `once` on plain TCP, `16` on TLS
@@ -2256,7 +2266,7 @@ ws_defaults() ->
         max_message_size := non_neg_integer(),
         recv_buffer := pos_integer() | undefined,
         hibernate_after := pos_integer() | infinity,
-        compress := boolean(),
+        compress := roadrunner_ws:compress(),
         idle_timeout := pos_integer() | infinity,
         active := once | 1..32767 | undefined
     }.
@@ -2299,6 +2309,8 @@ validate_ws_opts(Other) ->
     boolean().
 valid_ws_opt(active, V) ->
     V =:= once orelse (is_integer(V) andalso V >= 1 andalso V =< 32767);
+valid_ws_opt(compress, V) when is_map(V) ->
+    maps:fold(fun(K, N, Ok) -> Ok andalso valid_compress_opt(K, N) end, true, V);
 valid_ws_opt(compress, V) ->
     is_boolean(V);
 valid_ws_opt(idle_timeout, V) ->
@@ -2309,6 +2321,14 @@ valid_ws_opt(hibernate_after, V) ->
     is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
 valid_ws_opt(_SizeCap, V) ->
     is_integer(V) andalso V >= 0 andalso V =< 16#7FFFFFFF.
+
+%% A `ws.compress` map entry: zlib's raw deflate takes windows 9..15 and
+%% raw inflate 8..15 (`t:roadrunner_ws:compress_opts/0`).
+-spec valid_compress_opt(term(), term()) -> boolean().
+valid_compress_opt(server_window_bits, N) -> is_integer(N) andalso N >= 9 andalso N =< 15;
+valid_compress_opt(client_window_bits, N) -> is_integer(N) andalso N >= 8 andalso N =< 15;
+valid_compress_opt(mem_level, N) -> is_integer(N) andalso N >= 1 andalso N =< 9;
+valid_compress_opt(_Key, _N) -> false.
 
 %% Validate the `recv_buffer` opt (an inet buffer size — zero is
 %% meaningless) rather than passing a bad value into `gen_tcp:listen/2`,

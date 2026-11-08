@@ -61,7 +61,9 @@ main(Args) ->
         routes => roadrunner_autobahn_handler,
         ws => #{
             max_frame_size => ?AUTOBAHN_MAX_MESSAGE_SIZE,
-            max_message_size => ?AUTOBAHN_MAX_MESSAGE_SIZE
+            max_message_size => ?AUTOBAHN_MAX_MESSAGE_SIZE,
+            %% The compression sections (12.*, 13.*) need permessage-deflate.
+            compress => true
         }
     }),
     BoundPort = roadrunner_listener:port(?LISTENER),

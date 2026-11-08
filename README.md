@@ -539,7 +539,8 @@ Standards conformance:
   [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
   fuzzingclient).
 - **WebSocket compression**: RFC 7692 `permessage-deflate`,
-  including `*_max_window_bits` and `*_no_context_takeover`.
+  including `*_max_window_bits` and `*_no_context_takeover`; off by
+  default, with the zlib windows and memory level configurable.
 
 ## Performance
 

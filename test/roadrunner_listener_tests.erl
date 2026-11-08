@@ -355,6 +355,53 @@ listener_threads_ws_buffer_into_proto_opts_test() ->
         Cases
     ).
 
+listener_threads_ws_compress_into_proto_opts_test() ->
+    %% Off by default; `true` and a map resolve to the full zlib settings.
+    Cases = [
+        {#{}, false},
+        {#{ws => #{compress => true}}, #{
+            server_window_bits => 15, client_window_bits => 15, mem_level => 8
+        }},
+        {#{ws => #{compress => #{server_window_bits => 12, mem_level => 4}}}, #{
+            server_window_bits => 12, client_window_bits => 15, mem_level => 4
+        }}
+    ],
+    lists:foreach(
+        fun({Extra, Expected}) ->
+            Name = listener_test_ws_compress,
+            {ok, ListenerPid} = roadrunner_listener:start_link(
+                Name, Extra#{port => 0, routes => roadrunner_hello_handler}
+            ),
+            ProtoOpts = element(4, sys:get_state(ListenerPid)),
+            ?assertEqual(Expected, maps:get(ws_compress, ProtoOpts)),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        Cases
+    ).
+
+listener_rejects_invalid_ws_compress_test() ->
+    %% zlib's raw deflate takes windows 9..15, raw inflate 8..15, and
+    %% memLevel 1..9; anything else, or an unknown key, refuses to start.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Compress) ->
+            R = roadrunner_listener:start_link(listener_test_ws_compress_invalid, #{
+                port => 0, ws => #{compress => Compress}, routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, ws, _}, _Stack}}, R)
+        end,
+        [
+            #{server_window_bits => 8},
+            #{server_window_bits => 16},
+            #{client_window_bits => 7},
+            #{mem_level => 0},
+            #{mem_level => 10},
+            #{mem_level => bad},
+            #{level => 9},
+            'maybe'
+        ]
+    ).
+
 listener_threads_protocols_into_proto_opts_test() ->
     %% `protocols => [http2]` listener opt threads into proto_opts so
     %% the dispatch helper `roadrunner_conn_loop:h2c_only/1` can read

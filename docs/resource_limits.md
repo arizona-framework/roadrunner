@@ -71,6 +71,7 @@ e.g. `ws => #{max_frame_size => N, max_message_size => N}`.
 | `ws.max_message_size` | 10 MB | a reassembled message: the running total across fragments, and the decompressed size when permessage-deflate is negotiated |
 | `ws.active` | `once` on plain TCP, 16 on TLS | unread socket reads a session can hold in its mailbox |
 | `ws.recv_buffer` | adaptive, 8 KB up to `recv_buffer`, on plain TCP | bytes one socket read can carry, and what each connection holds for it |
+| `ws.compress` | `false` | whether a client's permessage-deflate offer is accepted; a compressed connection holds zlib state for its lifetime, about 290 KB with `true` and about 50 KB with `#{server_window_bits => 12, client_window_bits => 12, mem_level => 4}` |
 
 Notes:
 

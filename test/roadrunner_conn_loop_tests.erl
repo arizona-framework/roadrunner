@@ -2314,7 +2314,7 @@ fake_opts(ListenerName) ->
         ws_max_message_size => 10485760,
         ws_buffer => undefined,
         ws_hibernate_after => infinity,
-        ws_compress => true,
+        ws_compress => roadrunner_ws:compress_config(true),
         ws_idle_timeout => infinity,
         ws_active => undefined,
         request_timeout => 5000,
