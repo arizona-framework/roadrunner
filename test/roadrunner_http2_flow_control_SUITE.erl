@@ -557,7 +557,6 @@ start_conn(Handler, Extra) ->
             middlewares => [],
             handler_spawn_opts => [{fullsweep_after, 0}],
             tls_handshake_timeout => 5000,
-            handler_start_timeout => infinity,
             %% The RFC 9113 §6.9.2 baseline windows these cases count from.
             http2_conn_window => 65535,
             http2_stream_window => 65535,

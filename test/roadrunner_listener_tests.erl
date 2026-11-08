@@ -433,10 +433,9 @@ listener_protocols_default_is_http1_only_test() ->
 
 listener_threads_handler_spawn_defaults_into_proto_opts_test() ->
     %% With no `handler_spawn` opt the listener fills the flattened
-    %% `handler_spawn_opts` / `handler_start_timeout` proto_opts keys from the
-    %% defaults: `{fullsweep_after, 0}` (reclaim the per-conn response
-    %% heap instead of hoarding it as old-gen garbage across keep-alive
-    %% requests) and `infinity` (no init-ack deadline).
+    %% `handler_spawn_opts` proto_opts key from the default
+    %% `{fullsweep_after, 0}` (reclaim the per-conn response heap instead
+    %% of hoarding it as old-gen garbage across keep-alive requests).
     Name = listener_test_handler_spawn_default,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
@@ -445,20 +444,18 @@ listener_threads_handler_spawn_defaults_into_proto_opts_test() ->
     State = sys:get_state(ListenerPid),
     ProtoOpts = element(4, State),
     ?assertEqual([{fullsweep_after, 0}], maps:get(handler_spawn_opts, ProtoOpts)),
-    ?assertEqual(infinity, maps:get(handler_start_timeout, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
 listener_threads_custom_handler_spawn_into_proto_opts_test() ->
-    %% A custom `handler_spawn` map is flattened to the two top-level
-    %% proto_opts keys the spawn sites read directly (no nested lookup
+    %% A custom `handler_spawn` map is flattened to the top-level
+    %% proto_opts key the spawn sites read directly (no nested lookup
     %% on the hot path), mirroring the `ws` / `http2` flattening. Options
     %% the caller sets win over the defaults for the same key.
     Name = listener_test_handler_spawn_custom,
     {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
         port => 0,
         handler_spawn => #{
-            opts => [{fullsweep_after, 20}, {min_bin_vheap_size, 1024}],
-            start_timeout => 5000
+            opts => [{fullsweep_after, 20}, {min_bin_vheap_size, 1024}]
         },
         routes => roadrunner_hello_handler
     }),
@@ -468,7 +465,6 @@ listener_threads_custom_handler_spawn_into_proto_opts_test() ->
         [{fullsweep_after, 20}, {min_bin_vheap_size, 1024}],
         lists:sort(maps:get(handler_spawn_opts, ProtoOpts))
     ),
-    ?assertEqual(5000, maps:get(handler_start_timeout, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
 listener_handler_spawn_opts_keep_unset_defaults_test() ->
@@ -881,8 +877,7 @@ listener_rejects_invalid_handler_spawn_test() ->
     %% `handler_spawn` must be a map; `opts` a list that does not carry the
     %% roadrunner-owned linkage (`link` / `monitor` / `{monitor, _}`,
     %% which would break the unlinked-conn + monitored-worker
-    %% semantics); `start_timeout` a non-negative integer or `infinity`.
-    %% Anything else rejects at `init/1` rather than per-connection.
+    %% semantics). Anything else rejects at `init/1` rather than per-connection.
     process_flag(trap_exit, true),
     lists:foreach(
         fun(Bad) ->
@@ -898,8 +893,6 @@ listener_rejects_invalid_handler_spawn_test() ->
             #{opts => [monitor]},
             #{opts => [{monitor, []}]},
             #{opts => not_a_list},
-            #{start_timeout => -1},
-            #{start_timeout => bad},
             not_a_map
         ]
     ).

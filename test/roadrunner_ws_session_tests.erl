@@ -2845,8 +2845,7 @@ ws_proto_opts(MaxFrame, MaxMsg) ->
         ws_idle_timeout => infinity,
         ws_active => undefined,
         handler_spawn_opts => [{fullsweep_after, 0}],
-        tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity
+        tls_handshake_timeout => 5000
     }.
 
 %% A minimal text/binary single-fragment unmasked frame. Server-side

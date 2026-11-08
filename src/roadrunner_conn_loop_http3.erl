@@ -296,7 +296,7 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
     proc_lib:set_label({roadrunner_conn_loop_http3, ListenerName, Conn}),
     %% The `max_clients` slot was acquired by `start/2` (in the listener
     %% process); it is released in `terminate/1`.
-    ok = roadrunner_conn:register_for_drain(ProtoOpts),
+    ok = roadrunner_conn:register_for_drain(self(), ProtoOpts),
     %% Share fate with the QUIC connection process: if it dies abnormally
     %% (without a `closed` event) the loop dies too, rather than hanging.
     %% The slot then leaks until slot reconciliation reaps it, the same

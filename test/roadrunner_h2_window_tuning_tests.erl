@@ -237,7 +237,6 @@ start_conn(H2Opts) ->
         middlewares => [],
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         protocols => [http2],
         http2_conn_window => maps:get(conn_window, H2Opts, 65535),
         http2_stream_window => maps:get(stream_window, H2Opts, 65535),

@@ -40,7 +40,7 @@
     release_request_slot/3,
     release_request_slots/4,
     consume_body_reader/2,
-    register_for_drain/1,
+    register_for_drain/2,
     unregister_for_drain/1
 ]).
 %% Internal helpers shared with `roadrunner_conn_loop`. Marked `-doc false`
@@ -287,11 +287,10 @@ deadline in milliseconds. The shed form answers it `503` with the
     hibernate_after => pos_integer(),
     rate_check_interval => pos_integer(),
     %% Flattened spawn config for every handler-running process. The public
-    %% `handler_spawn => #{opts, start_timeout}` listener opt is expanded into
-    %% these top-level keys by `roadrunner_listener:build_proto_opts/2` so the
-    %% spawn sites read them with a single `maps:get/2`, never a nested lookup.
-    handler_spawn_opts => [proc_lib:start_spawn_option()],
-    handler_start_timeout => timeout()
+    %% `handler_spawn => #{opts}` listener opt is expanded into this top-level
+    %% key by `roadrunner_listener:build_proto_opts/2` so the spawn sites read
+    %% it with a single `maps:get/2`, never a nested lookup.
+    handler_spawn_opts => [proc_lib:start_spawn_option()]
 }.
 
 %% Resolved per-peer rate-limit config, built by `roadrunner_listener` when the
@@ -337,30 +336,33 @@ start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
     {ok, _Pid} = roadrunner_conn_loop:start(Socket, ProtoOpts).
 
 -doc """
-Register the calling connection process in its listener's drain
+Register connection process `Pid` in its listener's drain
 registry so `roadrunner_listener:drain/2` and `notify_drain/2` can send
 it `{roadrunner_drain, Deadline}`. A lock-free ETS insert, so
 connection starts never queue behind a registry process. Skipped when
 the listener opted out with `graceful_drain => false`, or when the
 proto_opts carry no registry (requests built by hand in tests).
 
-Called by the connection loops as they start, before they accept any
-work, and paired with `unregister_for_drain/1` on every exit path. A
-process outside the conn lifecycle registers through
+Called before a connection accepts any work, and paired with
+`unregister_for_drain/1` on every exit path. An HTTP/1.1 or HTTP/2 conn
+is registered by the acceptor right after spawning it, so a drain that
+begins before the new process first runs still reaches it. An HTTP/3
+conn loop registers itself. A process outside the conn lifecycle
+registers through
 `roadrunner_listener:register_for_drain/2` instead.
 """.
--spec register_for_drain(proto_opts()) -> ok.
-register_for_drain(#{graceful_drain := false}) ->
+-spec register_for_drain(pid(), proto_opts()) -> ok.
+register_for_drain(_Pid, #{graceful_drain := false}) ->
     ok;
-register_for_drain(#{drain_table := Table}) ->
-    true = ets:insert(Table, {self()}),
+register_for_drain(Pid, #{drain_table := Table}) ->
+    true = ets:insert(Table, {Pid}),
     ok;
-register_for_drain(#{}) ->
+register_for_drain(_Pid, #{}) ->
     ok.
 
 -doc """
 Remove the calling process from its listener's drain registry, paired
-with `register_for_drain/1`. The listener owns the table, and `stop/1`
+with `register_for_drain/2`. The listener owns the table, and `stop/1`
 does not wait for in-flight conns, so a conn that outlives its listener
 finds no registry to leave and that is fine.
 """.

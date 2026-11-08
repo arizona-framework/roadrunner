@@ -198,8 +198,7 @@ acceptor_hands_tls_sockets_off_before_the_handshake_test() ->
             client_counter => Counter,
             max_clients => 10,
             graceful_drain => false,
-            handler_spawn_opts => [{fullsweep_after, 0}],
-            handler_start_timeout => infinity
+            handler_spawn_opts => [{fullsweep_after, 0}]
         },
         1
     ),
