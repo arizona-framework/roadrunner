@@ -210,6 +210,7 @@ tls_closed_before_arm_exits_cleanly(_Config) ->
         ws_hibernate_after => infinity,
         ws_idle_timeout => infinity,
         ws_active => undefined,
+        ws_buffer => undefined,
         handler_spawn_opts => []
     },
     {module, _} = code:ensure_loaded(roadrunner_ws_echo_handler),

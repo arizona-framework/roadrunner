@@ -132,6 +132,145 @@ ws_buffer_opt_unset_leaves_socket_buffer_alone_test() ->
     ],
     ?assertEqual([], BufferSetopts).
 
+adaptive_buffer_starts_at_its_base_before_101_test() ->
+    %% Unset `ws.recv_buffer` (the listener turns it into `{adaptive, Max}`):
+    %% an active-once session sets the 8 KB base while the conn still owns
+    %% the socket, before the 101.
+    Events = adaptive_events(
+        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}}, [{recv, frame(close, <<1000:16>>)}]
+    ),
+    BufferIdx = find_event_index(fun(E) -> E =:= {setopts, [{buffer, 8192}]} end, Events),
+    SendIdx = find_event_index(
+        fun
+            ({send, Data}) -> binary:match(iolist_to_binary(Data), ~"101") =/= nomatch;
+            (_) -> false
+        end,
+        Events
+    ),
+    ?assertNotEqual(not_found, BufferIdx),
+    ?assert(BufferIdx < SendIdx).
+
+adaptive_buffer_grows_for_a_large_frame_and_shrinks_after_a_small_one_test() ->
+    %% A 20000-byte frame (20008 bytes on the wire) split across two reads:
+    %% the re-arm after the first part grows the buffer to fit the frame,
+    %% rounded up to 4 KB. A second large frame keeps it, so a stream of
+    %% them arrives one read each; a small message brings it back to 8 KB.
+    Big = binary:copy(~"x", 20000),
+    <<Head:100/binary, Tail/binary>> = frame16(text, Big),
+    Arms = adaptive_arms(
+        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}},
+        [
+            {recv, Head},
+            {recv, Tail},
+            {recv, frame16(text, Big)},
+            {recv, frame(text, ~"hi")},
+            {recv, frame(close, <<1000:16>>)}
+        ]
+    ),
+    ?assertEqual(
+        [
+            [{active, once}],
+            [{active, once}, {buffer, 20480}],
+            [{active, once}],
+            [{active, once}],
+            [{active, once}, {buffer, 8192}]
+        ],
+        Arms
+    ).
+
+adaptive_buffer_shrinks_after_a_message_without_a_reply_test() ->
+    %% The echo handler answers a binary frame with `{ok, State}`: that
+    %% path shrinks the grown buffer too.
+    <<Head:10/binary, Tail/binary>> = frame16(binary, binary:copy(~"x", 20000)),
+    Arms = adaptive_arms(
+        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}},
+        [
+            {recv, Head},
+            {recv, Tail},
+            {recv, frame(binary, ~"b")},
+            {recv, frame(close, <<1000:16>>)}
+        ]
+    ),
+    ?assertEqual(
+        [
+            [{active, once}],
+            [{active, once}, {buffer, 20480}],
+            [{active, once}],
+            [{active, once}, {buffer, 8192}]
+        ],
+        Arms
+    ).
+
+adaptive_buffer_keeps_its_base_for_a_split_small_frame_test() ->
+    %% A small frame split across reads already fits the 8 KB base, so
+    %% the re-arm between its parts leaves the buffer as it is.
+    <<Head:3/binary, Tail/binary>> = frame(text, ~"hello"),
+    Arms = adaptive_arms(
+        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}},
+        [{recv, Head}, {recv, Tail}, {recv, frame(close, <<1000:16>>)}]
+    ),
+    ?assertEqual([[{active, once}], [{active, once}], [{active, once}]], Arms).
+
+adaptive_buffer_stops_at_its_cap_test() ->
+    %% A frame with a 64-bit length, larger than the cap (the listener's
+    %% `recv_buffer`): the buffer grows to the cap and no further, and a
+    %% second partial read of it does not ask again. A frame whose length
+    %% is not buffered yet (one byte) leaves the buffer as it is.
+    Frame = frame64(binary, binary:copy(~"x", 70000)),
+    <<One:1/binary, Head:99/binary, Mid:30000/binary, Tail/binary>> = Frame,
+    Arms = adaptive_arms(
+        (ws_proto_opts())#{ws_buffer := {adaptive, 16384}},
+        [{recv, One}, {recv, Head}, {recv, Mid}, {recv, Tail}, {recv, frame(close, <<1000:16>>)}]
+    ),
+    ?assertEqual(
+        [
+            [{active, once}],
+            [{active, once}],
+            [{active, once}, {buffer, 16384}],
+            [{active, once}],
+            [{active, once}]
+        ],
+        Arms
+    ).
+
+small_listener_buffer_is_kept_test() ->
+    %% A listener `recv_buffer` no larger than the 8 KB the adaptive buffer
+    %% starts at: nothing to save, so the session keeps it and never
+    %% resizes.
+    <<Head:100/binary, Tail/binary>> = frame16(text, binary:copy(~"x", 20000)),
+    Events = adaptive_events(
+        (ws_proto_opts())#{ws_buffer := {adaptive, 8192}},
+        [{recv, Head}, {recv, Tail}, {recv, frame(close, <<1000:16>>)}]
+    ),
+    ?assertEqual(
+        [], [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
+    ).
+
+fixed_buffer_never_resizes_test() ->
+    %% An explicit `ws.recv_buffer` is applied once, before the 101, and
+    %% never changes after.
+    <<Head:100/binary, Tail/binary>> = frame16(text, binary:copy(~"x", 20000)),
+    Events = adaptive_events(
+        (ws_proto_opts())#{ws_buffer := 4096},
+        [{recv, Head}, {recv, Tail}, {recv, frame(text, ~"hi")}, {recv, frame(close, <<1000:16>>)}]
+    ),
+    ?assertEqual(
+        [[{buffer, 4096}]],
+        [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
+    ).
+
+active_n_session_keeps_its_buffer_test() ->
+    %% Only an `{active, once}` session adapts: one reading with
+    %% `{active, N}` re-arms once per N reads, so it keeps the buffer it
+    %% has and nothing is set before the 101 either.
+    Events = adaptive_events(
+        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}, ws_active := 4},
+        [{recv, frame(close, <<1000:16>>)}]
+    ),
+    ?assertEqual(
+        [], [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
+    ).
+
 coalesced_first_frame_seeded_in_buffer_is_processed_test() ->
     %% A client that pipelines its first frame in the same segment as
     %% the upgrade handshake: the conn read it past the request and
@@ -2682,9 +2821,64 @@ frame(Opcode, Payload) ->
     <<OpcodeByte, (16#80 bor Len), 1, 2, 3, 4, Masked/binary>>.
 
 %% Like `frame/2`, for a 126..65535-byte payload (16-bit extended length).
-frame16(text, Payload) ->
+frame16(Opcode, Payload) ->
     Masked = mask(Payload, <<1, 2, 3, 4>>),
-    <<16#81, (16#80 bor 126), (byte_size(Payload)):16, 1, 2, 3, 4, Masked/binary>>.
+    OpcodeByte =
+        case Opcode of
+            text -> 16#81;
+            binary -> 16#82
+        end,
+    <<OpcodeByte, (16#80 bor 126), (byte_size(Payload)):16, 1, 2, 3, 4, Masked/binary>>.
+
+%% Like `frame/2`, for a payload of 65536 bytes or more (64-bit length).
+frame64(binary, Payload) ->
+    Masked = mask(Payload, <<1, 2, 3, 4>>),
+    <<16#82, (16#80 bor 127), (byte_size(Payload)):64, 1, 2, 3, 4, Masked/binary>>.
+
+%% Run an upgrade whose socket delivers `Script`, one step per `setopts`
+%% that arms it, and return every socket event in order.
+adaptive_events(ProtoOpts, Script) ->
+    Tag = make_ref(),
+    Sink = spawn_scripted_events_sink(self(), Tag, Script),
+    {session, Ref, Pid} = start_upgrade(
+        {fake, Sink}, upgrade_req(), roadrunner_ws_echo_handler, undefined, #{}, <<>>, ProtoOpts
+    ),
+    ok = await_down(Ref, Pid),
+    Events = collect_events(Tag, 100),
+    Sink ! stop,
+    Events.
+
+%% The options of every `setopts` that armed the socket, in order.
+adaptive_arms(ProtoOpts, Script) ->
+    [
+        Opts
+     || {setopts, Opts} <- adaptive_events(ProtoOpts, Script), lists:member({active, once}, Opts)
+    ].
+
+%% Events sink whose socket delivers the next `Script` step each time it is
+%% armed (`{active, once}` or `{active, N}`).
+spawn_scripted_events_sink(Logger, Tag, Script) ->
+    spawn(fun() -> scripted_events_sink_loop(Logger, Tag, Script) end).
+
+scripted_events_sink_loop(Logger, Tag, Script) ->
+    receive
+        stop ->
+            ok;
+        {roadrunner_fake_send, _Pid, Data} ->
+            Logger ! {evt, Tag, {send, Data}},
+            scripted_events_sink_loop(Logger, Tag, Script);
+        {roadrunner_fake_setopts, ConnPid, Opts} ->
+            Logger ! {evt, Tag, {setopts, Opts}},
+            case {lists:keymember(active, 1, Opts), Script} of
+                {true, [{recv, Bytes} | Rest]} ->
+                    ConnPid ! {roadrunner_fake_data, self(), Bytes},
+                    scripted_events_sink_loop(Logger, Tag, Rest);
+                _ ->
+                    scripted_events_sink_loop(Logger, Tag, Script)
+            end;
+        _ ->
+            scripted_events_sink_loop(Logger, Tag, Script)
+    end.
 
 mask(Bin, Key) ->
     KeyBin = binary:copy(Key, (byte_size(Bin) div 4) + 1),

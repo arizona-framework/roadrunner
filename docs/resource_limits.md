@@ -70,9 +70,16 @@ e.g. `ws => #{max_frame_size => N, max_message_size => N}`.
 | `ws.max_frame_size` | 10 MB | one frame's declared payload, checked on the frame header before the body is buffered |
 | `ws.max_message_size` | 10 MB | a reassembled message: the running total across fragments, and the decompressed size when permessage-deflate is negotiated |
 | `ws.active` | `once` on plain TCP, 16 on TLS | unread socket reads a session can hold in its mailbox |
+| `ws.recv_buffer` | adaptive, 8 KB up to `recv_buffer`, on plain TCP | bytes one socket read can carry, and what each connection holds for it |
 
 Notes:
 
+- unset, `ws.recv_buffer` adapts on plain TCP: a session reads with 8 KB,
+  grows the buffer for a frame whose header announces more (up to the
+  listener's `recv_buffer`) while large frames keep coming, and goes back
+  to 8 KB after a small message. An idle connection then holds 8 KB, and a
+  large frame still arrives in one read. On TLS, or with a size set, the
+  buffer is fixed
 - `max_message_size` must be `>= max_frame_size`; a listener configured
   otherwise refuses to start
 - each fragment is charged at least a small fixed overhead toward

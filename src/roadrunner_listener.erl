@@ -772,16 +772,16 @@ WebSocket session tunables (under `ws` in the listener opts).
   `recv_buffer` listener opt. The emulator keeps a buffer of this size alive per
   socket, so it bounds how many bytes one `{tcp, _, Data}` delivery
   carries AND what every connection pays in resident memory. Unset
-  (the default) inherits the listener socket's `recv_buffer` (64 KB
-  default) — sized for HTTP request flow, where bodies arrive in
-  bulk. Long-lived
-  WebSocket sessions that exchange small messages should set this
-  lower in production: at high connection counts the inherited
-  64 KB dominates per-connection memory (64 KB × connections),
-  while a few KB is plenty for message-sized deliveries. Large
-  inbound frames are still delivered correctly with a small buffer,
-  just across more deliveries — deployments streaming multi-KB
-  frames client→server should keep it larger.
+  (the default), a session reading with `{active, once}` (plain TCP)
+  adapts it: it reads with 8 KB, grows the buffer to fit a frame
+  whose header announces more than that (up to the listener's
+  `recv_buffer`, 64 KB by default) and keeps it while large frames
+  keep coming, then goes back to 8 KB after a small message. Small
+  messages cost an idle connection 8 KB instead of the listener's
+  64 KB, and large frames still arrive in one read. The resize
+  rides on the re-arm the session makes per message anyway. A
+  session reading with `{active, N}` (TLS) keeps the listener's
+  `recv_buffer`. Set a size to fix the buffer at it instead.
 - `hibernate_after` — idle milliseconds after which a WebSocket
   session hibernates (heap shrinks to the minimum until the next
   inbound event wakes it). The session-side counterpart of the
@@ -1718,7 +1718,7 @@ build_proto_opts(Opts, ListenerName) ->
                 maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
             ws_max_frame_size => WsFrame,
             ws_max_message_size => WsMsg,
-            ws_buffer => WsBuffer,
+            ws_buffer => ws_buffer(WsBuffer, validate_recv_buffer(Opts)),
             ws_hibernate_after => WsHibernateAfter,
             ws_compress => WsCompress,
             ws_idle_timeout => WsIdleTimeout,
@@ -2209,6 +2209,14 @@ flatten_http3_opts(Entries) ->
             }
     end.
 
+%% The `ws_buffer` proto opt: an explicit `ws.recv_buffer` as is; unset,
+%% adaptive up to the listener's `recv_buffer`
+%% (`roadrunner_ws_session:apply_ws_buffer/2`).
+-spec ws_buffer(pos_integer() | undefined, pos_integer()) ->
+    pos_integer() | {adaptive, pos_integer()}.
+ws_buffer(undefined, ListenerBuffer) -> {adaptive, ListenerBuffer};
+ws_buffer(WsBuffer, _ListenerBuffer) -> WsBuffer.
+
 -spec ws_defaults() ->
     #{
         max_frame_size := non_neg_integer(),
@@ -2223,8 +2231,7 @@ ws_defaults() ->
     #{
         max_frame_size => ?DEFAULT_WS_MAX_FRAME_SIZE,
         max_message_size => ?DEFAULT_WS_MAX_MESSAGE_SIZE,
-        %% `undefined` = no setopts on upgrade; the session keeps the
-        %% listener socket's inherited `recv_buffer`.
+        %% `undefined` = adaptive (`ws_buffer/2`).
         recv_buffer => undefined,
         %% `infinity` = the session's receive never times out into a
         %% hibernate — the `after infinity` clause is dead by the

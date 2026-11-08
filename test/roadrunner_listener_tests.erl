@@ -333,6 +333,28 @@ listener_threads_hibernate_after_into_proto_opts_test() ->
     ?assertEqual(5000, maps:get(hibernate_after, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
+listener_threads_ws_buffer_into_proto_opts_test() ->
+    %% Unset `ws.recv_buffer` adapts up to the listener's `recv_buffer`
+    %% (64 KB by default, or the one set); an explicit `ws.recv_buffer`
+    %% stays fixed.
+    Cases = [
+        {#{}, {adaptive, 65536}},
+        {#{recv_buffer => 32768}, {adaptive, 32768}},
+        {#{ws => #{recv_buffer => 4096}}, 4096}
+    ],
+    lists:foreach(
+        fun({Extra, Expected}) ->
+            Name = listener_test_ws_buffer,
+            {ok, ListenerPid} = roadrunner_listener:start_link(
+                Name, Extra#{port => 0, routes => roadrunner_hello_handler}
+            ),
+            ProtoOpts = element(4, sys:get_state(ListenerPid)),
+            ?assertEqual(Expected, maps:get(ws_buffer, ProtoOpts)),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        Cases
+    ).
+
 listener_threads_protocols_into_proto_opts_test() ->
     %% `protocols => [http2]` listener opt threads into proto_opts so
     %% the dispatch helper `roadrunner_conn_loop:h2c_only/1` can read
