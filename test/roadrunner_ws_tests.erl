@@ -324,6 +324,26 @@ negotiate_extensions_window_bits_out_of_range_skips_offer_test() ->
         ])
     ).
 
+negotiate_extensions_server_window_bits_8_skips_offer_test() ->
+    %% zlib cannot deflate with an 8-bit window, and the server may not
+    %% use a larger one than asked for, so the offer is declined rather
+    %% than crashing the session when it sets up compression. An 8-bit
+    %% client window is fine: zlib inflates with it.
+    ?assertEqual(
+        none,
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [{~"server_max_window_bits", ~"8"}]}
+        ])
+    ),
+    {permessage_deflate, Params, _} =
+        roadrunner_ws:negotiate_extensions([
+            {~"permessage-deflate", [{~"client_max_window_bits", ~"8"}]}
+        ]),
+    ?assertEqual(8, maps:get(client_max_window_bits, Params)),
+    Z = zlib:open(),
+    ?assertEqual(ok, zlib:inflateInit(Z, -8)),
+    zlib:close(Z).
+
 negotiate_extensions_unknown_pmd_param_is_ignored_test() ->
     %% Future PMD parameters we don't recognize should be skipped, not
     %% rejected — RFC 7692 §7 allows future param additions.

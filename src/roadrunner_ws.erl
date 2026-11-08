@@ -457,8 +457,15 @@ parse_pmd_params([{~"client_no_context_takeover", true} | Rest], Acc) ->
     parse_pmd_params(Rest, Acc#{client_no_context_takeover => true});
 parse_pmd_params([{~"server_max_window_bits", Value} | Rest], Acc) ->
     case window_bits(Value) of
-        {ok, N} -> parse_pmd_params(Rest, Acc#{server_max_window_bits => N});
-        invalid -> invalid
+        {ok, 8} ->
+            %% zlib's raw deflate takes no 8-bit window (`deflateInit`
+            %% raises), and the server may not use a larger one than the
+            %% client asked for (RFC 7692 §7.1.2.1): decline the offer.
+            invalid;
+        {ok, N} ->
+            parse_pmd_params(Rest, Acc#{server_max_window_bits => N});
+        invalid ->
+            invalid
     end;
 parse_pmd_params([{~"client_max_window_bits", true} | Rest], Acc) ->
     %% Bare `client_max_window_bits` (no value) means the client
