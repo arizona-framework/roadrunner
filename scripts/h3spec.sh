@@ -64,7 +64,9 @@ sha256() {
 H3SPEC="_build/h3spec/$H3SPEC_VERSION/$ASSET"
 if [ ! -x "$H3SPEC" ]; then
     mkdir -p "$(dirname "$H3SPEC")"
-    curl -fsSL -o "$H3SPEC.part" \
+    # GitHub's release downloads answer an occasional 502/503/504;
+    # curl retries those (and timeouts) with --retry.
+    curl -fsSL --retry 5 --retry-delay 5 -o "$H3SPEC.part" \
         "https://github.com/kazu-yamamoto/h3spec/releases/download/$H3SPEC_VERSION/$ASSET"
     if [ "$(sha256 "$H3SPEC.part")" != "$SHA256" ]; then
         echo "h3spec download doesn't match the pinned SHA-256" >&2
