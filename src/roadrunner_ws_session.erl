@@ -232,13 +232,12 @@
     %% arms `{active, N}` and re-arms on the transport's passive message
     %% (the `active` option, `arm_active/1`).
     active :: once | 1..32767,
-    %% The adaptive inet `buffer` (`arm_and_recv/2`): the size the session
-    %% falls back to, the cap it grows to, and the size set now. All
-    %% `undefined` when the buffer is fixed (an explicit `ws.recv_buffer`,
-    %% or a session reading with `{active, N}`).
-    buf_base :: pos_integer() | undefined,
-    buf_max :: pos_integer() | undefined,
-    buf_cur :: pos_integer() | undefined,
+    %% The adaptive inet `buffer` (`arm_and_recv/2`): the size set now, the
+    %% size the session falls back to and the cap it grows to, in one field
+    %% so the record every message updates stays small. `undefined` when
+    %% the buffer is fixed (an explicit `ws.recv_buffer`, or a session
+    %% reading with `{active, N}`).
+    buf :: {Cur :: pos_integer(), Base :: pos_integer(), Max :: pos_integer()} | undefined,
     %% The connection's close path, called by `guarded/2` once the
     %% session has ended.
     finish :: finish()
@@ -397,9 +396,9 @@ apply_ws_buffer(_Socket, #{ws_buffer := undefined}) ->
     ok;
 apply_ws_buffer(Socket, #{ws_buffer := {adaptive, Max} = WsBuffer, ws_active := Active}) ->
     _ =
-        case adaptive_bounds(WsBuffer, read_mode(Active, Socket)) of
-            {Base, Max} -> roadrunner_transport:setopts(Socket, [{buffer, Base}]);
-            {undefined, undefined} -> ok
+        case adaptive_buf(WsBuffer, read_mode(Active, Socket)) of
+            {Base, Base, Max} -> roadrunner_transport:setopts(Socket, [{buffer, Base}]);
+            undefined -> ok
         end,
     ok;
 apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
@@ -410,12 +409,12 @@ apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
 %% session adapts, since it re-arms per message and so can resize in the
 %% same call, and only below a listener `recv_buffer` larger than the
 %% base. Anything else keeps the buffer it has.
--spec adaptive_bounds(pos_integer() | {adaptive, pos_integer()} | undefined, once | 1..32767) ->
-    {pos_integer(), pos_integer()} | {undefined, undefined}.
-adaptive_bounds({adaptive, Max}, once) when Max > ?ADAPTIVE_BUFFER_BASE ->
-    {?ADAPTIVE_BUFFER_BASE, Max};
-adaptive_bounds(_WsBuffer, _Mode) ->
-    {undefined, undefined}.
+-spec adaptive_buf(pos_integer() | {adaptive, pos_integer()} | undefined, once | 1..32767) ->
+    {pos_integer(), pos_integer(), pos_integer()} | undefined.
+adaptive_buf({adaptive, Max}, once) when Max > ?ADAPTIVE_BUFFER_BASE ->
+    {?ADAPTIVE_BUFFER_BASE, ?ADAPTIVE_BUFFER_BASE, Max};
+adaptive_buf(_WsBuffer, _Mode) ->
+    undefined.
 
 %% Run the session in the calling process until it ends, then call
 %% `Finish()`. The process takes the session's label and its garbage
@@ -452,7 +451,7 @@ serve(
     } = ProtoOpts,
     ok = apply_gc_settings(SpawnOpts),
     Mode = read_mode(Active, Socket),
-    {BufBase, BufMax} = adaptive_bounds(WsBuffer, Mode),
+    Buf = adaptive_buf(WsBuffer, Mode),
     {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
     Data = #data{
         socket = Socket,
@@ -475,9 +474,7 @@ serve(
         hibernate_after = HibernateAfter,
         idle = #idle{timeout = IdleTimeout},
         active = Mode,
-        buf_base = BufBase,
-        buf_max = BufMax,
-        buf_cur = BufBase,
+        buf = Buf,
         msg_acc = undefined,
         msg_opcode = undefined,
         msg_compressed = false,
@@ -1060,15 +1057,20 @@ arm_and_recv(#data{active = N} = Data, Hibernate) when is_integer(N) ->
     flush_and_wait(Data, Hibernate);
 arm_and_recv(#data{buffer = <<>>} = Data, Hibernate) ->
     arm_once([{active, once}], Data, Hibernate);
-arm_and_recv(#data{buf_base = undefined} = Data, Hibernate) ->
+arm_and_recv(#data{buf = undefined} = Data, Hibernate) ->
     arm_once([{active, once}], Data, Hibernate);
-arm_and_recv(#data{buffer = Buf, buf_cur = Cur, buf_max = Max} = Data, Hibernate) ->
+arm_and_recv(#data{buf = {Max, _Base, Max}} = Data, Hibernate) ->
+    %% Already at its cap.
+    arm_once([{active, once}], Data, Hibernate);
+arm_and_recv(#data{buffer = Buffered, buf = {Cur, Base, Max}} = Data, Hibernate) ->
     %% A frame is partly buffered: grow the buffer so the rest of it,
     %% and the frames like it that follow, arrive in one read.
-    case frame_wire_size(Buf) of
-        Size when Size > Cur, Cur < Max ->
+    case frame_wire_size(Buffered) of
+        Size when Size > Cur ->
             Want = min(round_up(Size), Max),
-            arm_once([{active, once}, {buffer, Want}], Data#data{buf_cur = Want}, Hibernate);
+            arm_once(
+                [{active, once}, {buffer, Want}], Data#data{buf = {Want, Base, Max}}, Hibernate
+            );
         _Size ->
             arm_once([{active, once}], Data, Hibernate)
     end.
@@ -1078,10 +1080,10 @@ arm_and_recv(#data{buffer = Buf, buf_cur = Cur, buf_max = Max} = Data, Hibernate
 %% goes back to its base once a message smaller than the base arrives, so
 %% a connection that sent one upload does not keep the large buffer.
 -spec arm_after_message(non_neg_integer(), #data{}, boolean()) -> finished.
-arm_after_message(_Size, #data{buf_cur = Cur, buf_base = Cur} = Data, Hibernate) ->
-    arm_and_recv(Data, Hibernate);
-arm_after_message(Size, #data{buf_base = Base} = Data, Hibernate) when Size < Base ->
-    arm_once([{active, once}, {buffer, Base}], Data#data{buf_cur = Base}, Hibernate);
+arm_after_message(Size, #data{buf = {Cur, Base, Max}} = Data, Hibernate) when
+    Cur > Base, Size < Base
+->
+    arm_once([{active, once}, {buffer, Base}], Data#data{buf = {Base, Base, Max}}, Hibernate);
 arm_after_message(_Size, Data, Hibernate) ->
     arm_and_recv(Data, Hibernate).
 
