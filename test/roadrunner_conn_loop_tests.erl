@@ -44,15 +44,18 @@ start_applies_handler_spawn_opts_to_process_test() ->
 
 conn_start_routes_through_loop_test() ->
     {ok, Pid} = roadrunner_conn:start({fake, spawn_sink()}, fake_opts(dispatch)),
-    ?assertMatch({roadrunner_conn, awaiting_shoot, dispatch}, proc_lib:get_label(Pid)),
+    ?assertMatch({roadrunner_conn, awaiting_shoot, dispatch}, await_label(Pid)),
     drain_then_wait(Pid).
 
 awaiting_shoot_label_set_test() ->
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, fake_opts(label)),
-    ?assertMatch({roadrunner_conn, awaiting_shoot, label}, proc_lib:get_label(Pid)),
+    ?assertMatch({roadrunner_conn, awaiting_shoot, label}, await_label(Pid)),
     drain_then_wait(Pid).
 
 awaiting_shoot_registers_for_drain_test() ->
+    %% `start/2` returns without waiting for the conn to run, and the conn
+    %% is already in the drain registry by then: a drain that begins before
+    %% it first runs still reaches it.
     Table = ets:new(drain_join, [set, public]),
     Opts = (fake_opts(drain_join))#{drain_table => Table},
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, Opts),
@@ -2097,6 +2100,17 @@ slot_released_after_parse_exit_test() ->
 
 %% --- helpers ---
 
+%% `start/2` returns before the conn first runs, and the conn sets its
+%% label as it starts: yield until it has.
+await_label(Pid) ->
+    case proc_lib:get_label(Pid) of
+        undefined ->
+            erlang:yield(),
+            await_label(Pid);
+        Label ->
+            Label
+    end.
+
 %% --- `{http1, #{active => N}}` reads ---
 
 active_n_arms_once_and_again_only_on_passive_test() ->
@@ -2330,8 +2344,7 @@ fake_opts(ListenerName) ->
         proxy_protocol => false,
         listener_name => ListenerName,
         handler_spawn_opts => [{fullsweep_after, 0}],
-        tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity
+        tls_handshake_timeout => 5000
     }.
 
 %% Plain sink — discards every message. Used when the test doesn't need

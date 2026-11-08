@@ -276,6 +276,23 @@ Revisit only if a real workload reports false `slow_client` drops.
 
 **Scope:** small.
 
+### Cheaper accepts under load — medium
+
+**What:** an acceptor still gives up its scheduler a few times per accept
+(`controlling_process` and the inet port calls on the shared listen
+socket), and under load each wait sits behind busy connection
+processes. When hundreds of clients connect at once to a busy server,
+the last ones wait tens of milliseconds to be accepted. Two ways to
+remove most of that cost: the acceptor becomes the connection and
+spawns its replacement (no handoff), or one listen socket per scheduler
+with `reuseport`.
+
+**Why deferred:** both change the acceptor pool's design. Running
+acceptors at high priority cut the wait further but cost about 2.5% of
+new connections per second, so it was not kept.
+
+**Scope:** medium.
+
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>

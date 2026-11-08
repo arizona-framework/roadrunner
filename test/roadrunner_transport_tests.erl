@@ -649,6 +649,5 @@ fake_proto_opts(Handler) ->
         body_buffering => auto,
         proxy_protocol => false,
         handler_spawn_opts => [{fullsweep_after, 0}],
-        tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity
+        tls_handshake_timeout => 5000
     }.

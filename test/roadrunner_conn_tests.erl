@@ -1972,9 +1972,9 @@ consume_state_next_chunk_bad_chunk_test() ->
         roadrunner_conn:consume_body_reader(State, next_chunk)
     ).
 
-register_for_drain_registers_self_test() ->
+register_for_drain_registers_pid_test() ->
     Table = ets:new(register_for_drain, [set, public]),
-    ?assertEqual(ok, roadrunner_conn:register_for_drain(#{drain_table => Table})),
+    ?assertEqual(ok, roadrunner_conn:register_for_drain(self(), #{drain_table => Table})),
     ?assertEqual([{self()}], ets:tab2list(Table)),
     ?assertEqual(ok, roadrunner_conn:unregister_for_drain(#{drain_table => Table})),
     ?assertEqual([], ets:tab2list(Table)).
@@ -1984,14 +1984,15 @@ register_for_drain_disabled_skips_registry_test() ->
     %% registry — the opt-out callers use on short-lived workloads.
     Table = ets:new(register_for_drain_disabled, [set, public]),
     ?assertEqual(
-        ok, roadrunner_conn:register_for_drain(#{graceful_drain => false, drain_table => Table})
+        ok,
+        roadrunner_conn:register_for_drain(self(), #{graceful_drain => false, drain_table => Table})
     ),
     ?assertEqual([], ets:tab2list(Table)).
 
 register_for_drain_without_registry_is_noop_test() ->
     %% Hand-built proto_opts (tests) carry no table: nothing to register or
     %% unregister.
-    ?assertEqual(ok, roadrunner_conn:register_for_drain(#{})),
+    ?assertEqual(ok, roadrunner_conn:register_for_drain(self(), #{})),
     ?assertEqual(ok, roadrunner_conn:unregister_for_drain(#{})).
 
 unregister_for_drain_after_listener_gone_is_noop_test() ->

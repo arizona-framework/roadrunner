@@ -69,10 +69,10 @@
 
 -export([start/2]).
 
-%% Internal entries — invoked via `proc_lib:start/3` and via
+%% Internal entries, invoked via `proc_lib:spawn_opt/4` and via
 %% `erlang:hibernate/3`. Must stay exported so the runtime can
 %% re-enter them after wake-from-hibernate.
--export([init_loop/3, recv_request_bytes_hib/3]).
+-export([init_loop/2, recv_request_bytes_hib/3]).
 
 %% Loop-state record carried through every phase. Allocated once on
 %% the transition out of `awaiting_shoot` and pattern-matched (not
@@ -192,24 +192,23 @@
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.
-start(
-    Socket, #{handler_spawn_opts := SpawnOpts, handler_start_timeout := StartTimeout} = ProtoOpts
-) ->
-    %% Unlinked from the acceptor — a single-conn crash never propagates
-    %% to the acceptor pool. Mirrors `gen_statem:start/3` (NOT start_link)
-    %% so existing acceptor handoff (`controlling_process` then `! shoot`)
-    %% works without modification.
-    Parent = self(),
-    proc_lib:start(?MODULE, init_loop, [Parent, Socket, ProtoOpts], StartTimeout, SpawnOpts).
+start(Socket, #{handler_spawn_opts := SpawnOpts} = ProtoOpts) ->
+    %% Unlinked from the acceptor, so a single-conn crash never reaches the
+    %% acceptor pool. Spawned without an init-ack wait: the acceptor hands
+    %% the socket over (`controlling_process` then `! shoot`) and goes back
+    %% to `accept` without waiting for this process to be scheduled. It is
+    %% registered for drain here, in the acceptor, so a drain that begins
+    %% before the new process first runs still reaches it.
+    Pid = proc_lib:spawn_opt(?MODULE, init_loop, [Socket, ProtoOpts], SpawnOpts),
+    ok = roadrunner_conn:register_for_drain(Pid, ProtoOpts),
+    {ok, Pid}.
 
 -doc false.
--spec init_loop(pid(), roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
+-spec init_loop(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     no_return().
-init_loop(Parent, Socket, ProtoOpts) ->
+init_loop(Socket, ProtoOpts) ->
     ListenerName = maps:get(listener_name, ProtoOpts, undefined),
     proc_lib:set_label({roadrunner_conn, awaiting_shoot, ListenerName}),
-    ok = roadrunner_conn:register_for_drain(ProtoOpts),
-    proc_lib:init_ack(Parent, {ok, self()}),
     awaiting_shoot(Socket, ProtoOpts, ListenerName).
 
 -spec awaiting_shoot(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), atom()) ->

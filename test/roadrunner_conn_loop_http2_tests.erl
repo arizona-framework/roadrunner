@@ -482,7 +482,6 @@ concurrent_streams_both_dispatch() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_concurrent_test,
@@ -556,7 +555,6 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         requests_counter => RequestsCounter,
@@ -613,7 +611,6 @@ plaintext_listener_without_h2c_stays_h1() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         requests_counter => RequestsCounter,
@@ -1666,7 +1663,6 @@ middleware_chain_runs() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_mw_test,
@@ -1739,7 +1735,6 @@ router_404_returns_not_found() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_404_listener,
@@ -1810,7 +1805,6 @@ router_405_returns_method_not_allowed() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_405_listener,
@@ -2897,7 +2891,6 @@ rst_during_stream_response_unwinds_worker() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_rst_during_stream,
@@ -2986,7 +2979,6 @@ drain_refuses_new_streams() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_drain_test,
@@ -3050,7 +3042,6 @@ drain_with_in_flight_stream_waits() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_drain_inflight_test,
@@ -3121,7 +3112,6 @@ drain_message_is_idempotent() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_drain_dup_test,
@@ -3182,7 +3172,6 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_drain_rst_test,
@@ -3435,7 +3424,6 @@ telemetry_request_stop_fires_for_router_404() ->
         ProtoOpts = #{
             handler_spawn_opts => [{fullsweep_after, 0}],
             tls_handshake_timeout => 5000,
-            handler_start_timeout => infinity,
             max_concurrent_requests => infinity,
             client_counter => Counter,
             listener_name => h2_telem_404,
@@ -3527,7 +3515,6 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_compress_test,
@@ -4814,7 +4801,6 @@ post_handshake_handler(Handler) ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_strict_test,
@@ -4956,7 +4942,6 @@ start_http2_conn(Extra) ->
                 listener_name => http2_test,
                 handler_spawn_opts => [{fullsweep_after, 0}],
                 tls_handshake_timeout => 5000,
-                handler_start_timeout => infinity,
                 dispatch =>
                     {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1,
                         undefined},
@@ -5117,7 +5102,6 @@ run_h2_request_with_handler(Handler, Path) ->
     ProtoOpts = #{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
-        handler_start_timeout => infinity,
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_handler_test,
@@ -5193,7 +5177,6 @@ run_stream_request(Path, PrefaceSettings, ExtraOpts) ->
         #{
             handler_spawn_opts => [{fullsweep_after, 0}],
             tls_handshake_timeout => 5000,
-            handler_start_timeout => infinity,
             max_concurrent_requests => infinity,
             client_counter => Counter,
             listener_name => h2_stream_test,
