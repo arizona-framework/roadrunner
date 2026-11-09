@@ -323,7 +323,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   many milliseconds of main-loop idle time, which sweeps and shrinks
   the conn's heap. Pairs with `handler_spawn` below for a pool of
   mostly-idle connections; waking a hibernated conn is charged to the
-  request that wakes it.
+  request that wakes it. On a TLS listener it also sets the `ssl`
+  option of the same name, unless `tls` sets it, so the processes that
+  run each TLS connection hibernate with it: an idle TLS connection
+  then holds about 15 KB less.
 - `handler_spawn` — spawn config for every handler-running process (the
   connection process and HTTP/2/3 stream workers) as a nested map with
   `opts` (`spawn_opt` / `proc_lib` options, default
@@ -1443,7 +1446,7 @@ open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     %% explicit value wins. Hardened defaults are layered underneath
     %% (user values win), and the standard transport options sit on
     %% top so accepted sockets behave like the plain-TCP variant.
-    TlsOpts = roadrunner_transport:build_tls_opts(Protocols, UserTlsOpts),
+    TlsOpts = roadrunner_transport:build_tls_opts(Protocols, tls_user_opts(UserTlsOpts, Opts)),
     roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts(Opts));
 open_listen_socket(Port, Opts, _Protocols) ->
     %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
@@ -1615,11 +1618,28 @@ setup_overload({shed, #{retry_after := RetryAfter}}, _Max, _Counter) ->
 -spec maybe_tls_upgrade(
     roadrunner_conn:proto_opts(), opts(), [http1 | http2 | http3, ...]
 ) -> roadrunner_conn:proto_opts().
-maybe_tls_upgrade(#{proxy_protocol := true} = ProtoOpts, #{tls := UserTlsOpts}, Protocols) ->
+maybe_tls_upgrade(#{proxy_protocol := true} = ProtoOpts, #{tls := UserTlsOpts} = Opts, Protocols) ->
     TcpProtocols = [P || P <- Protocols, P =/= http3],
-    ProtoOpts#{tls_upgrade => roadrunner_transport:build_tls_opts(TcpProtocols, UserTlsOpts)};
+    ProtoOpts#{
+        tls_upgrade =>
+            roadrunner_transport:build_tls_opts(TcpProtocols, tls_user_opts(UserTlsOpts, Opts))
+    };
 maybe_tls_upgrade(ProtoOpts, _Opts, _Protocols) ->
     ProtoOpts.
+
+%% The user's `tls` options, with the listener's `hibernate_after` added as
+%% the `ssl` option of the same name when `tls` does not set its own: the
+%% TLS connection process holds the session state, about two thirds of
+%% what an idle TLS connection costs, and hibernating it with the conn
+%% process shrinks that.
+-spec tls_user_opts([ssl:tls_server_option()], opts()) -> [ssl:tls_server_option()].
+tls_user_opts(UserTlsOpts, #{hibernate_after := Ms}) when is_integer(Ms), Ms > 0 ->
+    case lists:keymember(hibernate_after, 1, UserTlsOpts) of
+        true -> UserTlsOpts;
+        false -> [{hibernate_after, Ms} | UserTlsOpts]
+    end;
+tls_user_opts(UserTlsOpts, _Opts) ->
+    UserTlsOpts.
 
 %% Validate the opt-in `proxy_protocol` listener opt. It is a TCP-stream
 %% feature (an L4 balancer prepends the header before the first byte), so it

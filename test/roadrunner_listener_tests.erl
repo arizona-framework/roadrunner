@@ -317,6 +317,33 @@ listener_threads_rate_check_interval_into_proto_opts_test() ->
     ?assertEqual(500, maps:get(rate_check_interval, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
+listener_hibernate_after_reaches_tls_test() ->
+    %% On a TLS listener `hibernate_after` also becomes the `ssl` option of
+    %% the same name, so the TLS connection processes hibernate with the
+    %% conn; one set in `tls` wins, and an unset or zero `hibernate_after`
+    %% adds nothing. The PROXY-protocol TLS listener keeps the options it
+    %% upgrades each socket with in proto_opts, which shows them.
+    Tls = roadrunner_test_certs:server_opts(),
+    Cases = [
+        {#{hibernate_after => 5000, tls => Tls}, [5000]},
+        {#{hibernate_after => 5000, tls => [{hibernate_after, 100} | Tls]}, [100]},
+        {#{tls => Tls}, []},
+        {#{hibernate_after => 0, tls => Tls}, []}
+    ],
+    lists:foreach(
+        fun({Extra, Expected}) ->
+            Name = listener_test_tls_hibernate,
+            {ok, Pid} = roadrunner_listener:start_link(
+                Name,
+                Extra#{port => 0, proxy_protocol => true, routes => roadrunner_hello_handler}
+            ),
+            #{tls_upgrade := TlsOpts} = element(4, sys:get_state(Pid)),
+            ?assertEqual(Expected, [Ms || {hibernate_after, Ms} <- TlsOpts]),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        Cases
+    ).
+
 listener_threads_hibernate_after_into_proto_opts_test() ->
     %% `hibernate_after` listener opt must thread into proto_opts so
     %% `roadrunner_conn_loop` reads it and routes the recv path through
