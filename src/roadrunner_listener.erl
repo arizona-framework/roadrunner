@@ -323,10 +323,14 @@ Optional middleware and timing knobs (durations in milliseconds):
   many milliseconds of main-loop idle time, which sweeps and shrinks
   the conn's heap. Pairs with `handler_spawn` below for a pool of
   mostly-idle connections; waking a hibernated conn is charged to the
-  request that wakes it. On a TLS listener it also sets the `ssl`
-  option of the same name, unless `tls` sets it, so the processes that
-  run each TLS connection hibernate with it: an idle TLS connection
-  then holds about half as much (41 KB down to 22 KB).
+  request that wakes it. On a TLS listener (HTTP/1.1 and HTTP/2; HTTP/3
+  runs its own TLS) it also sets the `ssl` option of the same name,
+  unless `tls` sets it, so the processes that run each TLS connection
+  hibernate after that much idle time of their own: an idle TLS
+  connection then holds about half as much (41 KB down to 22 KB). This
+  applies to WebSocket sessions and streamed responses over TLS too,
+  whatever `ws.hibernate_after` says; set `{hibernate_after, infinity}`
+  in `tls` to keep the TLS processes awake.
 - `handler_spawn` — spawn config for every handler-running process (the
   connection process and HTTP/2/3 stream workers) as a nested map with
   `opts` (`spawn_opt` / `proc_lib` options, default
@@ -361,11 +365,12 @@ Optional middleware and timing knobs (durations in milliseconds):
   HTTP/2 connections per second, with 44% less CPU per connection. All current
   browsers support it. To make a self-signed one for testing:
   `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 365 -keyout key.pem -out cert.pem -subj /CN=localhost`.
-  Give CA certificates for client authentication as a file
-  (`cacertfile`) rather than as DER (`cacerts`): `ssl` decodes DER
-  `cacerts` again for every connection and keeps the decoded copy in
-  it, about 12 KB per connection for two small certificates, while a
-  file is decoded once and shared.
+  Give CA certificates (for client authentication or to complete the
+  certificate chain) as a file (`cacertfile`) rather than as DER
+  (`cacerts`): `ssl` decodes DER `cacerts` again for every connection
+  and keeps the decoded copy in it, about 12 KB per connection for two
+  small certificates and close to 1 MB for the 121-certificate OS
+  bundle, while a file is decoded once and shared.
 
 The inline source comments next to each field carry the deeper
 ops-tuning rationale.

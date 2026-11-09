@@ -24,7 +24,8 @@ the next.
     silent_peer_times_out_without_accept_telemetry/1,
     parked_handshakes_do_not_block_accepting/1,
     tls_listener_starts_ssl/1,
-    plain_listener_leaves_ssl_stopped/1
+    plain_listener_leaves_ssl_stopped/1,
+    hibernate_after_reaches_the_tls_processes/1
 ]).
 
 suite() ->
@@ -36,7 +37,8 @@ all() ->
         silent_peer_times_out_without_accept_telemetry,
         parked_handshakes_do_not_block_accepting,
         tls_listener_starts_ssl,
-        plain_listener_leaves_ssl_stopped
+        plain_listener_leaves_ssl_stopped,
+        hibernate_after_reaches_the_tls_processes
     ].
 
 init_per_testcase(Case, Config) ->
@@ -129,7 +131,41 @@ plain_listener_leaves_ssl_stopped(_Config) ->
     ),
     ?assertNot(lists:keymember(ssl, 1, application:which_applications())).
 
+hibernate_after_reaches_the_tls_processes(_Config) ->
+    %% The listener's `hibernate_after` becomes the `ssl` option of the same
+    %% name on the TLS listen socket, so the server side of each connection
+    %% runs with it. The client side does not set it, and whether `ssl` then
+    %% stores its default varies by version, so only a 50 is looked for.
+    Port = start_listener(#{hibernate_after => 50}),
+    Before = processes(),
+    ClientOpts = [{verify, verify_none} | roadrunner_test_certs:client_opts()],
+    {ok, Sock} = ssl:connect({127, 0, 0, 1}, Port, ClientOpts ++ [binary, {active, false}], 5000),
+    HibernateAfters = [
+        Ms
+     || P <- processes() -- Before,
+        is_ssl_connection(P),
+        Ms <- ssl_hibernate_after(P)
+    ],
+    ok = ssl:close(Sock),
+    ?assertEqual([50], [Ms || Ms <- HibernateAfters, Ms =/= infinity]).
+
 %% --- helpers ---
+
+%% An `ssl` connection process (`ssl_gen_statem`), client or server side.
+is_ssl_connection(P) ->
+    case process_info(P, dictionary) of
+        {dictionary, Dict} ->
+            proplists:get_value('$initial_call', Dict) =:= {ssl_gen_statem, init, 1};
+        undefined ->
+            false
+    end.
+
+%% The `hibernate_after` of an `ssl` connection process, read from the
+%% options map in its state. The map is found by its key rather than by its
+%% place in `ssl`'s state record, which is internal to OTP.
+ssl_hibernate_after(P) ->
+    {_StateName, State} = sys:get_state(P),
+    [Ms || #{hibernate_after := Ms} <- tuple_to_list(State)].
 
 start_listener(Extra) ->
     {ok, _} = roadrunner_listener:start_link(
