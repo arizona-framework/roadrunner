@@ -95,6 +95,7 @@ all_test_() ->
         fun runtime_idle_timeout_emits_goaway/0,
         fun active_n_rearms_only_on_passive/0,
         fun first_data_payload_grows_the_socket_buffer_once/0,
+        fun large_single_frame_body_grows_the_socket_buffer/0,
         fun active_once_rearms_after_every_read/0,
         fun hibernate_after_fires_when_idle/0,
         fun hibernated_idle_conn_still_emits_goaway/0,
@@ -2075,15 +2076,26 @@ runtime_idle_timeout_emits_goaway() ->
     end.
 
 first_data_payload_grows_the_socket_buffer_once() ->
-    %% A prior-knowledge h2c socket starts with its small `idle_recv_buffer`:
-    %% the first DATA frame that carries a payload grows it to
-    %% `recv_buffer` (`grow_recv_buffer`), an empty one does not, and a
-    %% later body does not set it again.
+    %% A prior-knowledge h2c socket starts with its small `idle_recv_buffer`
+    %% (8 here): a small body sent whole in one frame leaves it, and so
+    %% does an empty frame; a body split across frames grows it to
+    %% `recv_buffer` (64) at its first frame, and a later body does not
+    %% set it again.
     {Pid, Ref, ConnPid} = post_handshake_conn(#{grow_recv_buffer => {8, 64}}),
     ok = post_request(ConnPid, 1, [<<>>, ~"body"]),
-    ?assertEqual([[{buffer, 64}]], buffer_arms(collect_setopts(ConnPid))),
-    ok = post_request(ConnPid, 3, [~"more"]),
     ?assertEqual([], buffer_arms(collect_setopts(ConnPid))),
+    ok = post_request(ConnPid, 3, [~"ab", ~"cd"]),
+    ?assertEqual([[{buffer, 64}]], buffer_arms(collect_setopts(ConnPid))),
+    ok = post_request(ConnPid, 5, [~"more", ~"data"]),
+    ?assertEqual([], buffer_arms(collect_setopts(ConnPid))),
+    cleanup(Pid, Ref).
+
+large_single_frame_body_grows_the_socket_buffer() ->
+    %% A body sent whole in one frame still grows the socket when the frame
+    %% is larger than `idle_recv_buffer`.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{grow_recv_buffer => {8, 64}}),
+    ok = post_request(ConnPid, 1, [binary:copy(~"a", 9)]),
+    ?assertEqual([[{buffer, 64}]], buffer_arms(collect_setopts(ConnPid))),
     cleanup(Pid, Ref).
 
 %% Send a POST on `StreamId` whose body is `Chunks`, one DATA frame each (the

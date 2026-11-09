@@ -791,8 +791,9 @@ WebSocket session tunables (under `ws` in the listener opts).
   back after a small message. An idle connection holds the small
   buffer, and large frames still arrive in one read. The resize
   rides on the re-arm the session makes per message anyway. A
-  session reading with `{active, N}` (TLS) keeps the listener's
-  `recv_buffer`. Set a size to fix the buffer at it instead.
+  session reading with `{active, N}` (the default on TLS) cannot resize
+  per message, so it reads with the listener's `recv_buffer`. Set a
+  size to fix the buffer at it instead.
 - `hibernate_after` — idle milliseconds after which a WebSocket
   session hibernates (heap shrinks to the minimum until the next
   inbound event wakes it). The session-side counterpart of the
@@ -1471,14 +1472,10 @@ open_listen_socket(Port, Opts, _Protocols) ->
     %% (~106 lookups per connection). The new backend's
     %% async I/O wins are real for long-lived connections; revisit
     %% if/when the workload mix shifts there.
-    roadrunner_transport:listen(Port, base_listen_opts(Opts, plain_buffer(Opts))).
-
-%% The inet `buffer` of a plain-TCP listener's sockets: `idle_recv_buffer`,
-%% grown to `recv_buffer` once a connection gets a large body (HTTP/1.1)
-%% or its first DATA payload (h2c) (`maybe_grow/2`).
--spec plain_buffer(opts()) -> pos_integer().
-plain_buffer(Opts) ->
-    idle_recv_buffer(Opts).
+    %%
+    %% A plain-TCP socket starts at `idle_recv_buffer` and its connection
+    %% grows it to `recv_buffer` for a large request body (`maybe_grow/1`).
+    roadrunner_transport:listen(Port, base_listen_opts(Opts, idle_recv_buffer(Opts))).
 
 -spec base_listen_opts(opts(), pos_integer()) -> [gen_tcp:listen_option()].
 base_listen_opts(Opts, Buffer) ->
@@ -1881,9 +1878,9 @@ is_reserved_spawn_opt({monitor, _}) -> true;
 is_reserved_spawn_opt(_) -> false.
 
 %% `grow_recv_buffer` for a plain-TCP listener, whose sockets start at
-%% `idle_recv_buffer` (`plain_buffer/1`): an HTTP/1.1 conn grows its socket
-%% to `recv_buffer` before it reads a large body, an h2c one at its first
-%% DATA payload. TLS sockets read with `recv_buffer` from the start (the
+%% `idle_recv_buffer`: an HTTP/1.1 conn grows its socket to `recv_buffer`
+%% before it reads a large body, an h2c one at the first DATA frame that may
+%% carry one. TLS sockets read with `recv_buffer` from the start (the
 %% TLS connection process leaves an idle one unarmed, so it holds no read
 %% buffer), and one lowered to `idle_recv_buffer` has nowhere to grow, so
 %% those leave the key out.
@@ -2271,7 +2268,7 @@ ws_defaults() ->
     #{
         max_frame_size => ?DEFAULT_WS_MAX_FRAME_SIZE,
         max_message_size => ?DEFAULT_WS_MAX_MESSAGE_SIZE,
-        %% `undefined` = adaptive (`ws_buffer/2`).
+        %% `undefined` = adaptive (`ws_buffer/3`).
         recv_buffer => undefined,
         %% `infinity` = the session's receive never times out into a
         %% hibernate — the `after infinity` clause is dead by the

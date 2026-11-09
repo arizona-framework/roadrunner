@@ -382,17 +382,32 @@ upgrade(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) -
 
 %% Apply the `ws.recv_buffer` listener opt before the 101 goes out,
 %% while the conn still owns the socket: a fixed size for the session's
-%% lifetime, or, adaptive (the default), the base an `{active, once}`
-%% session starts from (`arm_and_recv/2` resizes it from there).
-%% `undefined` keeps the listener socket's `recv_buffer`. A setopts
-%% failure means the socket already died; the session discovers that on
-%% its first receive, so the result is ignored rather than special-cased.
+%% lifetime, or adaptive (the default). `undefined` keeps the socket's
+%% buffer. A setopts failure means the socket already died; the session
+%% discovers that on its first receive, so the result is ignored rather
+%% than special-cased.
 -spec apply_ws_buffer(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
 apply_ws_buffer(_Socket, #{ws_buffer := undefined}) ->
     ok;
-apply_ws_buffer(_Socket, #{ws_buffer := {adaptive, _Base, _Max}}) ->
-    %% The base is the buffer the socket already reads with (the
-    %% listener's `idle_recv_buffer`), so there is nothing to set.
+apply_ws_buffer(Socket, #{ws_buffer := {adaptive, _Base, Max}, ws_active := Active}) ->
+    _ =
+        case {read_mode(Active, Socket), Socket} of
+            {once, _} ->
+                %% Starts from the buffer the socket already reads with
+                %% (`idle_recv_buffer`), and `arm_and_recv/2` resizes it
+                %% from there. A socket that already grew for a large body
+                %% starts above that base; the session then only resizes
+                %% it on a large frame, which costs one setopts.
+                ok;
+            {_N, {ssl, _}} ->
+                %% A TLS socket already reads with `recv_buffer`.
+                ok;
+            {_N, _Plain} ->
+                %% `{active, N}` cannot resize per message, so a plain
+                %% socket reads with `recv_buffer`, as it did before it
+                %% started at `idle_recv_buffer`.
+                roadrunner_transport:setopts(Socket, [{buffer, Max}])
+        end,
     ok;
 apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
     _ = roadrunner_transport:setopts(Socket, [{buffer, Buffer}]),

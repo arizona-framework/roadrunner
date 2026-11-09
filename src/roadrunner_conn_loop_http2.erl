@@ -902,7 +902,7 @@ handle_frame({headers, StreamId, Flags, Priority, Fragment}, State) ->
 handle_frame({continuation, StreamId, Flags, Fragment}, State) ->
     on_continuation(StreamId, Flags, Fragment, State);
 handle_frame({data, StreamId, Flags, Payload, FlowLen}, State) ->
-    on_data(StreamId, Flags, Payload, FlowLen, grow_buffer(Payload, State));
+    on_data(StreamId, Flags, Payload, FlowLen, grow_buffer(Flags, Payload, State));
 handle_frame({push_promise, _, _, _, _}, State) ->
     %% Servers MUST NOT receive PUSH_PROMISE — RFC 9113 §6.6.
     goaway_exit(State, protocol_error);
@@ -914,17 +914,24 @@ handle_frame({unknown, _Type, _StreamId}, State) ->
 
 %% A prior-knowledge h2c socket starts with the small `idle_recv_buffer`,
 %% which bounds what an idle connection holds, and every `{active, N}` read
-%% is sized by it. The first DATA frame that carries a payload grows it to
-%% `recv_buffer` for the rest of the connection, so request bodies are not
-%% read in small pieces. It stays grown: the driver hands a freed buffer
-%% back to the next read that fits in it, so shrinking would not release
-%% it.
--spec grow_buffer(binary(), #loop{}) -> #loop{}.
-grow_buffer(<<>>, State) ->
+%% is sized by it. A request body that may be larger, a DATA frame with a
+%% payload that does not end its stream or does not fit in that buffer,
+%% grows it to `recv_buffer` for the rest of the connection, so large
+%% bodies are not read in small pieces. A small body sent whole in one
+%% frame, as an API client's JSON usually is, leaves it small, like the
+%% HTTP/1.1 threshold in `roadrunner_conn_loop:grow_buffer/2`. It stays
+%% grown: the driver hands a freed buffer back to the next read that fits
+%% in it, so shrinking would not release it.
+-spec grow_buffer(non_neg_integer(), binary(), #loop{}) -> #loop{}.
+grow_buffer(_Flags, _Payload, #loop{grow_buffer = undefined} = State) ->
     State;
-grow_buffer(_Payload, #loop{grow_buffer = undefined} = State) ->
+grow_buffer(_Flags, <<>>, State) ->
     State;
-grow_buffer(_Payload, #loop{grow_buffer = {_Idle, Max}, socket = Socket} = State) ->
+grow_buffer(Flags, Payload, #loop{grow_buffer = {Idle, _Max}} = State) when
+    Flags band 16#01 =/= 0, byte_size(Payload) =< Idle
+->
+    State;
+grow_buffer(_Flags, _Payload, #loop{grow_buffer = {_Idle, Max}, socket = Socket} = State) ->
     _ = roadrunner_transport:setopts(Socket, [{buffer, Max}]),
     State#loop{grow_buffer = undefined}.
 

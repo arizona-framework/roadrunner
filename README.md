@@ -455,7 +455,7 @@ type. Beyond `port`,
 - **Real client IP**: `proxy_protocol`, `real_ip` (see
   [Behind a proxy](#behind-a-proxy))
 - **Sockets**: `ip` (bind address, all interfaces by default),
-  `num_acceptors`, `socket_backlog`, `recv_buffer`
+  `num_acceptors`, `socket_backlog`, `recv_buffer`, `idle_recv_buffer`
 - **Middleware**: `middlewares`
 - **Body buffering**: `body_buffering`
 - **Graceful drain**: `graceful_drain`, `slot_reconciliation`

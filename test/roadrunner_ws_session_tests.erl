@@ -254,16 +254,18 @@ fixed_buffer_never_resizes_test() ->
         [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
     ).
 
-active_n_session_keeps_its_buffer_test() ->
+active_n_session_reads_with_the_listener_cap_test() ->
     %% Only an `{active, once}` session adapts: one reading with
-    %% `{active, N}` re-arms once per N reads, so it keeps the buffer it
-    %% has and nothing is set before the 101 either.
+    %% `{active, N}` re-arms once per N reads and cannot resize per
+    %% message, so a plain socket is set to the cap (`recv_buffer`) once,
+    %% before the 101, and never changed after.
     Events = adaptive_events(
         (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}, ws_active := 4},
         [{recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual(
-        [], [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
+        [[{buffer, 65536}]],
+        [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
     ).
 
 coalesced_first_frame_seeded_in_buffer_is_processed_test() ->

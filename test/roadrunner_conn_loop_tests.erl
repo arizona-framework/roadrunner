@@ -2258,6 +2258,45 @@ large_body_grows_the_socket_buffer_once_test() ->
     Pid ! {roadrunner_fake_closed, x},
     ok = await_normal_exit(Ref, Pid).
 
+expect_continue_body_grows_before_the_100_test() ->
+    %% A client holding a large body back for `Expect: 100-continue`: the
+    %% socket grows before the 100 asks for the body.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {8, 64}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    Pid !
+        {roadrunner_fake_data, x,
+            ~"POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 20\r\n\r\n"},
+    First =
+        receive
+            {Tag, setopts, Opts} -> {setopts, Opts};
+            {Tag, sent, Data} -> {sent, iolist_to_binary(Data)}
+        after 2000 -> error(nothing_from_conn)
+        end,
+    ?assertEqual({setopts, [{buffer, 64}]}, First),
+    ?assertMatch(<<"HTTP/1.1 100 Continue", _/binary>>, expect_sent(Tag)),
+    Pid ! {roadrunner_fake_data, x, binary:copy(~"a", 20)},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+mostly_buffered_body_keeps_the_socket_buffer_test() ->
+    %% Most of the body came in with the head: only what is still to come
+    %% counts, and 5 bytes fit the idle buffer.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {8, 64}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    Pid ! {roadrunner_fake_data, x, post_head(20, binary:copy(~"a", 15))},
+    Pid ! {roadrunner_fake_data, x, binary:copy(~"a", 5)},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
 chunked_body_grows_the_socket_buffer_test() ->
     %% A chunked body's size is not known up front, so it grows the socket.
     Tag = make_ref(),
@@ -2304,9 +2343,9 @@ manual_bodyless_request_keeps_the_socket_buffer_test() ->
     ok = await_normal_exit(Ref, Pid).
 
 no_grow_key_keeps_the_socket_buffer_test() ->
-    %% A listener with nothing to grow (TLS, h2c-only, or `idle_recv_buffer`
-    %% equal to `recv_buffer`) leaves the key out: a large body reads with
-    %% the buffer the socket has.
+    %% A listener with nothing to grow (TLS, or `idle_recv_buffer` equal to
+    %% `recv_buffer`) leaves the key out: a large body reads with the buffer
+    %% the socket has.
     Tag = make_ref(),
     {Pid, Ref} = start_active_n(Tag, size_opts(#{http1_active => 4})),
     [{active, 4}] = expect_setopts(Tag),
