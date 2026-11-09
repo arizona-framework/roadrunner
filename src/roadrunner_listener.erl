@@ -326,7 +326,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   request that wakes it. On a TLS listener it also sets the `ssl`
   option of the same name, unless `tls` sets it, so the processes that
   run each TLS connection hibernate with it: an idle TLS connection
-  then holds about 15 KB less.
+  then holds about half as much (41 KB down to 22 KB).
 - `handler_spawn` — spawn config for every handler-running process (the
   connection process and HTTP/2/3 stream workers) as a nested map with
   `opts` (`spawn_opt` / `proc_lib` options, default
@@ -361,6 +361,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   HTTP/2 connections per second, with 44% less CPU per connection. All current
   browsers support it. To make a self-signed one for testing:
   `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 365 -keyout key.pem -out cert.pem -subj /CN=localhost`.
+  Give CA certificates for client authentication as a file
+  (`cacertfile`) rather than as DER (`cacerts`): `ssl` decodes DER
+  `cacerts` again for every connection and keeps the decoded copy in
+  it, about 12 KB per connection for two small certificates, while a
+  file is decoded once and shared.
 
 The inline source comments next to each field carry the deeper
 ops-tuning rationale.
