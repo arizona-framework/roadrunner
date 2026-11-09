@@ -257,6 +257,11 @@
     %% True while an `{active, N}` arm still has reads left, so the
     %% frame loop skips the setopts call. Always false under `once`.
     armed = false :: boolean(),
+    %% `{Idle, Max}` while a prior-knowledge h2c socket still reads with
+    %% its small `idle_recv_buffer`: the first DATA frame with a payload
+    %% grows it to `Max` (`recv_buffer`) for good, so a request body is
+    %% not read in small pieces. `undefined` once grown, and on TLS.
+    grow_buffer :: {pos_integer(), pos_integer()} | undefined,
     %% Inbound bytes still to parse.
     buffer = <<>> :: binary(),
     %% HPACK contexts.
@@ -439,6 +444,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         msg_error = Error,
         msg_passive = roadrunner_transport:passive_message(Socket),
         active = maps:get(http2_active, ProtoOpts, ?DEFAULT_ACTIVE),
+        grow_buffer = maps:get(grow_recv_buffer, ProtoOpts, undefined),
         hpack_dec = roadrunner_http2_hpack:new_decoder(?HPACK_TABLE_SIZE),
         hpack_enc = roadrunner_http2_hpack:new_encoder(?HPACK_TABLE_SIZE),
         buffer = Buffered,
@@ -896,7 +902,7 @@ handle_frame({headers, StreamId, Flags, Priority, Fragment}, State) ->
 handle_frame({continuation, StreamId, Flags, Fragment}, State) ->
     on_continuation(StreamId, Flags, Fragment, State);
 handle_frame({data, StreamId, Flags, Payload, FlowLen}, State) ->
-    on_data(StreamId, Flags, Payload, FlowLen, State);
+    on_data(StreamId, Flags, Payload, FlowLen, grow_buffer(Payload, State));
 handle_frame({push_promise, _, _, _, _}, State) ->
     %% Servers MUST NOT receive PUSH_PROMISE — RFC 9113 §6.6.
     goaway_exit(State, protocol_error);
@@ -905,6 +911,22 @@ handle_frame({unknown, _Type, _StreamId}, State) ->
     %% awaiting_continuation guard above already rejected the
     %% mid-header-block case (§6.10), so reaching here is benign.
     frame_loop(State).
+
+%% A prior-knowledge h2c socket starts with the small `idle_recv_buffer`,
+%% which bounds what an idle connection holds, and every `{active, N}` read
+%% is sized by it. The first DATA frame that carries a payload grows it to
+%% `recv_buffer` for the rest of the connection, so request bodies are not
+%% read in small pieces. It stays grown: the driver hands a freed buffer
+%% back to the next read that fits in it, so shrinking would not release
+%% it.
+-spec grow_buffer(binary(), #loop{}) -> #loop{}.
+grow_buffer(<<>>, State) ->
+    State;
+grow_buffer(_Payload, #loop{grow_buffer = undefined} = State) ->
+    State;
+grow_buffer(_Payload, #loop{grow_buffer = {_Idle, Max}, socket = Socket} = State) ->
+    _ = roadrunner_transport:setopts(Socket, [{buffer, Max}]),
+    State#loop{grow_buffer = undefined}.
 
 %% --- HEADERS / CONTINUATION ---
 

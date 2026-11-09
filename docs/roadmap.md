@@ -293,24 +293,6 @@ new connections per second, so it was not kept.
 
 **Scope:** medium.
 
-### Smaller idle read buffers on TLS and HTTP/2 — medium
-
-**What:** a plain-TCP HTTP/1.1 connection now waits with a 16 KB read
-buffer (`idle_recv_buffer`) and grows to `recv_buffer` only for a large
-body. TLS and HTTP/2 connections still wait with the full 64 KB
-`recv_buffer`, since every read the emulator makes for them is sized
-by it. Growing them on demand the same way would cut what an idle
-TLS or HTTP/2 connection holds by about 48 KB.
-
-**Why deferred:** these sockets read with `{active, N}`, so no read
-says how much it needs. A fixed 16 KB buffer cut HTTP/2 upload
-throughput by about a quarter, so the buffer would have to grow as
-soon as a large DATA flow starts (HTTP/2) or a large body begins
-(HTTP/1.1 over TLS, where the socket belongs to the TLS connection
-process).
-
-**Scope:** medium.
-
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>

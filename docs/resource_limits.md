@@ -194,8 +194,8 @@ table.
 | Limit | Default | Configurable | Purpose |
 |---|---|---|---|
 | `socket_backlog` | 1024 | yes | TCP listen backlog (kernel SYN/accept queue depth) |
-| `recv_buffer` | 64 KB | yes | the most one read takes: every read on TLS and HTTP/2, a plain-TCP HTTP/1.1 connection once a large body comes in, a large WebSocket frame |
-| `idle_recv_buffer` | 16 KB | yes | the read buffer a plain-TCP HTTP/1.1 connection starts with, and what it holds while it waits for the next request or message |
+| `recv_buffer` | 64 KB | yes | the most one read takes: every read on TLS, a plain-TCP connection once a large request body comes in, a large WebSocket frame |
+| `idle_recv_buffer` | 16 KB | yes | the read buffer a plain-TCP connection starts with, and what it holds while it waits for the next request or message |
 | `max_clients` | 16384 | yes | concurrent connection cap per listener |
 | `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3, every protocol in `shed` mode) |
 | `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |
@@ -212,12 +212,13 @@ acceptors hit `emfile` at the descriptor ceiling — each emits
 back-off rather than going silent — so raise `ulimit -n` (and the systemd
 `LimitNOFILE`) for high concurrency.
 
-Every connection waiting to read holds a read buffer: `idle_recv_buffer`
-on a plain-TCP HTTP/1.1 connection, `recv_buffer` on TLS and HTTP/2. So
-idle memory scales as `max_clients` times that buffer. A plain-TCP
-connection that receives a body larger than `idle_recv_buffer` switches
-to `recv_buffer` for the rest of its life, so uploads read as fast as
-before, and only the connections that never receive one stay small.
+A plain-TCP connection waiting to read holds a read buffer of
+`idle_recv_buffer`, so idle memory scales as `max_clients` times that
+buffer. One that receives a large request body (HTTP/1.1), or any
+request body (HTTP/2), switches to `recv_buffer` for the rest of its
+life, so uploads read as fast as before, and only the connections that
+never receive one stay small. An idle TLS connection holds no read
+buffer: its cost is the TLS connection process.
 
 `max_clients` bounds connections and the HTTP/2 / HTTP/3
 `max_concurrent_streams` bounds streams per connection, but their product

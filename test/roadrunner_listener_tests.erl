@@ -906,7 +906,7 @@ listener_socket_buffer_by_transport_test() ->
         {#{idle_recv_buffer => 4096}, 4096, {4096, 65536}},
         {#{recv_buffer => 8192}, 8192, none},
         {#{idle_recv_buffer => 32768, recv_buffer => 131072}, 32768, {32768, 131072}},
-        {#{protocols => [http2]}, 65536, none},
+        {#{protocols => [http2]}, 16384, {16384, 65536}},
         {#{tls => Tls}, 65536, none},
         {#{tls => Tls, proxy_protocol => true}, 65536, none}
     ],

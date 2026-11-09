@@ -72,12 +72,12 @@ All duration and interval values in `opts()` are in milliseconds —
 %% which a burst of concurrent connects overflows; 1024 matches cowboy.
 %% Linux clamps the effective value at `net.core.somaxconn`.
 -define(DEFAULT_SOCKET_BACKLOG, 1024).
-%% The largest single read: a TLS or HTTP/2 socket's inet `buffer`, and the
-%% most one HTTP/1.1 body read or WebSocket frame read takes (see the
+%% The largest single read: a TLS socket's inet `buffer`, and what a
+%% plain-TCP socket grows to for a large body or WebSocket frame (see the
 %% `buffer` note in `base_listen_opts/2`).
 -define(DEFAULT_RECV_BUFFER, 65536).
-%% The inet `buffer` of a plain-TCP HTTP/1.1 socket: what it reads request
-%% heads with and holds while it waits for the next request.
+%% The inet `buffer` a plain-TCP socket starts with: what it reads request
+%% heads with and holds while it waits for the next request or frame.
 -define(DEFAULT_IDLE_RECV_BUFFER, 16384).
 %% Spawn config for every handler-running process (connection process +
 %% HTTP/2/3 stream workers). `fullsweep_after, 0` reclaims the per-connection
@@ -276,17 +276,18 @@ Optional middleware and timing knobs (durations in milliseconds):
   Applies to every socket the listener binds: plain TCP, TLS, and the
   HTTP/3 UDP socket.
 - `recv_buffer` — the most bytes one read takes, default 64 KB. A TLS
-  or HTTP/2 connection reads with a buffer of this size, a plain-TCP
-  HTTP/1.1 connection switches to it for good when a large body comes
-  in, and a WebSocket session grows to it for a large frame. Larger
-  values mean fewer reads for large bodies.
-- `idle_recv_buffer` — the read buffer a plain-TCP HTTP/1.1 connection
-  starts with, default 16 KB: request heads and small bodies arrive in
-  it, and it is what the connection holds while it waits for its next
+  connection reads with a buffer of this size. A plain-TCP connection
+  switches to it for good when a large request body comes in (HTTP/1.1)
+  or its first request body does (HTTP/2), and a WebSocket session
+  grows to it for a large frame. Larger values mean fewer reads for
+  large bodies.
+- `idle_recv_buffer` — the read buffer a plain-TCP connection starts
+  with, default 16 KB: request heads and small bodies arrive in it,
+  and it is what the connection holds while it waits for its next
   request or WebSocket message. The emulator keeps a buffer of this
   size for every connection waiting to read, so it bounds idle memory.
-  A body with more than this still to come switches the connection to
-  `recv_buffer`. Values above `recv_buffer` are lowered to it. See the
+  Values above `recv_buffer` are lowered to it. An idle TLS connection
+  holds no read buffer, so TLS listeners do not use it. See the
   `buffer` note in `base_listen_opts/2`.
 - `min_bytes_per_second` — slow-loris guard on the request-read
   phase (0 disables). Default 100.
@@ -1461,7 +1462,7 @@ open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     roadrunner_transport:listen_tls(
         Port, TlsOpts ++ base_listen_opts(Opts, validate_recv_buffer(Opts))
     );
-open_listen_socket(Port, Opts, Protocols) ->
+open_listen_socket(Port, Opts, _Protocols) ->
     %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
     %% lower per-call overhead than the OTP-27 `socket` backend on
     %% short-lived connections. fprof on `connection_storm` shows the
@@ -1470,16 +1471,13 @@ open_listen_socket(Port, Opts, Protocols) ->
     %% (~106 lookups per connection). The new backend's
     %% async I/O wins are real for long-lived connections; revisit
     %% if/when the workload mix shifts there.
-    roadrunner_transport:listen(Port, base_listen_opts(Opts, plain_buffer(Opts, Protocols))).
+    roadrunner_transport:listen(Port, base_listen_opts(Opts, plain_buffer(Opts))).
 
-%% The inet `buffer` of a plain-TCP listener's sockets: `idle_recv_buffer`
-%% on HTTP/1.1, which grows a socket to `recv_buffer` before a large body
-%% (`maybe_grow/2`); `recv_buffer` for prior-knowledge h2c, which reads
-%% `{active, N}`, so every read takes whatever one buffer carries.
--spec plain_buffer(opts(), [http1 | http2, ...]) -> pos_integer().
-plain_buffer(Opts, [http2]) ->
-    validate_recv_buffer(Opts);
-plain_buffer(Opts, _Protocols) ->
+%% The inet `buffer` of a plain-TCP listener's sockets: `idle_recv_buffer`,
+%% grown to `recv_buffer` once a connection gets a large body (HTTP/1.1)
+%% or its first DATA payload (h2c) (`maybe_grow/2`).
+-spec plain_buffer(opts()) -> pos_integer().
+plain_buffer(Opts) ->
     idle_recv_buffer(Opts).
 
 -spec base_listen_opts(opts(), pos_integer()) -> [gen_tcp:listen_option()].
@@ -1522,10 +1520,14 @@ base_listen_opts(Opts, Buffer) ->
     %% it waits, and uploads read as before. Exact-length body reads,
     %% which would let every connection stay small, measured 7% slower
     %% on a streamed upload: the driver hands nothing over until the
-    %% whole length is in. TLS and h2c sockets read `{active, N}` and
-    %% keep `recv_buffer`: a smaller one cut HTTP/2 upload throughput by
-    %% about a quarter. See `erlang/otp#9423` and `ninenines/cowlib#143`
-    %% for the upstream context.
+    %% whole length is in. A prior-knowledge h2c socket, which reads
+    %% `{active, N}`, starts small too and grows at its first DATA
+    %% payload (`roadrunner_conn_loop_http2:grow_buffer/2`): a fixed 16 KB
+    %% cut HTTP/2 upload throughput by about a quarter. A TLS socket keeps
+    %% `recv_buffer`: its TLS connection process leaves it unarmed while
+    %% idle, so an idle TLS connection holds no read buffer anyway. See
+    %% `erlang/otp#9423` and `ninenines/cowlib#143` for the upstream
+    %% context.
     Base = [
         binary,
         {active, false},
@@ -1748,7 +1750,7 @@ build_proto_opts(Opts, ListenerName) ->
     %% spawn sites read directly, mirroring the `ws` / `http2` flattening above.
     HandlerSpawnOpts = resolve_handler_spawn(Opts),
     Base = maps:merge(
-        maps:merge(maps:merge(maybe_alt_svc(Protocols, Opts), maybe_grow(Protocols, Opts)), #{
+        maps:merge(maps:merge(maybe_alt_svc(Protocols, Opts), maybe_grow(Opts)), #{
             dispatch => build_dispatch(Opts, ListenerName),
             middlewares => maps:get(middlewares, Opts, []),
             max_content_length =>
@@ -1878,17 +1880,17 @@ is_reserved_spawn_opt(monitor) -> true;
 is_reserved_spawn_opt({monitor, _}) -> true;
 is_reserved_spawn_opt(_) -> false.
 
-%% `grow_recv_buffer` for a plain-TCP HTTP/1.1 listener, whose sockets
-%% start at `idle_recv_buffer` (`plain_buffer/2`): the conn grows a socket
-%% to `recv_buffer` before it reads a large body. TLS and h2c-only sockets
-%% already read with `recv_buffer`, and one lowered to `idle_recv_buffer`
-%% has nowhere to grow, so those leave the key out.
--spec maybe_grow([http1 | http2 | http3, ...], opts()) -> map().
-maybe_grow(_Protocols, #{tls := _}) ->
+%% `grow_recv_buffer` for a plain-TCP listener, whose sockets start at
+%% `idle_recv_buffer` (`plain_buffer/1`): an HTTP/1.1 conn grows its socket
+%% to `recv_buffer` before it reads a large body, an h2c one at its first
+%% DATA payload. TLS sockets read with `recv_buffer` from the start (the
+%% TLS connection process leaves an idle one unarmed, so it holds no read
+%% buffer), and one lowered to `idle_recv_buffer` has nowhere to grow, so
+%% those leave the key out.
+-spec maybe_grow(opts()) -> map().
+maybe_grow(#{tls := _}) ->
     #{};
-maybe_grow([http2], _Opts) ->
-    #{};
-maybe_grow(_Protocols, Opts) ->
+maybe_grow(Opts) ->
     case {idle_recv_buffer(Opts), validate_recv_buffer(Opts)} of
         {Idle, Max} when Idle < Max -> #{grow_recv_buffer => {Idle, Max}};
         _ -> #{}

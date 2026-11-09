@@ -286,10 +286,11 @@ deadline in milliseconds. The shed form answers it `503` with the
     %% `#{hibernate_after := Ms}` against `proto_opts()`.
     hibernate_after => pos_integer(),
     rate_check_interval => pos_integer(),
-    %% `{Idle, Max}` on a plain-TCP HTTP/1.1 listener whose sockets start
-    %% at `idle_recv_buffer` (`Idle`) below `recv_buffer` (`Max`): a
+    %% `{Idle, Max}` on a plain-TCP listener whose sockets start at
+    %% `idle_recv_buffer` (`Idle`) below `recv_buffer` (`Max`): an HTTP/1.1
     %% connection grows its buffer to `Max` before it reads a large body
-    %% (`roadrunner_conn_loop:grow_buffer/2`). Absent everywhere else.
+    %% (`roadrunner_conn_loop:grow_buffer/2`), an h2c one at its first DATA
+    %% payload (`roadrunner_conn_loop_http2:grow_buffer/2`). Absent on TLS.
     grow_recv_buffer => {pos_integer(), pos_integer()},
     %% Flattened spawn config for every handler-running process. The public
     %% `handler_spawn => #{opts}` listener opt is expanded into this top-level
