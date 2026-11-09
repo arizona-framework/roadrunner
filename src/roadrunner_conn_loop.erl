@@ -127,6 +127,11 @@
     %% `auto` reads the full body synchronously; `manual` builds a
     %% body_reader the handler pulls from. Drives `read_body_phase/3`.
     body_buffering = auto :: auto | manual,
+    %% `{Idle, Max}` while the socket still reads with its small
+    %% `idle_recv_buffer`: the first body with more than `Idle` bytes still
+    %% to come grows it to `Max` for good (`grow_buffer/2`). `undefined`
+    %% once grown, or when the listener has nothing to grow.
+    grow_buffer = undefined :: {pos_integer(), pos_integer()} | undefined,
     %% How `recv_request_bytes/2` waits for bytes: the socket's read mode
     %% (`read_mode/2`), paired with `proto_opts.hibernate_after` when that
     %% is set. `once` arms the socket before each request and reads the
@@ -356,6 +361,7 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 request_timeout = RequestTimeout,
                 keep_alive_timeout = KeepAliveTimeout,
                 body_buffering = BodyBuffering,
+                grow_buffer = maps:get(grow_recv_buffer, ProtoOpts, undefined),
                 recv_mode = recv_mode(
                     read_mode(maps:get(http1_active, ProtoOpts, undefined), Socket),
                     maps:get(hibernate_after, ProtoOpts, 0)
@@ -1060,9 +1066,56 @@ route_and_read(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S, 
                     %% there is nothing to drain.
                     refuse_too_large(S);
                 Answer ->
-                    read_body(BodyMode, Answer, S, Req, Framing, MaxCL, Resolved, Deadline)
+                    read_body(
+                        BodyMode,
+                        Answer,
+                        grow_buffer(S, Framing),
+                        Req,
+                        Framing,
+                        MaxCL,
+                        Resolved,
+                        Deadline
+                    )
             end
     end.
+
+%% A socket starts with the small `idle_recv_buffer`, which bounds what an
+%% idle connection holds. A body larger than that, still to come, would
+%% then arrive in many small reads, so before reading one the socket grows
+%% to `recv_buffer` and keeps it for the rest of the connection: the driver
+%% hands a freed buffer back to the next read that fits in it, so shrinking
+%% again would not release it. Chunked bodies grow it too, as their size
+%% is not known up front.
+-spec grow_buffer(
+    #loop_state{},
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding}
+) -> #loop_state{}.
+grow_buffer(#loop_state{grow_buffer = undefined} = S, _Framing) ->
+    S;
+grow_buffer(#loop_state{grow_buffer = {Idle, Max}, buffered = Buffered} = S, Framing) ->
+    case large_body(Framing, byte_size(Buffered), Idle) of
+        true ->
+            _ = roadrunner_transport:setopts(S#loop_state.socket, [{buffer, Max}]),
+            S#loop_state{grow_buffer = undefined};
+        false ->
+            S
+    end.
+
+-spec large_body(
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding},
+    non_neg_integer(),
+    pos_integer()
+) -> boolean().
+large_body(none, _Buffered, _Idle) -> false;
+large_body(chunked, _Buffered, _Idle) -> true;
+large_body({content_length, N}, Buffered, Idle) -> N - Buffered > Idle;
+large_body({error, _}, _Buffered, _Idle) -> false.
 
 %% RFC 9110 §10.1.1: how a request is answered for its `Expect` field before
 %% its body is read. A client holding its body back for `Expect:

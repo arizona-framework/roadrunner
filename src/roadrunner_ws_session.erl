@@ -144,10 +144,6 @@
     recv = 0 :: non_neg_integer()
 }).
 
-%% The inet `buffer` an adaptive session reads with between large frames:
-%% message-sized deliveries fit, and it is what each idle connection holds.
--define(ADAPTIVE_BUFFER_BASE, 8192).
-
 -record(data, {
     socket :: roadrunner_transport:socket(),
     buffer :: binary(),
@@ -394,12 +390,9 @@ upgrade(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) -
 -spec apply_ws_buffer(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
 apply_ws_buffer(_Socket, #{ws_buffer := undefined}) ->
     ok;
-apply_ws_buffer(Socket, #{ws_buffer := {adaptive, Max} = WsBuffer, ws_active := Active}) ->
-    _ =
-        case adaptive_buf(WsBuffer, read_mode(Active, Socket)) of
-            {Base, Base, Max} -> roadrunner_transport:setopts(Socket, [{buffer, Base}]);
-            undefined -> ok
-        end,
+apply_ws_buffer(_Socket, #{ws_buffer := {adaptive, _Base, _Max}}) ->
+    %% The base is the buffer the socket already reads with (the
+    %% listener's `idle_recv_buffer`), so there is nothing to set.
     ok;
 apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
     _ = roadrunner_transport:setopts(Socket, [{buffer, Buffer}]),
@@ -409,10 +402,12 @@ apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
 %% session adapts, since it re-arms per message and so can resize in the
 %% same call, and only below a listener `recv_buffer` larger than the
 %% base. Anything else keeps the buffer it has.
--spec adaptive_buf(pos_integer() | {adaptive, pos_integer()} | undefined, once | 1..32767) ->
+-spec adaptive_buf(
+    pos_integer() | {adaptive, pos_integer(), pos_integer()} | undefined, once | 1..32767
+) ->
     {pos_integer(), pos_integer(), pos_integer()} | undefined.
-adaptive_buf({adaptive, Max}, once) when Max > ?ADAPTIVE_BUFFER_BASE ->
-    {?ADAPTIVE_BUFFER_BASE, ?ADAPTIVE_BUFFER_BASE, Max};
+adaptive_buf({adaptive, Base, Max}, once) when Max > Base ->
+    {Base, Base, Max};
 adaptive_buf(_WsBuffer, _Mode) ->
     undefined.
 

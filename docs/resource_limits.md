@@ -70,17 +70,17 @@ e.g. `ws => #{max_frame_size => N, max_message_size => N}`.
 | `ws.max_frame_size` | 10 MB | one frame's declared payload, checked on the frame header before the body is buffered |
 | `ws.max_message_size` | 10 MB | a reassembled message: the running total across fragments, and the decompressed size when permessage-deflate is negotiated |
 | `ws.active` | `once` on plain TCP, 16 on TLS | unread socket reads a session can hold in its mailbox |
-| `ws.recv_buffer` | adaptive, 8 KB up to `recv_buffer`, on plain TCP | bytes one socket read can carry, and what each connection holds for it |
+| `ws.recv_buffer` | adaptive, `idle_recv_buffer` up to `recv_buffer`, on plain TCP | bytes one socket read can carry, and what each connection holds for it |
 | `ws.compress` | `false` | whether a client's permessage-deflate offer is accepted; a compressed connection holds zlib state for its lifetime, about 290 KB with `true` and about 50 KB with `#{server_window_bits => 12, client_window_bits => 12, mem_level => 4}` |
 
 Notes:
 
-- unset, `ws.recv_buffer` adapts on plain TCP: a session reads with 8 KB,
-  grows the buffer for a frame whose header announces more (up to the
-  listener's `recv_buffer`) while large frames keep coming, and goes back
-  to 8 KB after a small message. An idle connection then holds 8 KB, and a
-  large frame still arrives in one read. On TLS, or with a size set, the
-  buffer is fixed
+- unset, `ws.recv_buffer` adapts on plain TCP: a session reads with the
+  listener's `idle_recv_buffer` (16 KB), grows the buffer for a frame whose
+  header announces more (up to the listener's `recv_buffer`) while large
+  frames keep coming, and goes back after a small message. An idle
+  connection then holds 16 KB, and a large frame still arrives in one read.
+  On TLS, or with a size set, the buffer is fixed
 - `max_message_size` must be `>= max_frame_size`; a listener configured
   otherwise refuses to start
 - each fragment is charged at least a small fixed overhead toward
@@ -194,7 +194,8 @@ table.
 | Limit | Default | Configurable | Purpose |
 |---|---|---|---|
 | `socket_backlog` | 1024 | yes | TCP listen backlog (kernel SYN/accept queue depth) |
-| `recv_buffer` | 64 KB | yes | per-connection inbound TCP buffer (body-path throughput vs memory at scale) |
+| `recv_buffer` | 64 KB | yes | the most one read takes: every read on TLS and HTTP/2, a plain-TCP HTTP/1.1 connection once a large body comes in, a large WebSocket frame |
+| `idle_recv_buffer` | 16 KB | yes | the read buffer a plain-TCP HTTP/1.1 connection starts with, and what it holds while it waits for the next request or message |
 | `max_clients` | 16384 | yes | concurrent connection cap per listener |
 | `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3, every protocol in `shed` mode) |
 | `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |
@@ -209,8 +210,14 @@ limit)`. With the 16384 default above a stock `ulimit -n` of 1024, the
 acceptors hit `emfile` at the descriptor ceiling — each emits
 `listener_accept_error` and keeps accepting after a short
 back-off rather than going silent — so raise `ulimit -n` (and the systemd
-`LimitNOFILE`) for high concurrency. Saturation recv-buffer memory scales
-as `max_clients × recv_buffer`, so lower either for a tighter bound.
+`LimitNOFILE`) for high concurrency.
+
+Every connection waiting to read holds a read buffer: `idle_recv_buffer`
+on a plain-TCP HTTP/1.1 connection, `recv_buffer` on TLS and HTTP/2. So
+idle memory scales as `max_clients` times that buffer. A plain-TCP
+connection that receives a body larger than `idle_recv_buffer` switches
+to `recv_buffer` for the rest of its life, so uploads read as fast as
+before, and only the connections that never receive one stay small.
 
 `max_clients` bounds connections and the HTTP/2 / HTTP/3
 `max_concurrent_streams` bounds streams per connection, but their product

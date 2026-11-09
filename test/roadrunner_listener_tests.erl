@@ -334,12 +334,15 @@ listener_threads_hibernate_after_into_proto_opts_test() ->
     ok = roadrunner_listener:stop(Name).
 
 listener_threads_ws_buffer_into_proto_opts_test() ->
-    %% Unset `ws.recv_buffer` adapts up to the listener's `recv_buffer`
-    %% (64 KB by default, or the one set); an explicit `ws.recv_buffer`
-    %% stays fixed.
+    %% Unset `ws.recv_buffer` adapts from the socket's `idle_recv_buffer`
+    %% (16 KB by default, lowered to `recv_buffer`) up to the listener's
+    %% `recv_buffer` (64 KB by default); an explicit `ws.recv_buffer` stays
+    %% fixed.
     Cases = [
-        {#{}, {adaptive, 65536}},
-        {#{recv_buffer => 32768}, {adaptive, 32768}},
+        {#{}, {adaptive, 16384, 65536}},
+        {#{recv_buffer => 32768}, {adaptive, 16384, 32768}},
+        {#{recv_buffer => 8192}, {adaptive, 8192, 8192}},
+        {#{idle_recv_buffer => 4096}, {adaptive, 4096, 65536}},
         {#{ws => #{recv_buffer => 4096}}, 4096}
     ],
     lists:foreach(
@@ -872,6 +875,57 @@ listener_rejects_invalid_recv_buffer_test() ->
         end,
         [0, -1, bad, 16#80000000]
     ).
+
+listener_rejects_invalid_idle_recv_buffer_test() ->
+    %% `idle_recv_buffer` is an inet buffer size like `recv_buffer`.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_idle_recv_buffer_invalid, #{
+                port => 0,
+                idle_recv_buffer => Bad,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, idle_recv_buffer, _}, _Stack}}, R)
+        end,
+        [0, -1, bad, 16#80000000]
+    ).
+
+listener_socket_buffer_by_transport_test() ->
+    %% A plain-TCP HTTP/1.1 listener's sockets read with `idle_recv_buffer`
+    %% (16 KB by default, lowered to `recv_buffer`), since its bodies are read
+    %% with exact-length reads of up to `recv_buffer`. The sockets that read
+    %% `{active, N}` keep `recv_buffer`: prior-knowledge h2c, TLS, and TLS
+    %% behind the PROXY protocol (plain until the conn upgrades it). Only a
+    %% plain-TCP HTTP/1.1 listener whose sockets start below `recv_buffer`
+    %% carries `grow_recv_buffer`, the sizes its conns grow between before
+    %% a large body.
+    Tls = roadrunner_test_certs:server_opts(),
+    Cases = [
+        {#{}, 16384, {16384, 65536}},
+        {#{idle_recv_buffer => 4096}, 4096, {4096, 65536}},
+        {#{recv_buffer => 8192}, 8192, none},
+        {#{idle_recv_buffer => 32768, recv_buffer => 131072}, 32768, {32768, 131072}},
+        {#{protocols => [http2]}, 65536, none},
+        {#{tls => Tls}, 65536, none},
+        {#{tls => Tls, proxy_protocol => true}, 65536, none}
+    ],
+    lists:foreach(
+        fun({Extra, SocketBuffer, Grow}) ->
+            Name = listener_test_socket_buffer,
+            {ok, ListenerPid} = roadrunner_listener:start_link(
+                Name, Extra#{port => 0, routes => roadrunner_hello_handler}
+            ),
+            State = sys:get_state(ListenerPid),
+            ?assertEqual({ok, [{buffer, SocketBuffer}]}, listen_buffer(element(2, State))),
+            ?assertEqual(Grow, maps:get(grow_recv_buffer, element(4, State), none)),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        Cases
+    ).
+
+listen_buffer({gen_tcp, LSock}) -> inet:getopts(LSock, [buffer]);
+listen_buffer({ssl, LSock}) -> ssl:getopts(LSock, [buffer]).
 
 listener_rejects_invalid_handler_spawn_test() ->
     %% `handler_spawn` must be a map; `opts` a list that does not carry the
