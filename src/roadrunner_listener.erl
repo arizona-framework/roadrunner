@@ -337,7 +337,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   many milliseconds of main-loop idle time, which sweeps and shrinks
   the conn's heap. Pairs with `handler_spawn` below for a pool of
   mostly-idle connections; waking a hibernated conn is charged to the
-  request that wakes it.
+  request that wakes it. It covers roadrunner's own processes only; on
+  TLS, see `tls` for the processes `ssl` runs per connection.
 - `handler_spawn` — spawn config for every handler-running process (the
   connection process and HTTP/2/3 stream workers) as a nested map with
   `opts` (`spawn_opt` / `proc_lib` options, default
@@ -372,6 +373,23 @@ Optional middleware and timing knobs (durations in milliseconds):
   HTTP/2 connections per second, with 44% less CPU per connection. All current
   browsers support it. To make a self-signed one for testing:
   `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 365 -keyout key.pem -out cert.pem -subj /CN=localhost`.
+  Give CA certificates (for client authentication or to complete the
+  certificate chain) as a file (`cacertfile`) rather than as DER
+  (`cacerts`): `ssl` decodes DER `cacerts` again for every connection
+  and keeps the decoded copy in it, about 12 KB per connection for two
+  small certificates and close to 1 MB for the 121-certificate OS
+  bundle, while a file is decoded once and shared.
+  Each TLS connection also runs in processes of `ssl`'s own, which hold
+  about two thirds of what an idle TLS connection costs and which
+  `hibernate_after` above does not reach. To hibernate them as well,
+  add `{hibernate_after, Ms}` to `tls`. On idle HTTP/1.1 connections
+  that cut the memory of an idle connection about in half (about 45 KB
+  to 22 KB), but every request that wakes them costs more server CPU:
+  about twice as much when each request woke a hibernated connection
+  (about 53 µs to 114 µs). It applies to every connection on the
+  listener, WebSocket sessions included, whatever `ws.hibernate_after`
+  says. Use it for listeners with many long-idle connections, and set
+  it well above the usual gap between requests.
 
 The inline source comments next to each field carry the deeper
 ops-tuning rationale.
