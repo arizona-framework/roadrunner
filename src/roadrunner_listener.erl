@@ -323,14 +323,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   many milliseconds of main-loop idle time, which sweeps and shrinks
   the conn's heap. Pairs with `handler_spawn` below for a pool of
   mostly-idle connections; waking a hibernated conn is charged to the
-  request that wakes it. On a TLS listener (HTTP/1.1 and HTTP/2; HTTP/3
-  runs its own TLS) it also sets the `ssl` option of the same name,
-  unless `tls` sets it, so the processes that run each TLS connection
-  hibernate after that much idle time of their own: an idle TLS
-  connection then holds about half as much (41 KB down to 22 KB). This
-  applies to WebSocket sessions and streamed responses over TLS too,
-  whatever `ws.hibernate_after` says; set `{hibernate_after, infinity}`
-  in `tls` to keep the TLS processes awake.
+  request that wakes it. It covers roadrunner's own processes only; on
+  TLS, see `tls` for the processes `ssl` runs per connection.
 - `handler_spawn` — spawn config for every handler-running process (the
   connection process and HTTP/2/3 stream workers) as a nested map with
   `opts` (`spawn_opt` / `proc_lib` options, default
@@ -371,6 +365,17 @@ Optional middleware and timing knobs (durations in milliseconds):
   and keeps the decoded copy in it, about 12 KB per connection for two
   small certificates and close to 1 MB for the 121-certificate OS
   bundle, while a file is decoded once and shared.
+  Each TLS connection also runs in processes of `ssl`'s own, which hold
+  about two thirds of what an idle TLS connection costs and which
+  `hibernate_after` above does not reach. To hibernate them as well,
+  add `{hibernate_after, Ms}` to `tls`. On idle HTTP/1.1 connections
+  that cut the memory of an idle connection about in half (about 45 KB
+  to 22 KB), but every request that wakes them costs more server CPU:
+  about twice as much when each request woke a hibernated connection
+  (about 53 µs to 114 µs). It applies to every connection on the
+  listener, WebSocket sessions included, whatever `ws.hibernate_after`
+  says. Use it for listeners with many long-idle connections, and set
+  it well above the usual gap between requests.
 
 The inline source comments next to each field carry the deeper
 ops-tuning rationale.
@@ -1456,7 +1461,7 @@ open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     %% explicit value wins. Hardened defaults are layered underneath
     %% (user values win), and the standard transport options sit on
     %% top so accepted sockets behave like the plain-TCP variant.
-    TlsOpts = roadrunner_transport:build_tls_opts(Protocols, tls_user_opts(UserTlsOpts, Opts)),
+    TlsOpts = roadrunner_transport:build_tls_opts(Protocols, UserTlsOpts),
     roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts(Opts));
 open_listen_socket(Port, Opts, _Protocols) ->
     %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
@@ -1628,28 +1633,11 @@ setup_overload({shed, #{retry_after := RetryAfter}}, _Max, _Counter) ->
 -spec maybe_tls_upgrade(
     roadrunner_conn:proto_opts(), opts(), [http1 | http2 | http3, ...]
 ) -> roadrunner_conn:proto_opts().
-maybe_tls_upgrade(#{proxy_protocol := true} = ProtoOpts, #{tls := UserTlsOpts} = Opts, Protocols) ->
+maybe_tls_upgrade(#{proxy_protocol := true} = ProtoOpts, #{tls := UserTlsOpts}, Protocols) ->
     TcpProtocols = [P || P <- Protocols, P =/= http3],
-    ProtoOpts#{
-        tls_upgrade =>
-            roadrunner_transport:build_tls_opts(TcpProtocols, tls_user_opts(UserTlsOpts, Opts))
-    };
+    ProtoOpts#{tls_upgrade => roadrunner_transport:build_tls_opts(TcpProtocols, UserTlsOpts)};
 maybe_tls_upgrade(ProtoOpts, _Opts, _Protocols) ->
     ProtoOpts.
-
-%% The user's `tls` options, with the listener's `hibernate_after` added as
-%% the `ssl` option of the same name when `tls` does not set its own: the
-%% TLS connection process holds the session state, about two thirds of
-%% what an idle TLS connection costs, and hibernating it with the conn
-%% process shrinks that.
--spec tls_user_opts([ssl:tls_server_option()], opts()) -> [ssl:tls_server_option()].
-tls_user_opts(UserTlsOpts, #{hibernate_after := Ms}) when is_integer(Ms), Ms > 0 ->
-    case lists:keymember(hibernate_after, 1, UserTlsOpts) of
-        true -> UserTlsOpts;
-        false -> [{hibernate_after, Ms} | UserTlsOpts]
-    end;
-tls_user_opts(UserTlsOpts, _Opts) ->
-    UserTlsOpts.
 
 %% Validate the opt-in `proxy_protocol` listener opt. It is a TCP-stream
 %% feature (an L4 balancer prepends the header before the first byte), so it
