@@ -72,9 +72,13 @@ All duration and interval values in `opts()` are in milliseconds —
 %% which a burst of concurrent connects overflows; 1024 matches cowboy.
 %% Linux clamps the effective value at `net.core.somaxconn`.
 -define(DEFAULT_SOCKET_BACKLOG, 1024).
-%% Emulator user-space recv buffer per accepted socket (see the `buffer`
-%% note in `base_listen_opts/1` for the throughput/memory trade-off).
+%% The largest single read: a TLS socket's inet `buffer`, and what a
+%% plain-TCP socket grows to for a large body or WebSocket frame (see the
+%% `buffer` note in `base_listen_opts/2`).
 -define(DEFAULT_RECV_BUFFER, 65536).
+%% The inet `buffer` a plain-TCP socket starts with: what it reads request
+%% heads with and holds while it waits for the next request or frame.
+-define(DEFAULT_IDLE_RECV_BUFFER, 16384).
 %% Spawn config for every handler-running process (connection process +
 %% HTTP/2/3 stream workers). `fullsweep_after, 0` reclaims the per-connection
 %% heap that grows building a response (e.g. a JSON encoder's transient iolist)
@@ -146,7 +150,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   defaulting to 10 MB with over-cap closing the connection with code
   1009, plus `recv_buffer` (per-session inet `buffer` — bounds
   per-connection memory at high WebSocket concurrency; adapts between
-  8 KB and the listener's `recv_buffer` when unset), `hibernate_after`
+  the listener's `idle_recv_buffer` and `recv_buffer` when unset),
+  `hibernate_after`
   (idle-session hibernation timeout in milliseconds; off when unset),
   `compress` (accept permessage-deflate, and with which zlib settings;
   default `false`) and `idle_timeout` (close
@@ -270,11 +275,20 @@ Optional middleware and timing knobs (durations in milliseconds):
   dev/admin/metrics endpoint that must not be reachable from the LAN.
   Applies to every socket the listener binds: plain TCP, TLS, and the
   HTTP/3 UDP socket.
-- `recv_buffer` — emulator user-space buffer (bytes) for inbound TCP
-  data, per accepted connection. Default 64 KB. Larger values cut the
-  per-body message count on high-MTU paths; smaller values cut
-  per-connection memory at scale. See the `buffer` note in
-  `base_listen_opts/1`.
+- `recv_buffer` — the most bytes one read takes, default 64 KB. A TLS
+  connection reads with a buffer of this size. A plain-TCP connection
+  switches to it for good when a large request body comes in (HTTP/1.1)
+  or its first request body does (HTTP/2), and a WebSocket session
+  grows to it for a large frame. Larger values mean fewer reads for
+  large bodies.
+- `idle_recv_buffer` — the read buffer a plain-TCP connection starts
+  with, default 16 KB: request heads and small bodies arrive in it,
+  and it is what the connection holds while it waits for its next
+  request or WebSocket message. The emulator keeps a buffer of this
+  size for every connection waiting to read, so it bounds idle memory.
+  Values above `recv_buffer` are lowered to it. An idle TLS connection
+  holds no read buffer, so TLS listeners do not use it. See the
+  `buffer` note in `base_listen_opts/2`.
 - `min_bytes_per_second` — slow-loris guard on the request-read
   phase (0 disables). Default 100.
 - `rate_check_interval` — how often the rate guard re-checks
@@ -393,6 +407,7 @@ ops-tuning rationale.
     %% listener to loopback.
     ip => inet:ip_address(),
     recv_buffer => pos_integer(),
+    idle_recv_buffer => pos_integer(),
     min_bytes_per_second => non_neg_integer(),
     %% How often `reading_request` re-checks the running
     %% bytes-per-second average against `min_bytes_per_second`.
@@ -769,15 +784,16 @@ WebSocket session tunables (under `ws` in the listener opts).
   socket, so it bounds how many bytes one `{tcp, _, Data}` delivery
   carries AND what every connection pays in resident memory. Unset
   (the default), a session reading with `{active, once}` (plain TCP)
-  adapts it: it reads with 8 KB, grows the buffer to fit a frame
-  whose header announces more than that (up to the listener's
-  `recv_buffer`, 64 KB by default) and keeps it while large frames
-  keep coming, then goes back to 8 KB after a small message. Small
-  messages cost an idle connection 8 KB instead of the listener's
-  64 KB, and large frames still arrive in one read. The resize
+  adapts it: it reads with the listener's `idle_recv_buffer` (16 KB
+  by default), grows the buffer to fit a frame whose header announces
+  more than that (up to the listener's `recv_buffer`, 64 KB by
+  default) and keeps it while large frames keep coming, then goes
+  back after a small message. An idle connection holds the small
+  buffer, and large frames still arrive in one read. The resize
   rides on the re-arm the session makes per message anyway. A
-  session reading with `{active, N}` (TLS) keeps the listener's
-  `recv_buffer`. Set a size to fix the buffer at it instead.
+  session reading with `{active, N}` (the default on TLS) cannot resize
+  per message, so it reads with the listener's `recv_buffer`. Set a
+  size to fix the buffer at it instead.
 - `hibernate_after` — idle milliseconds after which a WebSocket
   session hibernates (heap shrinks to the minimum until the next
   inbound event wakes it). The session-side counterpart of the
@@ -1434,7 +1450,7 @@ open_listen_socket(Port, #{tls := _, proxy_protocol := true} = Opts, _Protocols)
     %% before the ClientHello, so the listen socket is plain TCP and the conn
     %% reads the header off the raw stream, then upgrades the socket with the
     %% `tls_upgrade` options carried in proto_opts (`maybe_tls_upgrade/3`).
-    roadrunner_transport:listen(Port, base_listen_opts(Opts));
+    roadrunner_transport:listen(Port, base_listen_opts(Opts, validate_recv_buffer(Opts)));
 open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     %% TLS path — caller supplies cert/key. ALPN is derived from the
     %% normalized `protocols` list (`http2` → `~"h2"`, `http1` →
@@ -1444,7 +1460,9 @@ open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     %% (user values win), and the standard transport options sit on
     %% top so accepted sockets behave like the plain-TCP variant.
     TlsOpts = roadrunner_transport:build_tls_opts(Protocols, UserTlsOpts),
-    roadrunner_transport:listen_tls(Port, TlsOpts ++ base_listen_opts(Opts));
+    roadrunner_transport:listen_tls(
+        Port, TlsOpts ++ base_listen_opts(Opts, validate_recv_buffer(Opts))
+    );
 open_listen_socket(Port, Opts, _Protocols) ->
     %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
     %% lower per-call overhead than the OTP-27 `socket` backend on
@@ -1454,10 +1472,13 @@ open_listen_socket(Port, Opts, _Protocols) ->
     %% (~106 lookups per connection). The new backend's
     %% async I/O wins are real for long-lived connections; revisit
     %% if/when the workload mix shifts there.
-    roadrunner_transport:listen(Port, base_listen_opts(Opts)).
+    %%
+    %% A plain-TCP socket starts at `idle_recv_buffer` and its connection
+    %% grows it to `recv_buffer` for a large request body (`maybe_grow/1`).
+    roadrunner_transport:listen(Port, base_listen_opts(Opts, idle_recv_buffer(Opts))).
 
--spec base_listen_opts(opts()) -> [gen_tcp:listen_option()].
-base_listen_opts(Opts) ->
+-spec base_listen_opts(opts(), pos_integer()) -> [gen_tcp:listen_option()].
+base_listen_opts(Opts, Buffer) ->
     %% `nodelay` disables Nagle's algorithm on accepted sockets.
     %% RFC 9113 §5.2 doesn't mandate it, but every production h2
     %% server (nginx, h2o, cowboy, …) sets it because h2 responses
@@ -1479,19 +1500,31 @@ base_listen_opts(Opts) ->
     %% `net.core.somaxconn` (typically 4096), so the default is
     %% safely non-truncated everywhere.
     %%
-    %% `buffer` is the emulator's user-space buffer that bounds how
-    %% many bytes each `{tcp, _, Data}` message carries in
-    %% `{active, ...}` mode. The OTP default is `min(sndbuf,
-    %% recbuf)` and on plain TCP with MTU-bounded delivery
-    %% (1460-byte chunks) this can result in many small messages
-    %% per request body, each paying the message-passing tax. 64 KB
-    %% is enough to carry 4 default-sized HTTP/2 DATA frames or a
-    %% typical request, comfortably above the per-MTU floor. Saturation
-    %% memory scales as `max_clients × this buffer`, so it is the
-    %% `recv_buffer` listener opt — lower it to trade body-path
-    %% throughput for per-connection memory at a high `max_clients`. See
+    %% `buffer` is the emulator's user-space buffer: how many bytes one
+    %% read without a length (`recv(S, 0)`, every `{active, ...}`
+    %% delivery) carries. The driver allocates it when a read is armed,
+    %% before any data is there, and keeps it while the read waits, so
+    %% every connection waiting to read holds one. It also keeps the
+    %% buffers it frees on a small per-thread stack and hands any of them
+    %% out again to a read asking for no more than its size, so lowering
+    %% one socket's buffer after it has read with a larger one does not
+    %% shrink what it holds: the size has to be small from the first
+    %% read. A plain-TCP HTTP/1.1 socket therefore starts at
+    %% `idle_recv_buffer` (16 KB), which holds a request head, and grows
+    %% to `recv_buffer` (64 KB) for good the first time a larger body is
+    %% on its way (`roadrunner_conn_loop:grow_buffer/2`): a connection
+    %% that only sees small requests holds 16 KB instead of 64 KB while
+    %% it waits, and uploads read as before. Exact-length body reads,
+    %% which would let every connection stay small, measured 7% slower
+    %% on a streamed upload: the driver hands nothing over until the
+    %% whole length is in. A prior-knowledge h2c socket, which reads
+    %% `{active, N}`, starts small too and grows at its first DATA
+    %% payload (`roadrunner_conn_loop_http2:grow_buffer/2`): a fixed 16 KB
+    %% cut HTTP/2 upload throughput by about a quarter. A TLS socket keeps
+    %% `recv_buffer`: its TLS connection process leaves it unarmed while
+    %% idle, so an idle TLS connection holds no read buffer anyway. See
     %% `erlang/otp#9423` and `ninenines/cowlib#143` for the upstream
-    %% context that prompted this tuning.
+    %% context.
     Base = [
         binary,
         {active, false},
@@ -1499,7 +1532,7 @@ base_listen_opts(Opts) ->
         {packet, raw},
         {nodelay, true},
         {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)},
-        {buffer, validate_recv_buffer(Opts)}
+        {buffer, Buffer}
     ],
     %% Prepend `{ip, IP}` only when the caller set it, so the default
     %% list (and the default all-interfaces bind) is unchanged. Both
@@ -1714,14 +1747,14 @@ build_proto_opts(Opts, ListenerName) ->
     %% spawn sites read directly, mirroring the `ws` / `http2` flattening above.
     HandlerSpawnOpts = resolve_handler_spawn(Opts),
     Base = maps:merge(
-        maps:merge(maybe_alt_svc(Protocols, Opts), #{
+        maps:merge(maps:merge(maybe_alt_svc(Protocols, Opts), maybe_grow(Opts)), #{
             dispatch => build_dispatch(Opts, ListenerName),
             middlewares => maps:get(middlewares, Opts, []),
             max_content_length =>
                 maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
             ws_max_frame_size => WsFrame,
             ws_max_message_size => WsMsg,
-            ws_buffer => ws_buffer(WsBuffer, validate_recv_buffer(Opts)),
+            ws_buffer => ws_buffer(WsBuffer, idle_recv_buffer(Opts), validate_recv_buffer(Opts)),
             ws_hibernate_after => WsHibernateAfter,
             ws_compress => roadrunner_ws:compress_config(WsCompress),
             ws_idle_timeout => WsIdleTimeout,
@@ -1843,6 +1876,22 @@ is_reserved_spawn_opt(link) -> true;
 is_reserved_spawn_opt(monitor) -> true;
 is_reserved_spawn_opt({monitor, _}) -> true;
 is_reserved_spawn_opt(_) -> false.
+
+%% `grow_recv_buffer` for a plain-TCP listener, whose sockets start at
+%% `idle_recv_buffer`: an HTTP/1.1 conn grows its socket to `recv_buffer`
+%% before it reads a large body, an h2c one at the first DATA frame that may
+%% carry one. TLS sockets read with `recv_buffer` from the start (the
+%% TLS connection process leaves an idle one unarmed, so it holds no read
+%% buffer), and one lowered to `idle_recv_buffer` has nowhere to grow, so
+%% those leave the key out.
+-spec maybe_grow(opts()) -> map().
+maybe_grow(#{tls := _}) ->
+    #{};
+maybe_grow(Opts) ->
+    case {idle_recv_buffer(Opts), validate_recv_buffer(Opts)} of
+        {Idle, Max} when Idle < Max -> #{grow_recv_buffer => {Idle, Max}};
+        _ -> #{}
+    end.
 
 %% Precompute the `Alt-Svc` response-header value (RFC 7838) when the
 %% listener co-serves HTTP/3 alongside a TCP protocol on a fixed port,
@@ -2198,12 +2247,12 @@ flatten_http3_opts(Entries) ->
     end.
 
 %% The `ws_buffer` proto opt: an explicit `ws.recv_buffer` as is; unset,
-%% adaptive up to the listener's `recv_buffer`
-%% (`roadrunner_ws_session:apply_ws_buffer/2`).
--spec ws_buffer(pos_integer() | undefined, pos_integer()) ->
-    pos_integer() | {adaptive, pos_integer()}.
-ws_buffer(undefined, ListenerBuffer) -> {adaptive, ListenerBuffer};
-ws_buffer(WsBuffer, _ListenerBuffer) -> WsBuffer.
+%% adaptive from the socket's own buffer (`idle_recv_buffer`) up to the
+%% listener's `recv_buffer` (`roadrunner_ws_session:apply_ws_buffer/2`).
+-spec ws_buffer(pos_integer() | undefined, pos_integer(), pos_integer()) ->
+    pos_integer() | {adaptive, pos_integer(), pos_integer()}.
+ws_buffer(undefined, Base, Max) -> {adaptive, Base, Max};
+ws_buffer(WsBuffer, _Base, _Max) -> WsBuffer.
 
 -spec ws_defaults() ->
     #{
@@ -2219,7 +2268,7 @@ ws_defaults() ->
     #{
         max_frame_size => ?DEFAULT_WS_MAX_FRAME_SIZE,
         max_message_size => ?DEFAULT_WS_MAX_MESSAGE_SIZE,
-        %% `undefined` = adaptive (`ws_buffer/2`).
+        %% `undefined` = adaptive (`ws_buffer/3`).
         recv_buffer => undefined,
         %% `infinity` = the session's receive never times out into a
         %% hibernate — the `after infinity` clause is dead by the
@@ -2319,6 +2368,16 @@ validate_recv_buffer(Opts) ->
     case maps:get(recv_buffer, Opts, ?DEFAULT_RECV_BUFFER) of
         N when is_integer(N), N >= 1, N =< 16#7FFFFFFF -> N;
         Bad -> error({invalid_listener_opt, recv_buffer, Bad})
+    end.
+
+%% The validated `idle_recv_buffer`, lowered to `recv_buffer` when above
+%% it: a listener that lowers `recv_buffer` for memory gets a socket
+%% buffer no larger than that.
+-spec idle_recv_buffer(map()) -> pos_integer().
+idle_recv_buffer(Opts) ->
+    case maps:get(idle_recv_buffer, Opts, ?DEFAULT_IDLE_RECV_BUFFER) of
+        N when is_integer(N), N >= 1, N =< 16#7FFFFFFF -> min(N, validate_recv_buffer(Opts));
+        Bad -> error({invalid_listener_opt, idle_recv_buffer, Bad})
     end.
 
 %% Validate the `rate_limit` opt and, when set, create its per-listener ETS

@@ -2235,6 +2235,137 @@ active_once_hibernating_conn_treats_a_passive_message_as_stray_test() ->
     Pid ! {roadrunner_fake_closed, x},
     ok = await_normal_exit(Ref, Pid).
 
+%% --- growing the socket buffer before a large body ---
+
+large_body_grows_the_socket_buffer_once_test() ->
+    %% A body with more than `Idle` bytes still to come grows the socket to
+    %% `Max` before it is read, once for the connection; a small one, or
+    %% one already in, leaves it as it is.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {8, 64}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    ok = post_roundtrip(Tag, Pid, 5),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_data, x, post_head(20, binary:copy(~"a", 20))},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    ?assertEqual(none, take_setopts(Tag)),
+    ok = post_roundtrip(Tag, Pid, 20),
+    ?assertEqual([{buffer, 64}], expect_setopts(Tag)),
+    ok = post_roundtrip(Tag, Pid, 20),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+expect_continue_body_grows_before_the_100_test() ->
+    %% A client holding a large body back for `Expect: 100-continue`: the
+    %% socket grows before the 100 asks for the body.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {8, 64}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    Pid !
+        {roadrunner_fake_data, x,
+            ~"POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 20\r\n\r\n"},
+    First =
+        receive
+            {Tag, setopts, Opts} -> {setopts, Opts};
+            {Tag, sent, Data} -> {sent, iolist_to_binary(Data)}
+        after 2000 -> error(nothing_from_conn)
+        end,
+    ?assertEqual({setopts, [{buffer, 64}]}, First),
+    ?assertMatch(<<"HTTP/1.1 100 Continue", _/binary>>, expect_sent(Tag)),
+    Pid ! {roadrunner_fake_data, x, binary:copy(~"a", 20)},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+mostly_buffered_body_keeps_the_socket_buffer_test() ->
+    %% Most of the body came in with the head: only what is still to come
+    %% counts, and 5 bytes fit the idle buffer.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {8, 64}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    Pid ! {roadrunner_fake_data, x, post_head(20, binary:copy(~"a", 15))},
+    Pid ! {roadrunner_fake_data, x, binary:copy(~"a", 5)},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+chunked_body_grows_the_socket_buffer_test() ->
+    %% A chunked body's size is not known up front, so it grows the socket.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {8, 64}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    Pid !
+        {roadrunner_fake_data, x,
+            ~"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"},
+    Pid ! {roadrunner_fake_data, x, ~"3\r\nabc\r\n0\r\n\r\n"},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    ?assertEqual([{buffer, 64}], expect_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+bad_framing_does_not_grow_the_socket_buffer_test() ->
+    %% A body that will not be read (a malformed Content-Length) leaves
+    %% the socket as it is.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {8, 64}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    Pid ! {roadrunner_fake_data, x, ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: x\r\n\r\n"},
+    ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, expect_sent(Tag)),
+    ok = await_normal_exit(Ref, Pid),
+    ?assertEqual([], [Opts || Opts <- all_setopts(Tag), lists:keymember(buffer, 1, Opts)]).
+
+manual_bodyless_request_keeps_the_socket_buffer_test() ->
+    %% In manual body mode a request without a body still builds its body
+    %% reader: no body to come, nothing to grow, and the conn serves it.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag,
+        size_opts(#{
+            http1_active => 4, body_buffering => manual, grow_recv_buffer => {8, 64}
+        })
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    ok = request_roundtrip(Tag, Pid),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+no_grow_key_keeps_the_socket_buffer_test() ->
+    %% A listener with nothing to grow (TLS, or `idle_recv_buffer` equal to
+    %% `recv_buffer`) leaves the key out: a large body reads with the buffer
+    %% the socket has.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(Tag, size_opts(#{http1_active => 4})),
+    [{active, 4}] = expect_setopts(Tag),
+    ok = post_roundtrip(Tag, Pid, 100000),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+%% Deliver a POST's head and then its `Len`-byte body as two socket
+%% messages, and wait for its response.
+post_roundtrip(Tag, Pid, Len) ->
+    Pid ! {roadrunner_fake_data, x, post_head(Len, <<>>)},
+    Pid ! {roadrunner_fake_data, x, binary:copy(~"a", Len)},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    ok.
+
+post_head(Len, Body) ->
+    <<"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ", (integer_to_binary(Len))/binary, "\r\n\r\n",
+        Body/binary>>.
+
 size_opts(Extra) ->
     maps:merge(
         (fake_opts(active_n))#{
@@ -2296,6 +2427,13 @@ expect_setopts(Tag) ->
     receive
         {Tag, setopts, Opts} -> Opts
     after 2000 -> error(no_setopts)
+    end.
+
+%% Every arm already reported, oldest first.
+all_setopts(Tag) ->
+    case take_setopts(Tag) of
+        none -> [];
+        Opts -> [Opts | all_setopts(Tag)]
     end.
 
 take_setopts(Tag) ->

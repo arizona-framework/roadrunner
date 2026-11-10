@@ -164,10 +164,10 @@ deadline in milliseconds. The shed form answers it `503` with the
     ws_max_frame_size := non_neg_integer(),
     ws_max_message_size := non_neg_integer(),
     %% inet `buffer` for a WebSocket session: a fixed size,
-    %% `{adaptive, Max}` (the default: from 8 KB up to `Max`, the
-    %% listener's `recv_buffer`), or `undefined` to keep the listener
-    %% socket's `recv_buffer`.
-    ws_buffer := pos_integer() | {adaptive, pos_integer()} | undefined,
+    %% `{adaptive, Base, Max}` (the default: from `Base`, the listener's
+    %% `idle_recv_buffer`, up to `Max`, its `recv_buffer`), or `undefined`
+    %% to keep the socket's buffer.
+    ws_buffer := pos_integer() | {adaptive, pos_integer(), pos_integer()} | undefined,
     %% Idle ms after which a WebSocket session hibernates; `infinity`
     %% (the default) never hibernates on idle.
     ws_hibernate_after := pos_integer() | infinity,
@@ -286,6 +286,12 @@ deadline in milliseconds. The shed form answers it `503` with the
     %% `#{hibernate_after := Ms}` against `proto_opts()`.
     hibernate_after => pos_integer(),
     rate_check_interval => pos_integer(),
+    %% `{Idle, Max}` on a plain-TCP listener whose sockets start at
+    %% `idle_recv_buffer` (`Idle`) below `recv_buffer` (`Max`): an HTTP/1.1
+    %% connection grows its buffer to `Max` before it reads a large body
+    %% (`roadrunner_conn_loop:grow_buffer/2`), an h2c one at its first DATA
+    %% payload (`roadrunner_conn_loop_http2:grow_buffer/2`). Absent on TLS.
+    grow_recv_buffer => {pos_integer(), pos_integer()},
     %% Flattened spawn config for every handler-running process. The public
     %% `handler_spawn => #{opts}` listener opt is expanded into this top-level
     %% key by `roadrunner_listener:build_proto_opts/2` so the spawn sites read

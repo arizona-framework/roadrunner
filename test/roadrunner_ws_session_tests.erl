@@ -132,23 +132,18 @@ ws_buffer_opt_unset_leaves_socket_buffer_alone_test() ->
     ],
     ?assertEqual([], BufferSetopts).
 
-adaptive_buffer_starts_at_its_base_before_101_test() ->
-    %% Unset `ws.recv_buffer` (the listener turns it into `{adaptive, Max}`):
-    %% an active-once session sets the 8 KB base while the conn still owns
-    %% the socket, before the 101.
+adaptive_buffer_starts_from_the_socket_buffer_test() ->
+    %% Unset `ws.recv_buffer` (the listener turns it into
+    %% `{adaptive, Base, Max}`): `Base` is the buffer the socket already
+    %% reads with (the listener's `idle_recv_buffer`), so an active-once
+    %% session sets nothing before the 101, nor for a small message after.
     Events = adaptive_events(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}}, [{recv, frame(close, <<1000:16>>)}]
+        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}},
+        [{recv, frame(text, ~"hi")}, {recv, frame(close, <<1000:16>>)}]
     ),
-    BufferIdx = find_event_index(fun(E) -> E =:= {setopts, [{buffer, 8192}]} end, Events),
-    SendIdx = find_event_index(
-        fun
-            ({send, Data}) -> binary:match(iolist_to_binary(Data), ~"101") =/= nomatch;
-            (_) -> false
-        end,
-        Events
-    ),
-    ?assertNotEqual(not_found, BufferIdx),
-    ?assert(BufferIdx < SendIdx).
+    ?assertEqual(
+        [], [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
+    ).
 
 adaptive_buffer_grows_for_a_large_frame_and_shrinks_after_a_small_one_test() ->
     %% A 20000-byte frame (20008 bytes on the wire) split across two reads:
@@ -158,7 +153,7 @@ adaptive_buffer_grows_for_a_large_frame_and_shrinks_after_a_small_one_test() ->
     Big = binary:copy(~"x", 20000),
     <<Head:100/binary, Tail/binary>> = frame16(text, Big),
     Arms = adaptive_arms(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}},
+        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}},
         [
             {recv, Head},
             {recv, Tail},
@@ -183,7 +178,7 @@ adaptive_buffer_shrinks_after_a_message_without_a_reply_test() ->
     %% path shrinks the grown buffer too.
     <<Head:10/binary, Tail/binary>> = frame16(binary, binary:copy(~"x", 20000)),
     Arms = adaptive_arms(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}},
+        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}},
         [
             {recv, Head},
             {recv, Tail},
@@ -206,7 +201,7 @@ adaptive_buffer_keeps_its_base_for_a_split_small_frame_test() ->
     %% the re-arm between its parts leaves the buffer as it is.
     <<Head:3/binary, Tail/binary>> = frame(text, ~"hello"),
     Arms = adaptive_arms(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}},
+        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}},
         [{recv, Head}, {recv, Tail}, {recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual([[{active, once}], [{active, once}], [{active, once}]], Arms).
@@ -219,7 +214,7 @@ adaptive_buffer_stops_at_its_cap_test() ->
     Frame = frame64(binary, binary:copy(~"x", 70000)),
     <<One:1/binary, Head:99/binary, Mid:30000/binary, Tail/binary>> = Frame,
     Arms = adaptive_arms(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 16384}},
+        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 16384}},
         [{recv, One}, {recv, Head}, {recv, Mid}, {recv, Tail}, {recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual(
@@ -234,12 +229,12 @@ adaptive_buffer_stops_at_its_cap_test() ->
     ).
 
 small_listener_buffer_is_kept_test() ->
-    %% A listener `recv_buffer` no larger than the 8 KB the adaptive buffer
-    %% starts at: nothing to save, so the session keeps it and never
+    %% A listener `recv_buffer` no larger than the buffer the adaptive one
+    %% starts at: no room to grow, so the session keeps it and never
     %% resizes.
     <<Head:100/binary, Tail/binary>> = frame16(text, binary:copy(~"x", 20000)),
     Events = adaptive_events(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 8192}},
+        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 8192}},
         [{recv, Head}, {recv, Tail}, {recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual(
@@ -259,16 +254,18 @@ fixed_buffer_never_resizes_test() ->
         [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
     ).
 
-active_n_session_keeps_its_buffer_test() ->
+active_n_session_reads_with_the_listener_cap_test() ->
     %% Only an `{active, once}` session adapts: one reading with
-    %% `{active, N}` re-arms once per N reads, so it keeps the buffer it
-    %% has and nothing is set before the 101 either.
+    %% `{active, N}` re-arms once per N reads and cannot resize per
+    %% message, so a plain socket is set to the cap (`recv_buffer`) once,
+    %% before the 101, and never changed after.
     Events = adaptive_events(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 65536}, ws_active := 4},
+        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}, ws_active := 4},
         [{recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual(
-        [], [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
+        [[{buffer, 65536}]],
+        [Opts || {setopts, Opts} <- Events, lists:keymember(buffer, 1, Opts)]
     ).
 
 coalesced_first_frame_seeded_in_buffer_is_processed_test() ->

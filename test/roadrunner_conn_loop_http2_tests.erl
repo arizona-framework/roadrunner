@@ -94,6 +94,8 @@ all_test_() ->
         fun runtime_transport_error_triggers_goaway/0,
         fun runtime_idle_timeout_emits_goaway/0,
         fun active_n_rearms_only_on_passive/0,
+        fun first_data_payload_grows_the_socket_buffer_once/0,
+        fun large_single_frame_body_grows_the_socket_buffer/0,
         fun active_once_rearms_after_every_read/0,
         fun hibernate_after_fires_when_idle/0,
         fun hibernated_idle_conn_still_emits_goaway/0,
@@ -2072,6 +2074,63 @@ runtime_idle_timeout_emits_goaway() ->
     after
         persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
     end.
+
+first_data_payload_grows_the_socket_buffer_once() ->
+    %% A prior-knowledge h2c socket starts with its small `idle_recv_buffer`
+    %% (8 here): a small body sent whole in one frame leaves it, and so
+    %% does an empty frame; a body split across frames grows it to
+    %% `recv_buffer` (64) at its first frame, and a later body does not
+    %% set it again.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{grow_recv_buffer => {8, 64}}),
+    ok = post_request(ConnPid, 1, [<<>>, ~"body"]),
+    ?assertEqual([], buffer_arms(collect_setopts(ConnPid))),
+    ok = post_request(ConnPid, 3, [~"ab", ~"cd"]),
+    ?assertEqual([[{buffer, 64}]], buffer_arms(collect_setopts(ConnPid))),
+    ok = post_request(ConnPid, 5, [~"more", ~"data"]),
+    ?assertEqual([], buffer_arms(collect_setopts(ConnPid))),
+    cleanup(Pid, Ref).
+
+large_single_frame_body_grows_the_socket_buffer() ->
+    %% A body sent whole in one frame still grows the socket when the frame
+    %% is larger than `idle_recv_buffer`.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{grow_recv_buffer => {8, 64}}),
+    ok = post_request(ConnPid, 1, [binary:copy(~"a", 9)]),
+    ?assertEqual([[{buffer, 64}]], buffer_arms(collect_setopts(ConnPid))),
+    cleanup(Pid, Ref).
+
+%% Send a POST on `StreamId` whose body is `Chunks`, one DATA frame each (the
+%% last ends the stream), and wait for its response.
+post_request(ConnPid, StreamId, Chunks) ->
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"http"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"}
+        ],
+        roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    Headers = roadrunner_http2_frame:encode(
+        {headers, StreamId, 16#04, undefined, iolist_to_binary(Hpack)}
+    ),
+    Last = length(Chunks),
+    Data = [
+        roadrunner_http2_frame:encode(
+            {data, StreamId,
+                case I of
+                    Last -> 16#01;
+                    _ -> 0
+                end, Chunk}
+        )
+     || {I, Chunk} <- lists:enumerate(Chunks)
+    ],
+    ConnPid ! {roadrunner_fake_data, {fake, self()}, iolist_to_binary([Headers | Data])},
+    _ = expect_send(),
+    _ = drain_send(50),
+    ok.
+
+buffer_arms(Arms) ->
+    [A || A <- Arms, lists:keymember(buffer, 1, A)].
 
 active_n_rearms_only_on_passive() ->
     %% Under the default `{active, 16}` the frame loop arms once and
