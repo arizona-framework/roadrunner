@@ -277,5 +277,44 @@ alongside throughput:
     --with-resources --clients 8 --duration 5
 ```
 
-For hot-path analysis, add `--profile --profile-tool eprof` (or
-`fprof`).
+## Profiling
+
+`--profile --profile-tool eprof` (or `fprof`) traces every call, which
+gives exact call counts but charges each call a fixed tracing cost of
+about 0.1 µs. Small functions called many times per request therefore
+look far more expensive than they are: a change eprof put at 2% of a
+request measured 20 ns end to end. Use these tools to count calls, not
+to rank where time goes.
+
+To rank, sample with `perf` instead. The JIT writes a symbol map for
+`perf` when the emulator runs with `+JPperf true`, so Erlang functions
+show up by name:
+
+```bash
+ERL_FLAGS="+JPperf true" ./scripts/bench.escript --servers roadrunner \
+    --scenarios json --duration 14 &
+sleep 5  # let the server start and warm up
+# The server is the beam.smp whose parent is erl_child_setup.
+SERVER=$(for p in $(pgrep -f bench.escript); do
+    [ "$(ps -o comm= -p "$(ps -o ppid= -p "$p")")" = erl_child_setup ] && echo "$p"
+done)
+perf record -F 999 -g -p "$SERVER" -- sleep 8
+perf report --no-children --sort symbol
+```
+
+Garbage collection is charged to whichever function happens to
+allocate when the heap fills, so read the stacks (`perf script`) before
+blaming a function: a router function that looked like 3% of a request
+was almost all collection.
+
+## Proving a change
+
+Measure CPU per request, not only requests per second. Switch off
+scheduler busy-waiting so idle schedulers do not count as work
+(`ERL_ZFLAGS="+sbwt none +sbwtdcpu none +sbwtdio none"`), run with
+`--with-resources`, and divide: CPU per request is the reported `cpu`
+percentage over 100, times the duration, over `total`. Compare two
+builds at a time in alternating blocks (ABBA, then BAAB), with five to
+eight runs per side and a pause between runs, on an otherwise idle
+machine. Two builds of the same code differ by about 2% here, so a
+smaller difference is noise unless it holds in every block.
