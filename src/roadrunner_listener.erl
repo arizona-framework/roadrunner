@@ -32,6 +32,7 @@ All duration and interval values in `opts()` are in milliseconds —
     notify_drain/2,
     register_for_drain/2,
     port/1,
+    quic_port/1,
     info/1,
     status/1,
     reload_routes/2
@@ -988,6 +989,16 @@ port(Name) ->
     gen_server:call(Name, port).
 
 -doc """
+Return the UDP port the listener serves HTTP/3 on, or `undefined` when it
+serves no HTTP/3. With a fixed `port` it is the same number as the TCP
+port. With `port => 0` the UDP port is picked apart from the TCP one, so a
+client (or a test) reads it here.
+""".
+-spec quic_port(Name :: atom()) -> inet:port_number() | undefined.
+quic_port(Name) ->
+    gen_server:call(Name, quic_port).
+
+-doc """
 Return runtime introspection for a listener:
 
 - `active_clients` — current number of connections held open.
@@ -1275,11 +1286,16 @@ close_quic_probe(Probe) -> gen_udp:close(Probe).
 %% listener reads it back from the QUIC listener.
 -spec bound_port(roadrunner_transport:socket() | none, pid() | undefined) -> inet:port_number().
 bound_port(none, QuicPool) ->
-    [Listener | _] = roadrunner_quic_listener_sup:get_listeners(QuicPool),
-    roadrunner_quic_listener:get_port(Listener);
+    quic_pool_port(QuicPool);
 bound_port(LSocket, _QuicListener) ->
     {ok, BoundPort} = roadrunner_transport:port(LSocket),
     BoundPort.
+
+%% Every listener in the pool shares the one UDP port.
+-spec quic_pool_port(pid()) -> inet:port_number().
+quic_pool_port(QuicPool) ->
+    [Listener | _] = roadrunner_quic_listener_sup:get_listeners(QuicPool),
+    roadrunner_quic_listener:get_port(Listener).
 
 %% Only an `http3` listener has a QUIC accept gate, so a TCP-only listener
 %% never loads `roadrunner_quic_listener`: startup time is dominated by
@@ -2482,6 +2498,7 @@ bake_dispatch(Handler, Opts, HandlerMws, StateArg0) ->
 -doc false.
 -spec handle_call(
     port
+    | quic_port
     | info
     | status
     | {drain, non_neg_integer()}
@@ -2491,6 +2508,10 @@ bake_dispatch(Handler, Opts, HandlerMws, StateArg0) ->
 ) -> {reply, term(), #state{}} | {stop, normal, term(), #state{}}.
 handle_call(port, _From, #state{port = Port} = State) ->
     {reply, Port, State};
+handle_call(quic_port, _From, #state{quic_listener = undefined} = State) ->
+    {reply, undefined, State};
+handle_call(quic_port, _From, #state{quic_listener = QuicPool} = State) ->
+    {reply, quic_pool_port(QuicPool), State};
 handle_call(status, _From, #state{phase = Phase} = State) ->
     {reply, Phase, State};
 handle_call({drain, Timeout}, _From, State) ->
