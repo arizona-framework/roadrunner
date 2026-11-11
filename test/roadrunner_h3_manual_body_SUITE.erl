@@ -13,6 +13,8 @@ picks what it does with the body.
 -export([init_per_testcase/2, end_per_testcase/2]).
 -export([
     reads_the_body/1,
+    reads_a_body_that_came_whole_in_pieces/1,
+    body_that_came_whole_over_the_cap_gets_413/1,
     reads_data_as_it_arrives/1,
     reads_nothing_without_a_body/1,
     trailers_end_the_body/1,
@@ -48,6 +50,8 @@ suite() ->
 all() ->
     [
         reads_the_body,
+        reads_a_body_that_came_whole_in_pieces,
+        body_that_came_whole_over_the_cap_gets_413,
         reads_data_as_it_arrives,
         reads_nothing_without_a_body,
         trailers_end_the_body,
@@ -114,6 +118,7 @@ extra(_Case) ->
 routes(TestPid) ->
     [
         {~"/read", ?H, read},
+        {~"/pieces", ?H, pieces},
         {~"/reject", ?H, reject},
         #{path => ~"/gated", handler => ?H, state => {gated, ?GATED}, max_content_length => 500000},
         {~"/gated-small", ?H, {gated, ?GATED}},
@@ -137,6 +142,20 @@ reads_the_body(Config) ->
     StreamId = open(Conn, ~"/read", []),
     ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"hello", true),
     ?assertMatch({200, _, ~"5"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
+
+%% HEADERS, DATA and FIN in one send: the request arrives whole before it
+%% is dispatched, and its body is still read in pieces of the length asked
+%% for, as one still arriving is.
+reads_a_body_that_came_whole_in_pieces(Config) ->
+    Conn = ?config(conn, Config),
+    StreamId = send_whole(Conn, ~"/pieces", ~"hello world!"),
+    ?assertMatch({200, _, ~"3:12"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
+
+%% Over the cap, a body that came whole is refused before dispatch.
+body_that_came_whole_over_the_cap_gets_413(Config) ->
+    Conn = ?config(conn, Config),
+    StreamId = send_whole(Conn, ~"/read", binary:copy(~"x", 100)),
+    ?assertMatch({413, _, _}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
 
 reads_data_as_it_arrives(Config) ->
     %% The 100 shows the handler's read is waiting: each DATA then reaches it
@@ -337,6 +356,16 @@ parked_until_a_slot_frees(Config) ->
 %% =============================================================================
 %% Helpers
 %% =============================================================================
+
+%% A whole request (HEADERS, one DATA, FIN) in a single stream send.
+send_whole(Conn, Path, Body) ->
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    Frames = [
+        roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(headers(Path))),
+        roadrunner_quic_h3_frame:encode_data(Body)
+    ],
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, iolist_to_binary(Frames), true),
+    StreamId.
 
 headers(Path) ->
     [

@@ -67,6 +67,7 @@
     latest_reader/1,
     stream_body_reader/5,
     with_body_reader/5,
+    with_arrived_body_reader/3,
     continue_before_stream/1,
     skip_continue/1,
     send_body/4,
@@ -1220,6 +1221,25 @@ stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
         recv => stream_recv(Conn, StreamId, Deadline),
         max => Max
     }.
+
+%% A manual-mode request whose body arrived whole before dispatch (an
+%% HTTP/3 request in one chunk) reads it through a stream reader as well:
+%% its `body` gives way to a reader whose one pull hands over those bytes
+%% as the end of the body, so reads with a `length` and the `Max` cap work
+%% as for a body still arriving.
+-doc false.
+-spec with_arrived_body_reader(roadrunner_req:request(), iodata(), non_neg_integer()) ->
+    roadrunner_req:request().
+with_arrived_body_reader(Req, Body, Max) ->
+    Reader = #{
+        framing => stream,
+        buffered => <<>>,
+        bytes_read => 0,
+        done => false,
+        recv => fun() -> {ok, Body, true} end,
+        max => Max
+    },
+    (maps:remove(body, Req))#{body_reader => Reader}.
 
 %% A request whose handler reads its body as it arrives (HTTP/2 and HTTP/3
 %% in manual mode): its buffered `body` gives way to a stream body reader
