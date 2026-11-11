@@ -74,9 +74,15 @@ open(Port) ->
     open(Port, #{}).
 
 -doc """
-Open a UDP socket on `Port`. The socket is binary, with `reuseaddr` set;
-`recbuf` and `sndbuf` may be overridden via `Opts`. Port 0 picks an ephemeral
-port (read it back with `sockname/1`).
+Open a UDP socket on `Port`. The socket is binary; `recbuf` and `sndbuf`
+may be overridden via `Opts`. Port 0 picks an ephemeral port (read it back
+with `sockname/1`).
+
+The socket never sets `reuseaddr`. For UDP it would let the socket share a
+port with any other socket that sets it: a second server bound to a port
+already in use would start without an error and split the traffic, and on
+Linux port 0 can even pick a port another `reuseaddr` socket holds, so
+datagrams meant for one go to the other.
 
 `active` defaults to `false` (passive: drain with `recv/2`). Set it to `once`
 or a positive integer `N` for the listener: each datagram is then delivered to
@@ -101,7 +107,6 @@ open(Port, Opts) ->
     BaseOpts = [
         binary,
         {active, Active},
-        {reuseaddr, true},
         {reuseport, ReusePort},
         {recbuf, RecBuf},
         {sndbuf, SndBuf}

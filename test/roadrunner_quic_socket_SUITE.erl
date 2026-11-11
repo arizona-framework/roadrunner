@@ -17,6 +17,7 @@ clause is unit-tested in `roadrunner_quic_socket_tests`.
     loopback_echo/1,
     recv_timeout/1,
     open_in_use_errors/1,
+    open_refuses_reuseaddr_port/1,
     open_with_custom_buffers/1,
     open_binds_to_ip/1,
     reuseport_allows_shared_bind/1,
@@ -39,6 +40,7 @@ all() ->
         loopback_echo,
         recv_timeout,
         open_in_use_errors,
+        open_refuses_reuseaddr_port,
         open_with_custom_buffers,
         open_binds_to_ip,
         reuseport_allows_shared_bind,
@@ -157,6 +159,16 @@ open_in_use_errors(_Config) ->
     {ok, {_Ip, Port}} = inet:sockname(Blocker),
     ?assertEqual({error, eaddrinuse}, roadrunner_quic_socket:open(Port)),
     ok = gen_udp:close(Blocker).
+
+%% The socket does not set reuseaddr, so a port another socket holds with
+%% reuseaddr is refused too. With it, the bind would go through and the two
+%% sockets would share the port: on Linux, port 0 then hands out ports already
+%% in use, and datagrams meant for one socket reach the other.
+open_refuses_reuseaddr_port(_Config) ->
+    {ok, Holder} = gen_udp:open(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, {_Ip, Port}} = inet:sockname(Holder),
+    ?assertEqual({error, eaddrinuse}, roadrunner_quic_socket:open(Port)),
+    ok = gen_udp:close(Holder).
 
 %% Custom recbuf/sndbuf are accepted (validate_opt's recbuf/sndbuf
 %% success clauses); gen_udp owns whether they reach the kernel.
