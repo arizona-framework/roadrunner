@@ -411,6 +411,40 @@ about 3.0 ms. In that run every active connection started its idle gap
 at the same moment, so they woke at about the same time; staggered
 wakes were not measured.
 
+### A larger minimum heap for routes that build large responses
+
+Under the default policy, every full sweep leaves the heap just big
+enough for what is live, so a handler that builds a large response grows
+it again from that small size and collects several times on the way.
+Even on a small JSON route, garbage collection was about 18% of the
+server's CPU. Raising the starting heap size with `min_heap_size` lets
+a request finish with fewer collections. On the bench's
+`httparena_json` route, which builds a 50-item JSON list per request
+(8 interleaved runs per side):
+
+| `handler_spawn` opts | collections per request | req/s | CPU per request |
+| --- | --- | --- | --- |
+| default | 3.9 | 32.6k | 179 µs |
+| `[{min_heap_size, 16384}]` | 1.5 | 40.9k | 142 µs |
+
+```erlang
+roadrunner:start_listener(my_api, #{
+    port => 8080,
+    routes => my_handler,
+    handler_spawn => #{opts => [{min_heap_size, 16384}]}
+}).
+```
+
+The price is idle memory. The minimum applies to every handler-running
+process, the connection process included, so with 2000 idle
+connections each keep-alive or WebSocket connection held 140 KB of
+process memory instead of 9 KB. The gain also depends on what the route
+allocates: on a route that compresses a body it has already built,
+throughput moved within noise (+2.4%). Reach for it on listeners whose
+handlers build large responses and whose connections are rarely idle,
+and size it to what one request allocates: the value is in words, so
+16384 is 128 KB on a 64-bit system.
+
 Reproduce the idle-connection numbers in this section with
 `scripts/idle_pool.escript`, which opens a pool of mostly-idle
 connections and samples the server's memory. A closed-loop benchmark
