@@ -7,12 +7,18 @@
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
 -export([init_per_testcase/2, end_per_testcase/2]).
 -export([native_client_get/1, native_client_post/1]).
+-export([quic_port_of_ephemeral_co_listener/1, quic_port_without_http3/1]).
 
 suite() ->
     [{timetrap, {seconds, 30}}].
 
 all() ->
-    [native_client_get, native_client_post].
+    [
+        native_client_get,
+        native_client_post,
+        quic_port_of_ephemeral_co_listener,
+        quic_port_without_http3
+    ].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -57,6 +63,38 @@ native_client_post(Config) ->
     ok = roadrunner_quic_test_h3:close(Conn),
     ?assertEqual(200, Status),
     ?assertEqual(~"hello there", Body).
+
+%% =============================================================================
+%% quic_port/1
+%% =============================================================================
+
+%% An h3-only listener's `port/1` is its UDP port already. A co-listener on
+%% `port => 0` gets a UDP port apart from its TCP one: `quic_port/1` reads
+%% it back, and HTTP/3 answers there.
+quic_port_of_ephemeral_co_listener(_Config) ->
+    ?assertEqual(roadrunner_listener:port(?MODULE), roadrunner_listener:quic_port(?MODULE)),
+    {ok, _} = roadrunner_listener:start_link(quic_port_co, #{
+        port => 0,
+        protocols => [http1, http2, http3],
+        tls => roadrunner_test_certs:server_opts(),
+        routes => roadrunner_h3_test_handler
+    }),
+    QuicPort = roadrunner_listener:quic_port(quic_port_co),
+    ?assert(is_integer(QuicPort)),
+    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, QuicPort),
+    {Status, _Headers, Body} = roadrunner_quic_test_h3:get(Conn, ~"/method"),
+    ok = roadrunner_quic_test_h3:close(Conn),
+    ok = roadrunner_listener:stop(quic_port_co),
+    ?assertEqual({200, ~"GET"}, {Status, Body}).
+
+quic_port_without_http3(_Config) ->
+    {ok, _} = roadrunner_listener:start_link(quic_port_tcp, #{
+        port => 0,
+        routes => roadrunner_h3_test_handler
+    }),
+    QuicPort = roadrunner_listener:quic_port(quic_port_tcp),
+    ok = roadrunner_listener:stop(quic_port_tcp),
+    ?assertEqual(undefined, QuicPort).
 
 %% =============================================================================
 %% Helpers
