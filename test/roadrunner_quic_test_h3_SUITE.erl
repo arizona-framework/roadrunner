@@ -8,6 +8,7 @@
 -export([init_per_testcase/2, end_per_testcase/2]).
 -export([native_client_get/1, native_client_post/1]).
 -export([quic_port_of_ephemeral_co_listener/1, quic_port_without_http3/1]).
+-export([ephemeral_pool_port_is_not_shared/1]).
 
 suite() ->
     [{timetrap, {seconds, 30}}].
@@ -17,7 +18,8 @@ all() ->
         native_client_get,
         native_client_post,
         quic_port_of_ephemeral_co_listener,
-        quic_port_without_http3
+        quic_port_without_http3,
+        ephemeral_pool_port_is_not_shared
     ].
 
 init_per_suite(Config) ->
@@ -95,6 +97,25 @@ quic_port_without_http3(_Config) ->
     QuicPort = roadrunner_listener:quic_port(quic_port_tcp),
     ok = roadrunner_listener:stop(quic_port_tcp),
     ?assertEqual(undefined, QuicPort).
+
+%% With many reuseport sockets alive, a reuseport bind on port 0 is now and
+%% then given a port one of them holds (on Linux, about 1 in 30 with 1000
+%% held). The port a pool gets for `port => 0` is picked so it never is.
+ephemeral_pool_port_is_not_shared(_Config) ->
+    Held = [
+        Socket
+     || _ <- lists:seq(1, 1000), {ok, Socket} <- [gen_udp:open(0, [{reuseport, true}])]
+    ],
+    HeldPorts = sets:from_list([Port || Socket <- Held, {ok, Port} <- [inet:port(Socket)]]),
+    Shared = [
+        Port
+     || _ <- lists:seq(1, 300),
+        {Port, Probe} <- [roadrunner_listener:resolve_quic_port(0, 8, #{})],
+        ok =:= gen_udp:close(Probe),
+        sets:is_element(Port, HeldPorts)
+    ],
+    lists:foreach(fun gen_udp:close/1, Held),
+    ?assertEqual([], Shared).
 
 %% =============================================================================
 %% Helpers
