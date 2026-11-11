@@ -38,6 +38,9 @@ All duration and interval values in `opts()` are in milliseconds —
     reload_routes/2
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+%% Exported for a direct test of the port a pool gets with `port => 0`: a
+%% port shared with another socket is rare, so it takes many picks to see.
+-export([resolve_quic_port/3]).
 
 -export_type([opts/0]).
 
@@ -1263,17 +1266,27 @@ start_quic_pool(Port, PoolOpts) ->
 %% A single listener binds without reuseport, so the probe would hold the
 %% port against it: it binds port 0 itself instead, and the port is read
 %% back from it.
+%%
+%% The port is picked by a plain socket on port 0, then taken by the
+%% reuseport probe. On Linux, a reuseport socket bound to port 0 can be
+%% given a port another reuseport socket holds, so two pools could share
+%% one port; a plain socket is never given a port in use. Should another
+%% socket take the port between the two binds, the probe's bind fails and
+%% the listener does not start, rather than sharing it.
+-doc false.
 -spec resolve_quic_port(inet:port_number(), pos_integer(), opts()) ->
     {inet:port_number(), gen_udp:socket() | undefined}.
 resolve_quic_port(0, Listeners, Opts) when Listeners > 1 ->
-    ProbeOpts =
+    IpOpts =
         case Opts of
-            #{ip := IP} -> [{reuseport, true}, {ip, IP}];
-            #{} -> [{reuseport, true}]
+            #{ip := IP} -> [{ip, IP}];
+            #{} -> []
         end,
-    {ok, Probe} = gen_udp:open(0, ProbeOpts),
-    {ok, ProbePort} = inet:port(Probe),
-    {ProbePort, Probe};
+    {ok, Picker} = gen_udp:open(0, IpOpts),
+    {ok, Port} = inet:port(Picker),
+    ok = gen_udp:close(Picker),
+    {ok, Probe} = gen_udp:open(Port, [{reuseport, true} | IpOpts]),
+    {Port, Probe};
 resolve_quic_port(Port, _Listeners, _Opts) ->
     {Port, undefined}.
 
