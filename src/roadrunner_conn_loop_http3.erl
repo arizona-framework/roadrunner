@@ -1821,7 +1821,10 @@ build_request(Headers, Body, RequestContext) ->
     roadrunner_http3_request:from_headers(Headers, Body, RequestContext).
 
 %% A manual-mode request reads its body through a reader instead of the
-%% buffered `body`, within the listener's `request_timeout`.
+%% buffered `body`, within the listener's `request_timeout`. One whose body
+%% came whole with its headers (HEADERS, DATA and FIN in one chunk) reads it
+%% through a reader too, so a read with a `length` gets pieces of that
+%% length whatever way the body arrived.
 -spec with_body(roadrunner_req:request(), iodata() | reading, non_neg_integer(), #h3{}) ->
     roadrunner_req:request().
 with_body(Req, reading, StreamId, #h3{
@@ -1829,6 +1832,8 @@ with_body(Req, reading, StreamId, #h3{
 }) ->
     #{StreamId := #{continue_owed := ContinueOwed}} = Streams,
     roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxLen, ContinueOwed);
+with_body(Req, Body, _StreamId, #h3{body_buffering = manual, max_content_length = MaxLen}) ->
+    roadrunner_conn:with_arrived_body_reader(Req, Body, MaxLen);
 with_body(Req, _Body, _StreamId, _State) ->
     Req.
 
