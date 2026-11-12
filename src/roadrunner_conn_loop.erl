@@ -129,8 +129,10 @@
     body_buffering = auto :: auto | manual,
     %% `{Idle, Max}` while the socket still reads with its small
     %% `idle_recv_buffer`: the first body with more than `Idle` bytes still
-    %% to come grows it to `Max` for good (`grow_buffer/2`). `undefined`
-    %% once grown, or when the listener has nothing to grow.
+    %% to come grows it to `Max` for good (`grow_buffer/2`), and a request
+    %% head larger than `Idle` grows it to `?HEAD_RECV_BUFFER`
+    %% (`grow_for_head/1`), which becomes the new `Idle`. `undefined` once
+    %% grown to `Max`, or when the listener has nothing to grow.
     grow_buffer = undefined :: {pos_integer(), pos_integer()} | undefined,
     %% `{Floor, Base, Cap}`: the `min_heap_size` this process keeps between
     %% requests (`Floor`), raised from `Base` towards `Cap` to the heap its
@@ -468,6 +470,9 @@ proxy_protocol_stage(Socket, #{proxy_protocol := true} = ProtoOpts, OsPeer) ->
 %% Every this many requests a connection drops its heap floor and learns it
 %% again (`raise_heap_floor/1`).
 -define(HEAP_FLOOR_RELEARN, 16).
+%% What a socket reads request heads with once one did not fit its
+%% `idle_recv_buffer` (`grow_for_head/1`).
+-define(HEAD_RECV_BUFFER, 16384).
 
 %% Exact read for the TLS case. Six bytes tell v1 (`PROXY `) from v2 (the
 %% first six bytes of its signature); a v2 prefix then declares the length of
@@ -958,7 +963,7 @@ handle_request_bytes(
             %% needs. Don't call `arm_active_once` here — passive
             %% mode would silently leak the resulting `{tcp, _, _}`
             %% delivery into the mailbox.
-            recv_request_bytes(S, Deadline);
+            recv_request_bytes(grow_for_head(S), Deadline);
         {error, Reason} ->
             logger:debug(#{
                 msg => "roadrunner rejecting malformed request",
@@ -1098,6 +1103,25 @@ route_and_read(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S, 
 %% hands a freed buffer back to the next read that fits in it, so shrinking
 %% again would not release it. Chunked bodies grow it too, as their size
 %% is not known up front.
+%% A request head that filled the idle buffer and is still incomplete:
+%% a client with large heads (many cookies) sends them on every request,
+%% and a head split across reads costs about half a request again, so the
+%% socket reads heads with `?HEAD_RECV_BUFFER` from here on. Bodies still
+%% grow it to `Max` (`grow_buffer/2`).
+-spec grow_for_head(#loop_state{}) -> #loop_state{}.
+grow_for_head(#loop_state{grow_buffer = {Idle, Max}, buffered = Buffered} = S) when
+    byte_size(Buffered) >= Idle, Idle < ?HEAD_RECV_BUFFER
+->
+    Head = min(?HEAD_RECV_BUFFER, Max),
+    _ = roadrunner_transport:setopts(S#loop_state.socket, [{buffer, Head}]),
+    S#loop_state{grow_buffer = head_grown(Head, Max)};
+grow_for_head(S) ->
+    S.
+
+-spec head_grown(pos_integer(), pos_integer()) -> {pos_integer(), pos_integer()} | undefined.
+head_grown(Max, Max) -> undefined;
+head_grown(Head, Max) -> {Head, Max}.
+
 -spec grow_buffer(
     #loop_state{},
     none

@@ -2258,6 +2258,67 @@ large_body_grows_the_socket_buffer_once_test() ->
     Pid ! {roadrunner_fake_closed, x},
     ok = await_normal_exit(Ref, Pid).
 
+large_head_grows_the_socket_buffer_test() ->
+    %% A head that fills the idle buffer and is still incomplete grows the
+    %% socket to 16 KB, once: the next large head reads as it is, and a
+    %% large body still grows it to `Max`.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {8, 65536}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    Head = post_head(5, <<>>),
+    <<Part:20/binary, Rest/binary>> = Head,
+    Pid ! {roadrunner_fake_data, x, Part},
+    ?assertEqual([{buffer, 16384}], expect_setopts(Tag)),
+    Pid ! {roadrunner_fake_data, x, Rest},
+    Pid ! {roadrunner_fake_data, x, binary:copy(~"a", 5)},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    Pid ! {roadrunner_fake_data, x, Part},
+    Pid ! {roadrunner_fake_data, x, Rest},
+    Pid ! {roadrunner_fake_data, x, binary:copy(~"a", 5)},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    ?assertEqual(none, take_setopts(Tag)),
+    ok = post_roundtrip(Tag, Pid, 20000),
+    ?assertEqual([{buffer, 65536}], expect_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+large_head_grows_a_small_listener_buffer_to_its_cap_test() ->
+    %% With `Max` below 16 KB the head grows the socket to `Max`, and there
+    %% is nothing left to grow for a body.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {8, 64}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    <<Part:20/binary, Rest/binary>> = post_head(20, <<>>),
+    Pid ! {roadrunner_fake_data, x, Part},
+    ?assertEqual([{buffer, 64}], expect_setopts(Tag)),
+    Pid ! {roadrunner_fake_data, x, Rest},
+    Pid ! {roadrunner_fake_data, x, binary:copy(~"a", 20)},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
+split_small_head_keeps_the_socket_buffer_test() ->
+    %% A head split before it filled the idle buffer is just a short read:
+    %% the socket keeps its size.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag, size_opts(#{http1_active => 4, grow_recv_buffer => {64, 65536}})
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    <<Part:10/binary, Rest/binary>> = post_head(5, <<>>),
+    Pid ! {roadrunner_fake_data, x, Part},
+    Pid ! {roadrunner_fake_data, x, Rest},
+    Pid ! {roadrunner_fake_data, x, binary:copy(~"a", 5)},
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, expect_sent(Tag)),
+    ?assertEqual(none, take_setopts(Tag)),
+    Pid ! {roadrunner_fake_closed, x},
+    ok = await_normal_exit(Ref, Pid).
+
 expect_continue_body_grows_before_the_100_test() ->
     %% A client holding a large body back for `Expect: 100-continue`: the
     %% socket grows before the 100 asks for the body.
