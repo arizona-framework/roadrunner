@@ -1163,6 +1163,9 @@ raise_heap_floor(#loop_state{requests_served = Served} = S) when
     Served rem ?HEAP_FLOOR_RELEARN =:= 0
 ->
     reset_heap_floor(S);
+raise_heap_floor(#loop_state{heap_floor = {Cap, _Base, Cap}} = S) ->
+    %% At the cap already: nothing to raise, so skip reading the heap.
+    S;
 raise_heap_floor(#loop_state{heap_floor = {Floor, Base, Cap}} = S) ->
     {heap_size, Heap} = erlang:process_info(self(), heap_size),
     case min(Heap, Cap) of
