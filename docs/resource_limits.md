@@ -411,16 +411,40 @@ about 3.0 ms. In that run every active connection started its idle gap
 at the same moment, so they woke at about the same time; staggered
 wakes were not measured.
 
-### A larger minimum heap for routes that build large responses
+### The heap floor: a larger heap for requests that need one
 
 Under the default policy, every full sweep leaves the heap just big
 enough for what is live, so a handler that builds a large response grows
 it again from that small size and collects several times on the way.
 Even on a small JSON route, garbage collection was about 18% of the
-server's CPU. Raising the starting heap size with `min_heap_size` lets
-a request finish with fewer collections. On the bench's
-`httparena_json` route, which builds a 50-item JSON list per request
-(8 interleaved runs per side):
+server's CPU.
+
+An HTTP/1.1 connection therefore keeps a heap floor: after each request
+it raises its `min_heap_size` to the heap that request needed, up to
+`handler_spawn`'s `heap_floor` (46422 words, about 360 KB, by default),
+and the next request starts at that size. The floor only rises, so a
+connection resizes its heap a handful of times in its life, and it drops
+back before the connection hibernates or runs a WebSocket session. In a
+two-sided A/B against the arena-style JSON, pipelined and mixed
+GET/POST loads (1024 connections, a fresh server per run):
+
+| load | without the floor | with it |
+| --- | --- | --- |
+| compressed JSON | 16.8k req/s | 20.8k req/s (+23%) |
+| pipelined GETs | 1.09M req/s | 1.33M req/s (+22%) |
+| mixed GET/POST | 366k req/s | 385k req/s (+5%) |
+
+Busy connections held about 10% more memory on the JSON load and the
+same on the others. Idle connections cost the same with and without it,
+since a connection that waits collects nothing and so keeps the heap its
+last request left either way: 1000 connections idle after a large JSON
+response held the same memory. Set `heap_floor => 0` to turn it off.
+
+HTTP/2 and HTTP/3 run each request in a stream worker of its own, which
+the floor does not reach. For those, or to start every connection at a
+size from its first request, raise `min_heap_size` itself. On the
+bench's `httparena_json` route, which builds a 50-item JSON list per
+request (8 interleaved runs per side, before the floor existed):
 
 | `handler_spawn` opts | collections per request | req/s | CPU per request |
 | --- | --- | --- | --- |
@@ -436,14 +460,12 @@ roadrunner:start_listener(my_api, #{
 ```
 
 The price is idle memory. The minimum applies to every handler-running
-process, the connection process included, so with 2000 idle
-connections each keep-alive or WebSocket connection held 140 KB of
+process from its start, the connection process included, so with 2000
+idle connections each keep-alive or WebSocket connection held 140 KB of
 process memory instead of 9 KB. The gain also depends on what the route
 allocates: on a route that compresses a body it has already built,
-throughput moved within noise (+2.4%). Reach for it on listeners whose
-handlers build large responses and whose connections are rarely idle,
-and size it to what one request allocates: the value is in words, so
-16384 is 128 KB on a 64-bit system.
+throughput moved within noise (+2.4%). Size it to what one request
+allocates: the value is in words, so 16384 is 128 KB on a 64-bit system.
 
 Reproduce the idle-connection numbers in this section with
 `scripts/idle_pool.escript`, which opens a pool of mostly-idle

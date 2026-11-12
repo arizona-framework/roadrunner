@@ -945,8 +945,32 @@ listener_rejects_invalid_handler_spawn_test() ->
             #{opts => [monitor]},
             #{opts => [{monitor, []}]},
             #{opts => not_a_list},
+            #{heap_floor => -1},
+            #{heap_floor => not_an_integer},
             not_a_map
         ]
+    ).
+
+listener_heap_floor_into_proto_opts_test() ->
+    %% `handler_spawn.heap_floor` becomes `heap_floor => Cap`, 46422 words
+    %% unless set; `0` leaves the key out.
+    Cases = [
+        {#{}, 46422},
+        {#{handler_spawn => #{heap_floor => 5000}}, 5000},
+        {#{handler_spawn => #{opts => [{min_heap_size, 1000}]}}, 46422},
+        {#{handler_spawn => #{heap_floor => 0}}, none}
+    ],
+    lists:foreach(
+        fun({Extra, Expected}) ->
+            Name = listener_test_heap_floor,
+            {ok, ListenerPid} = roadrunner_listener:start_link(
+                Name, Extra#{port => 0, routes => roadrunner_hello_handler}
+            ),
+            ProtoOpts = element(4, sys:get_state(ListenerPid)),
+            ?assertEqual(Expected, maps:get(heap_floor, ProtoOpts, none)),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        Cases
     ).
 
 slot_reconciliation_disabled_drops_reconcile_slots_message_test() ->

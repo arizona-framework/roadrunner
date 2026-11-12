@@ -293,6 +293,10 @@ deadline in milliseconds. The shed form answers it `503` with the
     %% (`roadrunner_conn_loop:grow_buffer/2`), an h2c one at its first DATA
     %% payload (`roadrunner_conn_loop_http2:grow_buffer/2`). Absent on TLS.
     grow_recv_buffer => {pos_integer(), pos_integer()},
+    %% The most heap, in words, an HTTP/1.1 connection raises its
+    %% `min_heap_size` to (`roadrunner_conn_loop:raise_heap_floor/1`).
+    %% Absent when `handler_spawn.heap_floor` is `0`.
+    heap_floor => pos_integer(),
     %% Flattened spawn config for every handler-running process. The public
     %% `handler_spawn => #{opts}` listener opt is expanded into this top-level
     %% key by `roadrunner_listener:build_proto_opts/2` so the spawn sites read

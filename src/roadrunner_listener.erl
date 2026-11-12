@@ -89,6 +89,11 @@ All duration and interval values in `opts()` are in milliseconds —
 %% instead of hoarding it as old-gen garbage across keep-alive requests — at
 %% high connection counts the difference between hundreds of MB and a few GB.
 -define(DEFAULT_HANDLER_SPAWN_OPTS, [{fullsweep_after, 0}]).
+%% The most heap, in words, an HTTP/1.1 connection keeps between requests as
+%% its floor (`handler_spawn.heap_floor`): a step of the emulator's heap-size
+%% ladder, about 360 KB, well above what a handler building a sizeable JSON
+%% response needs (about 17,700 words).
+-define(DEFAULT_HEAP_FLOOR, 46422).
 -define(DEFAULT_WS_MAX_FRAME_SIZE, 10485760).
 -define(DEFAULT_WS_MAX_MESSAGE_SIZE, 10485760).
 %% Per-connection concurrent client-initiated request (bidirectional)
@@ -365,6 +370,21 @@ Optional middleware and timing knobs (durations in milliseconds):
   intermediate values measured (5, 10 and 20) bought no middle ground.
   The measurements behind all of this are in
   [Resource limits](resource_limits.md).
+
+  `heap_floor` is the most heap, in words, an HTTP/1.1 connection keeps
+  between requests. Under full sweeps a connection's heap starts small,
+  so every request grows it again over several collections; after each
+  request, the connection instead keeps the heap that request needed,
+  up to `heap_floor`, as its `min_heap_size`, and the next request
+  starts at that size. A handler that builds a sizeable response then
+  collects a few times per request instead of several, which cost
+  connections serving such handlers about a fifth of their CPU. The
+  floor only rises, so a connection resizes its heap a handful of times
+  in its life, not once per request; it drops back to `min_heap_size`
+  (or the emulator's default) before the connection hibernates or runs
+  a WebSocket session. A connection between requests holds about the
+  same heap either way, since it collects nothing while it waits.
+  Default `46422` (about 360 KB); `0` turns it off.
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.
 - `tls` — `[ssl:tls_server_option()]` for HTTPS. Absent for plain
@@ -529,7 +549,8 @@ ops-tuning rationale.
     %% off_heap}`, `{min_bin_vheap_size, _}`. `link`/`monitor` are rejected —
     %% roadrunner owns process linkage.
     handler_spawn => #{
-        opts => [proc_lib:start_spawn_option()]
+        opts => [proc_lib:start_spawn_option()],
+        heap_floor => non_neg_integer()
     },
     %% Protocols this listener accepts. Each entry is either a bare
     %% atom (`http1` / `http2`) or a `{Proto, Opts}` tuple carrying
@@ -1793,8 +1814,11 @@ build_proto_opts(Opts, ListenerName) ->
     %% Flatten the nested `handler_spawn` opt to top-level proto_opts keys the
     %% spawn sites read directly, mirroring the `ws` / `http2` flattening above.
     HandlerSpawnOpts = resolve_handler_spawn(Opts),
+    Optional = maps:merge(
+        maps:merge(maybe_alt_svc(Protocols, Opts), maybe_grow(Opts)), heap_floor(Opts)
+    ),
     Base = maps:merge(
-        maps:merge(maps:merge(maybe_alt_svc(Protocols, Opts), maybe_grow(Opts)), #{
+        maps:merge(Optional, #{
             dispatch => build_dispatch(Opts, ListenerName),
             middlewares => maps:get(middlewares, Opts, []),
             max_content_length =>
@@ -1938,6 +1962,21 @@ maybe_grow(Opts) ->
     case {idle_recv_buffer(Opts), validate_recv_buffer(Opts)} of
         {Idle, Max} when Idle < Max -> #{grow_recv_buffer => {Idle, Max}};
         _ -> #{}
+    end.
+
+%% `heap_floor => Cap` for the HTTP/1.1 connection loop: the most heap, in
+%% words, a connection raises its `min_heap_size` to
+%% (`roadrunner_conn_loop:raise_heap_floor/1`). Left out when it is `0`.
+-spec heap_floor(opts()) -> map().
+heap_floor(Opts) ->
+    case maps:get(handler_spawn, Opts, #{}) of
+        #{heap_floor := 0} ->
+            #{};
+        #{heap_floor := Words} when is_integer(Words), Words > 0 -> #{heap_floor => Words};
+        #{heap_floor := _} = HandlerSpawn ->
+            error({invalid_listener_opt, handler_spawn, HandlerSpawn});
+        #{} ->
+            #{heap_floor => ?DEFAULT_HEAP_FLOOR}
     end.
 
 %% Precompute the `Alt-Svc` response-header value (RFC 7838) when the
