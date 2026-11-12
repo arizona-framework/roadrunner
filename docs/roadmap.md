@@ -293,6 +293,39 @@ new connections per second, so it was not kept.
 
 **Scope:** medium.
 
+### Start WebSocket sessions at a 4 KB read buffer — small
+
+**What:** a session's adaptive inet `buffer` starts at the listener's
+idle buffer and grows only when a large frame arrives
+(`roadrunner_ws_session:adaptive_buf/2`). Start it at 4 KB instead,
+still growing for large frames and shrinking back after them.
+
+**Why:** most sessions exchange small messages and sit idle between
+them, as Arizona's do, and the buffer is held live per socket. At 16384
+echo sessions, a fixed 4 KB buffer used about 15% less memory than
+today's default with the same throughput (3 alternating rounds). It
+must stay a default every deployment gains from: measure a large-frame
+load too, so the extra growth step does not cost there.
+
+**Scope:** small.
+
+### A lower default heap floor cap — small
+
+**What:** `handler_spawn.heap_floor` defaults to `#{max => 46422}`
+words (about 360 KB), well above the ~17,700 words a handler building a
+sizeable JSON response needs. Measure `max` at 17731 and 28657 (the
+ladder steps around that need) against today's default.
+
+**Why:** the floor trades busy memory for fewer collections. With
+thousands of active connections the trade is larger than measured
+locally: TLS JSON served 35% more requests with twice the memory, and
+compressed JSON about 33-42% more with 38-46% more. A lower cap may
+keep most of the gain for far less memory. Measure throughput and busy
+memory on JSON, TLS JSON, pipelined and h2c JSON loads at 4096
+connections, and keep the default general, not fitted to one load.
+
+**Scope:** small.
+
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>
