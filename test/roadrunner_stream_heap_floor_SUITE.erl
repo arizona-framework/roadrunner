@@ -3,8 +3,8 @@
 The heap floor of HTTP/2 stream workers (`handler_spawn.heap_floor`): each
 worker raises its connection's floor to the heap its request needed, up to
 the cap, and the next worker starts at that size; every 16th stream starts
-at the base and learns it again. Over h2c, with
-`roadrunner_heap_floor_handler`.
+at the base and learns it again. Over h2c, and over HTTP/3 with the native
+test client (`roadrunner_quic_test_h3`), with `roadrunner_heap_floor_handler`.
 """.
 
 -behaviour(ct_suite).
@@ -20,7 +20,9 @@ at the base and learns it again. Over h2c, with
     floor_starts_at_the_spawn_min_heap_size/1,
     floor_off_when_the_cap_is_under_the_spawn_min_heap_size/1,
     floor_relearns_every_16_streams/1,
-    smaller_need_leaves_a_higher_floor/1
+    smaller_need_leaves_a_higher_floor/1,
+    h3_floor_rises_after_a_large_request/1,
+    h3_floor_relearns_every_16_streams/1
 ]).
 
 -define(H, roadrunner_heap_floor_handler).
@@ -36,15 +38,16 @@ all() ->
         floor_starts_at_the_spawn_min_heap_size,
         floor_off_when_the_cap_is_under_the_spawn_min_heap_size,
         floor_relearns_every_16_streams,
-        smaller_need_leaves_a_higher_floor
+        smaller_need_leaves_a_higher_floor,
+        h3_floor_rises_after_a_large_request,
+        h3_floor_relearns_every_16_streams
     ].
 
 init_per_testcase(Case, Config) ->
     {ok, _} = roadrunner_listener:start_link(
         ?MODULE,
-        maps:merge(listener_opts(Case), #{
+        maps:merge(maps:merge(listener_opts(Case), protocol_opts(Case)), #{
             port => 0,
-            protocols => [http2],
             routes => [
                 {~"/alloc", ?H, {alloc, self()}},
                 {~"/gated", ?H, {gated_alloc, self()}},
@@ -56,6 +59,14 @@ init_per_testcase(Case, Config) ->
 
 end_per_testcase(_Case, _Config) ->
     ok = roadrunner_listener:stop(?MODULE).
+
+protocol_opts(Case) when
+    Case =:= h3_floor_rises_after_a_large_request; Case =:= h3_floor_relearns_every_16_streams
+->
+    {ok, _} = application:ensure_all_started(ssl),
+    #{protocols => [http3], tls => roadrunner_test_certs:server_opts()};
+protocol_opts(_Case) ->
+    #{protocols => [http2]}.
 
 listener_opts(floor_stops_at_the_cap) ->
     #{handler_spawn => #{heap_floor => 1000}};
@@ -137,6 +148,26 @@ smaller_need_leaves_a_higher_floor(Config) ->
     {_, C4} = response(C3, 1),
     {After, _} = report(C4, 7),
     ?assertEqual(Floor, After).
+
+%% HTTP/3 request streams count up by 4 (0, 4, 8, ...); the first one
+%% relearns, so the floor starts at the base.
+h3_floor_rises_after_a_large_request(Config) ->
+    Conn = h3_connect(Config),
+    ?assertEqual(base(), h3_report(Conn)),
+    ok = h3_alloc(Conn),
+    Floor = h3_report(Conn),
+    ?assert(Floor > base()),
+    ?assert(Floor =< 46422),
+    ok = roadrunner_quic_test_h3:close(Conn).
+
+%% Stream 64 is the 17th: it starts at the base and resets the floor.
+h3_floor_relearns_every_16_streams(Config) ->
+    Conn = h3_connect(Config),
+    ok = h3_alloc(Conn),
+    Floors = [h3_report(Conn) || _ <- lists:seq(2, 16)],
+    ?assert(lists:all(fun(Floor) -> Floor > base() end, Floors)),
+    ?assertEqual(base(), h3_report(Conn)),
+    ok = roadrunner_quic_test_h3:close(Conn).
 
 %% =============================================================================
 %% Helpers
@@ -228,3 +259,19 @@ next_frame(#{sock := Sock, buf := Buf, dec := Dec} = C) ->
             {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
             next_frame(C#{buf := <<Buf/binary, Data/binary>>})
     end.
+
+h3_connect(Config) ->
+    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, ?config(port, Config)),
+    Conn.
+
+h3_alloc(Conn) ->
+    {200, _Headers, _Body} = roadrunner_quic_test_h3:get(Conn, ~"/alloc"),
+    receive
+        {conn, _Worker} -> ok
+    after 5000 -> ct:fail(no_alloc)
+    end.
+
+%% The `min_heap_size` the stream's worker started at.
+h3_report(Conn) ->
+    {200, _Headers, Body} = roadrunner_quic_test_h3:get(Conn, ~"/report"),
+    binary_to_integer(Body).
