@@ -182,6 +182,10 @@ deadline in milliseconds. The shed form answers it `503` with the
     %% reads per arm (the listener's `ws.active`); `undefined` (the
     %% default) is `once` on plain TCP and `16` on TLS.
     ws_active := once | 1..32767 | undefined,
+    %% `{Min, Cap}`: a WebSocket session's heap floor (the listener's
+    %% `ws.heap_floor_min` and `ws.heap_floor`, the cap `0` when off;
+    %% `roadrunner_ws_session:raise_heap_floor/1`).
+    ws_heap_floor => {non_neg_integer(), non_neg_integer()},
     request_timeout := non_neg_integer(),
     %% Bound on the TLS handshake in the accept path; see the
     %% `tls_handshake_timeout` listener opt.

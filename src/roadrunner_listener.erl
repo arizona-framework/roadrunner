@@ -94,6 +94,11 @@ All duration and interval values in `opts()` are in milliseconds —
 %% ladder, about 360 KB, well above what a handler building a sizeable JSON
 %% response needs (about 17,700 words).
 -define(DEFAULT_HEAP_FLOOR, 46422).
+%% The least heap, in words, a WebSocket session's `handle_info/2` must
+%% have needed to raise its floor (`ws.heap_floor_min`): a step of the
+%% heap-size ladder, about 20 KB. Small messages (a timer, a presence
+%% ping) leave the floor; building a sizeable push raises it.
+-define(DEFAULT_WS_HEAP_FLOOR_MIN, 2586).
 -define(DEFAULT_WS_MAX_FRAME_SIZE, 10485760).
 -define(DEFAULT_WS_MAX_MESSAGE_SIZE, 10485760).
 %% Per-connection concurrent client-initiated request (bidirectional)
@@ -163,10 +168,16 @@ Optional middleware and timing knobs (durations in milliseconds):
   `hibernate_after`
   (idle-session hibernation timeout in milliseconds; off when unset),
   `compress` (accept permessage-deflate, and with which zlib settings;
-  default `false`) and `idle_timeout` (close
+  default `false`), `idle_timeout` (close
   a session whose client sent nothing for that many milliseconds; off
-  when unset). An upgrade can set each for its own session
-  (`t:roadrunner_ws_handler:upgrade_opts/0`).
+  when unset), `heap_floor` (the most heap, in words, a session keeps
+  between events; defaults to `handler_spawn`'s `heap_floor`, `0` turns
+  it off) and `heap_floor_min` (the least heap, in words, an event must
+  have needed to raise the floor; default `2586`, about 20 KB, so a
+  session whose `handle_info/2` builds sizeable pushes starts each at
+  the size the last one needed while small messages leave the floor;
+  `0` lets every message raise it). An upgrade can set each
+  for its own session (`t:roadrunner_ws_handler:upgrade_opts/0`).
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
 - `tls_handshake_timeout` — bound on the TLS handshake (TLS listeners
@@ -388,6 +399,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   its own, so there the connection keeps the floor: each worker raises
   it to the heap its request needed and the next worker starts at that
   size, and every 16th stream starts at the base and learns it again.
+  A WebSocket session learns its floor from its `handle_info/2` calls,
+  where a server push is built, relearns every 16 of them while raised
+  and drops it before it hibernates; `ws.heap_floor` and
+  `ws.heap_floor_min` tune it for sessions.
   Default `46422` (about 360 KB); `0` turns it off.
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.
@@ -1812,7 +1827,9 @@ build_proto_opts(Opts, ListenerName) ->
         hibernate_after := WsHibernateAfter,
         compress := WsCompress,
         idle_timeout := WsIdleTimeout,
-        active := WsActive
+        active := WsActive,
+        heap_floor := WsHeapFloor,
+        heap_floor_min := WsHeapFloorMin
     } =
         validate_ws_opts(maps:get(ws, Opts, #{})),
     %% Flatten the nested `handler_spawn` opt to top-level proto_opts keys the
@@ -1834,6 +1851,7 @@ build_proto_opts(Opts, ListenerName) ->
             ws_compress => roadrunner_ws:compress_config(WsCompress),
             ws_idle_timeout => WsIdleTimeout,
             ws_active => WsActive,
+            ws_heap_floor => {WsHeapFloorMin, ws_heap_floor(WsHeapFloor, Opts)},
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             tls_handshake_timeout =>
                 maps:get(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT),
@@ -2344,6 +2362,14 @@ flatten_http3_opts(Entries) ->
 ws_buffer(undefined, Base, Max) -> {adaptive, Base, Max};
 ws_buffer(WsBuffer, _Base, _Max) -> WsBuffer.
 
+%% A WebSocket session's heap floor cap: `ws.heap_floor` when set, else
+%% the listener's `handler_spawn.heap_floor` (`0` when that is off).
+-spec ws_heap_floor(non_neg_integer() | undefined, opts()) -> non_neg_integer().
+ws_heap_floor(undefined, Opts) ->
+    maps:get(heap_floor, heap_floor(Opts), 0);
+ws_heap_floor(Words, _Opts) ->
+    Words.
+
 -spec ws_defaults() ->
     #{
         max_frame_size := non_neg_integer(),
@@ -2352,7 +2378,9 @@ ws_buffer(WsBuffer, _Base, _Max) -> WsBuffer.
         hibernate_after := infinity,
         compress := false,
         idle_timeout := infinity,
-        active := undefined
+        active := undefined,
+        heap_floor := undefined,
+        heap_floor_min := non_neg_integer()
     }.
 ws_defaults() ->
     #{
@@ -2371,7 +2399,10 @@ ws_defaults() ->
         idle_timeout => infinity,
         %% `undefined` = per transport: `once` on plain TCP, `16` on TLS
         %% (`roadrunner_ws_session:read_mode/2`).
-        active => undefined
+        active => undefined,
+        %% `undefined` = the listener's `handler_spawn.heap_floor`.
+        heap_floor => undefined,
+        heap_floor_min => ?DEFAULT_WS_HEAP_FLOOR_MIN
     }.
 
 %% Resolve the `ws` opts map against defaults, rejecting unknown keys
@@ -2387,7 +2418,9 @@ ws_defaults() ->
         hibernate_after := pos_integer() | infinity,
         compress := roadrunner_ws:compress(),
         idle_timeout := pos_integer() | infinity,
-        active := once | 1..32767 | undefined
+        active := once | 1..32767 | undefined,
+        heap_floor := non_neg_integer() | undefined,
+        heap_floor_min := non_neg_integer()
     }.
 validate_ws_opts(Opts) when is_map(Opts) ->
     Defaults = ws_defaults(),

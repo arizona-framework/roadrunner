@@ -456,6 +456,25 @@ connection, 3 alternating rounds at 64 connections, one at 256):
 | 64 | 28.8k-29.1k req/s | 36.7k-36.9k req/s (+27%) | about the same |
 | 256 | 28.9k req/s | 36.4k req/s (+26%) | 254 MiB instead of 281 MiB |
 
+A WebSocket session keeps a floor too, learned from its `handle_info/2`
+calls, where a server push is usually built: a message from another
+process turned into a rendered, encoded frame. The next push starts at
+the heap the last one needed. It relearns every 16 messages while
+raised and drops back before the session hibernates. A session pushing
+a 50-item JSON message from `handle_info/2` collected once per push
+instead of five times, and a push took 48 µs instead of 78 to 82 µs,
+round trip included. Inbound frames run no floor code, so an echo or
+chat session answering small messages costs exactly what it did. An
+idle session holds the heap its last event left with or without the
+floor.
+
+Only a `handle_info/2` that needed at least `ws.heap_floor_min` (2586
+words, about 20 KB, by default) raises the floor, so small messages such
+as timers or presence pings leave it; `0` lets every message raise it.
+`ws.heap_floor` sets the cap for sessions alone (by default
+`handler_spawn.heap_floor`, `0` turns it off), and an upgrade can set
+both for its own session.
+
 To start every connection at a size from its first request, raise
 `min_heap_size` itself. On the bench's `httparena_json` route, which
 builds a 50-item JSON list per request (8 interleaved runs per side,
