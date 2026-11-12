@@ -83,6 +83,11 @@ All duration and interval values in `opts()` are in milliseconds —
 %% The inet `buffer` a plain-TCP socket starts with: what it reads request
 %% heads with and holds while it waits for the next request or frame.
 -define(DEFAULT_IDLE_RECV_BUFFER, 16384).
+%% The read buffer a plain-TCP WebSocket session starts at, unless the
+%% listener's `idle_recv_buffer` is smaller: most sessions exchange small
+%% messages and sit idle between them, and the buffer is held per socket.
+%% It grows for a large frame (`roadrunner_ws_session:arm_and_recv/2`).
+-define(WS_IDLE_RECV_BUFFER, 4096).
 %% Spawn config for every handler-running process (connection process +
 %% HTTP/2/3 stream workers). `fullsweep_after, 0` reclaims the per-connection
 %% heap that grows building a response (e.g. a JSON encoder's transient iolist)
@@ -165,7 +170,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   defaulting to 10 MB with over-cap closing the connection with code
   1009, plus `recv_buffer` (per-session inet `buffer` — bounds
   per-connection memory at high WebSocket concurrency; adapts between
-  the listener's `idle_recv_buffer` and `recv_buffer` when unset),
+  4 KB and the listener's `recv_buffer` when unset),
   `hibernate_after`
   (idle-session hibernation timeout in milliseconds; off when unset),
   `compress` (accept permessage-deflate, and with which zlib settings;
@@ -848,16 +853,16 @@ WebSocket session tunables (under `ws` in the listener opts).
   socket, so it bounds how many bytes one `{tcp, _, Data}` delivery
   carries AND what every connection pays in resident memory. Unset
   (the default), a session reading with `{active, once}` (plain TCP)
-  adapts it: it reads with the listener's `idle_recv_buffer` (16 KB
-  by default), grows the buffer to fit a frame whose header announces
+  adapts it: it starts reading with 4 KB (or the listener's
+  `idle_recv_buffer`, when smaller), grows the buffer to fit a frame whose header announces
   more than that (up to the listener's `recv_buffer`, 64 KB by
-  default) and keeps it while large frames keep coming, then goes
-  back after a small message. An idle connection holds the small
-  buffer, and large frames still arrive in one read. The resize
-  rides on the re-arm the session makes per message anyway. A
-  session reading with `{active, N}` (the default on TLS) cannot resize
-  per message, so it reads with the listener's `recv_buffer`. Set a
-  size to fix the buffer at it instead.
+  default), keeps it while large and small messages mix, and goes
+  back after 16 small messages in a row. An idle connection holds the
+  small buffer, and large frames still arrive in one read. The resize
+  rides on the re-arm the session makes per message anyway. A TLS
+  session, whose records run up to 16 KB, and one reading with
+  `{active, N}`, which cannot resize per message, read with the
+  listener's `recv_buffer`. Set a size to fix the buffer at it instead.
 - `hibernate_after` — idle milliseconds after which a WebSocket
   session hibernates (heap shrinks to the minimum until the next
   inbound event wakes it). The session-side counterpart of the
@@ -2374,11 +2379,12 @@ flatten_http3_opts(Entries) ->
     end.
 
 %% The `ws_buffer` proto opt: an explicit `ws.recv_buffer` as is; unset,
-%% adaptive from the socket's own buffer (`idle_recv_buffer`) up to the
-%% listener's `recv_buffer` (`roadrunner_ws_session:apply_ws_buffer/2`).
+%% adaptive from 4 KB (or the listener's `idle_recv_buffer`, when smaller)
+%% up to the listener's `recv_buffer`
+%% (`roadrunner_ws_session:apply_ws_buffer/2`).
 -spec ws_buffer(pos_integer() | undefined, pos_integer(), pos_integer()) ->
     pos_integer() | {adaptive, pos_integer(), pos_integer()}.
-ws_buffer(undefined, Base, Max) -> {adaptive, Base, Max};
+ws_buffer(undefined, Idle, Max) -> {adaptive, min(?WS_IDLE_RECV_BUFFER, Idle), Max};
 ws_buffer(WsBuffer, _Base, _Max) -> WsBuffer.
 
 %% A WebSocket session's heap floor as `{Min, Cap}`: `ws.heap_floor`'s

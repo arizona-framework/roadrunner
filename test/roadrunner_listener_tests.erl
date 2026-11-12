@@ -334,15 +334,15 @@ listener_threads_hibernate_after_into_proto_opts_test() ->
     ok = roadrunner_listener:stop(Name).
 
 listener_threads_ws_buffer_into_proto_opts_test() ->
-    %% Unset `ws.recv_buffer` adapts from the socket's `idle_recv_buffer`
-    %% (16 KB by default, lowered to `recv_buffer`) up to the listener's
+    %% Unset `ws.recv_buffer` adapts from 4 KB, or the socket's
+    %% `idle_recv_buffer` when that is smaller, up to the listener's
     %% `recv_buffer` (64 KB by default); an explicit `ws.recv_buffer` stays
     %% fixed.
     Cases = [
-        {#{}, {adaptive, 16384, 65536}},
-        {#{recv_buffer => 32768}, {adaptive, 16384, 32768}},
-        {#{recv_buffer => 8192}, {adaptive, 8192, 8192}},
-        {#{idle_recv_buffer => 4096}, {adaptive, 4096, 65536}},
+        {#{}, {adaptive, 4096, 65536}},
+        {#{recv_buffer => 32768}, {adaptive, 4096, 32768}},
+        {#{recv_buffer => 2048}, {adaptive, 2048, 2048}},
+        {#{idle_recv_buffer => 2048}, {adaptive, 2048, 65536}},
         {#{ws => #{recv_buffer => 4096}}, 4096}
     ],
     lists:foreach(

@@ -21,6 +21,7 @@ timeout, size caps and the session process's GC settings. The handler is
     listener_idle_timeout/1,
     tls_idle_session_closes/1,
     tls_echo_past_active_window/1,
+    tls_once_session_reads_large_frames/1,
     tcp_echo_past_active_window/1,
     tls_closed_before_arm_exits_cleanly/1,
     upgrade_frame_cap/1,
@@ -45,6 +46,7 @@ all() ->
         listener_idle_timeout,
         tls_idle_session_closes,
         tls_echo_past_active_window,
+        tls_once_session_reads_large_frames,
         tcp_echo_past_active_window,
         tls_closed_before_arm_exits_cleanly,
         upgrade_frame_cap,
@@ -69,6 +71,7 @@ end_per_testcase(_Case, _Config) ->
 listener_tls(Case) when
     Case =:= tls_idle_session_closes;
     Case =:= tls_echo_past_active_window;
+    Case =:= tls_once_session_reads_large_frames;
     Case =:= tls_closed_before_arm_exits_cleanly
 ->
     {ok, _} = application:ensure_all_started(ssl),
@@ -97,6 +100,8 @@ upgrade_opts(Case) when
     Case =:= tls_idle_session_closes
 ->
     #{idle_timeout => 100};
+upgrade_opts(tls_once_session_reads_large_frames) ->
+    #{active => once};
 upgrade_opts(tcp_echo_past_active_window) ->
     #{active => 4};
 upgrade_opts(upgrade_frame_cap) ->
@@ -198,6 +203,25 @@ tls_idle_session_closes(Config) ->
     ?assertMatch(<<"HTTP/1.1 101", _/binary>>, Bytes),
     _ = session(),
     ?assertEqual({terminated, timeout}, terminated()).
+
+tls_once_session_reads_large_frames(Config) ->
+    %% A TLS session reading with `{active, once}` keeps the listener's
+    %% read buffer (its records run up to 16 KB) instead of adapting it,
+    %% and answers large and small frames alike.
+    {ok, Sock} = ssl:connect(
+        {127, 0, 0, 1},
+        ?config(port, Config),
+        [binary, {active, false}, {verify, verify_none}],
+        5000
+    ),
+    ok = ssl:send(Sock, upgrade_request([])),
+    {ok, Bytes} = ssl:recv(Sock, 0, 5000),
+    ?assertMatch(<<"HTTP/1.1 101", _/binary>>, Bytes),
+    Big = binary:copy(~"x", 20000),
+    ok = ssl:send(Sock, masked16(16#81, Big)),
+    ?assertEqual({ok, <<16#81, 126, 20000:16, Big/binary>>}, ssl:recv(Sock, 20004, 5000)),
+    ok = ssl:send(Sock, masked(16#81, ~"hi")),
+    ?assertEqual({ok, <<16#81, 2, "hi">>}, ssl:recv(Sock, 4, 5000)).
 
 tls_echo_past_active_window(Config) ->
     %% A TLS session reads with `{active, N}`; more echoes than one arm
@@ -355,6 +379,14 @@ recv_frame(Sock, Timeout) ->
     {ok, <<Op, Len>>} = gen_tcp:recv(Sock, 2, Timeout),
     {ok, Payload} = gen_tcp:recv(Sock, Len, Timeout),
     <<Op, Len, Payload/binary>>.
+
+%% A masked client frame with a 16-bit payload length (126 to 65535 bytes).
+masked16(OpByte, Payload) ->
+    Key = <<1, 2, 3, 4>>,
+    KeyBin = binary:copy(Key, (byte_size(Payload) div 4) + 1),
+    <<KeySlice:(byte_size(Payload))/binary, _/binary>> = KeyBin,
+    <<OpByte, (16#80 bor 126), (byte_size(Payload)):16, Key/binary,
+        (crypto:exor(Payload, KeySlice))/binary>>.
 
 masked(OpByte, Payload) ->
     Key = <<1, 2, 3, 4>>,
