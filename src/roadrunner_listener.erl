@@ -1844,6 +1844,9 @@ build_proto_opts(Opts, ListenerName) ->
     %% Flatten the nested `handler_spawn` opt to top-level proto_opts keys the
     %% spawn sites read directly, mirroring the `ws` / `http2` flattening above.
     HandlerSpawnOpts = resolve_handler_spawn(Opts),
+    %% After `resolve_handler_spawn/1`, which rejects a malformed
+    %% `handler_spawn` before its `heap_floor` is read here.
+    {WsHeapFloorMin, WsHeapFloorMax} = ws_heap_floor(WsHeapFloor, Opts),
     Optional = maps:merge(
         maps:merge(maybe_alt_svc(Protocols, Opts), maybe_grow(Opts)), heap_floor(Opts)
     ),
@@ -1860,7 +1863,8 @@ build_proto_opts(Opts, ListenerName) ->
             ws_compress => roadrunner_ws:compress_config(WsCompress),
             ws_idle_timeout => WsIdleTimeout,
             ws_active => WsActive,
-            ws_heap_floor => ws_heap_floor(WsHeapFloor, Opts),
+            ws_heap_floor_min => WsHeapFloorMin,
+            ws_heap_floor_max => WsHeapFloorMax,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             tls_handshake_timeout =>
                 maps:get(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT),

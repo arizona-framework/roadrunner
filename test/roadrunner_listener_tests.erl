@@ -982,7 +982,7 @@ listener_heap_floor_into_proto_opts_test() ->
     ).
 
 listener_ws_heap_floor_into_proto_opts_test() ->
-    %% `ws_heap_floor => {Min, Cap}`: `ws.heap_floor`'s `min` (2586 unless
+    %% `ws_heap_floor_min` and `ws_heap_floor_max`: `ws.heap_floor`'s `min` (2586 unless
     %% set) and `max`, which defaults to `handler_spawn.heap_floor`'s (`0`
     %% when either is `false`).
     Cases = [
@@ -1004,7 +1004,8 @@ listener_ws_heap_floor_into_proto_opts_test() ->
                 Name, Extra#{port => 0, routes => roadrunner_hello_handler}
             ),
             ProtoOpts = element(4, sys:get_state(ListenerPid)),
-            ?assertEqual(Expected, maps:get(ws_heap_floor, ProtoOpts)),
+            #{ws_heap_floor_min := Min, ws_heap_floor_max := Max} = ProtoOpts,
+            ?assertEqual(Expected, {Min, Max}),
             ok = roadrunner_listener:stop(Name)
         end,
         Cases

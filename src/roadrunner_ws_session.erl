@@ -344,11 +344,14 @@ session_opt(active, V, Opts) ->
     Opts#{ws_active := V};
 session_opt(hibernate_after, V, Opts) ->
     Opts#{ws_hibernate_after := V};
-session_opt(heap_floor, false, #{ws_heap_floor := {Min, _Cap}} = Opts) ->
-    Opts#{ws_heap_floor := {Min, 0}};
-session_opt(heap_floor, #{} = Floor, #{ws_heap_floor := {Min, Cap}} = Opts) ->
+session_opt(heap_floor, false, Opts) ->
+    Opts#{ws_heap_floor_max := 0};
+session_opt(heap_floor, #{} = Floor, #{ws_heap_floor_min := Min, ws_heap_floor_max := Cap} = Opts) ->
     %% Keys the upgrade leaves out keep the listener's.
-    Opts#{ws_heap_floor := {maps:get(min, Floor, Min), maps:get(max, Floor, Cap)}};
+    Opts#{
+        ws_heap_floor_min := maps:get(min, Floor, Min),
+        ws_heap_floor_max := maps:get(max, Floor, Cap)
+    };
 session_opt(Flag, V, #{handler_spawn_opts := Spawn} = Opts) when
     Flag =:= fullsweep_after; Flag =:= min_heap_size; Flag =:= max_heap_size
 ->
@@ -1180,7 +1183,7 @@ wait(Data, false) -> recv_loop(Data).
 %% smaller gives the heap back.
 -spec heap_floor(roadrunner_conn:proto_opts()) ->
     {pos_integer(), pos_integer(), pos_integer(), non_neg_integer()} | undefined.
-heap_floor(#{ws_heap_floor := {Min, Cap}}) ->
+heap_floor(#{ws_heap_floor_min := Min, ws_heap_floor_max := Cap}) ->
     %% After `apply_gc_settings/1`: the session's own `min_heap_size`, as
     %% the emulator rounded it, or the emulator's default.
     {min_heap_size, Base} = erlang:process_info(self(), min_heap_size),
