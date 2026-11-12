@@ -175,6 +175,9 @@
 -record(h3, {
     conn :: pid(),
     proto_opts :: roadrunner_conn:proto_opts(),
+    %% The heap floor this connection starts its workers at
+    %% (`roadrunner_stream_worker:conn_heap_floor/1`).
+    heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor(),
     listener_name :: atom(),
     peer :: {inet:ip_address(), inet:port_number()} | undefined,
     %% The connection queries each request carries, built once: they ask
@@ -311,6 +314,7 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
     loop(#h3{
         conn = Conn,
         proto_opts = ProtoOpts,
+        heap_floor = roadrunner_stream_worker:conn_heap_floor(ProtoOpts),
         listener_name = ListenerName,
         peer = Peer,
         conn_info = conn_info(Conn),
@@ -556,13 +560,21 @@ start_worker(
         conn = Conn,
         proto_opts = ProtoOpts,
         peer_max_field_section_size = PeerLimit,
+        heap_floor = HeapFloor,
         drain_deadline = Deadline
     },
     StreamId,
     Req
 ) ->
     {WorkerPid, _MonRef} =
-        Worker = roadrunner_http3_stream_worker:start(Conn, StreamId, Req, ProtoOpts, PeerLimit),
+        Worker = roadrunner_http3_stream_worker:start(
+            Conn,
+            StreamId,
+            Req,
+            ProtoOpts,
+            PeerLimit,
+            roadrunner_stream_worker:heap_floor(HeapFloor, StreamId, h3)
+        ),
     _ =
         case Deadline of
             undefined -> ok;

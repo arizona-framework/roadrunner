@@ -379,8 +379,11 @@
     %% (no limit, the §6.5.2 default) until a SETTINGS frame carries it.
     %% Not to be confused with `max_header_list_size`, our own limit on
     %% request headers. Handed to each worker as it is spawned
-    %% (`roadrunner_http2_stream_worker:start/5`), which applies it.
+    %% (`roadrunner_http2_stream_worker:start/6`), which applies it.
     peer_max_header_list_size = infinity :: non_neg_integer() | infinity,
+    %% The heap floor this connection starts its workers at
+    %% (`roadrunner_stream_worker:conn_heap_floor/1`).
+    heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor(),
     %% The `Deadline` of the first `{roadrunner_drain, Deadline}`
     %% message, `undefined` until one arrives. In drain mode we've
     %% already sent GOAWAY(NO_ERROR) and passed the message on to every
@@ -434,6 +437,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
+        heap_floor = roadrunner_stream_worker:conn_heap_floor(ProtoOpts),
         listener_name = ListenerName,
         peer = Peer,
         conn_info = roadrunner_conn:conn_info(Socket),
@@ -753,13 +757,21 @@ start_worker(
     #loop{
         proto_opts = ProtoOpts,
         peer_max_header_list_size = PeerLimit,
+        heap_floor = HeapFloor,
         drain_deadline = Deadline
     },
     StreamId,
     Req
 ) ->
     {WorkerPid, _MonRef} =
-        Worker = roadrunner_http2_stream_worker:start(self(), StreamId, Req, ProtoOpts, PeerLimit),
+        Worker = roadrunner_http2_stream_worker:start(
+            self(),
+            StreamId,
+            Req,
+            ProtoOpts,
+            PeerLimit,
+            roadrunner_stream_worker:heap_floor(HeapFloor, StreamId, h2)
+        ),
     _ =
         case Deadline of
             undefined -> ok;

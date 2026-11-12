@@ -1,10 +1,13 @@
 -module(roadrunner_heap_floor_handler).
 -moduledoc """
-Test fixture for `roadrunner_heap_floor_SUITE`. The route state picks what
-it does: `{alloc, Report}` builds a large live term before it answers (so
-the connection's heap grows) and tells `Report` the connection pid;
-`report` answers with the connection's `min_heap_size`; `{ws, Report}`
-upgrades and tells `Report` the session's `min_heap_size`.
+Test fixture for `roadrunner_heap_floor_SUITE` and
+`roadrunner_stream_heap_floor_SUITE`. The route state picks what it does:
+`{alloc, Report}` builds a large live term before it answers (so the
+heap of the process running it grows) and tells `Report` that pid;
+`{gated_alloc, Report}` tells `Report` its pid, waits for `go`, then
+builds a smaller one; `report` answers with the running process's
+`min_heap_size`; `{ws, Report}` upgrades and tells `Report` the
+session's `min_heap_size`.
 """.
 
 -behaviour(roadrunner_handler).
@@ -20,6 +23,13 @@ handle({alloc, Report}, Req) ->
     Report ! {conn, self()},
     %% About 40,000 words kept live until the handler returns.
     Live = lists:seq(1, 20000),
+    {roadrunner_resp:text(200, integer_to_binary(length(Live))), Req};
+handle({gated_alloc, Report}, Req) ->
+    Report ! {gated, self()},
+    receive
+        go -> ok
+    end,
+    Live = lists:seq(1, 2000),
     {roadrunner_resp:text(200, integer_to_binary(length(Live))), Req};
 handle(report, Req) ->
     {roadrunner_resp:text(200, integer_to_binary(min_heap_size())), Req};

@@ -35,7 +35,7 @@ logger_metadata_set_in_h2_worker_test_() ->
             tls_handshake_timeout => 5000
         },
         {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
-            ConnPid, StreamId, Req, ProtoOpts, infinity
+            ConnPid, StreamId, Req, ProtoOpts, infinity, undefined
         ),
         Body = recv_response_body(StreamId),
         ok = recv_worker_exit(MonRef, WorkerPid),

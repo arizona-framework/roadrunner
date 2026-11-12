@@ -66,8 +66,8 @@
 %% oversized fields never reach the conn's HPACK encoder. HTTP/3 does the
 %% same (`roadrunner_http3_stream_worker`).
 
--export([start/5]).
--export([init/5]).
+-export([start/6]).
+-export([init/6]).
 %% `roadrunner_stream_worker` callbacks.
 -export([send_buffered/5, emit_handler_response/4, send_interim/4, start_stream/5]).
 %% For the conn, which builds the section it sends with it.
@@ -98,7 +98,12 @@ sees the `'DOWN'` and emits `RST_STREAM(INTERNAL_ERROR)` for the
 stream's id, leaving the other 99 streams intact.
 """.
 -spec start(
-    pid(), pos_integer(), roadrunner_req:request(), map(), non_neg_integer() | infinity
+    pid(),
+    pos_integer(),
+    roadrunner_req:request(),
+    map(),
+    non_neg_integer() | infinity,
+    roadrunner_stream_worker:heap_floor()
 ) ->
     {pid(), reference()}.
 start(
@@ -106,12 +111,13 @@ start(
     StreamId,
     Req,
     #{handler_spawn_opts := SpawnOpts, dispatch := Dispatch} = ProtoOpts,
-    PeerLimit
+    PeerLimit,
+    HeapFloor
 ) ->
     spawn_opt(
         ?MODULE,
         init,
-        [ConnPid, StreamId, Req, Dispatch, peer_limit(PeerLimit, ProtoOpts)],
+        [ConnPid, StreamId, Req, Dispatch, peer_limit(PeerLimit, ProtoOpts), HeapFloor],
         [monitor | SpawnOpts]
     ).
 
@@ -131,9 +137,10 @@ peer_limit(Limit, ProtoOpts) ->
     pos_integer(),
     roadrunner_req:request(),
     roadrunner_conn:dispatch(),
-    {non_neg_integer(), binary() | undefined} | infinity
+    {non_neg_integer(), binary() | undefined} | infinity,
+    roadrunner_stream_worker:heap_floor()
 ) -> ok.
-init(ConnPid, StreamId, Req, Dispatch, PeerLimit) ->
+init(ConnPid, StreamId, Req, Dispatch, PeerLimit, HeapFloor) ->
     proc_lib:set_label({roadrunner_http2_stream_worker, StreamId}),
     %% Mirror the h1 path: attach request-scoped metadata so any
     %% `?LOG_*` from middleware/handlers is auto-correlated by
@@ -144,7 +151,7 @@ init(ConnPid, StreamId, Req, Dispatch, PeerLimit) ->
     %% No conn monitor here: a buffered response goes one way and never
     %% waits on the conn, so only the stream / loop emitters, which do,
     %% set one up (`roadrunner_http2_worker_sync:monitor_conn/1`).
-    ok = roadrunner_stream_worker:run(?MODULE, h2, ConnPid, StreamId, Req, Dispatch),
+    ok = roadrunner_stream_worker:run(?MODULE, h2, ConnPid, StreamId, Req, Dispatch, HeapFloor),
     %% No explicit completion message: the worker is spawn_monitored by
     %% the conn, which finalises the stream on the worker's `DOWN`
     %% (`normal` -> clean removal, or once a buffered body still queued
