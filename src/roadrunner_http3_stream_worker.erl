@@ -44,8 +44,8 @@
 %% unsafe header is; trailers over it, or a 500 that is itself over it,
 %% crash the worker, so the conn loop resets the stream (H3_INTERNAL_ERROR).
 
--export([start/5]).
--export([init/5]).
+-export([start/6]).
+-export([init/6]).
 %% Exported for `roadrunner_conn_loop_http3` to emit a buffered
 %% response (e.g. 413) directly, without spawning a worker.
 -export([send_buffered/5]).
@@ -86,14 +86,23 @@ at the connection / stream level, not by crashing this worker).
     non_neg_integer(),
     roadrunner_req:request(),
     roadrunner_conn:proto_opts(),
-    non_neg_integer() | infinity
+    non_neg_integer() | infinity,
+    roadrunner_stream_worker:heap_floor()
 ) ->
     {pid(), reference()}.
 start(
-    Conn, StreamId, Req, #{handler_spawn_opts := SpawnOpts, dispatch := Dispatch}, MaxFieldSection
+    Conn,
+    StreamId,
+    Req,
+    #{handler_spawn_opts := SpawnOpts, dispatch := Dispatch},
+    MaxFieldSection,
+    HeapFloor
 ) ->
     spawn_opt(
-        ?MODULE, init, [Conn, StreamId, Req, Dispatch, MaxFieldSection], [monitor | SpawnOpts]
+        ?MODULE,
+        init,
+        [Conn, StreamId, Req, Dispatch, MaxFieldSection, HeapFloor],
+        [monitor | SpawnOpts]
     ).
 
 -doc false.
@@ -102,16 +111,17 @@ start(
     non_neg_integer(),
     roadrunner_req:request(),
     roadrunner_conn:dispatch(),
-    non_neg_integer() | infinity
+    non_neg_integer() | infinity,
+    roadrunner_stream_worker:heap_floor()
 ) -> ok.
-init(Conn, StreamId, Req, Dispatch, MaxFieldSection) ->
+init(Conn, StreamId, Req, Dispatch, MaxFieldSection, HeapFloor) ->
     proc_lib:set_label({roadrunner_http3_stream_worker, StreamId}),
     %% Attach request-scoped logger metadata so any `?LOG_*` from
     %% middleware/handlers is auto-correlated by `request_id` — the
     %% handler runs in this worker, not on the conn loop.
     ok = roadrunner_conn:set_request_logger_metadata(Req),
     ok = set_peer_limit(MaxFieldSection),
-    roadrunner_stream_worker:run(?MODULE, h3, Conn, StreamId, Req, Dispatch).
+    roadrunner_stream_worker:run(?MODULE, h3, Conn, StreamId, Req, Dispatch, HeapFloor).
 
 %% Keep the client's limit for the send paths; nothing when it set none,
 %% so `get(?PEER_LIMIT_KEY)` is `undefined` and no size is computed.

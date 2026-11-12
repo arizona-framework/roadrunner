@@ -89,8 +89,8 @@ All duration and interval values in `opts()` are in milliseconds —
 %% instead of hoarding it as old-gen garbage across keep-alive requests — at
 %% high connection counts the difference between hundreds of MB and a few GB.
 -define(DEFAULT_HANDLER_SPAWN_OPTS, [{fullsweep_after, 0}]).
-%% The most heap, in words, an HTTP/1.1 connection keeps between requests as
-%% its floor (`handler_spawn.heap_floor`): a step of the emulator's heap-size
+%% The most heap, in words, a connection keeps between requests as its floor,
+%% or starts its HTTP/2 and HTTP/3 stream workers at (`handler_spawn.heap_floor`): a step of the emulator's heap-size
 %% ladder, about 360 KB, well above what a handler building a sizeable JSON
 %% response needs (about 17,700 words).
 -define(DEFAULT_HEAP_FLOOR, 46422).
@@ -371,8 +371,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   The measurements behind all of this are in
   [Resource limits](resource_limits.md).
 
-  `heap_floor` is the most heap, in words, an HTTP/1.1 connection keeps
-  between requests. Under full sweeps a connection's heap starts small,
+  `heap_floor` is the most heap, in words, a connection keeps between
+  requests. Under full sweeps a connection's heap starts small,
   so every request grows it again over several collections; after each
   request, the connection instead keeps the heap that request needed,
   up to `heap_floor`, as its `min_heap_size`, and the next request
@@ -384,7 +384,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   default) and is learned again, so a connection whose requests got
   smaller gives the larger heap back. A connection between requests
   holds about the same heap either way, since it collects nothing while
-  it waits.
+  it waits. HTTP/2 and HTTP/3 run each request in a stream worker of
+  its own, so there the connection keeps the floor: each worker raises
+  it to the heap its request needed and the next worker starts at that
+  size, and every 16th stream starts at the base and learns it again.
   Default `46422` (about 360 KB); `0` turns it off.
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.

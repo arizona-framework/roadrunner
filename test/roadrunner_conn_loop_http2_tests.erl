@@ -3470,7 +3470,7 @@ telemetry_request_exception_fires_on_h2_handler_crash() ->
 
 telemetry_request_stop_fires_for_router_404() ->
     %% Router-based dispatch where no route matches → 404 path
-    %% in `roadrunner_stream_worker:run/6` short-circuits past the
+    %% in `roadrunner_stream_worker:run/7` short-circuits past the
     %% handler invoke and still fires request_stop with status=404.
     HandlerId = attach_telemetry([[roadrunner, request, stop]]),
     try

@@ -445,10 +445,21 @@ last request left either way: 1000 connections idle after a large JSON
 response held the same memory. Set `heap_floor => 0` to turn it off.
 
 HTTP/2 and HTTP/3 run each request in a stream worker of its own, which
-the floor does not reach. For those, or to start every connection at a
-size from its first request, raise `min_heap_size` itself. On the
-bench's `httparena_json` route, which builds a 50-item JSON list per
-request (8 interleaved runs per side, before the floor existed):
+lives for that request alone, so there the connection keeps the floor:
+each worker raises it to the heap its request needed, the next worker
+starts at that size, and every 16th stream starts at the base and
+learns it again. On the arena-style JSON load over h2c (32 streams per
+connection, 3 alternating rounds at 64 connections, one at 256):
+
+| connections | without the floor | with it | peak memory |
+| --- | --- | --- | --- |
+| 64 | 28.8k-29.1k req/s | 36.7k-36.9k req/s (+27%) | about the same |
+| 256 | 28.9k req/s | 36.4k req/s (+26%) | 254 MiB instead of 281 MiB |
+
+To start every connection at a size from its first request, raise
+`min_heap_size` itself. On the bench's `httparena_json` route, which
+builds a 50-item JSON list per request (8 interleaved runs per side,
+before the floor existed):
 
 | `handler_spawn` opts | collections per request | req/s | CPU per request |
 | --- | --- | --- | --- |

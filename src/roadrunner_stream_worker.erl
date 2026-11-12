@@ -7,7 +7,20 @@
 %% on the stream differs, so each worker implements the two callbacks
 %% below and passes its module in.
 
--export([run/6]).
+-export([run/7]).
+-export([conn_heap_floor/1, heap_floor/3]).
+-export_type([conn_heap_floor/0, heap_floor/0]).
+
+%% The heap floor of a connection: the min_heap_size it starts its stream
+%% workers at, in an atomics cell its workers raise (see conn_heap_floor/1).
+%% Base is the size workers start at without it, Cap the most it rises to.
+-type conn_heap_floor() ::
+    {atomics:atomics_ref(), Base :: pos_integer(), Cap :: pos_integer()} | undefined.
+%% What a worker gets of it: the floor it starts at, beside the cell, base
+%% and cap (see heap_floor/3).
+-type heap_floor() ::
+    {atomics:atomics_ref(), Floor :: pos_integer(), Base :: pos_integer(), Cap :: pos_integer()}
+    | undefined.
 
 %% Send a complete response (headers and body) on the stream.
 -callback send_buffered(
@@ -43,9 +56,11 @@
     pid(),
     non_neg_integer(),
     roadrunner_req:request(),
-    roadrunner_conn:dispatch()
+    roadrunner_conn:dispatch(),
+    heap_floor()
 ) -> ok.
-run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
+run(Worker, Protocol, Conn, StreamId, Req, Dispatch, HeapFloor) ->
+    ok = start_at_heap_floor(HeapFloor),
     %% `dispatch` is set by listener init and always present. The matched
     %% route's `Pipeline` is a pre-composed `next()` fun (listener mws ++
     %% per-route mws, with `state` injected up front if attached, ending in
@@ -64,7 +79,8 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
                         Handler,
                         Pipeline,
                         Req1#{bindings => Bindings},
-                        Span
+                        Span,
+                        HeapFloor
                     );
                 too_large ->
                     ok = Worker:send_buffered(
@@ -98,6 +114,86 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch) ->
             ok = roadrunner_event:request_stop(Span, 404, buffered)
     end.
 
+%% A stream worker starts with a small heap and grows it over several
+%% collections to what its request needs, as an HTTP/1.1 connection did
+%% before its heap floor (`roadrunner_conn_loop:raise_heap_floor/1`). A
+%% worker lives for one request, so the connection keeps the floor instead:
+%% each worker raises the connection's cell to the heap its request needed,
+%% up to the cap, and the next worker starts at that size. Every 16th
+%% stream starts at the base and resets the cell, so the floor is learned
+%% again and a connection whose requests got smaller stops sizing workers
+%% for the larger ones.
+
+%% The connection's cell, or `undefined` when the listener's
+%% `handler_spawn.heap_floor` is `0` or no higher than the base.
+-doc false.
+-spec conn_heap_floor(roadrunner_conn:proto_opts()) -> conn_heap_floor().
+conn_heap_floor(#{heap_floor := Cap, handler_spawn_opts := SpawnOpts}) ->
+    Base =
+        case lists:keyfind(min_heap_size, 1, SpawnOpts) of
+            {min_heap_size, Words} -> Words;
+            false -> element(2, erlang:system_info(min_heap_size))
+        end,
+    case Cap > Base of
+        true ->
+            Cell = atomics:new(1, []),
+            ok = atomics:put(Cell, 1, Base),
+            {Cell, Base, Cap};
+        false ->
+            undefined
+    end;
+conn_heap_floor(#{}) ->
+    undefined.
+
+%% The floor the next worker starts at. `Relearn` (every 16th stream)
+%% starts it at the base and resets the cell.
+-doc false.
+-spec heap_floor(conn_heap_floor(), non_neg_integer(), h2 | h3) -> heap_floor().
+heap_floor(undefined, _StreamId, _Protocol) ->
+    undefined;
+heap_floor({Cell, Base, Cap}, StreamId, Protocol) ->
+    case relearn(StreamId, Protocol) of
+        true ->
+            ok = atomics:put(Cell, 1, Base),
+            {Cell, Base, Base, Cap};
+        false ->
+            {Cell, atomics:get(Cell, 1), Base, Cap}
+    end.
+
+%% Client-initiated request streams count up by 2 on HTTP/2 (1, 3, 5, ...)
+%% and by 4 on HTTP/3 (0, 4, 8, ...): every 16th of them relearns.
+-spec relearn(non_neg_integer(), h2 | h3) -> boolean().
+relearn(StreamId, h2) -> (StreamId bsr 1) rem 16 =:= 0;
+relearn(StreamId, h3) -> (StreamId bsr 2) rem 16 =:= 0.
+
+-spec start_at_heap_floor(heap_floor()) -> ok.
+start_at_heap_floor({_Cell, Floor, Base, _Cap}) when Floor > Base ->
+    _ = erlang:process_flag(min_heap_size, Floor),
+    ok;
+start_at_heap_floor(_HeapFloor) ->
+    ok.
+
+%% Sampled when the handler returns, before the response is encoded. Two
+%% workers raising at once can leave the smaller of their sizes; the next
+%% worker that needs more raises it again.
+-spec raise_heap_floor(heap_floor()) -> ok.
+raise_heap_floor(undefined) ->
+    ok;
+raise_heap_floor({_Cell, Cap, _Base, Cap}) ->
+    %% Started at the cap: nothing to raise, so skip reading the heap.
+    ok;
+raise_heap_floor({Cell, Floor, _Base, Cap}) ->
+    {heap_size, Heap} = erlang:process_info(self(), heap_size),
+    case min(Heap, Cap) of
+        Needed when Needed > Floor ->
+            case atomics:get(Cell, 1) of
+                Current when Needed > Current -> atomics:put(Cell, 1, Needed);
+                _ -> ok
+            end;
+        _ ->
+            ok
+    end.
+
 %% The request held to its route's own `max_content_length`, or `too_large`.
 %% The connection holds a buffered body to the listener's cap, raised to the
 %% route's when a body outgrows it, so only a route cap tighter than the
@@ -123,7 +219,8 @@ route_body(_Limits, Req) ->
     module(),
     roadrunner_middleware:next(),
     roadrunner_req:request(),
-    roadrunner_event_handler:span()
+    roadrunner_event_handler:span(),
+    heap_floor()
 ) -> ok.
 invoke(
     Worker,
@@ -133,12 +230,15 @@ invoke(
     Handler,
     Pipeline,
     #{method := Method} = Req,
-    Span
+    Span,
+    HeapFloor
 ) ->
     try Pipeline(Req) of
         {{send, Headers, Fun}, Req2} when is_list(Headers), is_function(Fun, 1) ->
+            ok = raise_heap_floor(HeapFloor),
             run_send(Worker, Protocol, Conn, StreamId, Handler, Req2, Headers, Fun, Span);
         {Response0, Req2} ->
+            ok = raise_heap_floor(HeapFloor),
             %% A handler-returned 1xx or unsafe header becomes a 500 here,
             %% for every shape (`roadrunner_conn:final_response/3`,
             %% `safe_response/3`). Telemetry reports the status actually
