@@ -898,18 +898,19 @@ listener_rejects_invalid_idle_recv_buffer_test() ->
 
 listener_socket_buffer_by_transport_test() ->
     %% A plain-TCP listener's sockets (HTTP/1.1 and prior-knowledge h2c)
-    %% start at `idle_recv_buffer` (16 KB by default, lowered to
+    %% start at `idle_recv_buffer` (4 KB by default, lowered to
     %% `recv_buffer`) and carry `grow_recv_buffer`, the sizes a conn grows
     %% between before a large body, when that is below `recv_buffer`. TLS
     %% sockets, and TLS behind the PROXY protocol (plain until the conn
     %% upgrades it), keep `recv_buffer` and carry no key.
     Tls = roadrunner_test_certs:server_opts(),
     Cases = [
-        {#{}, 16384, {16384, 65536}},
-        {#{idle_recv_buffer => 4096}, 4096, {4096, 65536}},
-        {#{recv_buffer => 8192}, 8192, none},
+        {#{}, 4096, {4096, 65536}},
+        {#{idle_recv_buffer => 16384}, 16384, {16384, 65536}},
+        {#{recv_buffer => 8192}, 4096, {4096, 8192}},
+        {#{recv_buffer => 2048}, 2048, none},
         {#{idle_recv_buffer => 32768, recv_buffer => 131072}, 32768, {32768, 131072}},
-        {#{protocols => [http2]}, 16384, {16384, 65536}},
+        {#{protocols => [http2]}, 4096, {4096, 65536}},
         {#{tls => Tls}, 65536, none},
         {#{tls => Tls, proxy_protocol => true}, 65536, none}
     ],
