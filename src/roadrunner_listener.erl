@@ -378,12 +378,13 @@ Optional middleware and timing knobs (durations in milliseconds):
   up to `heap_floor`, as its `min_heap_size`, and the next request
   starts at that size. A handler that builds a sizeable response then
   collects a few times per request instead of several, which cost
-  connections serving such handlers about a fifth of their CPU. The
-  floor only rises, so a connection resizes its heap a handful of times
-  in its life, not once per request; it drops back to `min_heap_size`
-  (or the emulator's default) before the connection hibernates or runs
-  a WebSocket session. A connection between requests holds about the
-  same heap either way, since it collects nothing while it waits.
+  connections serving such handlers about a fifth of their CPU. Every
+  16 requests, and before the connection hibernates or runs a WebSocket
+  session, the floor drops back to `min_heap_size` (or the emulator's
+  default) and is learned again, so a connection whose requests got
+  smaller gives the larger heap back. A connection between requests
+  holds about the same heap either way, since it collects nothing while
+  it waits.
   Default `46422` (about 360 KB); `0` turns it off.
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.

@@ -465,6 +465,9 @@ proxy_protocol_stage(Socket, #{proxy_protocol := true} = ProtoOpts, OsPeer) ->
 
 %% A v1 header (CRLF included) never exceeds 107 bytes (HAProxy spec §2.1).
 -define(PROXY_V1_MAX, 107).
+%% Every this many requests a connection drops its heap floor and learns it
+%% again (`raise_heap_floor/1`).
+-define(HEAP_FLOOR_RELEARN, 16).
 
 %% Exact read for the TLS case. Six bytes tell v1 (`PROXY `) from v2 (the
 %% first six bytes of its signature); a v2 prefix then declares the length of
@@ -1131,10 +1134,14 @@ large_body({error, _}, _Buffered, _Idle) -> false.
 %% request needs. Keeping the heap the last request needed as the floor
 %% (`min_heap_size`, up to `Cap`) lets the next request start at that size,
 %% so a handler building a sizeable response collects a few times per
-%% request instead of several. Raising the floor resizes the heap at once,
-%% so it only ever rises: a connection resizes a handful of times in its
-%% life, not once per request. Sampled when the handler returns, before the
-%% response is encoded.
+%% request instead of several. Sampled when the handler returns, before the
+%% response is encoded. Raising the floor resizes the heap at once, so it
+%% does not follow each request down; instead, every `?HEAP_FLOOR_RELEARN`
+%% requests it drops back to `Base` and the next request sets it again.
+%% Dropping it resizes nothing: the heap shrinks only at a collection that
+%% finds it mostly empty, which a connection whose requests still need the
+%% heap never makes, while one now serving smaller requests gives the
+%% memory back.
 -spec heap_floor(roadrunner_conn:proto_opts()) ->
     {pos_integer(), pos_integer(), pos_integer()} | undefined.
 heap_floor(#{heap_floor := Cap}) ->
@@ -1152,6 +1159,10 @@ heap_floor(#{}) ->
 -spec raise_heap_floor(#loop_state{}) -> #loop_state{}.
 raise_heap_floor(#loop_state{heap_floor = undefined} = S) ->
     S;
+raise_heap_floor(#loop_state{requests_served = Served} = S) when
+    Served rem ?HEAP_FLOOR_RELEARN =:= 0
+->
+    reset_heap_floor(S);
 raise_heap_floor(#loop_state{heap_floor = {Floor, Base, Cap}} = S) ->
     {heap_size, Heap} = erlang:process_info(self(), heap_size),
     case min(Heap, Cap) of

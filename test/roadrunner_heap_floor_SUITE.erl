@@ -18,6 +18,7 @@ WebSocket session. The handler is `roadrunner_heap_floor_handler`.
     floor_off/1,
     floor_starts_at_the_spawn_min_heap_size/1,
     floor_off_when_the_cap_is_under_the_spawn_min_heap_size/1,
+    floor_relearns_every_16_requests/1,
     floor_resets_before_hibernating/1,
     floor_resets_for_a_websocket_session/1
 ]).
@@ -34,6 +35,7 @@ all() ->
         floor_off,
         floor_starts_at_the_spawn_min_heap_size,
         floor_off_when_the_cap_is_under_the_spawn_min_heap_size,
+        floor_relearns_every_16_requests,
         floor_resets_before_hibernating,
         floor_resets_for_a_websocket_session
     ].
@@ -104,6 +106,18 @@ floor_off_when_the_cap_is_under_the_spawn_min_heap_size(Config) ->
     Sock = connect(Config),
     ok = alloc(Sock),
     ?assertEqual(rounded(2000), report(Sock)).
+
+%% Every 16th request drops the floor, so the 17th starts at the base: a
+%% connection whose requests got smaller can give the heap back. Each
+%% report reads the floor before its own request is counted.
+floor_relearns_every_16_requests(Config) ->
+    Sock = connect(Config),
+    ok = alloc(Sock),
+    Floors = [report(Sock) || _ <- lists:seq(2, 16)],
+    ?assert(lists:all(fun(Floor) -> Floor > base() end, Floors)),
+    ?assertEqual(base(), report(Sock)),
+    ok = alloc(Sock),
+    ?assert(report(Sock) > base()).
 
 %% The floor drops back before the connection hibernates, so it sleeps and
 %% wakes small, and the next requests raise it again.

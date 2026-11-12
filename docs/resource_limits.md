@@ -422,9 +422,13 @@ server's CPU.
 An HTTP/1.1 connection therefore keeps a heap floor: after each request
 it raises its `min_heap_size` to the heap that request needed, up to
 `handler_spawn`'s `heap_floor` (46422 words, about 360 KB, by default),
-and the next request starts at that size. The floor only rises, so a
-connection resizes its heap a handful of times in its life, and it drops
-back before the connection hibernates or runs a WebSocket session. In a
+and the next request starts at that size. Every 16 requests, and before
+the connection hibernates or runs a WebSocket session, the floor drops
+back and is learned again. Dropping it costs a connection whose requests
+still need the heap nothing, since the heap only shrinks at a collection
+that finds it mostly empty, while a connection that served one large
+response and now serves small ones gives the memory back: without that,
+it would keep the large heap as long as it stayed busy. In a
 two-sided A/B against the arena-style JSON, pipelined and mixed
 GET/POST loads (1024 connections, a fresh server per run):
 
