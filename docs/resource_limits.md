@@ -421,7 +421,7 @@ server's CPU.
 
 An HTTP/1.1 connection therefore keeps a heap floor: after each request
 it raises its `min_heap_size` to the heap that request needed, up to
-`handler_spawn`'s `heap_floor` (46422 words, about 360 KB, by default),
+`handler_spawn`'s `heap_floor` `max` (46422 words, about 360 KB, by default),
 and the next request starts at that size. Every 16 requests, and before
 the connection hibernates or runs a WebSocket session, the floor drops
 back and is learned again. Dropping it costs a connection whose requests
@@ -442,7 +442,7 @@ Busy connections held about 10% more memory on the JSON load and the
 same on the others. Idle connections cost the same with and without it,
 since a connection that waits collects nothing and so keeps the heap its
 last request left either way: 1000 connections idle after a large JSON
-response held the same memory. Set `heap_floor => 0` to turn it off.
+response held the same memory. Set `heap_floor => false` to turn it off.
 
 HTTP/2 and HTTP/3 run each request in a stream worker of its own, which
 lives for that request alone, so there the connection keeps the floor:
@@ -468,12 +468,13 @@ chat session answering small messages costs exactly what it did. An
 idle session holds the heap its last event left with or without the
 floor.
 
-Only a `handle_info/2` that needed at least `ws.heap_floor_min` (2586
-words, about 20 KB, by default) raises the floor, so small messages such
-as timers or presence pings leave it; `0` lets every message raise it.
-`ws.heap_floor` sets the cap for sessions alone (by default
-`handler_spawn.heap_floor`, `0` turns it off), and an upgrade can set
-both for its own session.
+Only a `handle_info/2` that needed at least the `min` of `ws.heap_floor`
+(2586 words, about 20 KB, by default) raises the floor, so small
+messages such as timers or presence pings leave it; `#{min => 0}` lets
+every message raise it. Its `max` sets the cap for sessions alone (by
+default `handler_spawn.heap_floor`'s), `ws => #{heap_floor => false}`
+turns it off for sessions, and an upgrade can set the same for its own
+session.
 
 To start every connection at a size from its first request, raise
 `min_heap_size` itself. On the bench's `httparena_json` route, which

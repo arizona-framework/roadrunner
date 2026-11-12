@@ -813,9 +813,11 @@ listener_rejects_invalid_ws_opt_test() ->
         [
             #{frame_size => 1},
             #{max_frame_size => -1},
-            #{heap_floor => -1},
-            #{heap_floor => undefined},
-            #{heap_floor_min => -1},
+            #{heap_floor => 0},
+            #{heap_floor => true},
+            #{heap_floor => #{max => 0}},
+            #{heap_floor => #{min => -1}},
+            #{heap_floor => #{cap => 1}},
             #{max_frame_size => bad},
             not_a_map,
             %% `recv_buffer` is an inet buffer size and `hibernate_after` an
@@ -948,20 +950,23 @@ listener_rejects_invalid_handler_spawn_test() ->
             #{opts => [monitor]},
             #{opts => [{monitor, []}]},
             #{opts => not_a_list},
-            #{heap_floor => -1},
-            #{heap_floor => not_an_integer},
+            #{heap_floor => 0},
+            #{heap_floor => #{max => -1}},
+            #{heap_floor => #{max => not_an_integer}},
+            #{heap_floor => #{min => 1}},
             not_a_map
         ]
     ).
 
 listener_heap_floor_into_proto_opts_test() ->
-    %% `handler_spawn.heap_floor` becomes `heap_floor => Cap`, 46422 words
+    %% `handler_spawn.heap_floor`'s `max` becomes `heap_floor => Cap`, 46422
     %% unless set; `0` leaves the key out.
     Cases = [
         {#{}, 46422},
-        {#{handler_spawn => #{heap_floor => 5000}}, 5000},
+        {#{handler_spawn => #{heap_floor => #{max => 5000}}}, 5000},
+        {#{handler_spawn => #{heap_floor => #{}}}, 46422},
         {#{handler_spawn => #{opts => [{min_heap_size, 1000}]}}, 46422},
-        {#{handler_spawn => #{heap_floor => 0}}, none}
+        {#{handler_spawn => #{heap_floor => false}}, none}
     ],
     lists:foreach(
         fun({Extra, Expected}) ->
@@ -977,16 +982,20 @@ listener_heap_floor_into_proto_opts_test() ->
     ).
 
 listener_ws_heap_floor_into_proto_opts_test() ->
-    %% `ws_heap_floor => {Min, Cap}`: `ws.heap_floor_min` (2586 unless set)
-    %% and `ws.heap_floor`, which defaults to `handler_spawn.heap_floor`
-    %% (`0` when that is off).
+    %% `ws_heap_floor_min` and `ws_heap_floor_max`: `ws.heap_floor`'s `min` (2586 unless
+    %% set) and `max`, which defaults to `handler_spawn.heap_floor`'s (`0`
+    %% when either is `false`).
     Cases = [
         {#{}, {2586, 46422}},
-        {#{handler_spawn => #{heap_floor => 5000}}, {2586, 5000}},
-        {#{handler_spawn => #{heap_floor => 0}}, {2586, 0}},
-        {#{ws => #{heap_floor => 8000}}, {2586, 8000}},
-        {#{handler_spawn => #{heap_floor => 0}, ws => #{heap_floor => 8000}}, {2586, 8000}},
-        {#{ws => #{heap_floor => 0, heap_floor_min => 0}}, {0, 0}}
+        {#{handler_spawn => #{heap_floor => #{max => 5000}}}, {2586, 5000}},
+        {#{handler_spawn => #{heap_floor => false}}, {2586, 0}},
+        {#{ws => #{heap_floor => #{max => 8000}}}, {2586, 8000}},
+        {
+            #{handler_spawn => #{heap_floor => false}, ws => #{heap_floor => #{max => 8000}}},
+            {2586, 8000}
+        },
+        {#{ws => #{heap_floor => #{min => 0}}}, {0, 46422}},
+        {#{ws => #{heap_floor => false}}, {2586, 0}}
     ],
     lists:foreach(
         fun({Extra, Expected}) ->
@@ -995,7 +1004,8 @@ listener_ws_heap_floor_into_proto_opts_test() ->
                 Name, Extra#{port => 0, routes => roadrunner_hello_handler}
             ),
             ProtoOpts = element(4, sys:get_state(ListenerPid)),
-            ?assertEqual(Expected, maps:get(ws_heap_floor, ProtoOpts)),
+            #{ws_heap_floor_min := Min, ws_heap_floor_max := Max} = ProtoOpts,
+            ?assertEqual(Expected, {Min, Max}),
             ok = roadrunner_listener:stop(Name)
         end,
         Cases

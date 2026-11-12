@@ -55,7 +55,7 @@ handle_info(alloc, Report) ->
     Report ! {ws_alloc, length(Live)},
     {ok, Report};
 handle_info(small_alloc, Report) ->
-    %% About 1,000 words: under the default `ws.heap_floor_min`.
+    %% About 1,000 words: under the default `ws.heap_floor` `min`.
     Live = lists:seq(1, 500),
     Report ! {ws_alloc, length(Live)},
     {ok, Report};

@@ -90,12 +90,13 @@ All duration and interval values in `opts()` are in milliseconds —
 %% high connection counts the difference between hundreds of MB and a few GB.
 -define(DEFAULT_HANDLER_SPAWN_OPTS, [{fullsweep_after, 0}]).
 %% The most heap, in words, a connection keeps between requests as its floor,
-%% or starts its HTTP/2 and HTTP/3 stream workers at (`handler_spawn.heap_floor`): a step of the emulator's heap-size
-%% ladder, about 360 KB, well above what a handler building a sizeable JSON
+%% or starts its HTTP/2 and HTTP/3 stream workers at (the `max` of
+%% `handler_spawn.heap_floor`): a step of the emulator's heap-size ladder,
+%% about 360 KB, well above what a handler building a sizeable JSON
 %% response needs (about 17,700 words).
 -define(DEFAULT_HEAP_FLOOR, 46422).
 %% The least heap, in words, a WebSocket session's `handle_info/2` must
-%% have needed to raise its floor (`ws.heap_floor_min`): a step of the
+%% have needed to raise its floor (the `min` of `ws.heap_floor`): a step of the
 %% heap-size ladder, about 20 KB. Small messages (a timer, a presence
 %% ping) leave the floor; building a sizeable push raises it.
 -define(DEFAULT_WS_HEAP_FLOOR_MIN, 2586).
@@ -170,14 +171,15 @@ Optional middleware and timing knobs (durations in milliseconds):
   `compress` (accept permessage-deflate, and with which zlib settings;
   default `false`), `idle_timeout` (close
   a session whose client sent nothing for that many milliseconds; off
-  when unset), `heap_floor` (the most heap, in words, a session keeps
-  between events; defaults to `handler_spawn`'s `heap_floor`, `0` turns
-  it off) and `heap_floor_min` (the least heap, in words, an event must
-  have needed to raise the floor; default `2586`, about 20 KB, so a
-  session whose `handle_info/2` builds sizeable pushes starts each at
-  the size the last one needed while small messages leave the floor;
-  `0` lets every message raise it). An upgrade can set each
-  for its own session (`t:roadrunner_ws_handler:upgrade_opts/0`).
+  when unset) and `heap_floor` (the session's heap floor, `false` to
+  turn it off or a map: `max`, the most heap in words a session keeps
+  between events, by default `handler_spawn`'s; `min`, the least heap
+  in words a `handle_info/2` must have needed to raise the floor,
+  default `2586`, about 20 KB, so a session whose `handle_info/2`
+  builds sizeable pushes starts each at the size the last one needed
+  while small messages leave the floor; `0` lets every message raise
+  it). An upgrade can set each for its own session
+  (`t:roadrunner_ws_handler:upgrade_opts/0`).
 - `request_timeout` — header-read timeout on a fresh conn.
   Default 30 s.
 - `tls_handshake_timeout` — bound on the TLS handshake (TLS listeners
@@ -382,11 +384,12 @@ Optional middleware and timing knobs (durations in milliseconds):
   The measurements behind all of this are in
   [Resource limits](resource_limits.md).
 
-  `heap_floor` is the most heap, in words, a connection keeps between
-  requests. Under full sweeps a connection's heap starts small,
+  `heap_floor` is the connection's heap floor: `false` turns it off,
+  and `#{max => Words}` sets the most heap, in words, a connection
+  keeps between requests. Under full sweeps a connection's heap starts small,
   so every request grows it again over several collections; after each
   request, the connection instead keeps the heap that request needed,
-  up to `heap_floor`, as its `min_heap_size`, and the next request
+  up to `max`, as its `min_heap_size`, and the next request
   starts at that size. A handler that builds a sizeable response then
   collects a few times per request instead of several, which cost
   connections serving such handlers about a fifth of their CPU. Every
@@ -401,9 +404,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   size, and every 16th stream starts at the base and learns it again.
   A WebSocket session learns its floor from its `handle_info/2` calls,
   where a server push is built, relearns every 16 of them while raised
-  and drops it before it hibernates; `ws.heap_floor` and
-  `ws.heap_floor_min` tune it for sessions.
-  Default `46422` (about 360 KB); `0` turns it off.
+  and drops it before it hibernates; `ws.heap_floor` tunes it for
+  sessions. Default `#{max => 46422}` (about 360 KB).
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically.
 - `tls` — `[ssl:tls_server_option()]` for HTTPS. Absent for plain
@@ -569,7 +571,7 @@ ops-tuning rationale.
     %% roadrunner owns process linkage.
     handler_spawn => #{
         opts => [proc_lib:start_spawn_option()],
-        heap_floor => non_neg_integer()
+        heap_floor => false | #{max => pos_integer()}
     },
     %% Protocols this listener accepts. Each entry is either a bare
     %% atom (`http1` / `http2`) or a `{Proto, Opts}` tuple carrying
@@ -891,6 +893,13 @@ WebSocket session tunables (under `ws` in the listener opts).
   several frames gather into one delivery and the socket keeps the
   quickest wake-up, and a TLS session with `16`. A value set here
   applies to both.
+- `heap_floor` — the session's heap floor: after a `handle_info/2`
+  that needed at least `min` words of heap, the session keeps that heap
+  (up to `max` words) as its `min_heap_size`, so a session building
+  sizeable pushes starts each at the size the last one needed. `max`
+  defaults to `handler_spawn`'s `heap_floor`, `min` to `2586` (about
+  20 KB, so small messages leave the floor; `0` lets every message
+  raise it). `false` turns it off. Inbound frames never raise it.
 
 An upgrade can set each of these for its own session
 (`t:roadrunner_ws_handler:upgrade_opts/0`).
@@ -902,7 +911,8 @@ An upgrade can set each of these for its own session
     hibernate_after => 1..16#7FFFFFFF,
     compress => roadrunner_ws:compress(),
     idle_timeout => 1..16#7FFFFFFF,
-    active => once | 1..32767
+    active => once | 1..32767,
+    heap_floor => false | #{max => pos_integer(), min => non_neg_integer()}
 }.
 
 -record(state, {
@@ -1828,13 +1838,15 @@ build_proto_opts(Opts, ListenerName) ->
         compress := WsCompress,
         idle_timeout := WsIdleTimeout,
         active := WsActive,
-        heap_floor := WsHeapFloor,
-        heap_floor_min := WsHeapFloorMin
+        heap_floor := WsHeapFloor
     } =
         validate_ws_opts(maps:get(ws, Opts, #{})),
     %% Flatten the nested `handler_spawn` opt to top-level proto_opts keys the
     %% spawn sites read directly, mirroring the `ws` / `http2` flattening above.
     HandlerSpawnOpts = resolve_handler_spawn(Opts),
+    %% After `resolve_handler_spawn/1`, which rejects a malformed
+    %% `handler_spawn` before its `heap_floor` is read here.
+    {WsHeapFloorMin, WsHeapFloorMax} = ws_heap_floor(WsHeapFloor, Opts),
     Optional = maps:merge(
         maps:merge(maybe_alt_svc(Protocols, Opts), maybe_grow(Opts)), heap_floor(Opts)
     ),
@@ -1851,7 +1863,8 @@ build_proto_opts(Opts, ListenerName) ->
             ws_compress => roadrunner_ws:compress_config(WsCompress),
             ws_idle_timeout => WsIdleTimeout,
             ws_active => WsActive,
-            ws_heap_floor => {WsHeapFloorMin, ws_heap_floor(WsHeapFloor, Opts)},
+            ws_heap_floor_min => WsHeapFloorMin,
+            ws_heap_floor_max => WsHeapFloorMax,
             request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
             tls_handshake_timeout =>
                 maps:get(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT),
@@ -1986,15 +1999,21 @@ maybe_grow(Opts) ->
         _ -> #{}
     end.
 
-%% `heap_floor => Cap` for the HTTP/1.1 connection loop: the most heap, in
-%% words, a connection raises its `min_heap_size` to
-%% (`roadrunner_conn_loop:raise_heap_floor/1`). Left out when it is `0`.
+%% `heap_floor => Cap` for the connection loops: the most heap, in words, a
+%% connection raises its `min_heap_size` to
+%% (`roadrunner_conn_loop:raise_heap_floor/1`). Left out when
+%% `handler_spawn.heap_floor` is `false`.
 -spec heap_floor(opts()) -> map().
 heap_floor(Opts) ->
     case maps:get(handler_spawn, Opts, #{}) of
-        #{heap_floor := 0} ->
+        #{heap_floor := false} ->
             #{};
-        #{heap_floor := Words} when is_integer(Words), Words > 0 -> #{heap_floor => Words};
+        #{heap_floor := #{max := Words} = Floor} when
+            map_size(Floor) =:= 1, is_integer(Words), Words > 0
+        ->
+            #{heap_floor => Words};
+        #{heap_floor := Floor} when Floor =:= #{} ->
+            #{heap_floor => ?DEFAULT_HEAP_FLOOR};
         #{heap_floor := _} = HandlerSpawn ->
             error({invalid_listener_opt, handler_spawn, HandlerSpawn});
         #{} ->
@@ -2362,13 +2381,22 @@ flatten_http3_opts(Entries) ->
 ws_buffer(undefined, Base, Max) -> {adaptive, Base, Max};
 ws_buffer(WsBuffer, _Base, _Max) -> WsBuffer.
 
-%% A WebSocket session's heap floor cap: `ws.heap_floor` when set, else
-%% the listener's `handler_spawn.heap_floor` (`0` when that is off).
--spec ws_heap_floor(non_neg_integer() | undefined, opts()) -> non_neg_integer().
+%% A WebSocket session's heap floor as `{Min, Cap}`: `ws.heap_floor`'s
+%% `min` (default 2586) and `max`, which defaults to the listener's
+%% `handler_spawn.heap_floor`; the cap is `0` when either is `false`.
+-spec ws_heap_floor(false | #{max => pos_integer(), min => non_neg_integer()} | undefined, opts()) ->
+    {non_neg_integer(), non_neg_integer()}.
+ws_heap_floor(false, _Opts) ->
+    {?DEFAULT_WS_HEAP_FLOOR_MIN, 0};
 ws_heap_floor(undefined, Opts) ->
-    maps:get(heap_floor, heap_floor(Opts), 0);
-ws_heap_floor(Words, _Opts) ->
-    Words.
+    ws_heap_floor(#{}, Opts);
+ws_heap_floor(#{} = Floor, Opts) ->
+    Cap =
+        case Floor of
+            #{max := Words} -> Words;
+            #{} -> maps:get(heap_floor, heap_floor(Opts), 0)
+        end,
+    {maps:get(min, Floor, ?DEFAULT_WS_HEAP_FLOOR_MIN), Cap}.
 
 -spec ws_defaults() ->
     #{
@@ -2379,8 +2407,7 @@ ws_heap_floor(Words, _Opts) ->
         compress := false,
         idle_timeout := infinity,
         active := undefined,
-        heap_floor := undefined,
-        heap_floor_min := non_neg_integer()
+        heap_floor := undefined
     }.
 ws_defaults() ->
     #{
@@ -2400,9 +2427,9 @@ ws_defaults() ->
         %% `undefined` = per transport: `once` on plain TCP, `16` on TLS
         %% (`roadrunner_ws_session:read_mode/2`).
         active => undefined,
-        %% `undefined` = the listener's `handler_spawn.heap_floor`.
-        heap_floor => undefined,
-        heap_floor_min => ?DEFAULT_WS_HEAP_FLOOR_MIN
+        %% `undefined` = the listener's `handler_spawn.heap_floor`, with
+        %% the default `min` (`ws_heap_floor/2`).
+        heap_floor => undefined
     }.
 
 %% Resolve the `ws` opts map against defaults, rejecting unknown keys
@@ -2419,8 +2446,7 @@ ws_defaults() ->
         compress := roadrunner_ws:compress(),
         idle_timeout := pos_integer() | infinity,
         active := once | 1..32767 | undefined,
-        heap_floor := non_neg_integer() | undefined,
-        heap_floor_min := non_neg_integer()
+        heap_floor := false | #{max => pos_integer(), min => non_neg_integer()} | undefined
     }.
 validate_ws_opts(Opts) when is_map(Opts) ->
     Defaults = ws_defaults(),
@@ -2447,7 +2473,8 @@ validate_ws_opts(Other) ->
 %% rejected for both. `active` takes what HTTP/2's does: `true` is
 %% rejected (an always-active socket has no bound on unread data), and
 %% `32767` is the largest count `inet:setopts/2` and `ssl:setopts/2`
-%% accept.
+%% accept. `heap_floor` is `false` or a map of a positive `max` and a
+%% non-negative `min`, each optional.
 -spec valid_ws_opt(
     max_frame_size
     | max_message_size
@@ -2455,7 +2482,8 @@ validate_ws_opts(Other) ->
     | hibernate_after
     | compress
     | idle_timeout
-    | active,
+    | active
+    | heap_floor,
     term()
 ) ->
     boolean().
@@ -2469,10 +2497,21 @@ valid_ws_opt(idle_timeout, V) ->
     is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
 valid_ws_opt(recv_buffer, V) ->
     is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
+valid_ws_opt(heap_floor, false) ->
+    true;
+valid_ws_opt(heap_floor, V) when is_map(V) ->
+    maps:fold(fun(K, N, Ok) -> Ok andalso valid_heap_floor_opt(K, N) end, true, V);
+valid_ws_opt(heap_floor, _V) ->
+    false;
 valid_ws_opt(hibernate_after, V) ->
     is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
 valid_ws_opt(_SizeCap, V) ->
     is_integer(V) andalso V >= 0 andalso V =< 16#7FFFFFFF.
+
+-spec valid_heap_floor_opt(term(), term()) -> boolean().
+valid_heap_floor_opt(max, V) -> is_integer(V) andalso V > 0;
+valid_heap_floor_opt(min, V) -> is_integer(V) andalso V >= 0;
+valid_heap_floor_opt(_Key, _V) -> false.
 
 %% A `ws.compress` map entry: zlib's raw deflate takes windows 9..15 and
 %% raw inflate 8..15 (`t:roadrunner_ws:compress_opts/0`).

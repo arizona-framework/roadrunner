@@ -2,7 +2,7 @@
 -moduledoc """
 The WebSocket session's heap floor (`ws.heap_floor`, by default
 `handler_spawn.heap_floor`): after a `handle_info/2` that needed at least
-`ws.heap_floor_min` the session keeps the heap that call needed as its
+its `min` the session keeps the heap that call needed as its
 `min_heap_size`, up to the cap, learns it again every 16 messages while
 raised, and drops back to its base before it hibernates. The handler is `roadrunner_heap_floor_handler`, driven
 by messages to the session's `handle_info/2`.
@@ -26,6 +26,7 @@ by messages to the session's `handle_info/2`.
     ws_cap_overrides_the_listener/1,
     ws_cap_off/1,
     upgrade_sets_the_floor/1,
+    upgrade_turns_the_floor_off/1,
     floor_resets_when_the_handler_hibernates/1,
     floor_resets_when_the_session_idles/1
 ]).
@@ -48,6 +49,7 @@ all() ->
         ws_cap_overrides_the_listener,
         ws_cap_off,
         upgrade_sets_the_floor,
+        upgrade_turns_the_floor_off,
         floor_resets_when_the_handler_hibernates,
         floor_resets_when_the_session_idles
     ].
@@ -66,17 +68,17 @@ end_per_testcase(_Case, _Config) ->
     ok = roadrunner_listener:stop(?MODULE).
 
 listener_opts(floor_stops_at_the_cap) ->
-    #{handler_spawn => #{heap_floor => 1000}};
+    #{handler_spawn => #{heap_floor => #{max => 1000}}};
 listener_opts(floor_off) ->
-    #{handler_spawn => #{heap_floor => 0}};
+    #{handler_spawn => #{heap_floor => false}};
 listener_opts(floor_off_when_the_cap_is_under_the_upgrade_min_heap_size) ->
-    #{handler_spawn => #{heap_floor => 1000}};
+    #{handler_spawn => #{heap_floor => #{max => 1000}}};
 listener_opts(small_events_raise_it_with_no_minimum) ->
-    #{ws => #{heap_floor_min => 0}};
+    #{ws => #{heap_floor => #{min => 0}}};
 listener_opts(ws_cap_overrides_the_listener) ->
-    #{ws => #{heap_floor => 1000}};
+    #{ws => #{heap_floor => #{max => 1000}}};
 listener_opts(ws_cap_off) ->
-    #{ws => #{heap_floor => 0}};
+    #{ws => #{heap_floor => false}};
 listener_opts(floor_resets_when_the_session_idles) ->
     #{ws => #{hibernate_after => 200}};
 listener_opts(_Case) ->
@@ -88,7 +90,9 @@ route_state(Case) when
 ->
     {ws, self(), #{min_heap_size => 2000}};
 route_state(upgrade_sets_the_floor) ->
-    {ws, self(), #{heap_floor => 1000, heap_floor_min => 0}};
+    {ws, self(), #{heap_floor => #{max => 1000, min => 0}}};
+route_state(upgrade_turns_the_floor_off) ->
+    {ws, self(), #{heap_floor => false}};
 route_state(_Case) ->
     {ws, self()}.
 
@@ -135,7 +139,7 @@ floor_relearns_every_16_events(Config) ->
     Floors = [report(Session) || _ <- lists:seq(1, 17)],
     ?assert(lists:member(base(), Floors)).
 
-%% An event that needed less than `ws.heap_floor_min` leaves the floor
+%% An event that needed less than the floor's `min` leaves the floor
 %% where it is.
 small_events_leave_the_floor(Config) ->
     Session = upgrade(Config),
@@ -162,7 +166,7 @@ ws_cap_off(Config) ->
     ok = alloc(Session),
     ?assertEqual(base(), report(Session)).
 
-%% The upgrade's own `heap_floor` and `heap_floor_min` win over the
+%% The upgrade's own `heap_floor` `max` and `min` win over the
 %% listener's.
 upgrade_sets_the_floor(Config) ->
     Session = upgrade(Config),
@@ -170,6 +174,11 @@ upgrade_sets_the_floor(Config) ->
     Floor = report(Session),
     ?assert(Floor > base()),
     ?assert(Floor =< rounded(1000)).
+
+upgrade_turns_the_floor_off(Config) ->
+    Session = upgrade(Config),
+    ok = alloc(Session),
+    ?assertEqual(base(), report(Session)).
 
 %% A handler's `hibernate` drops the floor first, so the session wakes at
 %% its base; hibernating again finds it there.

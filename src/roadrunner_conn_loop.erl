@@ -136,7 +136,7 @@
     %% requests (`Floor`), raised from `Base` towards `Cap` to the heap its
     %% requests need (`raise_heap_floor/1`) and dropped back to `Base` before
     %% it hibernates or runs a WebSocket session (`reset_heap_floor/1`).
-    %% `undefined` when the listener's `handler_spawn.heap_floor` is `0`.
+    %% `undefined` when the listener's `handler_spawn.heap_floor` is `false`.
     heap_floor = undefined :: {pos_integer(), pos_integer(), pos_integer()} | undefined,
     %% How `recv_request_bytes/2` waits for bytes: the socket's read mode
     %% (`read_mode/2`), paired with `proto_opts.hibernate_after` when that
