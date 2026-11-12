@@ -234,6 +234,23 @@
     %% the buffer is fixed (an explicit `ws.recv_buffer`, or a session
     %% reading with `{active, N}`).
     buf :: {Cur :: pos_integer(), Base :: pos_integer(), Max :: pos_integer()} | undefined,
+    %% The heap floor (`raise_heap_floor/1`): the `min_heap_size` kept
+    %% between events, the size the session started at, the cap, and the
+    %% least heap an event must have needed to raise it (`ws.heap_floor`
+    %% and `ws.heap_floor_min`).
+    %% `undefined` when the listener's `handler_spawn.heap_floor` is `0` or
+    %% no higher than the session's own `min_heap_size`. The events left
+    %% before it is learned again are counted in the process dictionary
+    %% (`?HEAP_FLOOR_LEFT`), so an event that leaves the floor as it was
+    %% does not rewrite this record.
+    heap_floor ::
+        {
+            Floor :: pos_integer(),
+            Base :: pos_integer(),
+            Cap :: pos_integer(),
+            Min :: non_neg_integer()
+        }
+        | undefined,
     %% The connection's close path, called by `guarded/2` once the
     %% session has ended.
     finish :: finish()
@@ -252,6 +269,10 @@
 %% least this much per fragment keeps real reassembly memory bounded by
 %% the cap (this is ~2x the actual cons-cell cost, a safe over-estimate).
 -define(WS_FRAGMENT_OVERHEAD, 64).
+%% Events between relearning the heap floor (`raise_heap_floor/1`), and
+%% the process dictionary key that counts them down.
+-define(HEAP_FLOOR_RELEARN, 16).
+-define(HEAP_FLOOR_LEFT, '$roadrunner_ws_heap_floor_left').
 
 -doc """
 Answer a WebSocket upgrade and hand back the session to run. Checks the
@@ -323,6 +344,10 @@ session_opt(active, V, Opts) ->
     Opts#{ws_active := V};
 session_opt(hibernate_after, V, Opts) ->
     Opts#{ws_hibernate_after := V};
+session_opt(heap_floor, V, #{ws_heap_floor := {Min, _Cap}} = Opts) ->
+    Opts#{ws_heap_floor := {Min, V}};
+session_opt(heap_floor_min, V, #{ws_heap_floor := {_Min, Cap}} = Opts) ->
+    Opts#{ws_heap_floor := {V, Cap}};
 session_opt(Flag, V, #{handler_spawn_opts := Spawn} = Opts) when
     Flag =:= fullsweep_after; Flag =:= min_heap_size; Flag =:= max_heap_size
 ->
@@ -460,6 +485,7 @@ serve(
         ws_buffer := WsBuffer
     } = ProtoOpts,
     ok = apply_gc_settings(SpawnOpts),
+    HeapFloor = heap_floor(ProtoOpts),
     Mode = read_mode(Active, Socket),
     Buf = adaptive_buf(WsBuffer, Mode),
     {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
@@ -485,6 +511,7 @@ serve(
         idle = #idle{timeout = IdleTimeout},
         active = Mode,
         buf = Buf,
+        heap_floor = HeapFloor,
         msg_acc = undefined,
         msg_opcode = undefined,
         msg_compressed = false,
@@ -690,8 +717,9 @@ recv_loop(
         %% message. The socket stays armed active-once, so an inbound
         %% frame (or a forwarded drain, or a handler info message) wakes
         %% the continuation straight back into this receive. With the
-        %% default `infinity` this clause never fires.
-        erlang:hibernate(?MODULE, resume, [Data])
+        %% default `infinity` this clause never fires. The heap floor
+        %% drops first, or the session would wake at it.
+        erlang:hibernate(?MODULE, resume, [reset_heap_floor(Data)])
     end.
 
 %% Run the handler's optional `terminate/2` with why the session ended
@@ -1130,10 +1158,86 @@ round_up(Size) -> (Size + 4095) band (bnot 4095).
 flush_and_wait(Data, Hibernate) ->
     wait(flush_out(Data), Hibernate).
 
-%% Back to `recv_loop/1`, hibernating first when a handler asked.
+%% Back to `recv_loop/1`, hibernating first when a handler asked, with the
+%% heap floor dropped so the session wakes at its base.
 -spec wait(#data{}, boolean()) -> finished.
-wait(Data, true) -> erlang:hibernate(?MODULE, resume, [Data]);
+wait(Data, true) -> erlang:hibernate(?MODULE, resume, [reset_heap_floor(Data)]);
 wait(Data, false) -> recv_loop(Data).
+
+%% Under full sweeps a session's heap starts each event small and grows
+%% over several collections to what the event needs, so a handler that
+%% turns a message from another process into a sizeable push (a rendered
+%% diff, encoded) collects several times per push. After each
+%% `handle_info/2` that needed at least `heap_floor_min`, the session
+%% keeps that heap as its floor (`min_heap_size`, up to `heap_floor`), so
+%% the next push starts at that size. Only `handle_info/2` teaches it:
+%% inbound frames, which a session answers in a couple of microseconds,
+%% run no floor code at all. An idle session collects nothing, so it holds
+%% the heap its last event left either way. Every `?HEAP_FLOOR_RELEARN`
+%% messages while raised, and before the session hibernates, the floor
+%% drops back to the size the session started at, so one whose pushes got
+%% smaller gives the heap back.
+-spec heap_floor(roadrunner_conn:proto_opts()) ->
+    {pos_integer(), pos_integer(), pos_integer(), non_neg_integer()} | undefined.
+heap_floor(#{ws_heap_floor := {Min, Cap}}) ->
+    %% After `apply_gc_settings/1`: the session's own `min_heap_size`, as
+    %% the emulator rounded it, or the emulator's default.
+    {min_heap_size, Base} = erlang:process_info(self(), min_heap_size),
+    case Cap > Base of
+        true ->
+            {Base, Base, Cap, Min};
+        false ->
+            undefined
+    end;
+heap_floor(#{}) ->
+    undefined.
+
+%% Rewrites the record only when the floor changes, and counts toward
+%% relearning only while the floor is raised: at the base, a message pays
+%% one heap read and nothing else.
+-spec raise_heap_floor(#data{}) -> #data{}.
+raise_heap_floor(#data{heap_floor = undefined} = Data) ->
+    Data;
+raise_heap_floor(#data{heap_floor = {Base, Base, Cap, _Min}} = Data) ->
+    raise_heap_floor(Base, Cap, Data);
+raise_heap_floor(#data{heap_floor = {Floor, _Base, Cap, _Min}} = Data) ->
+    case get(?HEAP_FLOOR_LEFT) of
+        0 ->
+            reset_heap_floor(Data);
+        Left ->
+            _ = put(?HEAP_FLOOR_LEFT, Left - 1),
+            raise_heap_floor(Floor, Cap, Data)
+    end.
+
+-spec raise_heap_floor(pos_integer(), pos_integer(), #data{}) -> #data{}.
+raise_heap_floor(Cap, Cap, Data) ->
+    %% At the cap already: nothing to raise, so skip reading the heap.
+    Data;
+raise_heap_floor(Floor, Cap, #data{heap_floor = {Floor, Base, Cap, Min}} = Data) ->
+    {heap_size, Heap} = erlang:process_info(self(), heap_size),
+    case min(Heap, Cap) of
+        Needed when Needed > Floor, Heap >= Min ->
+            _ = erlang:process_flag(min_heap_size, Needed),
+            _ =
+                case Floor of
+                    Base -> put(?HEAP_FLOOR_LEFT, ?HEAP_FLOOR_RELEARN);
+                    _ -> ok
+                end,
+            Data#data{heap_floor = {Needed, Base, Cap, Min}};
+        _ ->
+            Data
+    end.
+
+%% Back to the base; the relearn count starts again when the floor next
+%% rises (`raise_heap_floor/3`). Dropping the floor
+%% resizes nothing: the heap shrinks only at a collection that finds it
+%% mostly empty.
+-spec reset_heap_floor(#data{}) -> #data{}.
+reset_heap_floor(#data{heap_floor = {Floor, Base, Cap, Min}} = Data) when Floor > Base ->
+    _ = erlang:process_flag(min_heap_size, Base),
+    Data#data{heap_floor = {Base, Base, Cap, Min}};
+reset_heap_floor(Data) ->
+    Data.
 
 -spec handle_frame(roadrunner_ws:frame(), #data{}, boolean()) -> finished.
 handle_frame(#{opcode := close, payload := P}, Data, _Hibernate) ->
@@ -1619,9 +1723,8 @@ handle_info_msg(
     #data{callbacks = #callbacks{handle_info = true}, mod = Mod, mod_state = State} = Data,
     Hibernate
 ) ->
-    apply_handler_result(
-        Mod:handle_info(Msg, State), Data, Hibernate, fun flush_and_wait/2, normal
-    );
+    Result = Mod:handle_info(Msg, State),
+    apply_handler_result(Result, raise_heap_floor(Data), Hibernate, fun flush_and_wait/2, normal);
 handle_info_msg(_Msg, #data{callbacks = #callbacks{handle_info = false}} = Data, _Hibernate) ->
     recv_loop(Data).
 

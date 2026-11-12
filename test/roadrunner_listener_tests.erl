@@ -813,6 +813,9 @@ listener_rejects_invalid_ws_opt_test() ->
         [
             #{frame_size => 1},
             #{max_frame_size => -1},
+            #{heap_floor => -1},
+            #{heap_floor => undefined},
+            #{heap_floor_min => -1},
             #{max_frame_size => bad},
             not_a_map,
             %% `recv_buffer` is an inet buffer size and `hibernate_after` an
@@ -968,6 +971,31 @@ listener_heap_floor_into_proto_opts_test() ->
             ),
             ProtoOpts = element(4, sys:get_state(ListenerPid)),
             ?assertEqual(Expected, maps:get(heap_floor, ProtoOpts, none)),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        Cases
+    ).
+
+listener_ws_heap_floor_into_proto_opts_test() ->
+    %% `ws_heap_floor => {Min, Cap}`: `ws.heap_floor_min` (2586 unless set)
+    %% and `ws.heap_floor`, which defaults to `handler_spawn.heap_floor`
+    %% (`0` when that is off).
+    Cases = [
+        {#{}, {2586, 46422}},
+        {#{handler_spawn => #{heap_floor => 5000}}, {2586, 5000}},
+        {#{handler_spawn => #{heap_floor => 0}}, {2586, 0}},
+        {#{ws => #{heap_floor => 8000}}, {2586, 8000}},
+        {#{handler_spawn => #{heap_floor => 0}, ws => #{heap_floor => 8000}}, {2586, 8000}},
+        {#{ws => #{heap_floor => 0, heap_floor_min => 0}}, {0, 0}}
+    ],
+    lists:foreach(
+        fun({Extra, Expected}) ->
+            Name = listener_test_ws_heap_floor,
+            {ok, ListenerPid} = roadrunner_listener:start_link(
+                Name, Extra#{port => 0, routes => roadrunner_hello_handler}
+            ),
+            ProtoOpts = element(4, sys:get_state(ListenerPid)),
+            ?assertEqual(Expected, maps:get(ws_heap_floor, ProtoOpts)),
             ok = roadrunner_listener:stop(Name)
         end,
         Cases

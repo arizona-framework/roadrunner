@@ -215,6 +215,9 @@ name (`t:roadrunner_listener:ws_opts/0`):
   (`erlang:process_flag/2`); they default to the listener's
   `handler_spawn` options. A larger `min_heap_size` trades memory per
   session for fewer collections.
+- `heap_floor`, `heap_floor_min` — the session's heap floor, as the
+  listener's `ws` options: the most heap it keeps between `handle_info/2`
+  calls, and the least one must have needed to raise it.
 
 The values are the application's to get right, as the rest of a
 response is: they are not checked at the upgrade, and a key not listed
@@ -231,7 +234,9 @@ here crashes it.
     active => once | 1..32767,
     fullsweep_after => non_neg_integer(),
     min_heap_size => non_neg_integer(),
-    max_heap_size => erlang:max_heap_size()
+    max_heap_size => erlang:max_heap_size(),
+    heap_floor => non_neg_integer(),
+    heap_floor_min => non_neg_integer()
 }.
 
 -doc """
