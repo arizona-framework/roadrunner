@@ -309,23 +309,6 @@ load too, so the extra growth step does not cost there.
 
 **Scope:** small.
 
-### A lower default heap floor cap — small
-
-**What:** `handler_spawn.heap_floor` defaults to `#{max => 46422}`
-words (about 360 KB), well above the ~17,700 words a handler building a
-sizeable JSON response needs. Measure `max` at 17731 and 28657 (the
-ladder steps around that need) against today's default.
-
-**Why:** the floor trades busy memory for fewer collections. With
-thousands of active connections the trade is larger than measured
-locally: TLS JSON served 35% more requests with twice the memory, and
-compressed JSON about 33-42% more with 38-46% more. A lower cap may
-keep most of the gain for far less memory. Measure throughput and busy
-memory on JSON, TLS JSON, pipelined and h2c JSON loads at 4096
-connections, and keep the default general, not fitted to one load.
-
-**Scope:** small.
-
 ## Per-route framework knobs the map shape unlocks
 
 The map-shape route entry (`#{path => ..., handler => ..., state =>
