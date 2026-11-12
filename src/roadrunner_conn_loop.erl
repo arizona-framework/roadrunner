@@ -132,6 +132,12 @@
     %% to come grows it to `Max` for good (`grow_buffer/2`). `undefined`
     %% once grown, or when the listener has nothing to grow.
     grow_buffer = undefined :: {pos_integer(), pos_integer()} | undefined,
+    %% `{Floor, Base, Cap}`: the `min_heap_size` this process keeps between
+    %% requests (`Floor`), raised from `Base` towards `Cap` to the heap its
+    %% requests need (`raise_heap_floor/1`) and dropped back to `Base` before
+    %% it hibernates or runs a WebSocket session (`reset_heap_floor/1`).
+    %% `undefined` when the listener's `handler_spawn.heap_floor` is `0`.
+    heap_floor = undefined :: {pos_integer(), pos_integer(), pos_integer()} | undefined,
     %% How `recv_request_bytes/2` waits for bytes: the socket's read mode
     %% (`read_mode/2`), paired with `proto_opts.hibernate_after` when that
     %% is set. `once` arms the socket before each request and reads the
@@ -362,6 +368,7 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 keep_alive_timeout = KeepAliveTimeout,
                 body_buffering = BodyBuffering,
                 grow_buffer = maps:get(grow_recv_buffer, ProtoOpts, undefined),
+                heap_floor = heap_floor(ProtoOpts),
                 recv_mode = recv_mode(
                     read_mode(maps:get(http1_active, ProtoOpts, undefined), Socket),
                     maps:get(hibernate_after, ProtoOpts, 0)
@@ -458,6 +465,9 @@ proxy_protocol_stage(Socket, #{proxy_protocol := true} = ProtoOpts, OsPeer) ->
 
 %% A v1 header (CRLF included) never exceeds 107 bytes (HAProxy spec §2.1).
 -define(PROXY_V1_MAX, 107).
+%% Every this many requests a connection drops its heap floor and learns it
+%% again (`raise_heap_floor/1`).
+-define(HEAP_FLOOR_RELEARN, 16).
 
 %% Exact read for the TLS case. Six bytes tell v1 (`PROXY `) from v2 (the
 %% first six bytes of its signature); a v2 prefix then declares the length of
@@ -869,8 +879,10 @@ recv_active(
                 %% Idle window elapsed with the deadline still ahead.
                 %% The heap GCs and shrinks; the next inbound packet,
                 %% or the deadline timer, wakes the conn.
+                %% The floor drops first, or the conn would wake at it.
+                S1 = reset_heap_floor(S),
                 TRef = erlang:start_timer(Deadline, self(), ?MODULE, [{abs, true}]),
-                erlang:hibernate(?MODULE, recv_request_bytes_hib, [S, Deadline, TRef])
+                erlang:hibernate(?MODULE, recv_request_bytes_hib, [S1, Deadline, TRef])
         end
     end.
 
@@ -1117,6 +1129,62 @@ large_body(chunked, _Buffered, _Idle) -> true;
 large_body({content_length, N}, Buffered, Idle) -> N - Buffered > Idle;
 large_body({error, _}, _Buffered, _Idle) -> false.
 
+%% Under full sweeps (the default `fullsweep_after, 0`) a connection's heap
+%% starts each request small and grows over several collections to what the
+%% request needs. Keeping the heap the last request needed as the floor
+%% (`min_heap_size`, up to `Cap`) lets the next request start at that size,
+%% so a handler building a sizeable response collects a few times per
+%% request instead of several. Sampled when the handler returns, before the
+%% response is encoded. Raising the floor resizes the heap at once, so it
+%% does not follow each request down; instead, every `?HEAP_FLOOR_RELEARN`
+%% requests it drops back to `Base` and the next request sets it again.
+%% Dropping it resizes nothing: the heap shrinks only at a collection that
+%% finds it mostly empty, which a connection whose requests still need the
+%% heap never makes, while one now serving smaller requests gives the
+%% memory back.
+-spec heap_floor(roadrunner_conn:proto_opts()) ->
+    {pos_integer(), pos_integer(), pos_integer()} | undefined.
+heap_floor(#{heap_floor := Cap}) ->
+    %% The base is the size this process was spawned with: the listener's
+    %% `handler_spawn` `min_heap_size`, as the emulator rounded it up, or
+    %% the emulator's default.
+    {min_heap_size, Base} = erlang:process_info(self(), min_heap_size),
+    case Cap > Base of
+        true -> {Base, Base, Cap};
+        false -> undefined
+    end;
+heap_floor(#{}) ->
+    undefined.
+
+-spec raise_heap_floor(#loop_state{}) -> #loop_state{}.
+raise_heap_floor(#loop_state{heap_floor = undefined} = S) ->
+    S;
+raise_heap_floor(#loop_state{requests_served = Served} = S) when
+    Served rem ?HEAP_FLOOR_RELEARN =:= 0
+->
+    reset_heap_floor(S);
+raise_heap_floor(#loop_state{heap_floor = {Cap, _Base, Cap}} = S) ->
+    %% At the cap already: nothing to raise, so skip reading the heap.
+    S;
+raise_heap_floor(#loop_state{heap_floor = {Floor, Base, Cap}} = S) ->
+    {heap_size, Heap} = erlang:process_info(self(), heap_size),
+    case min(Heap, Cap) of
+        Needed when Needed > Floor ->
+            _ = erlang:process_flag(min_heap_size, Needed),
+            S#loop_state{heap_floor = {Needed, Base, Cap}};
+        _ ->
+            S
+    end.
+
+%% Back to `Base` before the process hibernates (it would otherwise wake at
+%% the floor) or runs a WebSocket session, which sizes its own heap.
+-spec reset_heap_floor(#loop_state{}) -> #loop_state{}.
+reset_heap_floor(#loop_state{heap_floor = {Floor, Base, Cap}} = S) when Floor > Base ->
+    _ = erlang:process_flag(min_heap_size, Base),
+    S#loop_state{heap_floor = {Base, Base, Cap}};
+reset_heap_floor(S) ->
+    S.
+
 %% RFC 9110 §10.1.1: how a request is answered for its `Expect` field before
 %% its body is read. A client holding its body back for `Expect:
 %% 100-continue` (no body bytes came with the headers, so it did wait) is
@@ -1291,10 +1359,10 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
     Span = roadrunner_event:request_start(Req),
     try Pipeline(Req) of
         {{send, Headers, Fun}, Req2} when is_list(Headers), is_function(Fun, 1), is_map(Req2) ->
-            S2 = S#loop_state{requests_served = S#loop_state.requests_served + 1},
+            S2 = raise_heap_floor(S#loop_state{requests_served = S#loop_state.requests_served + 1}),
             send_phase(S2, Handler, Req2, Headers, Fun, Span);
         {Response0, Req2} when is_map(Req2) ->
-            S2 = S#loop_state{requests_served = S#loop_state.requests_served + 1},
+            S2 = raise_heap_floor(S#loop_state{requests_served = S#loop_state.requests_served + 1}),
             %% Decide keep-alive-vs-close BEFORE the response is sent so a
             %% server-initiated close (count ceiling) lands on the wire as
             %% `Connection: close` — see `ensure_close_signaled/3`.
@@ -1310,7 +1378,9 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
                     %% `ws_finish/4` builds. `request_stop` fires there, so
                     %% its timing (response writer finished) matches the
                     %% other writer-owned shapes.
-                    Run(ws_finish(release_request_slot(S3), Req2, Span, Response));
+                    Run(
+                        ws_finish(release_request_slot(reset_heap_floor(S3)), Req2, Span, Response)
+                    );
                 #loop_state{} = S3 ->
                     ok = roadrunner_event:request_stop(
                         Span,
@@ -1355,7 +1425,7 @@ send_phase(S0, Handler, Req, Headers, Fun, Span) ->
         {done, {websocket, _Status, {session, Upgrade, Run}}, Req2} ->
             %% The fun answered with an upgrade: run the session here, as
             %% for a returned one; `request_stop` fires when it ends.
-            Run(ws_finish(release_request_slot(S), Req2, Span, Upgrade));
+            Run(ws_finish(release_request_slot(reset_heap_floor(S)), Req2, Span, Upgrade));
         {done, {Kind, Status, SentHeaders}, Req2} ->
             ok = roadrunner_event:request_stop(Span, Status, Kind),
             send_finish(S, Req2, Kind, SentHeaders);
