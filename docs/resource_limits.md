@@ -70,17 +70,18 @@ e.g. `ws => #{max_frame_size => N, max_message_size => N}`.
 | `ws.max_frame_size` | 10 MB | one frame's declared payload, checked on the frame header before the body is buffered |
 | `ws.max_message_size` | 10 MB | a reassembled message: the running total across fragments, and the decompressed size when permessage-deflate is negotiated |
 | `ws.active` | `once` on plain TCP, 16 on TLS | unread socket reads a session can hold in its mailbox |
-| `ws.recv_buffer` | adaptive, `idle_recv_buffer` up to `recv_buffer`, on plain TCP | bytes one socket read can carry, and what each connection holds for it |
+| `ws.recv_buffer` | adaptive, 4 KB up to `recv_buffer`, on plain TCP | bytes one socket read can carry, and what each connection holds for it |
 | `ws.compress` | `false` | whether a client's permessage-deflate offer is accepted; a compressed connection holds zlib state for its lifetime, about 290 KB with `true` and about 50 KB with `#{server_window_bits => 12, client_window_bits => 12, mem_level => 4}` |
 
 Notes:
 
-- unset, `ws.recv_buffer` adapts on plain TCP: a session reads with the
-  listener's `idle_recv_buffer` (16 KB), grows the buffer for a frame whose
-  header announces more (up to the listener's `recv_buffer`) while large
-  frames keep coming, and goes back after a small message. An idle
-  connection then holds 16 KB, and a large frame still arrives in one read.
-  On TLS, or with a size set, the buffer is fixed
+- unset, `ws.recv_buffer` adapts on plain TCP: a session reads with 4 KB
+  (or the listener's `idle_recv_buffer`, when smaller), grows the buffer
+  for a frame whose header announces more (up to the listener's
+  `recv_buffer`), keeps it while large and small messages mix, and goes
+  back after 16 small messages in a row, so a large frame still arrives in
+  one read. On TLS, whose records run up to 16 KB, or with a size set, the
+  buffer is fixed
 - `max_message_size` must be `>= max_frame_size`; a listener configured
   otherwise refuses to start
 - each fragment is charged at least a small fixed overhead toward

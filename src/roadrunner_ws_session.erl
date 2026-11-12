@@ -231,8 +231,11 @@
     %% The adaptive inet `buffer` (`arm_and_recv/2`): the size set now, the
     %% size the session falls back to and the cap it grows to, in one field
     %% so the record every message updates stays small. `undefined` when
-    %% the buffer is fixed (an explicit `ws.recv_buffer`, or a session
-    %% reading with `{active, N}`).
+    %% the buffer is fixed (an explicit `ws.recv_buffer`, a TLS socket, or
+    %% a session reading with `{active, N}`). While it is grown, the small
+    %% messages in a row since are counted in the process dictionary
+    %% (`?BUF_SMALL_RUN`, `arm_after_message/3`), so a message rewrites no
+    %% record for the count.
     buf :: {Cur :: pos_integer(), Base :: pos_integer(), Max :: pos_integer()} | undefined,
     %% The heap floor (`raise_heap_floor/1`): the `min_heap_size` kept
     %% between events, the size the session started at, the cap, and the
@@ -272,6 +275,10 @@
 %% Events between relearning the heap floor (`raise_heap_floor/1`), and
 %% the process dictionary key that counts them down.
 -define(HEAP_FLOOR_RELEARN, 16).
+%% Small messages in a row after which a grown adaptive buffer goes back to
+%% its base (`arm_after_message/3`).
+-define(BUF_SHRINK_AFTER, 16).
+-define(BUF_SMALL_RUN, '$roadrunner_ws_buf_small_run').
 -define(HEAP_FLOOR_LEFT, '$roadrunner_ws_heap_floor_left').
 
 -doc """
@@ -418,16 +425,19 @@ upgrade(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) -
 -spec apply_ws_buffer(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
 apply_ws_buffer(_Socket, #{ws_buffer := undefined}) ->
     ok;
-apply_ws_buffer(Socket, #{ws_buffer := {adaptive, _Base, Max}, ws_active := Active}) ->
+apply_ws_buffer(Socket, #{ws_buffer := {adaptive, Base, Max}, ws_active := Active}) ->
     _ =
         case {read_mode(Active, Socket), Socket} of
-            {once, _} ->
-                %% Starts from the buffer the socket already reads with
-                %% (`idle_recv_buffer`), and `arm_and_recv/2` resizes it
-                %% from there. A socket that already grew for a large body
-                %% starts above that base; the session then only resizes
-                %% it on a large frame, which costs one setopts.
+            {once, {ssl, _}} ->
+                %% A TLS socket keeps reading with `recv_buffer`
+                %% (`adaptive_buf/3`).
                 ok;
+            {once, _} ->
+                %% Drops the socket from the buffer it read the upgrade
+                %% with (`idle_recv_buffer`, or larger after a large body)
+                %% to the session's base, once per upgrade;
+                %% `arm_and_recv/2` grows it from there for a large frame.
+                roadrunner_transport:setopts(Socket, [{buffer, Base}]);
             {_N, {ssl, _}} ->
                 %% A TLS socket already reads with `recv_buffer`.
                 ok;
@@ -443,16 +453,20 @@ apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
     ok.
 
 %% The adaptive buffer's base and cap for a session: only an `once`
-%% session adapts, since it re-arms per message and so can resize in the
-%% same call, and only below a listener `recv_buffer` larger than the
-%% base. Anything else keeps the buffer it has.
+%% session on plain TCP adapts, since it re-arms per message and so can
+%% resize in the same call, and only below a listener `recv_buffer` larger
+%% than the base. A TLS socket keeps reading with `recv_buffer`: its
+%% records are up to 16 KB, so a smaller buffer would split them. Anything
+%% else keeps the buffer it has.
 -spec adaptive_buf(
-    pos_integer() | {adaptive, pos_integer(), pos_integer()} | undefined, once | 1..32767
+    pos_integer() | {adaptive, pos_integer(), pos_integer()} | undefined,
+    once | 1..32767,
+    roadrunner_transport:socket()
 ) ->
     {pos_integer(), pos_integer(), pos_integer()} | undefined.
-adaptive_buf({adaptive, Base, Max}, once) when Max > Base ->
+adaptive_buf({adaptive, Base, Max}, once, {Transport, _}) when Max > Base, Transport =/= ssl ->
     {Base, Base, Max};
-adaptive_buf(_WsBuffer, _Mode) ->
+adaptive_buf(_WsBuffer, _Mode, _Socket) ->
     undefined.
 
 %% Run the session in the calling process until it ends, then call
@@ -491,7 +505,7 @@ serve(
     ok = apply_gc_settings(SpawnOpts),
     HeapFloor = heap_floor(ProtoOpts),
     Mode = read_mode(Active, Socket),
-    Buf = adaptive_buf(WsBuffer, Mode),
+    Buf = adaptive_buf(WsBuffer, Mode, Socket),
     {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
     Data = #data{
         socket = Socket,
@@ -1120,13 +1134,31 @@ arm_and_recv(#data{buffer = Buffered, buf = {Cur, Base, Max}} = Data, Hibernate)
 
 %% Re-arm after dispatching a whole message of `Size` bytes that arrived
 %% with nothing else buffered. A buffer the session grew for large frames
-%% goes back to its base once a message smaller than the base arrives, so
-%% a connection that sent one upload does not keep the large buffer.
+%% goes back to its base after `?BUF_SHRINK_AFTER` messages smaller than
+%% the base in a row, so a connection that sent one upload does not keep
+%% the large buffer, while one mixing large and small messages does not
+%% resize around every small one. Only a grown buffer counts.
 -spec arm_after_message(non_neg_integer(), #data{}, boolean()) -> finished.
-arm_after_message(Size, #data{buf = {Cur, Base, Max}} = Data, Hibernate) when
-    Cur > Base, Size < Base
-->
-    arm_once([{active, once}, {buffer, Base}], Data#data{buf = {Base, Base, Max}}, Hibernate);
+arm_after_message(Size, #data{buf = {Cur, Base, Max}} = Data, Hibernate) when Cur > Base ->
+    case {Size < Base, get(?BUF_SMALL_RUN)} of
+        {true, Run} when Run =:= ?BUF_SHRINK_AFTER - 1 ->
+            _ = erase(?BUF_SMALL_RUN),
+            arm_once(
+                [{active, once}, {buffer, Base}], Data#data{buf = {Base, Base, Max}}, Hibernate
+            );
+        {true, undefined} ->
+            _ = put(?BUF_SMALL_RUN, 1),
+            arm_and_recv(Data, Hibernate);
+        {true, Run} ->
+            _ = put(?BUF_SMALL_RUN, Run + 1),
+            arm_and_recv(Data, Hibernate);
+        {false, undefined} ->
+            arm_and_recv(Data, Hibernate);
+        {false, _Run} ->
+            %% A large message breaks the run of small ones.
+            _ = erase(?BUF_SMALL_RUN),
+            arm_and_recv(Data, Hibernate)
+    end;
 arm_after_message(_Size, Data, Hibernate) ->
     arm_and_recv(Data, Hibernate).
 
