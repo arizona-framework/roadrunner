@@ -69,13 +69,13 @@ protocol_opts(_Case) ->
     #{protocols => [http2]}.
 
 listener_opts(floor_stops_at_the_cap) ->
-    #{handler_spawn => #{heap_floor => 1000}};
+    #{handler_spawn => #{heap_floor => #{max => 1000}}};
 listener_opts(floor_off) ->
-    #{handler_spawn => #{heap_floor => 0}};
+    #{handler_spawn => #{heap_floor => false}};
 listener_opts(floor_starts_at_the_spawn_min_heap_size) ->
     #{handler_spawn => #{opts => [{min_heap_size, 2000}]}};
 listener_opts(floor_off_when_the_cap_is_under_the_spawn_min_heap_size) ->
-    #{handler_spawn => #{opts => [{min_heap_size, 2000}], heap_floor => 1000}};
+    #{handler_spawn => #{opts => [{min_heap_size, 2000}], heap_floor => #{max => 1000}}};
 listener_opts(_Case) ->
     #{}.
 

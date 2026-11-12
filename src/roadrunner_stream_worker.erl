@@ -125,7 +125,7 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch, HeapFloor) ->
 %% for the larger ones.
 
 %% The connection's cell, or `undefined` when the listener's
-%% `handler_spawn.heap_floor` is `0` or no higher than the base.
+%% `handler_spawn.heap_floor` is `false` or its `max` no higher than the base.
 -doc false.
 -spec conn_heap_floor(roadrunner_conn:proto_opts()) -> conn_heap_floor().
 conn_heap_floor(#{heap_floor := Cap, handler_spawn_opts := SpawnOpts}) ->

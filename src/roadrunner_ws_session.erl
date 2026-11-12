@@ -236,10 +236,10 @@
     buf :: {Cur :: pos_integer(), Base :: pos_integer(), Max :: pos_integer()} | undefined,
     %% The heap floor (`raise_heap_floor/1`): the `min_heap_size` kept
     %% between events, the size the session started at, the cap, and the
-    %% least heap an event must have needed to raise it (`ws.heap_floor`
-    %% and `ws.heap_floor_min`).
-    %% `undefined` when the listener's `handler_spawn.heap_floor` is `0` or
-    %% no higher than the session's own `min_heap_size`. The events left
+    %% least heap an event must have needed to raise it (`ws.heap_floor`'s
+    %% `max` and `min`).
+    %% `undefined` when the floor is off or its cap is no higher than
+    %% the session's own `min_heap_size`. The events left
     %% before it is learned again are counted in the process dictionary
     %% (`?HEAP_FLOOR_LEFT`), so an event that leaves the floor as it was
     %% does not rewrite this record.
@@ -344,10 +344,11 @@ session_opt(active, V, Opts) ->
     Opts#{ws_active := V};
 session_opt(hibernate_after, V, Opts) ->
     Opts#{ws_hibernate_after := V};
-session_opt(heap_floor, V, #{ws_heap_floor := {Min, _Cap}} = Opts) ->
-    Opts#{ws_heap_floor := {Min, V}};
-session_opt(heap_floor_min, V, #{ws_heap_floor := {_Min, Cap}} = Opts) ->
-    Opts#{ws_heap_floor := {V, Cap}};
+session_opt(heap_floor, false, #{ws_heap_floor := {Min, _Cap}} = Opts) ->
+    Opts#{ws_heap_floor := {Min, 0}};
+session_opt(heap_floor, #{} = Floor, #{ws_heap_floor := {Min, Cap}} = Opts) ->
+    %% Keys the upgrade leaves out keep the listener's.
+    Opts#{ws_heap_floor := {maps:get(min, Floor, Min), maps:get(max, Floor, Cap)}};
 session_opt(Flag, V, #{handler_spawn_opts := Spawn} = Opts) when
     Flag =:= fullsweep_after; Flag =:= min_heap_size; Flag =:= max_heap_size
 ->
@@ -1168,8 +1169,8 @@ wait(Data, false) -> recv_loop(Data).
 %% over several collections to what the event needs, so a handler that
 %% turns a message from another process into a sizeable push (a rendered
 %% diff, encoded) collects several times per push. After each
-%% `handle_info/2` that needed at least `heap_floor_min`, the session
-%% keeps that heap as its floor (`min_heap_size`, up to `heap_floor`), so
+%% `handle_info/2` that needed at least `heap_floor`'s `min`, the session
+%% keeps that heap as its floor (`min_heap_size`, up to its `max`), so
 %% the next push starts at that size. Only `handle_info/2` teaches it:
 %% inbound frames, which a session answers in a couple of microseconds,
 %% run no floor code at all. An idle session collects nothing, so it holds
