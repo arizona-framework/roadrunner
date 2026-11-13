@@ -539,6 +539,14 @@ host_from_absolute_form_target_test() ->
     ?assertEqual(~"target.example", roadrunner_req:host(Req)),
     ?assertEqual(8080, roadrunner_req:port(Req)).
 
+host_all_digits_test() ->
+    %% A host made of digits alone has no port: the walk back from the end
+    %% finds no `:`.
+    ?assertEqual(~"8080", roadrunner_req:host(with_host(~"8080"))),
+    ?assertEqual(80, roadrunner_req:port(with_host(~"8080"))),
+    ?assertEqual(~"10", roadrunner_req:host(with_host(~"10:20"))),
+    ?assertEqual(20, roadrunner_req:port(with_host(~"10:20"))).
+
 port_test() ->
     ?assertEqual(8080, roadrunner_req:port(with_host(~"example.com:8080"))).
 

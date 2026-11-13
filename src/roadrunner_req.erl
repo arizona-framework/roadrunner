@@ -843,11 +843,12 @@ port(Req) ->
     end.
 
 %% A `uri-host [":" port]` split into its host and its port digits (empty
-%% when there is no port). An IP literal runs to its `]`; a reg-name holds
-%% no `:`, so it runs to the first one.
+%% when there is no port). The port is the digits at the end after a `:`:
+%% a reg-name holds no `:` and an IP literal ends at its `]`, so the walk
+%% back from the end stops within the port, whatever the host's length.
 -spec split_authority(binary()) -> {binary(), binary()}.
 split_authority(<<$[, _/binary>> = Authority) -> split_ip_literal(Authority, 1);
-split_authority(Authority) -> split_reg_name(Authority, 0).
+split_authority(Authority) -> split_port(Authority, byte_size(Authority) - 1).
 
 -spec split_ip_literal(binary(), non_neg_integer()) -> {binary(), binary()}.
 split_ip_literal(Authority, Len) ->
@@ -862,12 +863,16 @@ split_ip_literal(Authority, Len) ->
             split_ip_literal(Authority, Len + 1)
     end.
 
--spec split_reg_name(binary(), non_neg_integer()) -> {binary(), binary()}.
-split_reg_name(Authority, Len) ->
+-spec split_port(binary(), integer()) -> {binary(), binary()}.
+split_port(Authority, Len) ->
     case Authority of
-        <<Host:Len/binary, $:, Port/binary>> -> {Host, Port};
-        <<_:Len/binary>> -> {Authority, <<>>};
-        <<_:Len/binary, _, _/binary>> -> split_reg_name(Authority, Len + 1)
+        <<_:Len/binary, $:, _/binary>> ->
+            <<Host:Len/binary, _, Port/binary>> = Authority,
+            {Host, Port};
+        <<_:Len/binary, D, _/binary>> when D >= $0, D =< $9 ->
+            split_port(Authority, Len - 1);
+        _ ->
+            {Authority, <<>>}
     end.
 
 -spec explicit_port(binary(), request()) -> inet:port_number().
