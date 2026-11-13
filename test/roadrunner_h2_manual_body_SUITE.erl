@@ -34,6 +34,7 @@ each route's state picks what it does with the body.
     full_duplex_echo/1,
     reset_before_reading/1,
     read_times_out/1,
+    moved_deadline_ends_the_read/1,
     body_after_the_answer_is_dropped/1
 ]).
 
@@ -68,6 +69,7 @@ all() ->
         full_duplex_echo,
         reset_before_reading,
         read_times_out,
+        moved_deadline_ends_the_read,
         body_after_the_answer_is_dropped
     ].
 
@@ -115,6 +117,7 @@ routes(TestPid) ->
         {~"/chunks", ?H, chunks},
         #{path => ~"/gated", handler => ?H, state => {gated, ?GATED}, max_content_length => 100000},
         {~"/report", ?H, {report, TestPid}},
+        {~"/retimed", ?H, {retimed, TestPid}},
         {~"/gated-report", ?H, {gated_report, ?GATED, TestPid}},
         {~"/answer-first", ?H, {answer_first, ?GATED, TestPid}},
         {~"/stream-echo", ?H, stream_echo},
@@ -298,6 +301,14 @@ reset_before_reading(Config) ->
 read_times_out(Config) ->
     _ = send_headers(open(Config), 1, ~"/report", [], false),
     ?assertEqual({error, request_timeout}, read_result()).
+
+moved_deadline_ends_the_read(Config) ->
+    %% The handler gives its reads no time (`roadrunner_req:set_body_timeout/2`),
+    %% though the listener's `request_timeout` would: the read times out at
+    %% once, and the DATA that comes later is not handed to it.
+    C0 = send_headers(open(Config), 1, ~"/retimed", [], false),
+    ?assertEqual({error, request_timeout}, read_result()),
+    {_, _} = ping_sync(send_data(C0, 1, ~"body", true)).
 
 body_after_the_answer_is_dropped(Config) ->
     %% The response ends before the client's body: reading then fails, the

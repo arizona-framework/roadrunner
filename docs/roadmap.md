@@ -259,20 +259,21 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 ### Anchor the manual-mode body rate window at the first body byte — small
 
-**What:** `make_recv/3` (`roadrunner_conn.erl`) captures its rate-window start at
-closure creation (`read_body_phase/3`), so in manual body-buffering mode a handler
-that delays before calling `roadrunner_req:read_body/1,2` has its think-time counted
-toward the body's minimum-byte-rate average. Auto mode has no gap (it reads the
-body synchronously right after the closure is built), the request-read phase
-already anchors at the first byte, and a manual-mode request expecting
-`100-continue` anchors at the 100, which its first read sends.
+**What:** `make_reader_recv/2` (`roadrunner_conn.erl`) captures its rate-window
+start at closure creation (`read_body_phase/3`), so in manual body-buffering mode a
+handler that delays before calling `roadrunner_req:read_body/1,2` has its
+think-time counted toward the body's minimum-byte-rate average. Auto mode has no
+gap (it reads the body synchronously right after the closure is built), the
+request-read phase already anchors at the first byte, and a manual-mode request
+expecting `100-continue` anchors at the 100, which its first read sends.
 
-**Why deferred:** bounded today by the request_timeout `Deadline` threaded into the
-same closure (it fires first), and the residual is a narrow self-inflicted case
-(manual mode + a slow handler + a configured `min_bytes_per_second` + a small body).
-Anchoring at the first body recv would also slightly weaken Slowloris protection for
-a client that stalls between headers-done and body-start, so it is defensible as-is.
-Revisit only if a real workload reports false `slow_client` drops.
+**Why deferred:** a narrow self-inflicted case (manual mode + a slow handler + a
+configured `min_bytes_per_second` + a small body). A handler that lengthens its
+body reads with `roadrunner_req:set_body_timeout/2` can take longer before its
+first read, so this matters more for it. Anchoring at the first body recv would
+also slightly weaken Slowloris protection for a client that stalls between
+headers-done and body-start, so it is defensible as-is. Revisit if a real
+workload reports false `slow_client` drops.
 
 **Scope:** small.
 

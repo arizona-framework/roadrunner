@@ -34,6 +34,7 @@ picks what it does with the body.
     reset_of_a_stopped_stream/1,
     read_of_a_stopped_stream/1,
     read_times_out/1,
+    body_withdraw_of_a_gone_stream_is_answered/1,
     parked_until_a_slot_frees/1
 ]).
 
@@ -72,6 +73,7 @@ all() ->
         reset_of_a_stopped_stream,
         read_of_a_stopped_stream,
         read_times_out,
+        body_withdraw_of_a_gone_stream_is_answered,
         parked_until_a_slot_frees
     ].
 
@@ -344,6 +346,22 @@ read_of_a_stopped_stream(Config) ->
     ok = go(),
     ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"tail", true),
     ?assertMatch({200, _, ~"2"}, post(Conn, ~"/read", ~"ok")).
+
+body_withdraw_of_a_gone_stream_is_answered(Config) ->
+    %% A timed-out read takes its demand back; for a stream already gone
+    %% the connection still answers, so the read does not wait.
+    Conn = ?config(conn, Config),
+    {200, _, _} = post(Conn, ~"/read", ~"ok"),
+    [Loop | _] = [
+        P
+     || P <- processes(),
+        {roadrunner_conn_loop_http3, _, _} <- [proc_lib:get_label(P)]
+    ],
+    Loop ! {roadrunner_body_withdraw, self(), 999_999},
+    receive
+        {roadrunner_body_withdrawn, 999_999} -> ok
+    after 5000 -> ct:fail(no_withdraw_answer)
+    end.
 
 read_times_out(Config) ->
     Conn = ?config(conn, Config),

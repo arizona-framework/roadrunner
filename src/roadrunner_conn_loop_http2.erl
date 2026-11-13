@@ -656,6 +656,8 @@ recv_more(
             recv_more(handle_send_response(State, StreamId, Status, Headers, Body, BodyLen));
         {roadrunner_body_demand, Worker, StreamId} ->
             recv_more(handle_body_demand(State, Worker, StreamId));
+        {roadrunner_body_withdraw, Worker, StreamId} ->
+            recv_more(withdraw_body_demand(State, Worker, StreamId));
         {roadrunner_continue, Worker, StreamId} ->
             recv_more(handle_continue(State, Worker, StreamId));
         {roadrunner_skip_continue, StreamId} ->
@@ -1550,6 +1552,20 @@ ended_after_answer(#loop{streams = Streams} = State, StreamId) ->
         #{StreamId := #{end_stream_seen := true, state := closed}} ->
             uncount_stream(State, StreamId);
         _ ->
+            State
+    end.
+
+%% A worker's body read timed out (`roadrunner_conn:stream_recv/2`) and
+%% takes its demand back: DATA arriving later stays with the stream
+%% instead of going to a worker no longer reading. The answer tells the
+%% worker that whatever was handed to it before has arrived.
+-spec withdraw_body_demand(#loop{}, pid(), stream_id()) -> #loop{}.
+withdraw_body_demand(#loop{streams = Streams} = State, Worker, StreamId) ->
+    _ = Worker ! {roadrunner_body_withdrawn, StreamId},
+    case Streams of
+        #{StreamId := #{reader := Worker} = Stream} ->
+            State#loop{streams = Streams#{StreamId := Stream#{reader := undefined}}};
+        #{} ->
             State
     end.
 

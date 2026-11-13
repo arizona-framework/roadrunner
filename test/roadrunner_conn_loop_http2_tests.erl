@@ -107,6 +107,7 @@ all_test_() ->
         fun rst_stream_active_stream_synced/0,
         fun stream_window_update_grows_window_synced/0,
         fun rst_stream_unknown_stream_ignored/0,
+        fun body_withdraw_of_a_gone_stream_is_answered/0,
         fun headers_for_already_open_stream_without_end_stream_protocol_error/0,
         fun synthetic_send_data_after_reset/0,
         fun synthetic_send_headers_after_reset/0,
@@ -2541,6 +2542,17 @@ rst_stream_unknown_stream_ignored() ->
     serve_recv(ConnPid, Ping),
     PingAck = expect_send(),
     ?assertMatch(<<_:24, 6, 1, _/binary>>, PingAck),
+    cleanup(Pid, Ref).
+
+body_withdraw_of_a_gone_stream_is_answered() ->
+    %% A timed-out read takes its demand back; for a stream already gone
+    %% the conn still answers, so the read does not wait.
+    {Pid, Ref, _ConnPid} = post_handshake_conn(),
+    Pid ! {roadrunner_body_withdraw, self(), 1},
+    receive
+        {roadrunner_body_withdrawn, 1} -> ok
+    after 1000 -> error(no_withdraw_answer)
+    end,
     cleanup(Pid, Ref).
 
 headers_for_already_open_stream_without_end_stream_protocol_error() ->

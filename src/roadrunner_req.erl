@@ -21,7 +21,7 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 
 -include("roadrunner_swar.hrl").
 
--export_type([request/0, body_reader/0, cached_decisions/0, private/0, conn_info/0]).
+-export_type([request/0, body_reader/0, deadline/0, cached_decisions/0, private/0, conn_info/0]).
 
 -doc """
 The parsed request map handlers receive.
@@ -178,6 +178,10 @@ On HTTP/2 and HTTP/3 (`framing => stream`) the request's DATA is
 delimited by the stream itself: the recv closure asks the connection for
 what has arrived, `buffered` keeps what a length-bounded read left over,
 and `done` flips true with the stream's end.
+
+`deadline` is when reading the body times out, in
+`erlang:monotonic_time(millisecond)` units, or `infinity`. The recv
+closure takes it, so `set_body_timeout/2` can move it.
 """.
 -type body_reader() :: h1_body_reader() | stream_body_reader().
 
@@ -186,7 +190,10 @@ and `done` flips true with the stream's end.
     buffered := iodata(),
     bytes_read := non_neg_integer(),
     done := boolean(),
-    recv := fun(() -> {ok, iodata(), boolean()} | {error, term()}),
+    recv := fun((deadline()) -> {ok, iodata(), boolean()} | {error, term()}),
+    deadline := deadline(),
+    %% Tells this reader apart, so a failed read ends this body only.
+    id := reference(),
     max := non_neg_integer(),
     %% Present while a 100 Continue is owed to a client holding its body
     %% back: the connection process and stream a streaming response asks
@@ -200,18 +207,30 @@ and `done` flips true with the stream's end.
     bytes_read := non_neg_integer(),
     pending := binary(),
     done := boolean(),
-    recv := fun(() -> {ok, binary()} | {error, term()}),
+    recv := fun((deadline()) -> {ok, binary()} | {error, term()}),
+    deadline := deadline(),
+    %% The request's own deadline, which `set_body_timeout/2` leaves alone:
+    %% what is left of the body once the response is out is drained by
+    %% then at the latest.
+    request_deadline := integer(),
+    %% Tells this reader apart, so a failed read ends this body only.
+    id := reference(),
     max := non_neg_integer(),
     %% Trailer-header limits `{max_header_line, max_header_block,
     %% max_header_count}` threaded to `roadrunner_http1:parse_chunk/2`.
     trailer_limits := {pos_integer(), pos_integer(), pos_integer()},
     %% Present while a 100 Continue is owed to a client holding its body
-    %% back: the transport socket the first read sends it on, the request
-    %% deadline and minimum byte rate of the recv that read then starts, and
-    %% the flag that has it sent once, by that read or by a streaming
-    %% response starting first.
-    continue => {term(), integer(), non_neg_integer(), atomics:atomics_ref()}
+    %% back: the transport socket the first read sends it on, the minimum
+    %% byte rate of the recv that read then starts, and the flag that has it
+    %% sent once, by that read or by a streaming response starting first.
+    continue => {term(), non_neg_integer(), atomics:atomics_ref()}
 }.
+
+-doc """
+When a body read times out: an `erlang:monotonic_time(millisecond)`
+time, or `infinity` for never.
+""".
+-type deadline() :: integer() | infinity.
 
 -export([
     method/1,
@@ -231,6 +250,7 @@ and `done` flips true with the stream's end.
     read_body/1,
     read_body/2,
     read_body_chunked/1,
+    set_body_timeout/2,
     read_form/1,
     bindings/1,
     peer/1,
@@ -478,6 +498,9 @@ bytes per call.
 
 In `auto` mode the body is already buffered, so `length` has no
 effect — the buffered bytes are returned in one shot.
+
+A read that fails ends the body: every later read of it, in the process
+that read it, returns the same error.
 """.
 -spec read_body(request(), #{length => non_neg_integer()}) ->
     {ok, iodata(), request()}
@@ -534,6 +557,49 @@ read_body_chunked(#{body_reader := BS} = Req) ->
     end;
 read_body_chunked(Req) ->
     {ok, body(Req), Req}.
+
+-doc """
+Set how long the rest of the body may take to read, from now: the
+reads that follow fail with `{error, request_timeout}` once it has
+passed, or never with `infinity`. It replaces the deadline the request
+got from the listener (`request_timeout`, see `roadrunner_listener`) for
+this request, which a request whose body streams for long, such as a
+gRPC client stream, can outlive.
+
+Set it before the read it is for: a read that fails, a timeout
+included, ends the body, and every later read of it fails the same way.
+
+With `infinity`, a client that stops sending keeps the request, and its
+slot, until the client or its connection goes away, so set it only where
+a long, quiet body is expected. The connection's own limits still apply:
+on HTTP/1.1 the listener's `min_bytes_per_second`, as an average from the
+start of the body, waiting included (a long, quiet body there needs
+`min_bytes_per_second => 0`), and on HTTP/3 the QUIC idle timeout, which
+a client keeps from passing by sending PINGs. Once the response is out,
+what is left of an unread body is drained by the request's own deadline
+at the latest.
+
+Only `body_buffering => manual` mode reads the body after dispatch. In
+`auto` mode the body is already read, and the request comes back as it
+is.
+
+```erlang
+handle(Req0) ->
+    Req = roadrunner_req:set_body_timeout(infinity, Req0),
+    stream_in(Req).
+```
+""".
+-spec set_body_timeout(timeout(), request()) -> request().
+set_body_timeout(Timeout, #{body_reader := BS} = Req) ->
+    Req#{body_reader := BS#{deadline := deadline(Timeout)}};
+set_body_timeout(Timeout, Req) when Timeout =:= infinity; is_integer(Timeout), Timeout >= 0 ->
+    Req.
+
+-spec deadline(timeout()) -> deadline().
+deadline(infinity) ->
+    infinity;
+deadline(Ms) when is_integer(Ms), Ms >= 0 ->
+    erlang:monotonic_time(millisecond) + Ms.
 
 -doc """
 Read and parse a form-encoded request body. Inspects the request's
