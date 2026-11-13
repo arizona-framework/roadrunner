@@ -29,6 +29,8 @@ Use it when the response can only be decided while the handler runs:
 - `file/4` sends a file, as a `{sendfile, ...}` response does
 - `websocket/4` upgrades the connection to a WebSocket session, as a
   `{websocket, Module, State, Opts}` response does
+- `status/1` says whether the final response went out yet, for code
+  that sends one only if nothing else did
 
 The fun sends one final response (`reply/2,4`, `stream/3`, `file/4` or
 `websocket/4`). The calls take the request the fun holds now, so pass
@@ -79,7 +81,7 @@ request gets no body from `reply/2,4` or `file/4`. An interim response
 to an HTTP/1.0 client is skipped, as RFC 9110 §15.2 asks.
 """.
 
--export([inform/3, reply/2, reply/4, stream/3, file/4, websocket/4]).
+-export([inform/3, reply/2, reply/4, stream/3, file/4, websocket/4, status/1]).
 
 -export_type([sender/0]).
 
@@ -177,3 +179,31 @@ HTTP/3, which answer `501`.
     ok | {error, term()}.
 websocket(Module, State, Opts, Req) when is_atom(Module), is_map(Opts) ->
     roadrunner_send_writer:final(websocket, {websocket, Module, State, Opts}, Req).
+
+-doc """
+Return where the final response stands:
+
+- `none` before one is sent (an interim response from `inform/3` does
+  not count)
+- `streaming` while a response from `stream/3` is not ended yet
+- `sent` once it is complete, or once a WebSocket upgrade was made. A
+  `500` sent in place of a response that could not go out (an unsafe
+  header, a missing file) counts as sent too
+
+Use it when the code that would send the response is not the code that
+decides whether one is needed, such as a framework running its own
+pipeline in the fun, where an earlier step may have answered already:
+
+```erlang
+case roadrunner_send:status(Req) of
+    none -> ok = roadrunner_send:reply(204, [], <<>>, Req);
+    _ -> ok
+end
+```
+
+Like the other calls, it raises `not_in_send_fun` when called outside the
+fun's process.
+""".
+-spec status(roadrunner_req:request()) -> none | streaming | sent.
+status(Req) ->
+    roadrunner_send_writer:status(Req).

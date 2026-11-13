@@ -13,7 +13,7 @@
 
 -include_lib("kernel/include/file.hrl").
 
--export([inform/3, final/3, run/5, started/2]).
+-export([inform/3, final/3, status/1, run/5, started/2]).
 
 -export_type([writer/0, op/0, emit/0, sent/0, outcome/0]).
 
@@ -74,6 +74,20 @@ inform(Status, Headers, #{send := #writer{emit = Emit, owner = Owner}} = Req) wh
             {error, unsafe_header}
     end;
 inform(_Status, _Headers, #{send := #writer{}}) ->
+    error(not_in_send_fun).
+
+%% Where the final response stands, read from what went out so far. One
+%% the protocol's writer is still emitting (only seen by a fun that caught
+%% that writer's crash) counts as sent: another final response would be
+%% refused.
+-spec status(roadrunner_req:request()) -> none | streaming | sent.
+status(#{send := #writer{owner = Owner}}) when Owner =:= self() ->
+    case get(?KEY) of
+        undefined -> none;
+        {open, _Status, _Headers, _Send} -> streaming;
+        _ -> sent
+    end;
+status(#{send := #writer{}}) ->
     error(not_in_send_fun).
 
 %% The final response, with the tuple's headers added: sent, or answered
