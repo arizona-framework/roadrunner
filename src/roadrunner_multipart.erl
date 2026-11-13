@@ -93,7 +93,6 @@ save_body(Fd, Req0) ->
 
 -on_load(init_patterns/0).
 
--define(EQ_CP_KEY, {?MODULE, eq_cp}).
 -define(SEMI_CP_KEY, {?MODULE, semi_cp}).
 -define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
 -define(CRLF_CP_KEY, {?MODULE, crlf_cp}).
@@ -191,13 +190,11 @@ params(Value) when is_binary(Value) ->
 
 -spec params_map([binary()]) -> #{binary() => binary()}.
 params_map(Pairs) ->
-    parse_pairs(
-        Pairs, persistent_term:get(?EQ_CP_KEY), persistent_term:get(?QUOTE_CP_KEY), #{}
-    ).
+    parse_pairs(Pairs, persistent_term:get(?QUOTE_CP_KEY), #{}).
 
 %% A header value's type (before the first `;`) and its `key=value` pieces
 %% (split on every `;` after it). A `;` inside a quoted value splits it too;
-%% `parse_pairs/4` joins those pieces back.
+%% `parse_pairs/3` joins those pieces back.
 -spec split_params(binary()) -> {binary(), [binary()]}.
 split_params(Value) ->
     SemiCp = persistent_term:get(?SEMI_CP_KEY),
@@ -206,28 +203,43 @@ split_params(Value) ->
         [Type, Rest] -> {Type, binary:split(Rest, SemiCp, [global])}
     end.
 
--spec parse_pairs([binary()], binary:cp(), binary:cp(), #{binary() => binary()}) ->
+-spec parse_pairs([binary()], binary:cp(), #{binary() => binary()}) ->
     #{binary() => binary()}.
-parse_pairs([], _EqCp, _QuoteCp, Acc) ->
+parse_pairs([], _QuoteCp, Acc) ->
     Acc;
-parse_pairs([Pair | Rest], EqCp, QuoteCp, Acc) ->
-    case binary:split(roadrunner_bin:trim_ows(Pair), EqCp) of
-        [Key, <<$", Quoted/binary>>] ->
+parse_pairs([Pair | Rest], QuoteCp, Acc) ->
+    case split_pair(Pair) of
+        {Key, <<$", Quoted/binary>>} ->
             case {binary:match(Quoted, QuoteCp), Rest} of
                 {{End, _}, _} ->
                     <<Val:End/binary, _/binary>> = Quoted,
-                    parse_pairs(Rest, EqCp, QuoteCp, add_pair(Key, Val, Acc));
+                    parse_pairs(Rest, QuoteCp, add_pair(Key, Val, Acc));
                 {nomatch, [Next | More]} ->
                     %% A `;` inside the quotes split the value: join it back.
-                    parse_pairs([<<Pair/binary, $;, Next/binary>> | More], EqCp, QuoteCp, Acc);
+                    parse_pairs([<<Pair/binary, $;, Next/binary>> | More], QuoteCp, Acc);
                 {nomatch, []} ->
-                    parse_pairs(Rest, EqCp, QuoteCp, add_pair(Key, Quoted, Acc))
+                    parse_pairs(Rest, QuoteCp, add_pair(Key, Quoted, Acc))
             end;
-        [Key, Val] ->
-            parse_pairs(Rest, EqCp, QuoteCp, add_pair(Key, Val, Acc));
-        _ ->
-            parse_pairs(Rest, EqCp, QuoteCp, Acc)
+        {Key, Val} ->
+            parse_pairs(Rest, QuoteCp, add_pair(Key, Val, Acc));
+        nomatch ->
+            parse_pairs(Rest, QuoteCp, Acc)
     end.
+
+%% A pair's key (after leading OWS) and value, split at its first `=` in
+%% one walk over a single match context.
+-spec split_pair(binary()) -> {binary(), binary()} | nomatch.
+split_pair(<<C, Rest/binary>>) when C =:= $\s; C =:= $\t -> split_pair(Rest);
+split_pair(Pair) -> split_key(Pair, Pair, 0).
+
+-spec split_key(binary(), binary(), non_neg_integer()) -> {binary(), binary()} | nomatch.
+split_key(<<$=, Val/binary>>, Pair, Len) ->
+    <<Key:Len/binary, _/binary>> = Pair,
+    {Key, Val};
+split_key(<<_, Rest/binary>>, Pair, Len) ->
+    split_key(Rest, Pair, Len + 1);
+split_key(<<>>, _Pair, _Len) ->
+    nomatch.
 
 %% The trim comes after the unquote, so whitespace inside quotes is kept
 %% and trailing whitespace on a bare value goes.
@@ -619,7 +631,6 @@ append(Buf, Bytes) ->
 %% `persistent_term` so the hot path reads a constant, not a recompile.
 -spec init_patterns() -> ok.
 init_patterns() ->
-    persistent_term:put(?EQ_CP_KEY, binary:compile_pattern(~"=")),
     persistent_term:put(?SEMI_CP_KEY, binary:compile_pattern(~";")),
     persistent_term:put(?QUOTE_CP_KEY, binary:compile_pattern(~"\"")),
     persistent_term:put(?CRLF_CP_KEY, binary:compile_pattern(~"\r\n")),
