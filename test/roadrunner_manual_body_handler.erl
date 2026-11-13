@@ -22,6 +22,8 @@ picks what the handler does with the body:
 - `stream_echo`: start a streamed answer, then read the body and stream it
   back
 - `read_then_stream`: read the body, then stream it back
+- `echo_pieces`: a `{send, ...}` fun that starts a streamed answer, then
+  sends back each piece of the body as it arrives, ending with it
 """.
 
 -behaviour(roadrunner_handler).
@@ -48,6 +50,12 @@ behave(stream_echo, Req) ->
         ok
     end,
     {{stream, 200, [{~"content-type", ~"text/plain"}], Fun}, Req};
+behave(echo_pieces, Req) ->
+    Fun = fun(Req0) ->
+        {ok, Send} = roadrunner_send:stream(200, [{~"content-type", ~"text/plain"}], Req0),
+        echo(Send, Req0)
+    end,
+    {{send, [], Fun}, Req};
 behave(read_then_stream, Req) ->
     {ok, Body, _} = roadrunner_req:read_body(Req),
     Fun = fun(Send) ->
@@ -111,4 +119,16 @@ count(Req, Read, Count, Total) ->
             Size = iolist_size(Bytes),
             Out = [integer_to_binary(Count + 1), ~":", integer_to_binary(Total + Size)],
             {roadrunner_resp:text(200, Out), Req2}
+    end.
+
+%% Send back each piece of the body as it arrives, the last one ending the
+%% answer.
+echo(Send, Req) ->
+    case roadrunner_req:read_body_chunked(Req) of
+        {more, Piece, Req1} ->
+            ok = Send(Piece, nofin),
+            echo(Send, Req1);
+        {ok, Last, Req1} ->
+            ok = Send(Last, fin),
+            Req1
     end.
