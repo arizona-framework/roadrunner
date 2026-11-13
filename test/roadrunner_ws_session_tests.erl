@@ -3312,8 +3312,36 @@ terminate_reasons_test_() ->
                 terminated([{recv, frame(text, ~"hi")}], #{close_on_frame => true})
             )
         end},
-        {"client close frame is remote", fun() ->
-            ?assertMatch({remote, _}, terminated([{recv, frame(close, <<1000:16>>)}], #{}))
+        {"client close frame carries its code", fun() ->
+            ?assertMatch(
+                {{remote, 1000, <<>>}, _}, terminated([{recv, frame(close, <<1000:16>>)}], #{})
+            )
+        end},
+        {"client close frame carries its code and reason", fun() ->
+            ?assertMatch(
+                {{remote, 4000, ~"bye"}, _},
+                terminated([{recv, frame(close, <<4000:16, "bye">>)}], #{})
+            )
+        end},
+        {"client close frame without a code is remote", fun() ->
+            ?assertMatch({remote, _}, terminated([{recv, frame(close, <<>>)}], #{}))
+        end},
+        {"client close frame with a reserved code is a protocol error", fun() ->
+            ?assertMatch(
+                {{error, protocol_error}, _},
+                terminated([{recv, frame(close, <<1005:16>>)}], #{})
+            )
+        end},
+        {"client close frame with an invalid UTF-8 reason is a protocol error", fun() ->
+            ?assertMatch(
+                {{error, protocol_error}, _},
+                terminated([{recv, frame(close, <<1000:16, 16#FF>>)}], #{})
+            )
+        end},
+        {"client close frame of one byte is a protocol error", fun() ->
+            ?assertMatch(
+                {{error, protocol_error}, _}, terminated([{recv, frame(close, <<3>>)}], #{})
+            )
         end},
         {"socket closed without a close frame", fun() ->
             ?assertMatch({{error, closed}, _}, terminated([{error, closed}], #{}))
@@ -3551,7 +3579,7 @@ terminate_crash_still_ends_session_through_finish_test() ->
     ),
     Pid ! socket_ready,
     receive
-        {terminated, remote, _} -> ok
+        {terminated, {remote, 1000, <<>>}, _} -> ok
     after 2000 -> error(no_terminate)
     end,
     ok = await_normal_down(Ref, Pid),

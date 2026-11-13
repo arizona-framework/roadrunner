@@ -1278,12 +1278,24 @@ reset_heap_floor(Data) ->
 -spec handle_frame(roadrunner_ws:frame(), #data{}, boolean()) -> finished.
 handle_frame(#{opcode := close, payload := P}, Data, _Hibernate) ->
     %% RFC 6455 §5.5.1: when echoing a close, the typical behavior is
-    %% to send back the same status code the peer sent. But the peer
-    %% may also send a malformed close (invalid status code, bad
-    %% UTF-8 reason, 1-byte payload). Per §7.4.1 the server then
-    %% MUST close with 1002 (protocol error) instead of echoing.
-    Reply = close_reply(P),
-    flush_and_exit(remote, queue_frame(Data, close, Reply));
+    %% to send back the same status code the peer sent, and `terminate/2`
+    %% gets the code and reason. But the peer may also send a malformed
+    %% close (invalid status code, bad UTF-8 reason, 1-byte payload).
+    %% Per §7.4.1 the server then MUST close with 1002 (protocol error)
+    %% instead of echoing, which is a client error like any other.
+    case P of
+        <<>> ->
+            flush_and_exit(remote, queue_frame(Data, close, <<>>));
+        <<Code:16, Reason/binary>> ->
+            case is_valid_close_code(Code) andalso is_valid_utf8(Reason) of
+                true ->
+                    flush_and_exit({remote, Code, Reason}, queue_frame(Data, close, <<Code:16>>));
+                false ->
+                    close_with(close_protocol_error(), Data)
+            end;
+        _ ->
+            close_with(close_protocol_error(), Data)
+    end;
 handle_frame(#{opcode := ping, payload := P} = Frame, Data, Hibernate) ->
     %% The pong is the session's (RFC 6455 §5.5.2); the handler only sees
     %% the ping, if it asked to.
@@ -1679,28 +1691,6 @@ error_reason(<<1007:16>>) -> invalid_payload.
 close_oversize(Reason, Size, #data{span = Span} = Data) ->
     ok = roadrunner_event:ws_frame_rejected(Span, Reason, Size),
     close_with(Reason, close_message_too_big(), reset_msg(Data)).
-
-%% Build the payload for the close-handshake reply. RFC 6455 §5.5.1
-%% says servers typically echo the received status code back, BUT
-%% only if the peer's close was well-formed. §7.4.1 + §5.5.1
-%% reject malformed closes with 1002 (protocol error). Cases:
-%%
-%% - Empty payload                       → echo empty.
-%% - Two-byte status code that's valid   → echo just the code
-%%                                          (drop the peer's reason).
-%% - Two-byte valid code + invalid UTF-8 → reply 1002.
-%% - Invalid status code (reserved, etc.) → reply 1002.
-%% - One-byte (malformed)                → reply 1002.
--spec close_reply(binary()) -> binary().
-close_reply(<<>>) ->
-    <<>>;
-close_reply(<<Code:16, Reason/binary>>) ->
-    case is_valid_close_code(Code) andalso is_valid_utf8(Reason) of
-        true -> <<Code:16>>;
-        false -> close_protocol_error()
-    end;
-close_reply(_) ->
-    close_protocol_error().
 
 %% Per RFC 6455 §7.4.1 / §7.4.2 and the IANA WebSocket Close Code
 %% Number Registry:
