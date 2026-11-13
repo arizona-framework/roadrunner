@@ -20,7 +20,7 @@ frames.
 -export([parse_frame/1, parse_frame/2]).
 -export([parse_frame_known/3, match_data_frame/2]).
 -export([peek_frame_header/2]).
--export([encode_frame/3, encode_frame/4]).
+-export([encode_frame/3, encode_frame/4, encode_frame_sized/3]).
 -export([parse_extensions/1, negotiate_extensions/1, negotiate_extensions/2]).
 -export([compress_config/1]).
 -export([unmask_words/2]).
@@ -1082,6 +1082,15 @@ encode_frame(Opcode, Payload, Fin, Opts) ->
     Len = iolist_size(Payload),
     Header = encode_header(FinBit, Rsv1Bit, Op, Len),
     [Header, Payload].
+
+%% A final, uncompressed frame whose payload size the caller already
+%% measured: the session sizes each outbound payload once for its
+%% `ws_frame_out` event, and a deep iolist (a JSON encoder's output) is
+%% not cheap to walk twice.
+-doc false.
+-spec encode_frame_sized(opcode(), iodata(), non_neg_integer()) -> iodata().
+encode_frame_sized(Opcode, Payload, Len) ->
+    [encode_header(1, 0, encode_opcode(Opcode), Len), Payload].
 
 -spec encode_header(0 | 1, 0 | 1, 0..15, non_neg_integer()) -> binary().
 encode_header(FinBit, Rsv1Bit, Op, Len) when Len =< 125 ->

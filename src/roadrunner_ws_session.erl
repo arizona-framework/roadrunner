@@ -1868,8 +1868,9 @@ payload_size(#{payload := P}) -> byte_size(P).
 %% multi-fragment outbound message anyway, so the question is moot).
 -spec queue_frame(#data{}, roadrunner_ws:opcode(), iodata()) -> #data{}.
 queue_frame(#data{span = Span, out = Out} = Data, Opcode, Payload) ->
-    ok = roadrunner_event:ws_frame_out(Span, Opcode, iolist_size(Payload)),
-    Data#data{out = [Out | encode_outbound(Data, Opcode, Payload)]}.
+    Size = iolist_size(Payload),
+    ok = roadrunner_event:ws_frame_out(Span, Opcode, Size),
+    Data#data{out = [Out | encode_outbound(Data, Opcode, Payload, Size)]}.
 
 %% Queue a handler `{reply, [...]}` batch — one event per frame (so
 %% the event handler can count by opcode), encoded in one walk.
@@ -1916,21 +1917,24 @@ flush_and_exit(Reason, Data) ->
 encode_frames(_Data, _Span, []) ->
     [];
 encode_frames(Data, Span, [{Op, Payload} | Rest]) ->
-    ok = roadrunner_event:ws_frame_out(Span, Op, iolist_size(Payload)),
-    [encode_outbound(Data, Op, Payload) | encode_frames(Data, Span, Rest)].
+    Size = iolist_size(Payload),
+    ok = roadrunner_event:ws_frame_out(Span, Op, Size),
+    [encode_outbound(Data, Op, Payload, Size) | encode_frames(Data, Span, Rest)].
 
--spec encode_outbound(#data{}, roadrunner_ws:opcode(), iodata()) -> iodata().
-encode_outbound(#data{pmd_params = undefined}, Opcode, Payload) ->
+%% `Size` is the payload's, measured once by the caller for its event; only the
+%% compressed path needs another, of its deflated bytes.
+-spec encode_outbound(#data{}, roadrunner_ws:opcode(), iodata(), non_neg_integer()) -> iodata().
+encode_outbound(#data{pmd_params = undefined}, Opcode, Payload, Size) ->
     %% No PMD negotiated — straight encode.
-    roadrunner_ws:encode_frame(Opcode, Payload, true);
-encode_outbound(_Data, Opcode, Payload) when
+    roadrunner_ws:encode_frame_sized(Opcode, Payload, Size);
+encode_outbound(_Data, Opcode, Payload, Size) when
     Opcode =:= close; Opcode =:= ping; Opcode =:= pong; Opcode =:= continuation
 ->
     %% Control frames must not be compressed (RFC 7692 §6.1). We
     %% never emit continuation outbound either, but treat it the
     %% same as a control for safety.
-    roadrunner_ws:encode_frame(Opcode, Payload, true);
-encode_outbound(Data, Opcode, Payload) ->
+    roadrunner_ws:encode_frame_sized(Opcode, Payload, Size);
+encode_outbound(Data, Opcode, Payload, _Size) ->
     %% text / binary with PMD — deflate, strip per-message tail,
     %% emit single frame with RSV1=1.
     Compressed = deflate_message(Data, Payload),

@@ -830,6 +830,18 @@ encode_accepts_iodata_payload_test() ->
     Encoded = iolist_to_binary(roadrunner_ws:encode_frame(text, [~"hel", $l, ~"o"], true)),
     ?assertEqual(<<16#81, 16#05, "hello">>, Encoded).
 
+encode_frame_sized_matches_encode_frame_test() ->
+    %% The sized encoder takes the payload size from the caller and must
+    %% produce the same final frame at every length encoding.
+    [
+        ?assertEqual(
+            iolist_to_binary(roadrunner_ws:encode_frame(Op, Payload, true)),
+            iolist_to_binary(roadrunner_ws:encode_frame_sized(Op, Payload, iolist_size(Payload)))
+        )
+     || Op <- [text, binary, close, ping, pong],
+        Payload <- [[~"hel", $l, ~"o"], binary:copy(~"x", 300), binary:copy(~"x", 70000)]
+    ].
+
 encode_frame_4_with_rsv1_sets_the_bit_test() ->
     %% encode_frame/4 with #{rsv1 => true} sets RSV1=1 in the first byte
     %% — used by the permessage-deflate sender path on the first frame
