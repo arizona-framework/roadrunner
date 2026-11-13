@@ -85,6 +85,7 @@ save_body(Fd, Req0) ->
 -on_load(init_patterns/0).
 
 -define(EQ_CP_KEY, {?MODULE, eq_cp}).
+-define(SEMI_CP_KEY, {?MODULE, semi_cp}).
 -define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
 -define(CRLF_CP_KEY, {?MODULE, crlf_cp}).
 -define(DBL_CRLF_CP_KEY, {?MODULE, dbl_crlf_cp}).
@@ -153,7 +154,7 @@ lowercased, and its parameters, as `params/1` returns them.
 """.
 -spec disposition(binary()) -> {binary(), #{binary() => binary()}}.
 disposition(Value) when is_binary(Value) ->
-    [Type | Pairs] = split_params(Value, 0, false),
+    {Type, Pairs} = split_params(Value),
     {roadrunner_bin:ascii_lowercase(roadrunner_bin:trim_ows(Type)), params_map(Pairs)}.
 
 -doc """
@@ -176,7 +177,7 @@ Malformed pairs (no `=`) are silently skipped.
 """.
 -spec params(binary()) -> #{binary() => binary()}.
 params(Value) when is_binary(Value) ->
-    [_Type | Pairs] = split_params(Value, 0, false),
+    {_Type, Pairs} = split_params(Value),
     params_map(Pairs).
 
 -spec params_map([binary()]) -> #{binary() => binary()}.
@@ -185,20 +186,15 @@ params_map(Pairs) ->
         Pairs, persistent_term:get(?EQ_CP_KEY), persistent_term:get(?QUOTE_CP_KEY), #{}
     ).
 
-%% A header value split on each `;` outside a quoted string. `Len` is how
-%% far into the current piece the walk is; `Quoted` is whether that point
-%% is inside quotes.
--spec split_params(binary(), non_neg_integer(), boolean()) -> [binary()].
-split_params(Value, Len, Quoted) ->
-    case Value of
-        <<Piece:Len/binary, $;, Rest/binary>> when not Quoted ->
-            [Piece | split_params(Rest, 0, false)];
-        <<_:Len/binary, $", _/binary>> ->
-            split_params(Value, Len + 1, not Quoted);
-        <<_:Len/binary, _, _/binary>> ->
-            split_params(Value, Len + 1, Quoted);
-        <<_:Len/binary>> ->
-            [Value]
+%% A header value's type (before the first `;`) and its `key=value` pieces
+%% (split on every `;` after it). A `;` inside a quoted value splits it too;
+%% `parse_pairs/4` joins those pieces back.
+-spec split_params(binary()) -> {binary(), [binary()]}.
+split_params(Value) ->
+    SemiCp = persistent_term:get(?SEMI_CP_KEY),
+    case binary:split(Value, SemiCp) of
+        [Type] -> {Type, []};
+        [Type, Rest] -> {Type, binary:split(Rest, SemiCp, [global])}
     end.
 
 -spec parse_pairs([binary()], binary:cp(), binary:cp(), #{binary() => binary()}) ->
@@ -207,32 +203,28 @@ parse_pairs([], _EqCp, _QuoteCp, Acc) ->
     Acc;
 parse_pairs([Pair | Rest], EqCp, QuoteCp, Acc) ->
     case binary:split(roadrunner_bin:trim_ows(Pair), EqCp) of
+        [Key, <<$", Quoted/binary>>] ->
+            case {binary:match(Quoted, QuoteCp), Rest} of
+                {{End, _}, _} ->
+                    <<Val:End/binary, _/binary>> = Quoted,
+                    parse_pairs(Rest, EqCp, QuoteCp, add_pair(Key, Val, Acc));
+                {nomatch, [Next | More]} ->
+                    %% A `;` inside the quotes split the value: join it back.
+                    parse_pairs([<<Pair/binary, $;, Next/binary>> | More], EqCp, QuoteCp, Acc);
+                {nomatch, []} ->
+                    parse_pairs(Rest, EqCp, QuoteCp, add_pair(Key, Quoted, Acc))
+            end;
         [Key, Val] ->
-            %% Unquote first so internal whitespace inside quoted strings
-            %% is preserved; trim afterwards catches trailing whitespace
-            %% on bare (unquoted) values.
-            parse_pairs(
-                Rest,
-                EqCp,
-                QuoteCp,
-                Acc#{
-                    roadrunner_bin:ascii_lowercase(Key) => roadrunner_bin:trim_ows(
-                        unquote(Val, QuoteCp)
-                    )
-                }
-            );
+            parse_pairs(Rest, EqCp, QuoteCp, add_pair(Key, Val, Acc));
         _ ->
             parse_pairs(Rest, EqCp, QuoteCp, Acc)
     end.
 
--spec unquote(binary(), binary:cp()) -> binary().
-unquote(<<$", Rest/binary>>, QuoteCp) ->
-    case binary:match(Rest, QuoteCp) of
-        {End, _} -> binary:part(Rest, 0, End);
-        nomatch -> Rest
-    end;
-unquote(Bin, _QuoteCp) ->
-    Bin.
+%% The trim comes after the unquote, so whitespace inside quotes is kept
+%% and trailing whitespace on a bare value goes.
+-spec add_pair(binary(), binary(), #{binary() => binary()}) -> #{binary() => binary()}.
+add_pair(Key, Val, Acc) ->
+    Acc#{roadrunner_bin:ascii_lowercase(Key) => roadrunner_bin:trim_ows(Val)}.
 
 -doc """
 Split `Body` into a list of multipart parts using `Boundary` as the
@@ -619,6 +611,7 @@ append(Buf, Bytes) ->
 -spec init_patterns() -> ok.
 init_patterns() ->
     persistent_term:put(?EQ_CP_KEY, binary:compile_pattern(~"=")),
+    persistent_term:put(?SEMI_CP_KEY, binary:compile_pattern(~";")),
     persistent_term:put(?QUOTE_CP_KEY, binary:compile_pattern(~"\"")),
     persistent_term:put(?CRLF_CP_KEY, binary:compile_pattern(~"\r\n")),
     persistent_term:put(?DBL_CRLF_CP_KEY, binary:compile_pattern(~"\r\n\r\n")),
