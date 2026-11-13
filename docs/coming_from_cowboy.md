@@ -243,6 +243,9 @@ name.
 | `cowboy_req:has_body(Req)` | `roadrunner_req:has_body(Req)` |
 | `cowboy_req:read_body(Req)` | `roadrunner_req:read_body(Req)` |
 | `cowboy_req:read_urlencoded_body(Req)` | `roadrunner_req:read_form(Req)` |
+| `cowboy_req:read_part(Req)` | `roadrunner_multipart:read_part(Req)` |
+| `cowboy_req:read_part_body(Req)` | `roadrunner_multipart:read_part_body(Req)` |
+| `cow_multipart:form_data(Headers)` | `roadrunner_multipart:disposition(Value)` on the part's `content-disposition` |
 | `cowboy_req:peer(Req)` | `roadrunner_req:peer(Req)` |
 | `cowboy_req:sock(Req)` | `roadrunner_req:sockname(Req)`, `{ok, {Ip, Port}}` |
 | `cowboy_req:cert(Req)` | `roadrunner_req:peercert(Req)`, `{ok, Der}` or `{error, no_peercert}` |
@@ -737,8 +740,6 @@ cover each one.
   `parse_qs/1` or `parse_cookies/1`, or the raw value from `header/2`, and
   convert it in your code
 - **`cowboy_req:push/3,4`** (HTTP/2 server push): not available
-- **`read_part/1` and `read_part_body/1`** (reading multipart one part at a
-  time): `read_form/1` parses a multipart body after reading all of it
 - **`cowboy_req:cast/2`** (messages to stream handlers): there are no stream
   handlers. To read a body piece by piece, use `body_buffering => manual` and
   `read_body/2` with `length`
