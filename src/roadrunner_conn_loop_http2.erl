@@ -90,6 +90,10 @@
 -define(HANDSHAKE_TIMEOUT_DEFAULT, 10_000).
 -define(IDLE_TIMEOUT_DEFAULT, 30_000).
 
+%% Opaque data of the PING a conn still serving sends when its idle timeout
+%% passes with nothing heard (`recv_idle_expired/1`).
+-define(LIVENESS_PING, ~"rr-alive").
+
 %% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`.
 -define(MAX_FRAME_SIZE, 16_384).
 
@@ -364,6 +368,8 @@
     streams = #{} :: #{stream_id() => stream_entry()},
     %% Worker monitor ref → stream id, for DOWN correlation.
     worker_refs = #{} :: #{reference() => stream_id()},
+    %% Whether a liveness PING (`recv_idle_expired/1`) waits for its ACK.
+    liveness_ping = false :: boolean(),
     %% Set to a stream id while a HEADERS / PUSH_PROMISE block is
     %% still being assembled (no END_HEADERS yet). The next inbound
     %% frame MUST be a CONTINUATION on the same stream — anything
@@ -689,20 +695,65 @@ recv_timeout(#loop{idle_timeout = T}) ->
 %% `recv_more_hib/2` resumes the loop. A hibernated process only wakes
 %% on a message, so a timer for the rest of the idle timeout goes with
 %% it: without one, an idle conn would never send its idle GOAWAY.
-%% Otherwise emit the idle GOAWAY now.
+%% A conn still serving is not idle, however quiet the wire: a handler
+%% may take longer than the idle timeout to answer, or a `{loop, ...}`
+%% stream wait that long for its next event. It sends a PING (RFC 9113
+%% §6.7) and waits again: a live client ACKs it, and a client gone without
+%% a word (a dropped network, a NAT that forgot the flow) lets another
+%% idle timeout pass, which closes the conn. Otherwise emit the idle
+%% GOAWAY now.
 -spec recv_idle_expired(#loop{}) -> no_return().
 recv_idle_expired(#loop{streams = Streams, hibernate_after = Ms, idle_timeout = T} = State) when
     map_size(Streams) =:= 0, Ms > 0, Ms < T
 ->
     TRef = erlang:start_timer(T - Ms, self(), ?MODULE),
     erlang:hibernate(?MODULE, recv_more_hib, [State, TRef]);
+recv_idle_expired(#loop{liveness_ping = false} = State) ->
+    case serving(State) of
+        true ->
+            _ = send(State, roadrunner_http2_frame:encode({ping, 0, ?LIVENESS_PING})),
+            recv_more(State#loop{liveness_ping = true});
+        false ->
+            idle_goaway(State)
+    end;
 recv_idle_expired(State) ->
-    idle_goaway(State).
+    %% The liveness PING went unanswered for a whole idle timeout: the
+    %% client is gone if the conn still serves, else simply idle.
+    case serving(State) of
+        true -> idle_goaway(State, liveness_timeout);
+        false -> idle_goaway(State)
+    end.
+
+%% Whether the conn is still serving: a worker runs and no stream holds
+%% sends that wait for the client's flow-control window. A worker reading a
+%% body waits on the client too, but its read has its own deadline. A
+%% client that stops granting window meets the idle timeout, and the conn
+%% closes with every stream on it, a quiet one still at work included: a
+%% client that holds a window shut that long has stopped reading.
+-spec serving(#loop{}) -> boolean().
+serving(#loop{worker_refs = Refs}) when map_size(Refs) =:= 0 ->
+    false;
+serving(#loop{streams = Streams}) ->
+    no_blocked_sends(maps:iterator(Streams)).
+
+-spec no_blocked_sends(maps:iterator(stream_id(), stream_entry())) -> boolean().
+no_blocked_sends(Iter) ->
+    case maps:next(Iter) of
+        none ->
+            true;
+        {_StreamId, #{pending_sends := Pending}, Next} ->
+            queue:is_empty(Pending) andalso no_blocked_sends(Next)
+    end.
 
 -spec idle_goaway(#loop{}) -> no_return().
 idle_goaway(State) ->
-    _ = send_goaway(State, protocol_error),
-    exit_clean(State, keep_alive_timeout).
+    idle_goaway(State, keep_alive_timeout).
+
+-spec idle_goaway(#loop{}, keep_alive_timeout | liveness_timeout) -> no_return().
+idle_goaway(State, Reason) ->
+    %% Closing an idle conn is no error (RFC 9113 §6.8, §7).
+    _ = send_goaway(State, no_error),
+    exit_clean(State, Reason).
 
 %% Hibernate re-entry (see `recv_idle_expired/1`). Drops the idle
 %% timer and resumes the unified mailbox loop after an idle conn wakes
@@ -833,6 +884,8 @@ handle_frame({settings, 0, Params}, State) ->
         {error, {flow_control_error, _}} ->
             goaway_exit(State, flow_control_error)
     end;
+handle_frame({ping, 1, ?LIVENESS_PING}, State) ->
+    frame_loop(State#loop{liveness_ping = false});
 handle_frame({ping, 1, _Data}, State) ->
     frame_loop(State);
 handle_frame({ping, 0, Opaque}, State) ->

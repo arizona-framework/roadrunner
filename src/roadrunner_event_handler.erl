@@ -235,6 +235,9 @@ Why a connection ended, as carried by `listener_conn_close`.
   (on HTTP/2, the client preface and `SETTINGS` did not arrive in time)
 - `keep_alive_timeout`: idle between requests past `keep_alive_timeout`
   (on HTTP/2 and HTTP/3, the connection's idle timeout)
+- `liveness_timeout`: an HTTP/2 connection with a handler still at work
+  went quiet, and the client did not answer the PING sent to check it is
+  still there
 - `slow_client`: the client sent slower than `min_bytes_per_second`
 - `drained`: closed by `roadrunner_listener:drain/2`
 - `rejected`: an HTTP/1.1 request was refused before its handler ran
@@ -251,6 +254,7 @@ Why a connection ended, as carried by `listener_conn_close`.
     | peer_closed
     | request_timeout
     | keep_alive_timeout
+    | liveness_timeout
     | slow_client
     | drained
     | rejected

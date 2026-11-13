@@ -101,6 +101,9 @@ all_test_() ->
         fun hibernated_idle_conn_still_emits_goaway/0,
         fun hibernate_after_past_idle_timeout_emits_goaway/0,
         fun idle_timeout_with_open_stream_emits_goaway/0,
+        fun idle_timeout_waits_for_a_running_worker/0,
+        fun idle_timeout_closes_when_the_liveness_ping_goes_unanswered/0,
+        fun idle_timeout_after_the_handler_ends_is_a_plain_idle_close/0,
         fun rst_stream_active_stream_synced/0,
         fun stream_window_update_grows_window_synced/0,
         fun rst_stream_unknown_stream_ignored/0,
@@ -2289,6 +2292,139 @@ idle_timeout_with_open_stream_emits_goaway() ->
     after
         persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
     end.
+
+idle_timeout_waits_for_a_running_worker() ->
+    %% A handler taking longer than the idle timeout keeps the conn: it is
+    %% serving, not idle. Each idle timeout with nothing heard sends a
+    %% liveness PING, which a live client ACKs. The response goes out when
+    %% the handler answers, and the idle timeout closes the conn, without
+    %% an error, once no worker runs.
+    drain_mailbox(),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(#{
+            dispatch =>
+                {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                    undefined}
+        }),
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        serve_recv(ConnPid, complete_get_headers(1, ~"/block")),
+        Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+        ok = ack_liveness_ping(ConnPid),
+        ok = ack_liveness_ping(ConnPid),
+        Worker ! release,
+        ?assertMatch(
+            {ok, {headers, 1, _, _, _}, _},
+            roadrunner_http2_frame:parse(expect_send(), 16384)
+        ),
+        ?assertMatch(<<0, 0, 8, 7, 0, 0:32, _:32, 0:32>>, expect_send()),
+        expect_close(),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(process_did_not_exit)
+        end
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+idle_timeout_closes_when_the_liveness_ping_goes_unanswered() ->
+    %% A client gone without a word while a handler works: the liveness
+    %% PING gets no ACK, and the next idle timeout closes the conn, with a
+    %% close reason of its own.
+    {ok, _} = roadrunner_test_event_handler:start(),
+    drain_mailbox(),
+    Self = self(),
+    Tag = make_ref(),
+    ok = telemetry:attach(
+        Tag,
+        [roadrunner, listener, conn_close],
+        fun(_, _, #{reason := Reason}, _) -> Self ! {Tag, Reason} end,
+        undefined
+    ),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(#{
+            dispatch =>
+                {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                    undefined}
+        }),
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        serve_recv(ConnPid, complete_get_headers(1, ~"/block")),
+        Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+        ?assertMatch(<<0, 0, 8, 6, 0, 0:32, "rr-alive">>, expect_send()),
+        ?assertMatch(<<0, 0, 8, 7, 0, 0:32, _:32, 0:32>>, expect_send()),
+        expect_close(),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(process_did_not_exit)
+        end,
+        receive
+            {Tag, CloseReason} -> ?assertEqual(liveness_timeout, CloseReason)
+        after 1000 -> error(no_conn_close)
+        end,
+        Worker ! release
+    after
+        ok = telemetry:detach(Tag),
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+idle_timeout_after_the_handler_ends_is_a_plain_idle_close() ->
+    %% A liveness PING goes out, then the handler answers and ends: with
+    %% nothing left serving, the next idle timeout is a plain idle close,
+    %% even with that PING unanswered.
+    {ok, _} = roadrunner_test_event_handler:start(),
+    drain_mailbox(),
+    Self = self(),
+    Tag = make_ref(),
+    ok = telemetry:attach(
+        Tag,
+        [roadrunner, listener, conn_close],
+        fun(_, _, #{reason := Reason}, _) -> Self ! {Tag, Reason} end,
+        undefined
+    ),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(#{dispatch => h2_test_dispatch()}),
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        serve_recv(ConnPid, complete_get_headers(1, ~"/block")),
+        Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+        ?assertMatch(<<0, 0, 8, 6, 0, 0:32, "rr-alive">>, expect_send()),
+        Worker ! release,
+        ?assertMatch(
+            {ok, {headers, 1, _, _, _}, _},
+            roadrunner_http2_frame:parse(expect_send(), 16384)
+        ),
+        ?assertMatch(<<0, 0, 8, 7, 0, 0:32, _:32, 0:32>>, expect_send()),
+        expect_close(),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(process_did_not_exit)
+        end,
+        receive
+            {Tag, CloseReason} -> ?assertEqual(keep_alive_timeout, CloseReason)
+        after 1000 -> error(no_conn_close)
+        end
+    after
+        ok = telemetry:detach(Tag),
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+%% Wait for the conn's liveness PING and ACK it.
+ack_liveness_ping(ConnPid) ->
+    ?assertMatch(<<0, 0, 8, 6, 0, 0:32, "rr-alive">>, expect_send()),
+    _ = serve_recv(
+        ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({ping, 1, ~"rr-alive"}))
+    ),
+    ok.
 
 %% Poll until the conn process has actually hibernated. A hibernated
 %% process reports `current_function = {erlang, hibernate, 3}` — the
@@ -5049,6 +5185,9 @@ expect_send() ->
         {roadrunner_fake_send, _Pid, Data} -> iolist_to_binary(Data)
     after 500 -> error(no_send)
     end.
+
+h2_test_dispatch() ->
+    {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1, undefined}.
 
 drain_send(Timeout) ->
     receive
