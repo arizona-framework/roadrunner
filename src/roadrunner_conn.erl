@@ -63,7 +63,8 @@
     refine_conn_label/2,
     scheme/1,
     conn_info/1,
-    make_body_reader/5,
+    make_body_reader/6,
+    make_reader_recv/2,
     latest_reader/1,
     stream_body_reader/5,
     with_body_reader/5,
@@ -849,6 +850,17 @@ make_recv(Socket, Deadline, MinRate) ->
     _ = erase(?RECV_BYTES_PDKEY),
     fun() -> recv_body_chunk(Socket, Deadline, MinRate, Start) end.
 
+%% `make_recv/3` for a manual-mode body reader, which keeps its deadline
+%% itself (`roadrunner_req:set_body_timeout/2` moves it) and hands it to
+%% each read.
+-doc false.
+-spec make_reader_recv(roadrunner_transport:socket(), non_neg_integer()) ->
+    fun((roadrunner_req:deadline()) -> {ok, binary()} | {error, term()}).
+make_reader_recv(Socket, MinRate) ->
+    Start = erlang:monotonic_time(millisecond),
+    _ = erase(?RECV_BYTES_PDKEY),
+    fun(Deadline) -> recv_body_chunk(Socket, Deadline, MinRate, Start) end.
+
 %% One drain-aware body read, kept out of the closure so a
 %% chunk-timeout tick can recurse without rebuilding it.
 %%
@@ -870,7 +882,9 @@ make_recv(Socket, Deadline, MinRate) ->
 %% the deadline has passed. A timeout with time still left on the
 %% deadline is a drain-check tick and loops; one without is the
 %% request_timeout itself.
--spec recv_body_chunk(roadrunner_transport:socket(), integer(), non_neg_integer(), integer()) ->
+-spec recv_body_chunk(
+    roadrunner_transport:socket(), roadrunner_req:deadline(), non_neg_integer(), integer()
+) ->
     {ok, binary()} | {error, request_timeout | slow_client | drained | term()}.
 recv_body_chunk(Socket, Deadline, MinRate, Start) ->
     case get(?ACTIVE_PDKEY) of
@@ -881,7 +895,9 @@ recv_body_chunk(Socket, Deadline, MinRate, Start) ->
 
 %% A body read on a socket disarmed with reads still in the mailbox:
 %% those come first, in order, then the socket.
--spec recv_body_queued(roadrunner_transport:socket(), integer(), non_neg_integer(), integer()) ->
+-spec recv_body_queued(
+    roadrunner_transport:socket(), roadrunner_req:deadline(), non_neg_integer(), integer()
+) ->
     {ok, binary()} | {error, request_timeout | slow_client | drained | term()}.
 recv_body_queued(Socket, Deadline, MinRate, Start) ->
     {DataTag, _ClosedTag, _ErrorTag} = roadrunner_transport:messages(Socket),
@@ -892,7 +908,9 @@ recv_body_queued(Socket, Deadline, MinRate, Start) ->
         recv_body_passive(Socket, Deadline, MinRate, Start)
     end.
 
--spec recv_body_passive(roadrunner_transport:socket(), integer(), non_neg_integer(), integer()) ->
+-spec recv_body_passive(
+    roadrunner_transport:socket(), roadrunner_req:deadline(), non_neg_integer(), integer()
+) ->
     {ok, binary()} | {error, request_timeout | slow_client | drained | term()}.
 recv_body_passive(Socket, Deadline, MinRate, Start) ->
     case drain_pending() of
@@ -900,7 +918,7 @@ recv_body_passive(Socket, Deadline, MinRate, Start) ->
             {error, drained};
         ok ->
             Now = erlang:monotonic_time(millisecond),
-            Remaining = max(0, Deadline - Now),
+            Remaining = remaining(Deadline, Now),
             ChunkTimeout = min(Remaining, ?DRAIN_CHECK_INTERVAL_MS),
             case roadrunner_transport:recv(Socket, 0, ChunkTimeout) of
                 {ok, Data} ->
@@ -921,13 +939,17 @@ recv_body_passive(Socket, Deadline, MinRate, Start) ->
 %% in manual body buffering may hold messages meant for the handler, is
 %% left alone. The socket's passive message arms it again.
 -spec recv_body_active(
-    roadrunner_transport:socket(), integer(), non_neg_integer(), integer(), pos_integer()
+    roadrunner_transport:socket(),
+    roadrunner_req:deadline(),
+    non_neg_integer(),
+    integer(),
+    pos_integer()
 ) ->
     {ok, binary()} | {error, request_timeout | slow_client | drained | term()}.
 recv_body_active(Socket, Deadline, MinRate, Start, N) ->
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
     PassiveTag = roadrunner_transport:passive_message(Socket),
-    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    Remaining = remaining(Deadline, erlang:monotonic_time(millisecond)),
     receive
         {DataTag, _Sock, Data} ->
             rate_checked(Data, erlang:monotonic_time(millisecond) - Start, MinRate);
@@ -945,6 +967,13 @@ recv_body_active(Socket, Deadline, MinRate, Start, N) ->
     after Remaining ->
         {error, request_timeout}
     end.
+
+%% Milliseconds left before `Deadline`, none once it has passed.
+-spec remaining(roadrunner_req:deadline(), integer()) -> timeout().
+remaining(infinity, _Now) ->
+    infinity;
+remaining(Deadline, Now) ->
+    max(0, Deadline - Now).
 
 %% A body read's bytes, counted toward the request's running rate after
 %% `Elapsed` ms of its window.
@@ -984,7 +1013,8 @@ drain_check_interval_ms() ->
 %% Get-or-create the per-request received-byte counter. Allocated lazily
 %% on the first recv so a bodyless or fully-buffered request (whose recv
 %% closure is never invoked) skips the `atomics` allocation; memoized in
-%% the process dictionary until `make_recv/3` resets it for the next
+%% the process dictionary until `make_recv/3` or `make_reader_recv/2`
+%% resets it for the next
 %% request. Process-local state is safe because the HTTP/1 connection
 %% process reads one request body at a time.
 -spec recv_byte_counter() -> atomics:atomics_ref().
@@ -1199,11 +1229,12 @@ expects_continue(Req) ->
 -spec make_body_reader(
     none | chunked | {content_length, non_neg_integer()},
     binary(),
-    fun(() -> {ok, binary()} | {error, term()}),
+    fun((roadrunner_req:deadline()) -> {ok, binary()} | {error, term()}),
     non_neg_integer(),
-    {pos_integer(), pos_integer(), pos_integer()}
+    {pos_integer(), pos_integer(), pos_integer()},
+    integer()
 ) -> roadrunner_req:body_reader().
-make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits) ->
+make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits, Deadline) ->
     _ = erase(?READER_PDKEY),
     #{
         framing => Framing,
@@ -1212,13 +1243,16 @@ make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits) ->
         pending => <<>>,
         done => false,
         recv => Recv,
+        deadline => Deadline,
+        request_deadline => Deadline,
+        id => make_ref(),
         max => Max,
         trailer_limits => TrailerLimits
     }.
 
 %% The body reader of an HTTP/2 request in manual body mode: its DATA is
 %% delimited by the stream, so the reader pulls what the connection has
-%% received through `recv` (`stream_recv/3`) until the stream's end, held to
+%% received through `recv` (`stream_recv/2`) until the stream's end, held to
 %% `Max` bytes. A request whose stream already ended with its headers has no
 %% body to pull (`Done`).
 -doc false.
@@ -1230,7 +1264,9 @@ stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
         buffered => <<>>,
         bytes_read => 0,
         done => Done,
-        recv => stream_recv(Conn, StreamId, Deadline),
+        recv => stream_recv(Conn, StreamId),
+        deadline => Deadline,
+        id => make_ref(),
         max => Max
     }.
 
@@ -1252,7 +1288,9 @@ with_arrived_body_reader(Req, Body, Len, Max) ->
         buffered => <<>>,
         bytes_read => 0,
         done => Len =:= 0,
-        recv => fun() -> {ok, Body, true} end,
+        recv => fun(_Deadline) -> {ok, Body, true} end,
+        deadline => infinity,
+        id => make_ref(),
         max => Max
     },
     (maps:remove(body, Req))#{body_reader => Reader}.
@@ -1288,7 +1326,7 @@ with_body_reader(Req, StreamId, Timeout, Max, ContinueOwed) ->
 %% a body no handler reads is never asked for.
 -doc false.
 -spec continue_before_stream(roadrunner_req:request()) -> ok.
-continue_before_stream(#{body_reader := #{continue := {Socket, _Deadline, _MinRate, Owed}}}) ->
+continue_before_stream(#{body_reader := #{continue := {Socket, _MinRate, Owed}}}) ->
     send_continue_once(Owed, Socket);
 continue_before_stream(#{body_reader := #{continue := {Conn, StreamId}}}) ->
     MRef = monitor(process, Conn),
@@ -1309,7 +1347,7 @@ continue_before_stream(_Req) ->
 %% HTTP/3 the connection is told, ahead of the reads it orders after it.
 -doc false.
 -spec skip_continue(roadrunner_req:request()) -> ok.
-skip_continue(#{body_reader := #{continue := {_Socket, _Deadline, _MinRate, Owed}}}) ->
+skip_continue(#{body_reader := #{continue := {_Socket, _MinRate, Owed}}}) ->
     atomics:put(Owed, 1, 1);
 skip_continue(#{body_reader := #{continue := {Conn, StreamId}}}) ->
     _ = Conn ! {roadrunner_skip_continue, StreamId},
@@ -1327,7 +1365,7 @@ send_continue_once(Owed, Socket) ->
         1 -> ok
     end.
 
-%% The connection's answer to a stream body reader's demand (`stream_recv/3`
+%% The connection's answer to a stream body reader's demand (`stream_recv/2`
 %% receives it): DATA, `Fin` marking the body's end.
 -doc false.
 -spec send_body(pid(), pos_integer(), iodata(), boolean()) -> ok.
@@ -1347,25 +1385,47 @@ send_body_error(Reader, StreamId, Reason) ->
 
 %% The recv of a stream body reader, run in the worker that reads the body:
 %% ask the connection for the stream's next DATA and wait for it, until the
-%% request's `Deadline`. The connection answers with what it holds, or with
+%% reader's `Deadline`. The connection answers with what it holds, or with
 %% the next DATA to arrive, and `Fin` once the stream has ended; a stream it
 %% no longer has, or a connection that goes away, ends the read.
--spec stream_recv(pid(), pos_integer(), integer()) ->
-    fun(() -> {ok, iodata(), boolean()} | {error, term()}).
-stream_recv(Conn, StreamId, Deadline) ->
-    fun() ->
+-spec stream_recv(pid(), pos_integer()) ->
+    fun((roadrunner_req:deadline()) -> {ok, iodata(), boolean()} | {error, term()}).
+stream_recv(Conn, StreamId) ->
+    fun(Deadline) ->
         MRef = monitor(process, Conn),
         Conn ! {roadrunner_body_demand, self(), StreamId},
-        Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
+        Timeout = remaining(Deadline, erlang:monotonic_time(millisecond)),
         Result =
             receive
                 {roadrunner_body, StreamId, Data, Fin} -> {ok, Data, Fin};
                 {roadrunner_body_error, StreamId, Reason} -> {error, Reason};
                 {'DOWN', MRef, process, Conn, _} -> {error, closed}
-            after Timeout -> {error, request_timeout}
+            after Timeout -> withdraw_demand(Conn, StreamId, MRef)
             end,
         true = demonitor(MRef, [flush]),
         Result
+    end.
+
+%% A read that timed out takes its demand back from the connection, which
+%% answers once it holds no more for this worker; anything it handed over
+%% before is dropped, so no late DATA lands in a mailbox nobody reads it
+%% from (a `{loop, ...}` handler's, say).
+-spec withdraw_demand(pid(), pos_integer(), reference()) -> {error, request_timeout}.
+withdraw_demand(Conn, StreamId, MRef) ->
+    Conn ! {roadrunner_body_withdraw, self(), StreamId},
+    receive
+        {roadrunner_body_withdrawn, StreamId} -> ok;
+        {'DOWN', MRef, process, Conn, _} -> ok
+    end,
+    ok = drop_delivered(StreamId),
+    {error, request_timeout}.
+
+-spec drop_delivered(pos_integer()) -> ok.
+drop_delivered(StreamId) ->
+    receive
+        {roadrunner_body, StreamId, _Data, _Fin} -> drop_delivered(StreamId);
+        {roadrunner_body_error, StreamId, _Reason} -> drop_delivered(StreamId)
+    after 0 -> ok
     end.
 
 -doc false.
@@ -1515,13 +1575,17 @@ drain_reader(BS) ->
 %% never read: a handler that read its body inside a stream, or handed
 %% back an older request, leaves the connection a copy that does not know
 %% what was read, and draining that copy would wait for bytes already
-%% taken.
+%% taken. `{failed, Reason}` once a read failed: what is left of the body
+%% is unknown, so it cannot be drained.
 -doc false.
--spec latest_reader(roadrunner_req:body_reader()) -> roadrunner_req:body_reader().
+-spec latest_reader(roadrunner_req:body_reader()) ->
+    roadrunner_req:body_reader() | {failed, term()}.
 latest_reader(BS) ->
-    case erase(?READER_PDKEY) of
-        undefined -> BS;
-        Latest -> Latest
+    case {erase(?READER_PDKEY), BS} of
+        {undefined, _} -> BS;
+        {{failed, Id, Reason}, #{id := Id}} -> {failed, Reason};
+        {{failed, _OtherId, _Reason}, _} -> BS;
+        {Latest, _} -> Latest
     end.
 
 -doc """
@@ -1541,14 +1605,22 @@ full read).
     | {more, iodata(), roadrunner_req:body_reader()}
     | {error, term()}.
 consume_body_reader(BS, Mode) ->
-    remember_reader(consume_reader(BS, Mode)).
+    case {get(?READER_PDKEY), BS} of
+        {{failed, Id, Reason}, #{id := Id}} -> {error, Reason};
+        _ -> remember_reader(BS, consume_reader(BS, Mode))
+    end.
 
 %% The reader as the handler last left it, so the connection drains from
 %% there (`latest_reader/1`) even when the request the handler hands
 %% back, or none at all for a stream, still holds an older copy. One
-%% reader per HTTP/1 connection process at a time; `make_body_reader/5`
-%% clears it for the next request.
+%% reader per HTTP/1 connection process at a time; `make_body_reader/6`
+%% clears it for the next request. A failed read ends the body: a read
+%% gathers what it takes from several receives before it returns, and
+%% one that fails partway has taken bytes no copy of the reader knows of,
+%% so every later read of that body fails the same way
+%% (`consume_body_reader/2`) instead of reading on from the wrong place.
 -spec remember_reader(
+    roadrunner_req:body_reader(),
     {ok, iodata(), roadrunner_req:body_reader()}
     | {more, iodata(), roadrunner_req:body_reader()}
     | {error, term()}
@@ -1556,9 +1628,10 @@ consume_body_reader(BS, Mode) ->
     {ok, iodata(), roadrunner_req:body_reader()}
     | {more, iodata(), roadrunner_req:body_reader()}
     | {error, term()}.
-remember_reader({error, _} = E) ->
+remember_reader(#{id := Id}, {error, Reason} = E) ->
+    _ = put(?READER_PDKEY, {failed, Id, Reason}),
     E;
-remember_reader({_, _Bytes, BS} = Result) ->
+remember_reader(_BS, {_, _Bytes, BS} = Result) ->
     _ = put(?READER_PDKEY, BS),
     Result.
 
@@ -1568,13 +1641,13 @@ remember_reader({_, _Bytes, BS} = Result) ->
     {ok, iodata(), roadrunner_req:body_reader()}
     | {more, iodata(), roadrunner_req:body_reader()}
     | {error, term()}.
-consume_reader(#{continue := {Socket, Deadline, MinRate, Owed}} = BS, Mode) ->
+consume_reader(#{continue := {Socket, MinRate, Owed}} = BS, Mode) ->
     %% The client is holding its body back for a 100 Continue the conn left
     %% to this first read (`roadrunner_conn_loop:read_body/8`): send it,
     %% then read with a recv whose slow-client rate window starts now, as the
     %% client can only start sending now.
     ok = send_continue_once(Owed, Socket),
-    Recv = make_recv(Socket, Deadline, MinRate),
+    Recv = make_reader_recv(Socket, MinRate),
     consume_reader(maps:remove(continue, BS#{recv := Recv}), Mode);
 consume_reader(#{framing := stream} = BS, all) ->
     stream_collect(BS, infinity, [], 0);
@@ -1598,7 +1671,13 @@ consume_reader(#{framing := {content_length, N}, max := Max}, _Mode) when N > Ma
     %% much as one of the whole body, before any of it is read.
     {error, content_length_too_large};
 consume_reader(
-    #{framing := {content_length, N}, bytes_read := Read, buffered := Buf, recv := Recv} = BS,
+    #{
+        framing := {content_length, N},
+        bytes_read := Read,
+        buffered := Buf,
+        recv := Recv,
+        deadline := Deadline
+    } = BS,
     Mode
 ) ->
     Remaining = N - Read,
@@ -1608,7 +1687,7 @@ consume_reader(
             next_chunk -> Remaining;
             {length, L} -> min(Remaining, L)
         end,
-    case fill_n(Want, Buf, Recv) of
+    case fill_n(Want, Buf, fun() -> Recv(Deadline) end) of
         {ok, Bytes, NewBuf} ->
             NewRead = Read + iolist_size(Bytes),
             NewState = BS#{buffered := NewBuf, bytes_read := NewRead},
@@ -1692,8 +1771,8 @@ stream_next(#{buffered := Buf, done := Done} = BS) ->
 %% before), held to the reader's `max`.
 -spec stream_pull(roadrunner_req:body_reader()) ->
     {ok, roadrunner_req:body_reader()} | {error, term()}.
-stream_pull(#{recv := Recv, bytes_read := Read, max := Max} = BS) ->
-    case Recv() of
+stream_pull(#{recv := Recv, deadline := Deadline, bytes_read := Read, max := Max} = BS) ->
+    case Recv(Deadline) of
         {ok, Data, Fin} ->
             case Read + iolist_size(Data) of
                 Total when Total > Max ->
@@ -1744,6 +1823,7 @@ chunked_collect(
     #{
         buffered := Buf,
         recv := Recv,
+        deadline := Deadline,
         max := Max,
         bytes_read := Read,
         trailer_limits := TrailerLimits
@@ -1758,7 +1838,7 @@ chunked_collect(
         {ok, last, _Trailers, Rest} ->
             chunked_collect(BS#{buffered := Rest, done := true}, Want);
         {more, _} ->
-            case Recv() of
+            case Recv(Deadline) of
                 {ok, More} ->
                     chunked_collect(BS#{buffered := roadrunner_bin:append(Buf, More)}, Want);
                 {error, _} = E ->
@@ -1784,6 +1864,7 @@ next_chunk(
     #{
         buffered := Buf,
         recv := Recv,
+        deadline := Deadline,
         max := Max,
         bytes_read := Read,
         trailer_limits := TrailerLimits
@@ -1796,7 +1877,7 @@ next_chunk(
         {ok, last, _Trailers, Rest} ->
             {ok, <<>>, BS#{buffered := Rest, done := true}};
         {more, _} ->
-            case Recv() of
+            case Recv(Deadline) of
                 {ok, More} ->
                     next_chunk(BS#{buffered := roadrunner_bin:append(Buf, More)});
                 {error, _} = E ->

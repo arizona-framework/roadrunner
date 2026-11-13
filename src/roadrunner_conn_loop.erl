@@ -1272,14 +1272,19 @@ read_body(
 read_body(auto, none, S, Req, Framing, MaxCL, Resolved, Deadline) ->
     read_auto_body(S, Req, Framing, MaxCL, Resolved, Deadline);
 read_body(manual, Answer, S, Req, Framing, MaxCL, Resolved, Deadline) ->
+    #loop_state{socket = Socket, min_rate = MinRate} = S,
     BodyState = roadrunner_conn:make_body_reader(
-        Framing, S#loop_state.buffered, body_recv(S, Deadline), MaxCL, trailer_limits(S)
+        Framing,
+        S#loop_state.buffered,
+        roadrunner_conn:make_reader_recv(Socket, MinRate),
+        MaxCL,
+        trailer_limits(S),
+        Deadline
     ),
     case Answer of
         continue ->
-            #loop_state{socket = Socket, min_rate = MinRate} = S,
             Owed = atomics:new(1, []),
-            Reader = BodyState#{continue => {Socket, Deadline, MinRate, Owed}},
+            Reader = BodyState#{continue => {Socket, MinRate, Owed}},
             dispatch_phase(flush_out(S), Req#{body_reader => Reader}, Resolved);
         none ->
             dispatch_phase(S, Req#{body_reader => BodyState}, Resolved)
@@ -1960,14 +1965,23 @@ drain_reader(none) ->
 drain_reader(Reader) ->
     drain_latest(roadrunner_conn:latest_reader(Reader)).
 
--spec drain_latest(roadrunner_req:body_reader()) -> {ok, binary()} | {error, term()}.
+-spec drain_latest(roadrunner_req:body_reader() | {failed, term()}) ->
+    {ok, binary()} | {error, term()}.
+drain_latest({failed, Reason}) ->
+    %% A read of the body failed: where the rest of it starts is unknown,
+    %% so the connection closes instead of draining it.
+    {error, Reason};
 drain_latest(#{continue := _}) ->
     %% The handler answered without asking for the body (`read_body/8`):
     %% no 100 went out and the client is holding the body back, so there is
     %% nothing to drain, and the connection closes.
     {error, body_not_requested};
-drain_latest(Reader) ->
-    roadrunner_conn:drain_reader(Reader).
+drain_latest(#{deadline := Deadline, request_deadline := RequestDeadline} = Reader) ->
+    %% Not past the request's own deadline, whatever the handler moved its
+    %% reads to (`roadrunner_req:set_body_timeout/2`): a client that stops
+    %% sending the rest of a body nobody wants must not hold the
+    %% connection.
+    roadrunner_conn:drain_reader(Reader#{deadline := min(Deadline, RequestDeadline)}).
 
 %% 413 + close for a body over its cap, after any queued pipelined
 %% responses, lingering over the body the client may be sending.

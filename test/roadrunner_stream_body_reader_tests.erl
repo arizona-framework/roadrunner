@@ -87,11 +87,83 @@ recv_errors_test_() ->
         ?assertEqual({error, closed}, read(Refusing, deadline(5000))),
         Gone = spawn(fun() -> ok end),
         ?assertEqual({error, closed}, read(Gone, deadline(5000))),
-        Silent = spawn_link(fun() -> receive
-            after infinity -> ok
-            end end),
+        Silent = spawn_link(fun() -> serve_late(~"") end),
         ?assertEqual({error, request_timeout}, read(Silent, deadline(0)))
     end}.
+
+%% --- withdrawing a timed-out read ---
+
+%% A late body error is dropped with the read, and a connection that goes
+%% away instead of answering the withdrawal does not leave the read
+%% waiting.
+withdrawn_read_test_() ->
+    {spawn, fun() ->
+        Erring = spawn_link(fun() ->
+            serve_late_message({roadrunner_body_error, 7, closed})
+        end),
+        ?assertEqual({error, request_timeout}, read(Erring, deadline(0))),
+        ?assertEqual(
+            none,
+            receive
+                {roadrunner_body_error, 7, _} = Late -> Late
+            after 0 -> none
+            end
+        ),
+        Leaving = spawn(fun() ->
+            receive
+                {roadrunner_body_demand, _, 7} -> ok
+            end,
+            receive
+                {roadrunner_body_withdraw, _, 7} -> ok
+            end
+        end),
+        ?assertEqual({error, request_timeout}, read(Leaving, deadline(0)))
+    end}.
+
+%% --- moving the deadline ---
+
+%% A reader whose deadline has passed reads again once
+%% `set_body_timeout/2` moves it, here to never, before the read.
+set_body_timeout_moves_the_deadline_test_() ->
+    {spawn, fun() ->
+        Conn = spawn_link(fun() -> serve([{~"abcd", true}]) end),
+        Req = #{body_reader => roadrunner_conn:stream_body_reader(Conn, 7, deadline(0), 64, false)},
+        Req1 = roadrunner_req:set_body_timeout(infinity, Req),
+        {ok, Body, _} = roadrunner_req:read_body(Req1),
+        ?assertEqual(~"abcd", iolist_to_binary(Body))
+    end}.
+
+%% A read that fails ends the body: a later read fails the same way, even
+%% with a deadline moved past it.
+failed_read_ends_the_body_test_() ->
+    {spawn, fun() ->
+        Conn = spawn_link(fun() -> serve_late(~"late") end),
+        Req = #{body_reader => roadrunner_conn:stream_body_reader(Conn, 7, deadline(0), 64, false)},
+        ?assertEqual({error, request_timeout}, roadrunner_req:read_body(Req)),
+        Req1 = roadrunner_req:set_body_timeout(infinity, Req),
+        ?assertEqual({error, request_timeout}, roadrunner_req:read_body(Req1)),
+        %% The DATA handed over just before the demand was withdrawn was
+        %% dropped, not left in the mailbox.
+        ?assertEqual(
+            none,
+            receive
+                {roadrunner_body, 7, _, _} = Late -> Late
+            after 0 -> none
+            end
+        )
+    end}.
+
+set_body_timeout_from_now_test() ->
+    Req = #{body_reader => roadrunner_conn:stream_body_reader(self(), 7, deadline(0), 64, false)},
+    Before = erlang:monotonic_time(millisecond),
+    #{body_reader := #{deadline := Deadline}} = roadrunner_req:set_body_timeout(1000, Req),
+    ?assert(Deadline >= Before + 1000).
+
+%% Without a reader (`auto` mode) the body is already read: nothing moves.
+set_body_timeout_without_a_reader_test() ->
+    Req = #{body => ~"read"},
+    ?assertEqual(Req, roadrunner_req:set_body_timeout(1000, Req)),
+    ?assertEqual(Req, roadrunner_req:set_body_timeout(infinity, Req)).
 
 %% --- helpers ---
 
@@ -116,7 +188,9 @@ req(Script, Max) ->
             buffered => <<>>,
             bytes_read => 0,
             done => false,
-            recv => Recv,
+            deadline => infinity,
+            id => make_ref(),
+            recv => fun(_Deadline) -> Recv() end,
             max => Max
         }
     }.
@@ -140,6 +214,21 @@ serve([Next | Rest]) ->
                     {Data, Fin} -> Worker ! {roadrunner_body, 7, Data, Fin}
                 end,
             serve(Rest)
+    end.
+
+%% A connection that leaves the ask unanswered until the read times out,
+%% then hands over `Data` just before it confirms the demand is withdrawn.
+serve_late(Data) ->
+    serve_late_message({roadrunner_body, 7, Data, false}).
+
+serve_late_message(Late) ->
+    receive
+        {roadrunner_body_demand, _Worker, 7} -> ok
+    end,
+    receive
+        {roadrunner_body_withdraw, Worker, 7} ->
+            Worker ! Late,
+            Worker ! {roadrunner_body_withdrawn, 7}
     end.
 
 continue_before_stream_when_the_conn_is_gone_test() ->

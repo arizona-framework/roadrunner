@@ -1705,6 +1705,49 @@ make_recv_armed_reads_socket_messages_test_() ->
         end}
     ].
 
+%% An HTTP/1.1 manual-mode reader keeps its deadline: one already passed
+%% is moved by `set_body_timeout/2` (here to never) before the read, which
+%% then takes the body. Its own process: it drives its own mailbox.
+h1_reader_set_body_timeout_test_() ->
+    {spawn, fun() ->
+        Req = #{body_reader => h1_reader()},
+        Req1 = roadrunner_req:set_body_timeout(infinity, Req),
+        self() ! {roadrunner_fake_data, x, ~"body"},
+        {ok, Body, _} = roadrunner_req:read_body(Req1),
+        ?assertEqual(~"body", iolist_to_binary(Body))
+    end}.
+
+%% A read that fails ends the body, on HTTP/1.1 too: a later one fails the
+%% same way, whatever arrived since, and the connection does not drain it.
+h1_failed_read_ends_the_body_test_() ->
+    {spawn, fun() ->
+        Reader = h1_reader(),
+        Req = #{body_reader => Reader},
+        ?assertEqual({error, request_timeout}, roadrunner_req:read_body(Req)),
+        %% The failure is this reader's alone: another one is as it was.
+        Other = roadrunner_conn:stream_body_reader(self(), 7, 0, 64, true),
+        ?assertEqual(Other, roadrunner_conn:latest_reader(Other)),
+        ?assertEqual({error, request_timeout}, roadrunner_req:read_body(Req)),
+        self() ! {roadrunner_fake_data, x, ~"body"},
+        ?assertEqual(
+            {error, request_timeout},
+            roadrunner_req:read_body(roadrunner_req:set_body_timeout(infinity, Req))
+        ),
+        ?assertEqual({failed, request_timeout}, roadrunner_conn:latest_reader(Reader))
+    end}.
+
+%% A content-length 4 reader on an armed fake socket, its deadline now.
+h1_reader() ->
+    ok = roadrunner_conn:armed(4),
+    roadrunner_conn:make_body_reader(
+        {content_length, 4},
+        <<>>,
+        roadrunner_conn:make_reader_recv({fake, self()}, 0),
+        100,
+        {8192, 10240, 100},
+        erlang:monotonic_time(millisecond)
+    ).
+
 %% Disarmed with reads still queued (`disarmed/0`): those come first, in
 %% order, then the socket. Its own process: it drives its own mailbox.
 make_recv_disarmed_reads_queued_then_socket_test_() ->
@@ -1733,7 +1776,9 @@ consume_state_no_framing_returns_empty_test() ->
         framing => none,
         buffered => ~"hi",
         bytes_read => 0,
-        recv => fun() -> error(unused) end,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
         trailer_limits => {8192, 10240, 100}
     },
@@ -1744,7 +1789,9 @@ consume_state_already_drained_returns_empty_test() ->
         framing => {content_length, 5},
         buffered => <<>>,
         bytes_read => 5,
-        recv => fun() -> error(unused) end,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
         trailer_limits => {8192, 10240, 100}
     },
@@ -1755,7 +1802,9 @@ consume_state_length_returns_more_then_ok_test() ->
         framing => {content_length, 6},
         buffered => ~"abcdef",
         bytes_read => 0,
-        recv => fun() -> error(unused) end,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
         trailer_limits => {8192, 10240, 100}
     },
@@ -1769,7 +1818,9 @@ consume_state_length_recv_error_propagates_test() ->
         framing => {content_length, 100},
         buffered => <<>>,
         bytes_read => 0,
-        recv => fun() -> {error, closed} end,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> {error, closed} end,
         max => 1000,
         trailer_limits => {8192, 10240, 100}
     },
@@ -1797,7 +1848,9 @@ consume_state_length_multi_recv_test() ->
         framing => {content_length, 100},
         buffered => <<>>,
         bytes_read => 0,
-        recv => Recv,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> Recv() end,
         max => 1000,
         trailer_limits => {8192, 10240, 100}
     },
@@ -1823,7 +1876,9 @@ consume_state_length_multi_recv_error_test() ->
         framing => {content_length, 100},
         buffered => <<>>,
         bytes_read => 0,
-        recv => Recv,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> Recv() end,
         max => 1000,
         trailer_limits => {8192, 10240, 100}
     },
@@ -1837,7 +1892,9 @@ consume_state_request_too_large_test() ->
         framing => {content_length, 100},
         buffered => <<>>,
         bytes_read => 0,
-        recv => fun() -> error(unused) end,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> error(unused) end,
         max => 10,
         trailer_limits => {8192, 10240, 100}
     },
@@ -1853,7 +1910,9 @@ consume_state_request_too_large_in_pieces_test() ->
         framing => {content_length, 100},
         buffered => binary:copy(~"x", 100),
         bytes_read => 0,
-        recv => fun() -> error(unused) end,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> error(unused) end,
         max => 10,
         trailer_limits => {8192, 10240, 100}
     },
@@ -2026,7 +2085,9 @@ consume_state_next_chunk_for_content_length_drains_fully_test() ->
         bytes_read => 0,
         pending => <<>>,
         done => false,
-        recv => fun() -> error(unused) end,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
         trailer_limits => {8192, 10240, 100}
     },
@@ -2055,7 +2116,9 @@ chunked_state(Buf, Recv) ->
         bytes_read => 0,
         pending => <<>>,
         done => false,
-        recv => Recv,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> Recv() end,
         max => 1000,
         trailer_limits => {8192, 10240, 100}
     }.
@@ -2068,7 +2131,9 @@ consume_state_recvs_more_when_buffer_short_test() ->
         framing => {content_length, 5},
         buffered => ~"he",
         bytes_read => 0,
-        recv => fun() ->
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) ->
             Self ! recv_called,
             {ok, ~"llo"}
         end,

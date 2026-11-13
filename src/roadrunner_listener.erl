@@ -182,8 +182,12 @@ Optional middleware and timing knobs (durations in milliseconds):
   while small messages leave the floor; `0` lets every message raise
   it). An upgrade can set each for its own session
   (`t:roadrunner_ws_handler:upgrade_opts/0`).
-- `request_timeout` — header-read timeout on a fresh conn.
-  Default 30 s.
+- `request_timeout` — header-read timeout on a fresh conn. With
+  `body_buffering => manual` it also bounds reading the body: on
+  HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the deadline the
+  request's read started with (this timeout for a connection's first
+  request, `keep_alive_timeout` after). `roadrunner_req:set_body_timeout/2`
+  changes it per request. Default 30 s.
 - `tls_handshake_timeout` — bound on the TLS handshake (TLS listeners
   only). The handshake runs in the connection process, not the
   acceptor, so a slow or silent peer never blocks other connections

@@ -368,6 +368,8 @@ loop(#h3{conn = Conn} = State) ->
             loop(handle_worker_down(State, MonRef, Reason));
         {roadrunner_body_demand, Worker, StreamId} ->
             loop(handle_body_demand(State, Worker, StreamId));
+        {roadrunner_body_withdraw, Worker, StreamId} ->
+            loop(withdraw_body_demand(State, Worker, StreamId));
         {roadrunner_continue, Worker, StreamId} ->
             loop(handle_continue(State, Worker, StreamId));
         {roadrunner_skip_continue, StreamId} ->
@@ -1039,6 +1041,20 @@ handle_body_demand(#h3{streams = Streams} = State, Worker, StreamId) ->
             State;
         _ ->
             ok = roadrunner_conn:send_body_error(Worker, StreamId, closed),
+            State
+    end.
+
+%% A worker's body read timed out (`roadrunner_conn:stream_recv/2`) and
+%% takes its demand back: DATA arriving later stays with the stream
+%% instead of going to a worker no longer reading. The answer tells the
+%% worker that whatever was handed to it before has arrived.
+-spec withdraw_body_demand(#h3{}, pid(), non_neg_integer()) -> #h3{}.
+withdraw_body_demand(#h3{streams = Streams} = State, Worker, StreamId) ->
+    _ = Worker ! {roadrunner_body_withdrawn, StreamId},
+    case Streams of
+        #{StreamId := #{reader := Worker} = Stream} ->
+            State#h3{streams = Streams#{StreamId := Stream#{reader := undefined}}};
+        #{} ->
             State
     end.
 
