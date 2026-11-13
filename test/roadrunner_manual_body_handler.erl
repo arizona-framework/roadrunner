@@ -6,6 +6,7 @@ picks what the handler does with the body:
 - `read`: read it all and answer with its size (413 with the reason when
   the read fails)
 - `reject`: answer 401 without reading it
+- `has_body`: answer with `roadrunner_req:has_body/1`, before any read
 - `pieces` / `chunks`: read it 4 bytes at a time / chunk by chunk and answer
   `Count:Total`
 - `{gated, Name}`: register as `Name`, wait for `go`, then `read`
@@ -36,6 +37,8 @@ behave(read, Req) ->
         {ok, Body, Req2} -> {roadrunner_resp:text(200, integer_to_binary(iolist_size(Body))), Req2};
         {error, Reason} -> {roadrunner_resp:text(413, atom_to_binary(Reason)), Req}
     end;
+behave(has_body, Req) ->
+    {roadrunner_resp:text(200, atom_to_binary(roadrunner_req:has_body(Req))), Req};
 behave(reject, Req) ->
     {roadrunner_resp:text(401, ~"no"), Req};
 behave(stream_echo, Req) ->

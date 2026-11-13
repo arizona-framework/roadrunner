@@ -16,6 +16,7 @@ each route's state picks what it does with the body.
     reads_chunk_by_chunk/1,
     reads_data_as_it_arrives/1,
     reads_nothing_without_a_body/1,
+    has_body_before_reading/1,
     trailers_end_the_body/1,
     answers_before_the_body/1,
     expect_continue_asks_on_the_first_read/1,
@@ -48,6 +49,7 @@ all() ->
         reads_chunk_by_chunk,
         reads_data_as_it_arrives,
         reads_nothing_without_a_body,
+        has_body_before_reading,
         trailers_end_the_body,
         answers_before_the_body,
         expect_continue_asks_on_the_first_read,
@@ -106,6 +108,7 @@ routes(TestPid) ->
     [
         {~"/read", ?H, read},
         {~"/reject", ?H, reject},
+        {~"/has-body", ?H, has_body},
         {~"/pieces", ?H, pieces},
         {~"/chunks", ?H, chunks},
         #{path => ~"/gated", handler => ?H, state => {gated, ?GATED}, max_content_length => 100000},
@@ -150,6 +153,13 @@ reads_data_as_it_arrives(Config) ->
 reads_nothing_without_a_body(Config) ->
     C = send_headers(open(Config), 1, ~"/read", [], true),
     ?assertMatch({[200], ~"0", end_stream, _}, response(C, 1)).
+
+has_body_before_reading(Config) ->
+    %% Known from the stream before any read: ended with its headers, or not.
+    C0 = send_headers(open(Config), 1, ~"/has-body", [], true),
+    {[200], ~"false", end_stream, C1} = response(C0, 1),
+    C2 = send_data(send_headers(C1, 3, ~"/has-body", [], false), 3, ~"hello", true),
+    ?assertMatch({[200], ~"true", end_stream, _}, response(C2, 3)).
 
 trailers_end_the_body(Config) ->
     C0 = send_headers(open(Config), 1, ~"/read", [], false),

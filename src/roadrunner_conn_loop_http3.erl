@@ -1844,8 +1844,11 @@ with_body(Req, reading, StreamId, #h3{
 }) ->
     #{StreamId := #{continue_owed := ContinueOwed}} = Streams,
     roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxLen, ContinueOwed);
-with_body(Req, Body, _StreamId, #h3{body_buffering = manual, max_content_length = MaxLen}) ->
-    roadrunner_conn:with_arrived_body_reader(Req, Body, MaxLen);
+with_body(Req, Body, StreamId, #h3{
+    body_buffering = manual, max_content_length = MaxLen, streams = Streams
+}) ->
+    #{StreamId := #{body_len := Len}} = Streams,
+    roadrunner_conn:with_arrived_body_reader(Req, Body, Len, MaxLen);
 with_body(Req, _Body, _StreamId, _State) ->
     Req.
 

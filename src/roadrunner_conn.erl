@@ -67,7 +67,7 @@
     latest_reader/1,
     stream_body_reader/5,
     with_body_reader/5,
-    with_arrived_body_reader/3,
+    with_arrived_body_reader/4,
     continue_before_stream/1,
     skip_continue/1,
     send_body/4,
@@ -1238,16 +1238,20 @@ stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
 %% HTTP/3 request in one chunk) reads it through a stream reader as well:
 %% its `body` gives way to a reader whose one pull hands over those bytes
 %% as the end of the body, so reads with a `length` and the `Max` cap work
-%% as for a body still arriving.
+%% as for a body still arriving. `Len` is the body's size, which the
+%% connection counted as it arrived: `0` is a stream that ended with its
+%% headers, with nothing to pull.
 -doc false.
--spec with_arrived_body_reader(roadrunner_req:request(), iodata(), non_neg_integer()) ->
+-spec with_arrived_body_reader(
+    roadrunner_req:request(), iodata(), non_neg_integer(), non_neg_integer()
+) ->
     roadrunner_req:request().
-with_arrived_body_reader(Req, Body, Max) ->
+with_arrived_body_reader(Req, Body, Len, Max) ->
     Reader = #{
         framing => stream,
         buffered => <<>>,
         bytes_read => 0,
-        done => false,
+        done => Len =:= 0,
         recv => fun() -> {ok, Body, true} end,
         max => Max
     },

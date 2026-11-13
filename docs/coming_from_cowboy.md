@@ -240,7 +240,7 @@ name.
 | `cowboy_req:header(<<"user-agent">>, Req)` | `roadrunner_req:header(~"user-agent", Req)` |
 | `cowboy_req:headers(Req)` | `roadrunner_req:headers(Req)`, a list of `{Name, Value}` |
 | `cowboy_req:parse_cookies(Req)` | `roadrunner_req:parse_cookies(Req)` |
-| `cowboy_req:has_body(Req)` | `roadrunner_req:has_body(Req)` (with `body_buffering => manual`, `false` until the body is read) |
+| `cowboy_req:has_body(Req)` | `roadrunner_req:has_body(Req)` |
 | `cowboy_req:read_body(Req)` | `roadrunner_req:read_body(Req)` |
 | `cowboy_req:read_urlencoded_body(Req)` | `roadrunner_req:read_form(Req)` |
 | `cowboy_req:peer(Req)` | `roadrunner_req:peer(Req)` |
