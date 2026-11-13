@@ -100,6 +100,9 @@
 %% Opaque data of the PING a conn still serving sends when its idle timeout
 %% passes with nothing heard (`recv_idle_expired/1`).
 -define(LIVENESS_PING, ~"rr-alive").
+%% How many of the streams it reset a conn remembers, to ignore what the
+%% peer still sends on them (`remember_reset/2`).
+-define(RESET_MEMORY, 128).
 
 %% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`.
 -define(MAX_FRAME_SIZE, 16_384).
@@ -230,8 +233,9 @@
     pending_sends := queue:queue(pending_send()),
     %% Set on a stream we are resetting with this code until its field
     %% block, possibly still arriving in CONTINUATION frames, is complete
-    %% and decoded for its HPACK side effects (`reset_refused/4`).
-    refused => roadrunner_http2_frame:error_code(),
+    %% and decoded for its HPACK side effects (`reset_refused/4`); `ignore`
+    %% for a late block on a stream we already reset, which gets no reply.
+    refused => roadrunner_http2_frame:error_code() | ignore,
     %% Manual body mode (`body_buffering => manual`): the worker runs from
     %% the end of the headers and pulls the body (`handle_body_demand/3`),
     %% `body` holding the DATA it has not taken yet. These keys mark such a
@@ -377,6 +381,9 @@
     worker_refs = #{} :: #{reference() => stream_id()},
     %% Whether a liveness PING (`recv_idle_expired/1`) waits for its ACK.
     liveness_ping = false :: boolean(),
+    %% Streams this conn reset, oldest first, so frames the peer sent
+    %% before it saw the reset are ignored (`remember_reset/2`).
+    reset_ids = {queue:new(), #{}} :: {queue:queue(stream_id()), #{stream_id() => []}},
     %% Set to a stream id while a HEADERS / PUSH_PROMISE block is
     %% still being assembled (no END_HEADERS yet). The next inbound
     %% frame MUST be a CONTINUATION on the same stream — anything
@@ -678,6 +685,8 @@ recv_more(
             recv_more(handle_continue(State, Worker, StreamId));
         {roadrunner_skip_continue, StreamId} ->
             recv_more(skip_continue(State, StreamId));
+        {roadrunner_cancel_stream, StreamId} ->
+            recv_more(maybe_exit_when_drained(cancel_stream(State, StreamId)));
         {'DOWN', MonRef, process, _Pid, Reason} ->
             recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
         {roadrunner_slot, StreamId, Outcome} ->
@@ -969,7 +978,7 @@ handle_frame({priority, _, _}, State) ->
 handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
     case Streams of
         #{StreamId := _} ->
-            frame_loop(reset_stream(State, StreamId));
+            frame_loop(drop_reset_stream(State, StreamId));
         #{} ->
             %% RFC 9113 §5.1: RST_STREAM on an idle stream is
             %% PROTOCOL_ERROR (we never opened it). On a closed
@@ -1069,6 +1078,14 @@ on_headers(StreamId, Flags, Priority, Fragment, #loop{streams = Streams} = State
         false ->
             goaway_exit(State, protocol_error)
     end;
+on_headers(StreamId, Flags, _Priority, Fragment, #loop{reset_ids = {_, Ids}} = State) when
+    StreamId =< State#loop.peer_stream_id, is_map_key(StreamId, Ids)
+->
+    %% Trailers the peer sent before it saw our RST_STREAM (RFC 9113 §5.1:
+    %% ignored on a stream we reset), decoded all the same so the HPACK
+    %% state stays in step (§4.3). Only an id at or below the last opened
+    %% one can be remembered, so a new stream's HEADERS skips the lookup.
+    refuse_new_stream(StreamId, Flags, Fragment, ignore, State);
 on_headers(StreamId, _Flags, _Priority, _Fragment, State) when
     StreamId =< State#loop.peer_stream_id
 ->
@@ -1137,7 +1154,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
 %% sent on it lands on a closed stream, not an idle one, and it never
 %% counts toward `max_concurrent_streams`.
 -spec refuse_new_stream(
-    stream_id(), non_neg_integer(), binary(), roadrunner_http2_frame:error_code(), #loop{}
+    stream_id(), non_neg_integer(), binary(), roadrunner_http2_frame:error_code() | ignore, #loop{}
 ) -> no_return().
 refuse_new_stream(StreamId, Flags, Fragment, Code, State) ->
     EndHeaders = (Flags band 16#04) =/= 0,
@@ -1150,15 +1167,17 @@ refuse_new_stream(StreamId, Flags, Fragment, Code, State) ->
         State#loop.max_content_length
     ),
     State1 = State#loop{
-        streams = (State#loop.streams)#{StreamId => Stream#{counted := false, refused => Code}},
-        peer_stream_id = StreamId
+        streams = (State#loop.streams)#{
+            StreamId => Stream#{state := closed, counted := false, refused => Code}
+        },
+        peer_stream_id = max(StreamId, State#loop.peer_stream_id)
     },
     refuse_block(StreamId, EndHeaders, Fragment, Code, State1).
 
 %% A refused stream's field block: decode it now when complete, or wait
 %% for its CONTINUATION frames (`on_continuation/4` finishes it).
 -spec refuse_block(
-    stream_id(), boolean(), binary(), roadrunner_http2_frame:error_code(), #loop{}
+    stream_id(), boolean(), binary(), roadrunner_http2_frame:error_code() | ignore, #loop{}
 ) -> no_return().
 refuse_block(StreamId, true, Fragment, Code, State) ->
     reset_refused(StreamId, Fragment, Code, State);
@@ -1166,14 +1185,20 @@ refuse_block(StreamId, false, _Fragment, _Code, State) ->
     frame_loop(State#loop{awaiting_continuation = StreamId}).
 
 %% Decode a refused stream's complete field block for its HPACK side
-%% effects only, then reset the stream with `Code`.
--spec reset_refused(stream_id(), iodata(), roadrunner_http2_frame:error_code(), #loop{}) ->
-    no_return().
+%% effects only, then reset the stream with `Code`, or drop it with
+%% `ignore`.
+-spec reset_refused(
+    stream_id(), iodata(), roadrunner_http2_frame:error_code() | ignore, #loop{}
+) -> no_return().
 reset_refused(StreamId, Fragment, Code, #loop{hpack_dec = Dec} = State) ->
     case roadrunner_http2_hpack:decode(iolist_to_binary(Fragment), Dec) of
         {ok, _Headers, Dec1} ->
             State1 = State#loop{hpack_dec = Dec1},
-            _ = send_rst_stream(State1, StreamId, Code),
+            _ =
+                case Code of
+                    ignore -> ok;
+                    _ -> send_rst_stream(State1, StreamId, Code)
+                end,
             frame_loop(reset_stream(State1, StreamId));
         {error, Reason} ->
             goaway_exit(State, decode_error_code(Reason))
@@ -1331,7 +1356,7 @@ finalize_headers(
                         byte_size(Resp)
                     ),
                     _ = send_rst_stream(State2, StreamId, no_error),
-                    frame_loop(remove_stream(State2, StreamId));
+                    frame_loop(remove_reset_stream(State2, StreamId));
                 false ->
                     case EndStreamSeen of
                         true -> dispatch_stream(StreamId, State1);
@@ -1358,7 +1383,7 @@ await_body(StreamId, Headers, #loop{proto_opts = ProtoOpts, max_content_length =
             reject_too_large(State, StreamId);
         malformed ->
             _ = send_rst_stream(State, StreamId, protocol_error),
-            frame_loop(remove_stream(State, StreamId));
+            frame_loop(remove_reset_stream(State, StreamId));
         continue ->
             body_wanted(StreamId, State);
         none ->
@@ -1398,7 +1423,7 @@ reject_too_large(State, StreamId) ->
         State, StreamId, 413, [{~"content-type", ~"text/plain"}], Resp, byte_size(Resp)
     ),
     _ = send_rst_stream(State1, StreamId, no_error),
-    frame_loop(remove_stream(State1, StreamId)).
+    frame_loop(remove_reset_stream(State1, StreamId)).
 
 %% --- DATA ---
 
@@ -1408,11 +1433,18 @@ on_data(StreamId, _Flags, _Payload, _FlowLen, State) when StreamId > State#loop.
 on_data(StreamId, _Flags, _Payload, FlowLen, #loop{streams = Streams} = State) when
     not is_map_key(StreamId, Streams)
 ->
-    %% RFC 9113 §6.1: DATA on a closed stream is STREAM_CLOSED. The bytes
-    %% still consumed the peer's connection-level send window (§6.9.1);
-    %% return the full on-wire `FlowLen` (padding included) since we're
-    %% discarding them, so the conn window doesn't drift down across resets.
-    _ = send_rst_stream(State, StreamId, stream_closed),
+    %% DATA on a stream we no longer hold. Its bytes still consumed the
+    %% peer's connection-level send window (RFC 9113 §6.9.1); return the
+    %% full on-wire `FlowLen` (padding included) since we're discarding
+    %% them, so the conn window doesn't drift down across resets. On a
+    %% stream we reset, the peer sent it before it saw our RST_STREAM:
+    %% ignored (§5.1). On any other closed stream it is STREAM_CLOSED
+    %% (§6.1). A stream we hold, the common case, never gets here.
+    _ =
+        case State#loop.reset_ids of
+            {_, #{StreamId := _}} -> ok;
+            _ -> send_rst_stream(State, StreamId, stream_closed)
+        end,
     frame_loop(replenish_conn_window(State, FlowLen));
 on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
     case Streams of
@@ -1798,7 +1830,7 @@ dispatch_reading(StreamId, ContinueOwed, #loop{streams = Streams} = State) ->
     case roadrunner_http:request_content_length(Headers) of
         error ->
             _ = send_rst_stream(State, StreamId, protocol_error),
-            frame_loop(remove_stream(State, StreamId));
+            frame_loop(remove_reset_stream(State, StreamId));
         Declared ->
             Reading = Stream#{
                 reader => undefined,
@@ -1859,7 +1891,9 @@ dispatch_request(
                     %% no worker spawned. 429 (not REFUSED_STREAM) so the
                     %% client backs off per Retry-After instead of
                     %% retrying the stream immediately.
-                    frame_loop(remove_stream(State1#loop{req_id_buffer = NewBuf}, StreamId));
+                    frame_loop(
+                        remove_reset_stream(State1#loop{req_id_buffer = NewBuf}, StreamId)
+                    );
                 ok ->
                     case
                         roadrunner_conn:acquire_request_slot(
@@ -1896,7 +1930,7 @@ dispatch_request(
                             StateBuf = State#loop{req_id_buffer = NewBuf},
                             ok = throttle_stream(StateBuf, ListenerName),
                             _ = send_rst_stream(StateBuf, StreamId, refused_stream),
-                            frame_loop(remove_stream(StateBuf, StreamId));
+                            frame_loop(remove_reset_stream(StateBuf, StreamId));
                         {shed, RetryAfter} ->
                             %% Over the ceiling on a shed listener: 503 +
                             %% Retry-After, no worker spawned, so the client
@@ -1904,7 +1938,7 @@ dispatch_request(
                             StateBuf = State#loop{req_id_buffer = NewBuf},
                             ok = throttle_stream(StateBuf, ListenerName),
                             State1 = retry_later(StateBuf, StreamId, 503, RetryAfter),
-                            frame_loop(remove_stream(State1, StreamId))
+                            frame_loop(remove_reset_stream(State1, StreamId))
                     end
             end;
         {error, Reason} when Reason =:= not_implemented; Reason =:= unsupported_expectation ->
@@ -1914,10 +1948,10 @@ dispatch_request(
             Status = roadrunner_conn:parse_error_status(Reason),
             State1 = encode_and_send_response_atomic(State, StreamId, Status, [], ~"", 0),
             _ = send_rst_stream(State1, StreamId, no_error),
-            frame_loop(remove_stream(State1#loop{req_id_buffer = NewBuf}, StreamId));
+            frame_loop(remove_reset_stream(State1#loop{req_id_buffer = NewBuf}, StreamId));
         {error, _Reason} ->
             _ = send_rst_stream(State, StreamId, protocol_error),
-            frame_loop(remove_stream(State#loop{req_id_buffer = NewBuf}, StreamId))
+            frame_loop(remove_reset_stream(State#loop{req_id_buffer = NewBuf}, StreamId))
     end.
 
 -spec buffered_body({body, iodata()} | reader) -> iodata().
@@ -2036,11 +2070,13 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
             ),
             Refs1 = maps:remove(MonRef, Refs),
             case State#loop.streams of
-                #{StreamId := _} ->
+                #{StreamId := #{worker_ref := MonRef}} ->
                     worker_ended(State, StreamId, Refs1, Reason);
                 #{} ->
-                    %% Its stream was reset while it ran (`reset_stream/2`):
-                    %% nothing is left to answer.
+                    %% Its stream was reset while it ran (`reset_stream/2`),
+                    %% gone or left as a placeholder for a header block
+                    %% still arriving (`forget_stream/3`): nothing is left
+                    %% to answer.
                     State#loop{worker_refs = Refs1}
             end;
         #{} ->
@@ -2099,7 +2135,7 @@ finish_stream(#loop{streams = Streams} = State, StreamId, Refs) ->
             remove_stream(State, StreamId, Refs);
         {true, #{state := closed}} ->
             _ = send_rst_stream(State, StreamId, no_error),
-            remove_stream(State, StreamId, Refs);
+            remove_stream(remember_reset(State, StreamId), StreamId, Refs);
         {true, _} ->
             abort_stream(State#loop{worker_refs = Refs}, StreamId, internal_error);
         {false, _} ->
@@ -2460,6 +2496,32 @@ uncount_stream(#loop{streams = Streams, live_streams = Live} = State, StreamId) 
             State
     end.
 
+%% A stream the server gives up on, at a deadline its worker armed
+%% (`roadrunner_send_writer:cancel_after/2`): reset it, which tells the
+%% worker. The frame depends on how far the exchange got (RFC 9113 §5.1,
+%% §8.1): CANCEL while our response is unfinished; NO_ERROR once it is
+%% complete and only the client's body is left, so the client keeps the
+%% response; nothing once both sides ended, as no frame may go on a closed
+%% stream, so it is not remembered as reset either. Stream ids are never
+%% reused, so a stream already gone makes this a no-op.
+-spec cancel_stream(#loop{}, stream_id()) -> #loop{}.
+cancel_stream(#loop{streams = Streams} = State, StreamId) ->
+    case Streams of
+        #{StreamId := #{refused := _}} ->
+            %% Already reset by us, its header block still arriving.
+            State;
+        #{StreamId := #{state := closed, end_stream_seen := true}} ->
+            drop_reset_stream(State, StreamId);
+        #{StreamId := #{state := closed}} ->
+            _ = send_rst_stream(State, StreamId, no_error),
+            reset_stream(State, StreamId);
+        #{StreamId := _} ->
+            _ = send_rst_stream(State, StreamId, cancel),
+            reset_stream(State, StreamId);
+        #{} ->
+            State
+    end.
+
 %% Reset a stream we have alive: the peer sent RST_STREAM, or we sent
 %% one for a stream-level flow-control error. Tell the worker (if any)
 %% to bail, then drop our stream entry. Pending sends get reset
@@ -2468,7 +2530,13 @@ uncount_stream(#loop{streams = Streams, live_streams = Live} = State, StreamId) 
 %% learns of it at its next write or read; it keeps its in-flight slot
 %% until it exits (`handle_worker_down/3`), so work a client abandons
 %% still counts toward `max_concurrent_requests` while it runs.
-reset_stream(State0, StreamId) ->
+reset_stream(State, StreamId) ->
+    drop_reset_stream(remember_reset(State, StreamId), StreamId).
+
+%% `reset_stream/2` for the peer's own RST_STREAM: nothing it sent before
+%% is in flight, so the stream is not remembered.
+-spec drop_reset_stream(#loop{}, stream_id()) -> #loop{}.
+drop_reset_stream(State0, StreamId) ->
     #loop{streams = Streams} = State = uncount_stream(State0, StreamId),
     #{
         StreamId := #{
@@ -2489,7 +2557,7 @@ reset_stream(State0, StreamId) ->
             undefined -> ok;
             _MonRef -> WorkerPid ! {h2_stream_reset, StreamId}
         end,
-    withdraw_parked(State#loop{streams = maps:remove(StreamId, Streams)}, StreamId).
+    withdraw_parked(State#loop{streams = forget_stream(State, StreamId, Streams)}, StreamId).
 
 %% Called by `handle_worker_down/3` when a worker dies abnormally.
 %% Send RST_STREAM(error_code) to the peer and drop our state.
@@ -2498,7 +2566,29 @@ abort_stream(State0, StreamId, ErrorCode) ->
     #{StreamId := #{pending_sends := Pending}} = Streams,
     notify_pending_reset(StreamId, Pending),
     _ = send_rst_stream(State, StreamId, ErrorCode),
-    withdraw_parked(State#loop{streams = maps:remove(StreamId, Streams)}, StreamId).
+    withdraw_parked(
+        remember_reset(State#loop{streams = forget_stream(State, StreamId, Streams)}, StreamId),
+        StreamId
+    ).
+
+%% Remember a stream this conn reset, or saw reset, so frames on it that
+%% were in flight are ignored (RFC 9113 §5.1) instead of answered as on a
+%% stream that never existed. The last `?RESET_MEMORY` are kept, which
+%% §5.1 allows ("MAY choose to limit the period"): a peer still sending
+%% on an older one is answered as before.
+-spec remember_reset(#loop{}, stream_id()) -> #loop{}.
+remember_reset(#loop{reset_ids = {_, Ids}} = State, StreamId) when is_map_key(StreamId, Ids) ->
+    State;
+remember_reset(#loop{reset_ids = {Queue, Ids}} = State, StreamId) ->
+    Queue1 = queue:in(StreamId, Queue),
+    Ids1 = Ids#{StreamId => []},
+    case map_size(Ids1) > ?RESET_MEMORY of
+        true ->
+            {{value, Oldest}, Queue2} = queue:out(Queue1),
+            State#loop{reset_ids = {Queue2, maps:remove(Oldest, Ids1)}};
+        false ->
+            State#loop{reset_ids = {Queue1, Ids1}}
+    end.
 
 %% Drop a stream that needs no RST_STREAM: its response is complete
 %% (`finish_stream/2`, `retire_drained/2`), or the caller already sent
@@ -2506,11 +2596,39 @@ abort_stream(State0, StreamId, ErrorCode) ->
 remove_stream(#loop{worker_refs = Refs} = State, StreamId) ->
     remove_stream(State, StreamId, Refs).
 
+%% Drop a stream we just reset, remembering it (`remember_reset/2`).
+-spec remove_reset_stream(#loop{}, stream_id()) -> #loop{}.
+remove_reset_stream(State, StreamId) ->
+    remove_stream(remember_reset(State, StreamId), StreamId).
+
 %% Drop a stream and store `Refs` as the worker-ref map in the same update.
 -spec remove_stream(#loop{}, stream_id(), #{reference() => stream_id()}) -> #loop{}.
 remove_stream(State0, StreamId, Refs) ->
     #loop{streams = Streams} = State = withdraw_parked(uncount_stream(State0, StreamId), StreamId),
-    State#loop{streams = maps:remove(StreamId, Streams), worker_refs = Refs}.
+    State#loop{streams = forget_stream(State, StreamId, Streams), worker_refs = Refs}.
+
+%% Drop a stream's entry, unless its header block (trailers) is still
+%% arriving in CONTINUATION frames: then the entry stays, as a closed
+%% `ignore` refusal with no worker (a write to it finds it not open,
+%% `stream_open/2`), until the block is complete, so the block is
+%% still decoded (RFC 9113 §4.3) and its CONTINUATION frames land on a
+%% stream we hold instead of failing the connection. Its end drops it
+%% (`reset_refused/4`).
+-spec forget_stream(#loop{}, stream_id(), #{stream_id() => stream_entry()}) ->
+    #{stream_id() => stream_entry()}.
+forget_stream(#loop{awaiting_continuation = StreamId}, StreamId, Streams) ->
+    #{StreamId := Stream} = Streams,
+    Streams#{
+        StreamId := maps:remove(reader, Stream#{
+            state := closed,
+            refused => ignore,
+            worker_pid := undefined,
+            worker_ref := undefined,
+            pending_sends := queue:new()
+        })
+    };
+forget_stream(_State, StreamId, Streams) ->
+    maps:remove(StreamId, Streams).
 
 %% Withdraw a request parked for a slot. Every path that drops a stream
 %% goes through here, so `awaiting_slot` never outlives its stream entry
@@ -2545,7 +2663,7 @@ handle_slot(#loop{awaiting_slot = Awaiting, listener_name = ListenerName} = Stat
             State1 = State#loop{awaiting_slot = maps:remove(StreamId, Awaiting)},
             ok = throttle_stream(State1, ListenerName),
             _ = send_rst_stream(State1, StreamId, refused_stream),
-            remove_stream(State1, StreamId);
+            remove_reset_stream(State1, StreamId);
         _ ->
             State
     end.

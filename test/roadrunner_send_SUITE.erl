@@ -52,7 +52,9 @@ fun does.
     stream_over_the_client_limit_is_500/1,
     reply_over_the_client_limit_is_500/1,
     file_over_the_client_limit_is_500/1,
-    client_reset_ends_the_fun/1
+    client_reset_ends_the_fun/1,
+    cancel_after_resets_the_stream/1,
+    cancel_after_is_not_supported/1
 ]).
 
 -define(H, roadrunner_send_handler).
@@ -65,9 +67,11 @@ all() ->
 
 groups() ->
     [
-        {http1, [], common() ++ http1()},
-        {http2, [], common() ++ multiplexed() ++ [client_reset_ends_the_fun]},
-        {http3, [], common() ++ multiplexed()}
+        {http1, [], common() ++ http1() ++ [cancel_after_is_not_supported]},
+        {http2, [],
+            common() ++ multiplexed() ++
+                [client_reset_ends_the_fun, cancel_after_resets_the_stream]},
+        {http3, [], common() ++ multiplexed() ++ [cancel_after_is_not_supported]}
     ].
 
 common() ->
@@ -202,6 +206,7 @@ routes(TestPid, File) ->
         {~"/read-then-reply", ?H, {report, TestPid, read_then_reply}},
         {~"/big-file", ?H, {report, TestPid, {big_file, File}}},
         {~"/until-reset", ?H, {report, TestPid, until_reset}},
+        {~"/cancel-after", ?H, {report, TestPid, cancel_after}},
         {~"/upgrade", ?H, {report, TestPid, upgrade}},
         {~"/missing-file", ?H, {report, TestPid, {file, {missing_file(File), 0, 4}}}},
         {~"/short-file", ?H, {report, TestPid, {file, {File, 6, 4}}}},
@@ -311,6 +316,7 @@ short_file_is_500(Config) ->
 
 calls_from_another_process_raise(Config) ->
     ?assertMatch({[200], _, ~"own", complete}, get(Config, ~"/other-process")),
+    ?assertEqual({raised, not_in_send_fun}, result()),
     ?assertEqual({raised, not_in_send_fun}, result()),
     ?assertEqual({raised, not_in_send_fun}, result()),
     ?assertEqual({raised, not_in_send_fun}, result()).
@@ -433,6 +439,18 @@ client_reset_ends_the_fun(Config) ->
         {telemetry_event, [roadrunner, request, exception], _} -> ct:fail(reset_reported)
     after 500 -> ok
     end.
+
+cancel_after_resets_the_stream(Config) ->
+    %% At the deadline the connection resets the stream with CANCEL, cutting
+    %% the response the fun was still sending.
+    ?assertMatch(
+        {[200], _, <<"first", _/binary>>, {reset, cancel}}, get(Config, ~"/cancel-after")
+    ),
+    ?assertEqual(armed, result()).
+
+cancel_after_is_not_supported(Config) ->
+    ?assertMatch({[200], _, ~"ok", complete}, get(Config, ~"/cancel-after")),
+    ?assertEqual({error, not_supported}, result()).
 
 %% =============================================================================
 %% Helpers

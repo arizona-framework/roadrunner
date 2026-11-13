@@ -209,7 +209,11 @@ codegen story (rebar3 plugin or grpcbox-style runtime descriptors).
 variants.
 
 **Scope:** large. None of the bits are exotic, but there are a
-lot of them.
+lot of them. The HTTP/2 groundwork is in: a handler can read its body
+while it streams the answer, move its body read deadline
+(`roadrunner_req:set_body_timeout/2`), and have its stream cancelled at a
+deadline (internal `roadrunner_send_writer:cancel_after/2`, to be made
+public with the gRPC layer). That cancel has no HTTP/3 counterpart yet.
 
 ## Other
 

@@ -1535,7 +1535,11 @@ send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
             case dispatch_websocket(S, Req, Mod, State, Opts) of
                 {ws_upgrade, Run, _S} -> {ok, 101, {session, Upgrade, Run}};
                 #loop_state{} -> {{error, rejected}, 101, rejected}
-            end
+            end;
+        ({cancel_after, _Ms}, _Req) ->
+            %% The fun runs in the connection process itself: nothing
+            %% could stop it at the deadline.
+            {error, not_supported}
     end.
 
 %% RFC 9110 §15.2: a server MUST NOT send a 1xx response to an HTTP/1.0

@@ -13,7 +13,7 @@
 
 -include_lib("kernel/include/file.hrl").
 
--export([inform/3, final/3, status/1, run/5, started/2]).
+-export([inform/3, final/3, status/1, cancel_after/2, run/5, started/2]).
 
 -export_type([writer/0, op/0, emit/0, sent/0, outcome/0]).
 
@@ -37,7 +37,8 @@
     | {stream, roadrunner_http:status(), roadrunner_http:headers()}
     | {sendfile, roadrunner_http:status(), roadrunner_http:headers(),
         roadrunner_handler:sendfile_spec()}
-    | {websocket, module(), term(), roadrunner_ws_handler:upgrade_opts()}.
+    | {websocket, module(), term(), roadrunner_ws_handler:upgrade_opts()}
+    | {cancel_after, non_neg_integer()}.
 
 %% A protocol's writer for each call, given the request the fun holds then.
 %% `inform` returns the call's result; a final response returns it with the
@@ -88,6 +89,22 @@ status(#{send := #writer{owner = Owner}}) when Owner =:= self() ->
         _ -> sent
     end;
 status(#{send := #writer{}}) ->
+    error(not_in_send_fun).
+
+%% Cancel the request's stream after `Ms` milliseconds, unless the timer
+%% is cancelled first (`erlang:cancel_timer/1` on the reference): the
+%% connection resets the stream and tells the process serving it, as for
+%% a client's reset (its next write or read fails). For a deadline on the
+%% request, such as gRPC's `grpc-timeout`. A deadline past the longest
+%% timer (about 49 days) waits that long. Only HTTP/2 streams can be
+%% cancelled; HTTP/1.1 and HTTP/3 return `{error, not_supported}`.
+-spec cancel_after(non_neg_integer(), roadrunner_req:request()) ->
+    {ok, reference()} | {error, not_supported}.
+cancel_after(Ms, #{send := #writer{emit = Emit, owner = Owner}} = Req) when
+    is_integer(Ms), Ms >= 0, Owner =:= self()
+->
+    Emit({cancel_after, Ms}, Req);
+cancel_after(_Ms, #{send := #writer{owner = Owner}}) when Owner =/= self() ->
     error(not_in_send_fun).
 
 %% The final response, with the tuple's headers added: sent, or answered

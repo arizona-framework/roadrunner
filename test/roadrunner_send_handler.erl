@@ -177,7 +177,8 @@ send_fun({report, Pid, other_process}) ->
         _ = spawn(fun() ->
             Self ! {other, raised(fun() -> roadrunner_send:reply(200, [], ~"other", Req) end)},
             Self ! {other, raised(fun() -> roadrunner_send:inform(103, [], Req) end)},
-            Self ! {other, raised(fun() -> roadrunner_send:status(Req) end)}
+            Self ! {other, raised(fun() -> roadrunner_send:status(Req) end)},
+            Self ! {other, raised(fun() -> roadrunner_send_writer:cancel_after(10, Req) end)}
         end),
         Pid !
             {send_result,
@@ -194,8 +195,31 @@ send_fun({report, Pid, other_process}) ->
                 receive
                     {other, R3} -> R3
                 end},
+        Pid !
+            {send_result,
+                receive
+                    {other, R4} -> R4
+                end},
         ok = roadrunner_send:reply(200, [], ~"own", Req),
         Req
+    end;
+send_fun({report, Pid, cancel_after}) ->
+    %% Over HTTP/2 the stream is cancelled at the deadline while the fun
+    %% is still sending, and its next write ends it; elsewhere cancelling
+    %% is not supported.
+    fun(Req) ->
+        case roadrunner_send_writer:cancel_after(50, Req) of
+            {ok, TRef} when is_reference(TRef) ->
+                Pid ! {send_result, armed},
+                {ok, Send} = roadrunner_send:stream(200, [], Req),
+                ok = Send(~"first", nofin),
+                ok = send_until_error(Send),
+                Req;
+            {error, not_supported} = Error ->
+                Pid ! {send_result, Error},
+                ok = roadrunner_send:reply(200, [], ~"ok", Req),
+                Req
+        end
     end;
 send_fun({report, Pid, big_reply}) ->
     fun(Req) ->
