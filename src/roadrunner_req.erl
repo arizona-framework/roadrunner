@@ -120,7 +120,11 @@ care which protocol delivered the bytes.
     %% How a `{send, Headers, Fun}` response's fun reaches its
     %% connection, set only on the request that fun gets. Internal:
     %% read only by `roadrunner_send` (its private writer state).
-    send => term()
+    send => term(),
+    %% The streaming multipart reader's state, set by
+    %% `roadrunner_multipart:read_part/1,2`. Internal: read only by
+    %% `roadrunner_multipart`.
+    multipart => term()
 }.
 
 -type headers() :: roadrunner_http:headers().

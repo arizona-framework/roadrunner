@@ -353,3 +353,243 @@ parse_part_with_multiple_same_named_headers_preserves_order_test() ->
         ]},
         roadrunner_multipart:parse(Body, ~"B")
     ).
+
+%% =============================================================================
+%% disposition/1
+%% =============================================================================
+
+disposition_test() ->
+    ?assertEqual(
+        {~"form-data", #{~"name" => ~"avatar", ~"filename" => ~"me.png"}},
+        roadrunner_multipart:disposition(~"form-data; name=\"avatar\"; filename=\"me.png\"")
+    ).
+
+disposition_lowercases_the_type_test() ->
+    ?assertEqual(
+        {~"form-data", #{~"name" => ~"a"}},
+        roadrunner_multipart:disposition(~" Form-Data ;name=a")
+    ).
+
+disposition_without_params_test() ->
+    ?assertEqual({~"inline", #{}}, roadrunner_multipart:disposition(~"inline")).
+
+%% =============================================================================
+%% read_part/1,2 and read_part_body/1,2 over a buffered (auto mode) body
+%% =============================================================================
+
+-define(TWO_PARTS, <<
+    "preamble\r\n",
+    "--B\r\n",
+    "Content-Disposition: form-data; name=\"field\"\r\n",
+    "\r\n",
+    "value",
+    "\r\n--B\r\n",
+    "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n",
+    "Content-Type: text/plain\r\n",
+    "\r\n",
+    "hello world",
+    "\r\n--B--\r\n",
+    "epilogue"
+>>).
+
+read_parts_test() ->
+    {ok, H1, R1} = roadrunner_multipart:read_part(stream_req(?TWO_PARTS)),
+    ?assertEqual([{~"content-disposition", ~"form-data; name=\"field\""}], H1),
+    {ok, ~"value", R2} = roadrunner_multipart:read_part_body(R1),
+    {ok, H2, R3} = roadrunner_multipart:read_part(R2),
+    ?assertEqual(
+        [
+            {~"content-disposition", ~"form-data; name=\"file\"; filename=\"a.txt\""},
+            {~"content-type", ~"text/plain"}
+        ],
+        H2
+    ),
+    {ok, ~"hello world", R4} = roadrunner_multipart:read_part_body(R3),
+    {done, R5} = roadrunner_multipart:read_part(R4),
+    %% Done stays done.
+    ?assertMatch({done, _}, roadrunner_multipart:read_part(R5)).
+
+read_part_body_in_pieces_test() ->
+    {ok, _, R1} = roadrunner_multipart:read_part(stream_req(?TWO_PARTS)),
+    {ok, _, R2} = roadrunner_multipart:read_part(R1),
+    {more, ~"hell", R3} = roadrunner_multipart:read_part_body(R2, #{length => 4}),
+    {more, ~"o wo", R4} = roadrunner_multipart:read_part_body(R3, #{length => 4}),
+    {ok, ~"rld", R5} = roadrunner_multipart:read_part_body(R4, #{length => 4}),
+    ?assertMatch({done, _}, roadrunner_multipart:read_part(R5)).
+
+read_part_body_length_reached_before_the_delimiter_test() ->
+    %% The delimiter is in the buffer, past `length`: the first piece is cut
+    %% at `length`, the second ends at the delimiter.
+    {ok, _, R1} = roadrunner_multipart:read_part(stream_req(?TWO_PARTS)),
+    {more, ~"val", R2} = roadrunner_multipart:read_part_body(R1, #{length => 3}),
+    ?assertMatch({ok, ~"ue", _}, roadrunner_multipart:read_part_body(R2, #{length => 3})).
+
+unread_part_body_is_skipped_test() ->
+    {ok, _, R1} = roadrunner_multipart:read_part(stream_req(?TWO_PARTS)),
+    {ok, H2, R2} = roadrunner_multipart:read_part(R1),
+    ?assertMatch([{~"content-disposition", <<"form-data; name=\"file\"", _/binary>>} | _], H2),
+    {ok, ~"hello world", _} = roadrunner_multipart:read_part_body(R2).
+
+partly_read_part_body_is_skipped_test() ->
+    {ok, _, R1} = roadrunner_multipart:read_part(stream_req(?TWO_PARTS)),
+    {more, ~"v", R2} = roadrunner_multipart:read_part_body(R1, #{length => 1}),
+    {ok, _, R3} = roadrunner_multipart:read_part(R2),
+    ?assertMatch({ok, ~"hello world", _}, roadrunner_multipart:read_part_body(R3)).
+
+part_without_headers_test() ->
+    Body = <<"--B\r\n\r\nraw\r\n--B--">>,
+    {ok, [], R1} = roadrunner_multipart:read_part(stream_req(Body)),
+    {ok, ~"raw", R2} = roadrunner_multipart:read_part_body(R1),
+    ?assertMatch({done, _}, roadrunner_multipart:read_part(R2)).
+
+empty_part_body_test() ->
+    Body = <<"--B\r\nX-A: 1\r\n\r\n\r\n--B--">>,
+    {ok, [{~"x-a", ~"1"}], R1} = roadrunner_multipart:read_part(stream_req(Body)),
+    ?assertMatch({ok, <<>>, _}, roadrunner_multipart:read_part_body(R1)).
+
+no_parts_test() ->
+    ?assertMatch({done, _}, roadrunner_multipart:read_part(stream_req(<<"--B--\r\n">>))).
+
+transport_padding_after_a_boundary_test() ->
+    %% RFC 2046 §5.1.1: spaces and tabs may follow a boundary.
+    Body = <<"--B \t\r\n\r\nv\r\n--B-- ">>,
+    {ok, [], R1} = roadrunner_multipart:read_part(stream_req(Body)),
+    {ok, ~"v", R2} = roadrunner_multipart:read_part_body(R1),
+    ?assertMatch({done, _}, roadrunner_multipart:read_part(R2)).
+
+content_type_is_case_insensitive_test() ->
+    Req = stream_req(~"Multipart/Form-Data; boundary=B", <<"--B--">>),
+    ?assertMatch({done, _}, roadrunner_multipart:read_part(Req)).
+
+quoted_boundary_test() ->
+    Req = stream_req(~"multipart/mixed; boundary=\"a b\"", <<"--a b\r\n\r\nv\r\n--a b--">>),
+    {ok, [], R1} = roadrunner_multipart:read_part(Req),
+    ?assertMatch({ok, ~"v", _}, roadrunner_multipart:read_part_body(R1)).
+
+not_multipart_test() ->
+    ?assertEqual(
+        {error, not_multipart},
+        roadrunner_multipart:read_part(stream_req(~"text/plain", <<>>))
+    ),
+    ?assertEqual({error, not_multipart}, roadrunner_multipart:read_part(stream_req(no, <<>>))).
+
+no_boundary_test() ->
+    ?assertEqual(
+        {error, no_boundary},
+        roadrunner_multipart:read_part(stream_req(~"multipart/form-data", <<>>))
+    ).
+
+no_initial_boundary_test() ->
+    ?assertEqual(
+        {error, no_initial_boundary},
+        roadrunner_multipart:read_part(stream_req(<<"no boundary here">>))
+    ).
+
+no_header_terminator_test() ->
+    ?assertEqual(
+        {error, no_header_terminator},
+        roadrunner_multipart:read_part(stream_req(<<"--B\r\nX-A: 1\r\n">>))
+    ).
+
+no_part_terminator_reading_the_body_test() ->
+    {ok, [], R1} = roadrunner_multipart:read_part(stream_req(<<"--B\r\n\r\ncut short">>)),
+    ?assertEqual({error, no_part_terminator}, roadrunner_multipart:read_part_body(R1)).
+
+no_part_terminator_skipping_the_body_test() ->
+    {ok, [], R1} = roadrunner_multipart:read_part(stream_req(<<"--B\r\n\r\ncut short">>)),
+    ?assertEqual({error, no_part_terminator}, roadrunner_multipart:read_part(R1)).
+
+headers_too_large_test() ->
+    Body = <<"--B\r\nX-Long: 0123456789\r\n\r\nv\r\n--B--">>,
+    ?assertEqual(
+        {error, headers_too_large},
+        roadrunner_multipart:read_part(stream_req(Body), #{length => 10})
+    ).
+
+headers_too_large_without_their_end_test() ->
+    %% Over the cap before the blank line even arrives.
+    Body = <<"--B\r\nX-Long: 0123456789">>,
+    ?assertEqual(
+        {error, headers_too_large},
+        roadrunner_multipart:read_part(stream_req(Body), #{length => 10})
+    ).
+
+bad_header_test() ->
+    ?assertEqual(
+        {error, bad_header},
+        roadrunner_multipart:read_part(stream_req(<<"--B\r\nno colon\r\n\r\nv\r\n--B--">>))
+    ).
+
+malformed_after_a_boundary_test() ->
+    ?assertEqual(
+        {error, malformed},
+        roadrunner_multipart:read_part(stream_req(<<"--Bxx\r\n\r\nv\r\n--B--">>))
+    ).
+
+body_ending_right_after_a_boundary_test() ->
+    ?assertEqual(
+        {error, no_part_terminator}, roadrunner_multipart:read_part(stream_req(<<"--B">>))
+    ),
+    ?assertEqual(
+        {error, no_part_terminator}, roadrunner_multipart:read_part(stream_req(<<"--B-">>))
+    ),
+    ?assertEqual(
+        {error, no_part_terminator}, roadrunner_multipart:read_part(stream_req(<<"--B\r">>))
+    ).
+
+empty_boundary_test() ->
+    ?assertEqual(
+        {error, no_boundary},
+        roadrunner_multipart:read_part(stream_req(~"multipart/form-data; boundary=", <<>>))
+    ),
+    ?assertEqual(
+        {error, no_boundary},
+        roadrunner_multipart:read_part(stream_req(~"multipart/form-data; boundary=\"\"", <<>>))
+    ).
+
+boundary_over_70_characters_test() ->
+    Long = binary:copy(~"b", 71),
+    ?assertEqual(
+        {error, no_boundary},
+        roadrunner_multipart:read_part(
+            stream_req(<<"multipart/form-data; boundary=", Long/binary>>, <<>>)
+        )
+    ),
+    Max = binary:copy(~"b", 70),
+    ?assertMatch(
+        {done, _},
+        roadrunner_multipart:read_part(
+            stream_req(<<"multipart/form-data; boundary=", Max/binary>>, <<"--", Max/binary, "--">>)
+        )
+    ).
+
+disposition_keeps_a_semicolon_in_quotes_test() ->
+    ?assertEqual(
+        {~"form-data", #{~"name" => ~"f", ~"filename" => ~"a;b.txt"}},
+        roadrunner_multipart:disposition(~"form-data; name=\"f\"; filename=\"a;b.txt\"")
+    ).
+
+params_keeps_a_semicolon_in_quotes_test() ->
+    ?assertEqual(
+        #{~"boundary" => ~"x;y", ~"charset" => ~"utf-8"},
+        roadrunner_multipart:params(~"multipart/form-data; boundary=\"x;y\"; charset=utf-8")
+    ).
+
+body_ending_in_headers_after_a_cr_test() ->
+    ?assertEqual(
+        {error, no_header_terminator}, roadrunner_multipart:read_part(stream_req(<<"--B\r\n\r">>))
+    ).
+
+stream_req(Body) ->
+    stream_req(~"multipart/form-data; boundary=B", Body).
+
+stream_req(no, Body) ->
+    #{method => ~"POST", target => ~"/", version => {1, 1}, headers => [], body => Body};
+stream_req(ContentType, Body) ->
+    #{
+        method => ~"POST",
+        target => ~"/",
+        version => {1, 1},
+        headers => [{~"content-type", ContentType}],
+        body => Body
+    }.
