@@ -31,6 +31,7 @@ each route's state picks what it does with the body.
     content_length_shortfall_resets/1,
     malformed_content_length_resets/1,
     reset_while_reading/1,
+    full_duplex_echo/1,
     reset_before_reading/1,
     read_times_out/1,
     body_after_the_answer_is_dropped/1
@@ -64,6 +65,7 @@ all() ->
         content_length_shortfall_resets,
         malformed_content_length_resets,
         reset_while_reading,
+        full_duplex_echo,
         reset_before_reading,
         read_times_out,
         body_after_the_answer_is_dropped
@@ -117,6 +119,7 @@ routes(TestPid) ->
         {~"/answer-first", ?H, {answer_first, ?GATED, TestPid}},
         {~"/stream-echo", ?H, stream_echo},
         {~"/read-then-stream", ?H, read_then_stream},
+        {~"/echo-pieces", ?H, echo_pieces},
         #{path => ~"/small", handler => ?H, state => read, max_content_length => 2}
     ].
 
@@ -256,6 +259,24 @@ content_length_shortfall_resets(Config) ->
 malformed_content_length_resets(Config) ->
     C = send_headers(open(Config), 1, ~"/read", [{~"content-length", ~"abc"}], false),
     ?assertMatch({protocol_error, _}, rst(C, 1)).
+
+%% =============================================================================
+%% Reading while answering
+%% =============================================================================
+
+full_duplex_echo(Config) ->
+    %% The handler answers each piece of the body while the request is
+    %% still open: the client sends the next piece only once the answer
+    %% to the last one came back, so neither side waits for the other's
+    %% end.
+    C0 = send_headers(open(Config), 1, ~"/echo-pieces", [], false),
+    {_, C1} = until(C0, fun
+        ({headers, 1, _, _}) -> true;
+        (_) -> false
+    end),
+    C2 = echoed(send_data(C1, 1, ~"one", false), ~"one"),
+    C3 = echoed(send_data(C2, 1, ~"two", false), ~"two"),
+    ?assertMatch({[], <<>>, end_stream, _}, response(send_data(C3, 1, <<>>, true), 1)).
 
 %% =============================================================================
 %% Ending the read
@@ -426,6 +447,14 @@ rst(C, StreamId) ->
     end),
     {rst_stream, StreamId, Code} = lists:last(Frames),
     {Code, C1}.
+
+%% Wait for stream 1's DATA carrying `Bin`.
+echoed(C, Bin) ->
+    {_, C1} = until(C, fun
+        ({data, 1, _, Data, _}) -> Data =:= Bin;
+        (_) -> false
+    end),
+    C1.
 
 until(C, Pred) ->
     until(C, Pred, []).
