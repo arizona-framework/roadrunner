@@ -117,7 +117,7 @@ save_body(Fd, Req0) ->
     delim :: binary(),
     delim_cp :: binary:cp(),
     buf :: binary(),
-    stage :: preamble | seek | delimited | headers | body | done,
+    stage :: start | preamble | seek | delimited | headers | body | done,
     eof :: boolean()
 }).
 
@@ -421,10 +421,10 @@ the part, or an error from `roadrunner_req:read_body/2`.
 read_part_body(#{multipart := #reader{stage = body} = Reader} = Req, Opts) ->
     part_body(Reader, Req, maps:get(length, Opts, ?DEFAULT_BODY_LENGTH), 0).
 
-%% The request's reader, or a new one from its `Content-Type`. The buffer
-%% starts with a line break so that the first boundary, which opens the
-%% body without one, matches the same `\r\n--Boundary` delimiter as the
-%% others (RFC 2046 §5.1.1).
+%% The request's reader, or a new one from its `Content-Type`. It starts
+%% by looking for the `--Boundary` that opens the body without a line
+%% break before it (RFC 2046 §5.1.1), so the body is never copied behind
+%% one.
 -spec reader(roadrunner_req:request()) -> {ok, #reader{}} | {error, not_multipart | no_boundary}.
 reader(#{multipart := #reader{} = Reader}) ->
     {ok, Reader};
@@ -438,8 +438,8 @@ reader(Req) ->
         {ok, #reader{
             delim = Delim,
             delim_cp = binary:compile_pattern(Delim),
-            buf = ~"\r\n",
-            stage = preamble,
+            buf = <<>>,
+            stage = start,
             eof = false
         }}
     end.
@@ -479,6 +479,20 @@ next_part(#reader{stage = done} = Reader, Req, _Length, _Scanned) ->
 next_part(#reader{stage = body} = Reader, Req, Length, _Scanned) ->
     %% The part's body was left unread: skip it.
     next_part(Reader#reader{stage = seek}, Req, Length, 0);
+next_part(
+    #reader{stage = start, buf = Buf, delim = <<"\r\n", Dash/binary>>} = Reader, Req, Length, _
+) ->
+    %% The first boundary may open the body with no line break before it
+    %% (RFC 2046 §5.1.1); past that, the preamble ends at a whole delimiter.
+    DashLen = byte_size(Dash),
+    case Buf of
+        <<Dash:DashLen/binary, Rest/binary>> ->
+            next_part(Reader#reader{stage = delimited, buf = Rest}, Req, Length, 0);
+        _ when byte_size(Buf) < DashLen, not Reader#reader.eof ->
+            refill_part(Reader, Req, Length, 0, no_initial_boundary);
+        _ ->
+            next_part(Reader#reader{stage = preamble}, Req, Length, 0)
+    end;
 next_part(#reader{stage = Stage, buf = Buf, delim = Delim} = Reader, Req, Length, Scanned) when
     Stage =:= preamble; Stage =:= seek
 ->
@@ -610,6 +624,8 @@ refill(#reader{buf = Buf} = Reader, Req0, Length) ->
     end.
 
 -spec append(binary(), iodata()) -> binary().
+append(<<>>, Bytes) when is_binary(Bytes) ->
+    Bytes;
 append(Buf, Bytes) when is_binary(Bytes) ->
     <<Buf/binary, Bytes/binary>>;
 append(Buf, Bytes) ->

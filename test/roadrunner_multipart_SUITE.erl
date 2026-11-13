@@ -16,7 +16,8 @@ far as it needs.
     reads_parts_as_they_arrive/1,
     reads_a_chunked_body/1,
     read_error_is_returned/1,
-    read_error_in_headers_is_returned/1
+    read_error_in_headers_is_returned/1,
+    reads_shorter_than_the_boundary/1
 ]).
 
 -define(H, roadrunner_multipart_stream_handler).
@@ -29,7 +30,8 @@ all() ->
         reads_parts_as_they_arrive,
         reads_a_chunked_body,
         read_error_is_returned,
-        read_error_in_headers_is_returned
+        read_error_in_headers_is_returned,
+        reads_shorter_than_the_boundary
     ].
 
 init_per_testcase(Case, Config) ->
@@ -40,7 +42,10 @@ init_per_testcase(Case, Config) ->
                 port => 0,
                 protocols => [http1],
                 body_buffering => manual,
-                routes => [{~"/parts", ?H, {self(), 64, 3}}]
+                routes => [
+                    {~"/parts", ?H, {self(), 64, 3}},
+                    {~"/small-reads", ?H, {self(), 4, 3}}
+                ]
             },
             extra(Case)
         )
@@ -110,6 +115,22 @@ read_error_in_headers_is_returned(Config) ->
     Sock = ?config(sock, Config),
     ok = gen_tcp:send(Sock, [head(~"content-length: ", ~"200"), <<"--B\r\nx-a: 1">>]),
     ?assertEqual({parts, {error, request_timeout}}, next()).
+
+reads_shorter_than_the_boundary(Config) ->
+    %% Each read asks for 4 bytes, fewer than the opening `--BOUNDARY12`, so
+    %% the reader reads on before it can tell the body opens with it.
+    Sock = ?config(sock, Config),
+    Body = <<"--BOUNDARY12\r\n\r\nvalue\r\n--BOUNDARY12--">>,
+    ok = gen_tcp:send(Sock, [
+        ~"POST /small-reads HTTP/1.1\r\nhost: x\r\n",
+        ~"content-type: multipart/form-data; boundary=BOUNDARY12\r\n",
+        ~"content-length: ",
+        integer_to_binary(byte_size(Body)),
+        ~"\r\n\r\n",
+        Body
+    ]),
+    ?assertEqual({part, []}, next()),
+    ?assertEqual({parts, {ok, [{[], ~"value"}]}}, next()).
 
 head(Name, Value) ->
     [
