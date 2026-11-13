@@ -413,12 +413,23 @@ body(_) -> <<>>.
 -doc """
 Return whether the request carries a non-empty body.
 
-Returns `false` for both an absent `body` field and an empty body.
-Handlers can use this as a short-circuit before doing any body-aware
-work. Uses `iolist_size/1` so the check is O(length of iolist), not
-O(total bytes).
+With the default `body_buffering => auto`, the body is already read, and
+this is whether it has any bytes. With `body_buffering => manual` it is
+known before reading: on HTTP/1.1 from the body's framing (a
+`Content-Length` above `0`, or `Transfer-Encoding: chunked`), on HTTP/2
+and HTTP/3 from whether the stream goes on after its headers. A stream
+that turns out to carry no bytes reads `false` once it is read.
+
+Returns `false` when the request has neither (a request map built by
+hand). Handlers can use this as a short-circuit before doing any
+body-aware work.
 """.
 -spec has_body(request()) -> boolean().
+has_body(#{body_reader := #{framing := none}}) -> false;
+has_body(#{body_reader := #{framing := {content_length, N}}}) -> N > 0;
+has_body(#{body_reader := #{framing := chunked}}) -> true;
+has_body(#{body_reader := #{framing := stream, done := true, bytes_read := 0}}) -> false;
+has_body(#{body_reader := #{framing := stream}}) -> true;
 has_body(#{body := B}) -> iolist_size(B) > 0;
 has_body(_) -> false.
 

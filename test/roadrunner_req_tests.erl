@@ -440,6 +440,27 @@ read_body_chunked_manual_pending_then_recv_error_test() ->
         roadrunner_req:read_body(Req, #{length => 5})
     ).
 
+has_body_manual_framing_test() ->
+    %% Manual mode answers from the body reader, before any read.
+    Reader = fun(Framing) -> (sample_req())#{body_reader => #{framing => Framing}} end,
+    ?assertEqual(false, roadrunner_req:has_body(Reader(none))),
+    ?assertEqual(false, roadrunner_req:has_body(Reader({content_length, 0}))),
+    ?assertEqual(true, roadrunner_req:has_body(Reader({content_length, 5}))),
+    ?assertEqual(true, roadrunner_req:has_body(Reader(chunked))).
+
+has_body_manual_stream_test() ->
+    Stream = fun(Done, Read) ->
+        (sample_req())#{
+            body_reader => #{framing => stream, done => Done, bytes_read => Read}
+        }
+    end,
+    %% Ended with its headers: no body.
+    ?assertEqual(false, roadrunner_req:has_body(Stream(true, 0))),
+    %% Still open: a body follows.
+    ?assertEqual(true, roadrunner_req:has_body(Stream(false, 0))),
+    %% Read to its end.
+    ?assertEqual(true, roadrunner_req:has_body(Stream(true, 5))).
+
 has_body_absent_returns_false_test() ->
     ?assertEqual(false, roadrunner_req:has_body(sample_req())).
 

@@ -17,6 +17,7 @@ picks what it does with the body.
     body_that_came_whole_over_the_cap_gets_413/1,
     reads_data_as_it_arrives/1,
     reads_nothing_without_a_body/1,
+    has_body_before_reading/1,
     trailers_end_the_body/1,
     answers_before_the_body/1,
     expect_continue_asks_on_the_first_read/1,
@@ -54,6 +55,7 @@ all() ->
         body_that_came_whole_over_the_cap_gets_413,
         reads_data_as_it_arrives,
         reads_nothing_without_a_body,
+        has_body_before_reading,
         trailers_end_the_body,
         answers_before_the_body,
         expect_continue_asks_on_the_first_read,
@@ -118,6 +120,7 @@ extra(_Case) ->
 routes(TestPid) ->
     [
         {~"/read", ?H, read},
+        {~"/has-body", ?H, has_body},
         {~"/pieces", ?H, pieces},
         {~"/reject", ?H, reject},
         #{path => ~"/gated", handler => ?H, state => {gated, ?GATED}, max_content_length => 500000},
@@ -171,6 +174,13 @@ reads_nothing_without_a_body(Config) ->
     Conn = ?config(conn, Config),
     {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"/read")),
     ?assertMatch({200, _, ~"0"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
+
+has_body_before_reading(Config) ->
+    %% Known from the stream before any read: ended with its headers, or not.
+    Conn = ?config(conn, Config),
+    {ok, Empty} = roadrunner_quic_test_h3:open_request(Conn, headers(~"/has-body")),
+    ?assertMatch({200, _, ~"false"}, roadrunner_quic_test_h3:collect(Conn, Empty)),
+    ?assertMatch({200, _, ~"true"}, post(Conn, ~"/has-body", ~"hello")).
 
 trailers_end_the_body(Config) ->
     Conn = ?config(conn, Config),
