@@ -32,6 +32,7 @@ fun does.
     crash_after_the_response_keeps_it/1,
     crash_in_an_open_stream_cuts_it/1,
     second_final_response_raises/1,
+    status_follows_the_response/1,
     unsafe_inform_is_not_sent/1,
     unsafe_reply_is_500/1,
     missing_file_is_500/1,
@@ -93,6 +94,7 @@ common() ->
         missing_file_is_500,
         short_file_is_500,
         calls_from_another_process_raise,
+        status_follows_the_response,
         reply_before_reading_sends_no_continue,
         continue_goes_before_a_reply_after_reading
     ].
@@ -188,6 +190,8 @@ routes(TestPid, File) ->
         {~"/crash-after", ?H, crash_after},
         {~"/crash-open", ?H, crash_open},
         {~"/twice", ?H, {report, TestPid, twice}},
+        {~"/status", ?H, {report, TestPid, status}},
+        {~"/status-after-reply", ?H, {report, TestPid, status_after_reply}},
         {~"/unsafe-inform", ?H, {report, TestPid, unsafe_inform}},
         {~"/unsafe-reply", ?H, {report, TestPid, unsafe_reply}},
         {~"/big-inform", ?H, {report, TestPid, big_inform}},
@@ -308,7 +312,16 @@ short_file_is_500(Config) ->
 calls_from_another_process_raise(Config) ->
     ?assertMatch({[200], _, ~"own", complete}, get(Config, ~"/other-process")),
     ?assertEqual({raised, not_in_send_fun}, result()),
+    ?assertEqual({raised, not_in_send_fun}, result()),
     ?assertEqual({raised, not_in_send_fun}, result()).
+
+status_follows_the_response(Config) ->
+    %% Before anything, after an interim, while a stream is open, once it
+    %% is ended; and right after a complete reply.
+    ?assertMatch({[103, 200], _, ~"part-end", complete}, get(Config, ~"/status")),
+    ?assertEqual([none, none, streaming, streaming, sent], [result() || _ <- lists:seq(1, 5)]),
+    ?assertMatch({[200], _, ~"done", complete}, get(Config, ~"/status-after-reply")),
+    ?assertEqual(sent, result()).
 
 reply_before_reading_sends_no_continue(Config) ->
     %% The client is answered before the fun reads the body it holds back

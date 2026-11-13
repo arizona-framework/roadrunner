@@ -90,6 +90,25 @@ send_fun(crash_open) ->
         ok = Send(~"partial", nofin),
         error(boom)
     end;
+send_fun({report, Pid, status}) ->
+    fun(Req) ->
+        Pid ! {send_result, roadrunner_send:status(Req)},
+        ok = roadrunner_send:inform(103, [], Req),
+        Pid ! {send_result, roadrunner_send:status(Req)},
+        {ok, Send} = roadrunner_send:stream(200, [], Req),
+        Pid ! {send_result, roadrunner_send:status(Req)},
+        ok = Send(~"part-", nofin),
+        Pid ! {send_result, roadrunner_send:status(Req)},
+        ok = Send(~"end", fin),
+        Pid ! {send_result, roadrunner_send:status(Req)},
+        Req
+    end;
+send_fun({report, Pid, status_after_reply}) ->
+    fun(Req) ->
+        ok = roadrunner_send:reply(200, [], ~"done", Req),
+        Pid ! {send_result, roadrunner_send:status(Req)},
+        Req
+    end;
 send_fun({report, Pid, twice}) ->
     fun(Req) ->
         ok = roadrunner_send:reply(200, [], ~"first", Req),
@@ -157,7 +176,8 @@ send_fun({report, Pid, other_process}) ->
         Self = self(),
         _ = spawn(fun() ->
             Self ! {other, raised(fun() -> roadrunner_send:reply(200, [], ~"other", Req) end)},
-            Self ! {other, raised(fun() -> roadrunner_send:inform(103, [], Req) end)}
+            Self ! {other, raised(fun() -> roadrunner_send:inform(103, [], Req) end)},
+            Self ! {other, raised(fun() -> roadrunner_send:status(Req) end)}
         end),
         Pid !
             {send_result,
@@ -168,6 +188,11 @@ send_fun({report, Pid, other_process}) ->
             {send_result,
                 receive
                     {other, R2} -> R2
+                end},
+        Pid !
+            {send_result,
+                receive
+                    {other, R3} -> R3
                 end},
         ok = roadrunner_send:reply(200, [], ~"own", Req),
         Req
