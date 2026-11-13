@@ -50,6 +50,7 @@
     reuseport => boolean(),
     active => active(),
     ip => inet:ip_address(),
+    ipv6_v6only => boolean(),
     gso => boolean()
 }.
 
@@ -98,7 +99,9 @@ sockets share one concrete port with kernel datagram fan-out (the shape the
 listener pool uses); it defaults to `false` for a lone socket.
 
 Set `ip` to a specific local address (e.g. `{127,0,0,1}`) to bind that
-interface only; unset binds all interfaces.
+interface only; unset binds all interfaces. With an IPv6 `ip`, set
+`ipv6_v6only` to `true` to serve IPv6 clients only, or `false` to serve
+IPv4 clients too; unset, the operating system decides.
 """.
 -spec open(inet:port_number(), open_opts()) -> {ok, socket()} | {error, term()}.
 open(Port, Opts) ->
@@ -111,13 +114,13 @@ open(Port, Opts) ->
         {recbuf, RecBuf},
         {sndbuf, SndBuf}
     ],
-    %% Bind a specific interface only when `ip` was set, so the default
-    %% binds all interfaces exactly as before.
-    SocketOpts =
-        case Validated of
-            #{ip := IP} -> [{ip, IP} | BaseOpts];
-            #{} -> BaseOpts
-        end,
+    %% Bind a specific interface, and set `ipv6_v6only`, only when the
+    %% caller set them, so the default binds all interfaces exactly as before.
+    SocketOpts = maps:fold(
+        fun(Key, Value, Acc) -> [{Key, Value} | Acc] end,
+        BaseOpts,
+        maps:with([ip, ipv6_v6only], Validated)
+    ),
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} -> {ok, {gen_udp, Socket, gso_segment(Socket, Validated, os:type())}};
         {error, _} = Error -> Error
@@ -261,6 +264,7 @@ sockname({gen_udp, Socket, _Segment}) ->
         reuseport := boolean(),
         active := active(),
         ip => inet:ip_address(),
+        ipv6_v6only => boolean(),
         gso := boolean()
     }.
 validate_opts(Opts) ->
@@ -286,6 +290,8 @@ validate_opt(active, Value, Acc) when is_integer(Value), Value > 0 ->
     Acc#{active => Value};
 validate_opt(ip, Value, Acc) when is_tuple(Value) ->
     Acc#{ip => Value};
+validate_opt(ipv6_v6only, Value, Acc) when is_boolean(Value) ->
+    Acc#{ipv6_v6only => Value};
 validate_opt(gso, Value, Acc) when is_boolean(Value) ->
     Acc#{gso => Value};
 validate_opt(Key, Value, _Acc) ->

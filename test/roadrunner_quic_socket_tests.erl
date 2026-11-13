@@ -27,6 +27,11 @@ open_rejects_invalid_active_test() ->
 open_rejects_non_tuple_ip_test() ->
     ?assertError({invalid_quic_socket_opt, ip, "bad"}, ?M:open(0, #{ip => "bad"})).
 
+open_rejects_non_boolean_ipv6_v6only_test() ->
+    ?assertError(
+        {invalid_quic_socket_opt, ipv6_v6only, yes}, ?M:open(0, #{ipv6_v6only => yes})
+    ).
+
 from_message_ignores_foreign_message_test() ->
     %% A message that is not this socket's datagram (a different socket's data,
     %% a DOWN, a system message) parses to `ignore` without opening any I/O.

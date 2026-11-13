@@ -57,6 +57,7 @@
     connection_handler := fun((pid()) -> {ok, pid()} | {error, term()}),
     pool_size := non_neg_integer(),
     ip => inet:ip_address(),
+    ipv6_v6only => boolean(),
     %% When a request stream's receive credit is granted back: as its data
     %% arrives (the default), or as its owner consumes it
     %% (`roadrunner_quic:consumed/3`), for a reader that pulls the body.
@@ -179,10 +180,12 @@ listener_opts(Port, PoolOpts, Registry, ReusePort) ->
         reuseport => ReusePort,
         registry => Registry
     },
-    %% Carry `ip` (the per-listener bind), `stream_credit`, and `accept_gate`
-    %% through only when the pool was started with them, so a default pool is
-    %% unchanged.
-    maps:merge(Base, maps:with([ip, stream_credit, accept_gate], PoolOpts)).
+    %% Carry `ip` and `ipv6_v6only` (the per-listener bind), `stream_credit`,
+    %% and `accept_gate` through only when the pool was started with them, so
+    %% a default pool is unchanged.
+    maps:merge(
+        Base, maps:with([ip, ipv6_v6only, stream_credit, accept_gate], PoolOpts)
+    ).
 
 -spec transport_params(non_neg_integer()) -> roadrunner_quic_transport_params:params().
 transport_params(MaxStreamsBidi) ->
