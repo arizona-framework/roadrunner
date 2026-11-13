@@ -33,23 +33,32 @@ handle(Req) ->
     ...
 ```
 
-Streamed, writing each part to its own file as it arrives (never build
-a path from the client's `name` or `filename`):
+Streamed, writing each uploaded file to disk as it arrives. The upload
+directory comes from the route's state, as in
+`{~"/upload", upload_handler, #{dir => UploadDir}}`, and each file gets a
+name of our own (never build a path from the client's `name` or
+`filename`):
 
 ```erlang
 handle(Req) ->
     {{send, [], fun save_parts/1}, Req}.
 
 save_parts(Req0) ->
+    #{dir := Dir} = roadrunner_req:state(Req0),
     case roadrunner_multipart:read_part(Req0) of
         {ok, Headers, Req1} ->
             {_, Disposition} = lists:keyfind(~"content-disposition", 1, Headers),
-            {~"form-data", #{~"name" := _Name}} = roadrunner_multipart:disposition(Disposition),
-            Path = filename:join("/tmp/uploads", integer_to_list(erlang:unique_integer([positive]))),
-            {ok, Fd} = file:open(Path, [write, raw, binary]),
-            Req2 = save_body(Fd, Req1),
-            ok = file:close(Fd),
-            save_parts(Req2);
+            case roadrunner_multipart:disposition(Disposition) of
+                {~"form-data", #{~"filename" := _}} ->
+                    Name = integer_to_list(erlang:unique_integer([positive])),
+                    {ok, Fd} = file:open(filename:join(Dir, Name), [write, raw, binary]),
+                    Req2 = save_body(Fd, Req1),
+                    ok = file:close(Fd),
+                    save_parts(Req2);
+                _Field ->
+                    %% Not a file: the next read_part/1 skips its body.
+                    save_parts(Req1)
+            end;
         {done, Req1} ->
             ok = roadrunner_send:reply(204, [], <<>>, Req1),
             Req1
