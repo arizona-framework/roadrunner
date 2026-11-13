@@ -177,7 +177,9 @@ connection with `exit(Pid, kill)`.
 Why a session ended, as `terminate/2` gets it:
 
 - `normal` — the handler closed it (a `close` return).
-- `remote` — the client sent a close frame.
+- `{remote, Code, Reason}` — the client sent a close frame with a
+  status code and a (possibly empty) UTF-8 reason.
+- `remote` — the client sent a close frame without a status code.
 - `shutdown` — the handler closed it from `handle_drain/2`, as the
   listener drains.
 - `timeout` — the client sent nothing for the session's `idle_timeout`
@@ -188,7 +190,13 @@ Why a session ended, as `terminate/2` gets it:
   `invalid_payload`, or the cap a frame or message went over:
   `max_frame_size`, `max_message_size`).
 """.
--type terminate_reason() :: normal | remote | shutdown | timeout | {error, term()}.
+-type terminate_reason() ::
+    normal
+    | remote
+    | {remote, roadrunner_ws:close_code(), binary()}
+    | shutdown
+    | timeout
+    | {error, term()}.
 
 -doc """
 Options for one session, the 4th element of a `{websocket, Module, State,
