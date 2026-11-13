@@ -236,6 +236,8 @@ and `done` flips true with the stream's end.
     client_ip/1,
     forwarded_for/1,
     scheme/1,
+    host/1,
+    port/1,
     state/1,
     request_id/1,
     listener_name/1,
@@ -768,6 +770,103 @@ connection pipeline.
 -spec scheme(request()) -> http | https.
 scheme(#{scheme := S}) -> S;
 scheme(_) -> http.
+
+-doc """
+Return the host the request was sent to, without its port.
+
+It comes from the `Host` header, or on HTTP/2 and HTTP/3 from the
+`:authority` pseudo-header, which reaches the request as `host`. For an
+absolute-form target (`GET http://example.com/ HTTP/1.1`) it is the
+target's host, as RFC 9112 §3.2.2 asks. The host is lowercased, since a
+host name matches in any case, and an IPv6 address keeps its brackets
+(`[::1]`), so the result can go straight into a URL.
+
+Returns `undefined` when the request names no host, which only an
+HTTP/1.0 request may do. A request whose host is malformed is answered
+`400` before any handler runs, so the value is always well formed.
+
+```erlang
+%% Host: Example.COM:8080
+~"example.com" = roadrunner_req:host(Req).
+```
+""".
+-spec host(request()) -> binary() | undefined.
+host(Req) ->
+    case header_normalized(~"host", Req) of
+        undefined ->
+            undefined;
+        Authority ->
+            {Host, _Port} = split_authority(Authority),
+            roadrunner_bin:ascii_lowercase(Host)
+    end.
+
+-doc """
+Return the port the request was sent to.
+
+It is the port in the `Host` header (or `:authority`, see `host/1`), or
+the scheme's default when the request names none: `80` for `http` and
+`443` for `https`. A port above `65535` is no port, so it gets the
+default too.
+
+This is the port the client asked for. Behind a proxy it can differ from
+the one the listener accepted the connection on, which `sockname/1`
+returns.
+
+```erlang
+%% Host: example.com:8080
+8080 = roadrunner_req:port(Req).
+```
+""".
+-spec port(request()) -> inet:port_number().
+port(Req) ->
+    case header_normalized(~"host", Req) of
+        undefined ->
+            default_port(scheme(Req));
+        Authority ->
+            {_Host, Digits} = split_authority(Authority),
+            explicit_port(Digits, Req)
+    end.
+
+%% A `uri-host [":" port]` split into its host and its port digits (empty
+%% when there is no port). An IP literal runs to its `]`; a reg-name holds
+%% no `:`, so it runs to the first one.
+-spec split_authority(binary()) -> {binary(), binary()}.
+split_authority(<<$[, _/binary>> = Authority) -> split_ip_literal(Authority, 1);
+split_authority(Authority) -> split_reg_name(Authority, 0).
+
+-spec split_ip_literal(binary(), non_neg_integer()) -> {binary(), binary()}.
+split_ip_literal(Authority, Len) ->
+    case Authority of
+        <<_:Len/binary, $], $:, _/binary>> ->
+            HostLen = Len + 1,
+            <<Host:HostLen/binary, $:, Port/binary>> = Authority,
+            {Host, Port};
+        <<_:Len/binary, $], _/binary>> ->
+            {Authority, <<>>};
+        <<_:Len/binary, _, _/binary>> ->
+            split_ip_literal(Authority, Len + 1)
+    end.
+
+-spec split_reg_name(binary(), non_neg_integer()) -> {binary(), binary()}.
+split_reg_name(Authority, Len) ->
+    case Authority of
+        <<Host:Len/binary, $:, Port/binary>> -> {Host, Port};
+        <<_:Len/binary>> -> {Authority, <<>>};
+        <<_:Len/binary, _, _/binary>> -> split_reg_name(Authority, Len + 1)
+    end.
+
+-spec explicit_port(binary(), request()) -> inet:port_number().
+explicit_port(<<>>, Req) ->
+    default_port(scheme(Req));
+explicit_port(Digits, Req) ->
+    case binary_to_integer(Digits) of
+        Port when Port =< 65535 -> Port;
+        _ -> default_port(scheme(Req))
+    end.
+
+-spec default_port(http | https) -> inet:port_number().
+default_port(http) -> 80;
+default_port(https) -> 443.
 
 -doc """
 Return the opaque per-route handler state attached at compile time.

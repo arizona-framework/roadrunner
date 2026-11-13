@@ -482,6 +482,70 @@ scheme_https_test() ->
 scheme_absent_defaults_to_http_test() ->
     ?assertEqual(http, roadrunner_req:scheme(sample_req())).
 
+%% --- host/1, port/1 ---
+
+host_test() ->
+    ?assertEqual(~"example.com", roadrunner_req:host(sample_req())).
+
+host_drops_port_test() ->
+    ?assertEqual(~"example.com", roadrunner_req:host(with_host(~"example.com:8080"))).
+
+host_lowercased_test() ->
+    ?assertEqual(~"example.com", roadrunner_req:host(with_host(~"Example.COM:8080"))).
+
+host_empty_port_test() ->
+    ?assertEqual(~"example.com", roadrunner_req:host(with_host(~"example.com:"))).
+
+host_ipv4_test() ->
+    ?assertEqual(~"127.0.0.1", roadrunner_req:host(with_host(~"127.0.0.1:4000"))).
+
+host_ipv6_keeps_brackets_test() ->
+    ?assertEqual(~"[::1]", roadrunner_req:host(with_host(~"[::1]"))).
+
+host_ipv6_drops_port_test() ->
+    ?assertEqual(~"[2001:db8::a]", roadrunner_req:host(with_host(~"[2001:DB8::A]:8443"))).
+
+host_absent_test() ->
+    %% Only an HTTP/1.0 request may name no host.
+    Req = (sample_req())#{version := {1, 0}, headers := []},
+    ?assertEqual(undefined, roadrunner_req:host(Req)).
+
+host_from_absolute_form_target_test() ->
+    %% RFC 9112 §3.2.2: the target's host wins over the Host header.
+    {ok, Req, <<>>} = roadrunner_http1:parse_request(
+        ~"GET http://Target.example:8080/a HTTP/1.1\r\nHost: other.example\r\n\r\n"
+    ),
+    ?assertEqual(~"target.example", roadrunner_req:host(Req)),
+    ?assertEqual(8080, roadrunner_req:port(Req)).
+
+port_test() ->
+    ?assertEqual(8080, roadrunner_req:port(with_host(~"example.com:8080"))).
+
+port_leading_zeros_test() ->
+    ?assertEqual(80, roadrunner_req:port(with_host(~"example.com:0080"))).
+
+port_ipv6_test() ->
+    ?assertEqual(8443, roadrunner_req:port(with_host(~"[::1]:8443"))).
+
+port_default_http_test() ->
+    ?assertEqual(80, roadrunner_req:port(sample_req())).
+
+port_default_https_test() ->
+    ?assertEqual(443, roadrunner_req:port((sample_req())#{scheme => https})).
+
+port_empty_defaults_test() ->
+    ?assertEqual(80, roadrunner_req:port(with_host(~"example.com:"))).
+
+port_ipv6_without_port_defaults_test() ->
+    ?assertEqual(443, roadrunner_req:port((with_host(~"[::1]"))#{scheme => https})).
+
+port_out_of_range_defaults_test() ->
+    ?assertEqual(443, roadrunner_req:port((with_host(~"example.com:65536"))#{scheme => https})).
+
+port_absent_host_defaults_test() ->
+    Req = (sample_req())#{version := {1, 0}, headers := [], scheme => https},
+    ?assertEqual(443, roadrunner_req:port(Req)).
+
 %% --- state/1 ---
 
 state_present_test() ->
@@ -600,6 +664,9 @@ sample_req() ->
 
 sample_req_target(Target) ->
     (sample_req())#{target := Target}.
+
+with_host(Host) ->
+    (sample_req())#{headers := [{~"host", Host}]}.
 
 with_cookie(CookieValue) ->
     Req = sample_req(),

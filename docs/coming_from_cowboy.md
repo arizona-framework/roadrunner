@@ -164,8 +164,8 @@ routes => [
 Notable differences:
 
 - Binding names are binaries (`~"id"`), not atoms
-- There is no host matching. If you route by host, read the `host` header in
-  a handler or middleware
+- There is no host matching. If you route by host, check
+  `roadrunner_req:host/1` in a handler or middleware
 - There are no optional segments (`[page/:number]`). Write one route per
   shape, for example `/hats` and `/hats/page/:number`
 - There are no constraints. Check and convert bindings in the handler
@@ -244,10 +244,11 @@ name.
 | `cowboy_req:read_body(Req)` | `roadrunner_req:read_body(Req)` |
 | `cowboy_req:read_urlencoded_body(Req)` | `roadrunner_req:read_form(Req)` |
 | `cowboy_req:peer(Req)` | `roadrunner_req:peer(Req)` |
-| `cowboy_req:sock(Req)`, `cowboy_req:port(Req)` | `roadrunner_req:sockname(Req)`, `{ok, {Ip, Port}}` |
+| `cowboy_req:sock(Req)` | `roadrunner_req:sockname(Req)`, `{ok, {Ip, Port}}` |
 | `cowboy_req:cert(Req)` | `roadrunner_req:peercert(Req)`, `{ok, Der}` or `{error, no_peercert}` |
 | `cowboy_req:scheme(Req)` | `roadrunner_req:scheme(Req)`, the atom `http` or `https` |
-| `cowboy_req:host(Req)` | `roadrunner_req:header(~"host", Req)` |
+| `cowboy_req:host(Req)` | `roadrunner_req:host(Req)` |
+| `cowboy_req:port(Req)` | `roadrunner_req:port(Req)` |
 
 For example, reading a query parameter with a default and a form body:
 
@@ -277,8 +278,9 @@ Notable differences:
 - `header/2` matches the name in any case
 - There is no `header/3` with a default; `header/2` returns `undefined` when
   the header is missing
-- `host` is the raw header value, so it can include the port. On HTTP/2 and
-  HTTP/3 the `:authority` pseudo-header is passed on as `host`
+- `host/1` returns `undefined` when the request names no host, which only
+  an HTTP/1.0 request may do. On HTTP/2 and HTTP/3 the `:authority`
+  pseudo-header is passed on as the `host` header
 - `read_form/1` reads both `application/x-www-form-urlencoded` and
   `multipart/form-data` bodies, and returns `{ok, urlencoded, Pairs, Req}` or
   `{ok, multipart, Parts, Req}`
@@ -728,8 +730,9 @@ cover each one.
   that matches on the method, and use the map route's `methods` for `405`
   answers, `roadrunner_etag` for `ETag` and `304`, `roadrunner_cors` for CORS,
   and your own middleware for shared steps such as authentication
-- **Host matching, optional segments, and constraints** in routes: read the
-  `host` header, write one route per shape, and check bindings in the handler
+- **Host matching, optional segments, and constraints** in routes: check
+  `roadrunner_req:host/1`, write one route per shape, and check bindings in
+  the handler
 - **`match_qs/2`, `match_cookies/2`, `parse_header/2`**: read the list from
   `parse_qs/1` or `parse_cookies/1`, or the raw value from `header/2`, and
   convert it in your code
