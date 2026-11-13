@@ -16,7 +16,8 @@ and a drained listener stays down until started again.
     crashed_acceptor_restarts_the_listener/1,
     normal_exit_of_a_linked_process_is_ignored/1,
     drained_listener_stays_down/1,
-    drained_listener_starts_again/1
+    drained_listener_starts_again/1,
+    draining_listener_answers_calls/1
 ]).
 
 suite() ->
@@ -29,7 +30,8 @@ all() ->
         crashed_acceptor_restarts_the_listener,
         normal_exit_of_a_linked_process_is_ignored,
         drained_listener_stays_down,
-        drained_listener_starts_again
+        drained_listener_starts_again,
+        draining_listener_answers_calls
     ].
 
 init_per_suite(Config) ->
@@ -106,7 +108,39 @@ drained_listener_starts_again(_Config) ->
     ?assert(lists:member(lifecycle_redrain, roadrunner:listeners())),
     ok = roadrunner:stop_listener(lifecycle_redrain).
 
+draining_listener_answers_calls(_Config) ->
+    %% A connection that ignores the drain holds it to its deadline. Until
+    %% then the listener reports itself draining, counts the connection,
+    %% and a second drain gets the same result as the first.
+    {ok, _} = roadrunner:start_listener(lifecycle_draining, #{
+        port => 0, routes => [{~"/sleep", roadrunner_drain_ignore_handler, #{}}]
+    }),
+    Port = roadrunner_listener:port(lifecycle_draining),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n"),
+    {ok, _Started} = gen_tcp:recv(Sock, 0, 2000),
+    Self = self(),
+    Drain = fun() -> Self ! {drained, roadrunner_listener:drain(lifecycle_draining, 1000)} end,
+    _ = spawn(Drain),
+    ok = wait_for_draining(lifecycle_draining),
+    ?assertMatch(#{active_clients := 1}, roadrunner_listener:info(lifecycle_draining)),
+    _ = spawn(Drain),
+    [
+        receive
+            {drained, Result} -> ?assertEqual({timeout, 1}, Result)
+        end
+     || _ <- [first, second]
+    ],
+    ?assertEqual(undefined, whereis(lifecycle_draining)),
+    ok = gen_tcp:close(Sock).
+
 %% --- helpers ---
+
+wait_for_draining(Name) ->
+    case roadrunner_listener:status(Name) of
+        draining -> ok;
+        accepting -> wait_for_draining(Name)
+    end.
 
 %% A route with its own `rate_limit`, so the listener publishes both its
 %% routes and its route bucket store.

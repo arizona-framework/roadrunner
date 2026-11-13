@@ -952,7 +952,7 @@ An upgrade can set each of these for its own session
         },
     %% QUIC listener pool supervisor pid when `http3` is in `protocols`,
     %% else `undefined`. roadrunner owns its lifecycle (started in
-    %% `init/1`, stopped in `terminate/1` / `do_drain/2`); the pooled
+    %% `init/1`, stopped in `terminate/1` / `finish_drain/2`); the pooled
     %% reuseport listeners drive the UDP sockets while roadrunner owns
     %% the h3 conn loop.
     %% Kept after the fields above so their positions are unchanged
@@ -962,10 +962,15 @@ An upgrade can set each of these for its own session
     %% when the route table first has one (at start or on `reload_routes/2`)
     %% and kept for the life of the listener; `undefined` until then.
     route_buckets = undefined :: ets:table() | undefined,
-    %% Shared by the QUIC pool's listeners; `do_drain/2` closes it so no new
+    %% Shared by the QUIC pool's listeners; `start_drain/3` closes it so no new
     %% h3 connection starts while the open ones finish. `undefined` on a
     %% listener without `http3`.
-    quic_accept_gate :: roadrunner_quic_listener:accept_gate() | undefined
+    quic_accept_gate :: roadrunner_quic_listener:accept_gate() | undefined,
+    %% While `drain/2` runs: its deadline and the callers waiting for its
+    %% result. The listener keeps answering calls (`status/1`, `info/1`)
+    %% and checks its connections on a timer (`drain_check`).
+    drain = undefined ::
+        undefined | #{deadline := integer(), waiters := [gen_server:from(), ...]}
 }).
 
 -doc """
@@ -1006,9 +1011,12 @@ deadline, or `{timeout, Remaining}` with the count that was still
 alive when the timeout fired (those processes are torn down before
 returning).
 
-The listener then exits, and `drain/2` returns only once it is gone, so
-the name is free and a `roadrunner:start_listener/2` or `start_link/2`
-right after it starts a fresh listener.
+While it drains, the listener still answers calls: `status/1` returns
+`draining`, `info/1` counts the connections still open, and another
+`drain/2` waits for the same result. The listener then exits, and
+`drain/2` returns only once it is gone, so the name is free and a
+`roadrunner:start_listener/2` or `start_link/2` right after it starts a
+fresh listener.
 """.
 -spec drain(Name :: atom(), Timeout :: non_neg_integer()) ->
     {ok, drained} | {timeout, non_neg_integer()}.
@@ -2663,7 +2671,7 @@ bake_dispatch(Handler, Opts, HandlerMws, StateArg0) ->
     | {reload_routes, roadrunner_router:routes()},
     gen_server:from(),
     #state{}
-) -> {reply, term(), #state{}} | {stop, normal, term(), #state{}}.
+) -> {reply, term(), #state{}} | {noreply, #state{}}.
 handle_call(port, _From, #state{port = Port} = State) ->
     {reply, Port, State};
 handle_call(quic_port, _From, #state{quic_listener = undefined} = State) ->
@@ -2672,9 +2680,11 @@ handle_call(quic_port, _From, #state{quic_listener = QuicPool} = State) ->
     {reply, quic_pool_port(QuicPool), State};
 handle_call(status, _From, #state{phase = Phase} = State) ->
     {reply, Phase, State};
-handle_call({drain, Timeout}, _From, State) ->
-    {Reply, NewState} = do_drain(State, Timeout),
-    {stop, normal, Reply, NewState};
+handle_call({drain, Timeout}, From, #state{phase = accepting} = State) ->
+    {noreply, start_drain(State, Timeout, From)};
+handle_call({drain, _Timeout}, From, #state{drain = #{waiters := Waiters} = Drain} = State) ->
+    %% A drain is already running: this caller gets its result too.
+    {noreply, State#state{drain = Drain#{waiters := [From | Waiters]}}};
 handle_call({reload_routes, Routes}, _From, State) ->
     {Reply, State1} = do_reload_routes(State, Routes),
     {reply, Reply, State1};
@@ -2758,16 +2768,18 @@ reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws) ->
             {{error, {init_failed, Reason}}, State}
     end.
 
--spec do_drain(#state{}, non_neg_integer()) ->
-    {{ok, drained} | {timeout, non_neg_integer()}, #state{}}.
-do_drain(
+%% Stop taking new connections and tell the open ones to wind down; the
+%% `drain_check` timer then waits for them, so the listener keeps answering
+%% calls while they finish.
+-spec start_drain(#state{}, non_neg_integer(), gen_server:from()) -> #state{}.
+start_drain(
     #state{
         listen_socket = LSocket,
-        quic_listener = QuicListener,
         quic_accept_gate = QuicAcceptGate,
-        proto_opts = ProtoOpts
+        proto_opts = #{drain_table := Table}
     } = State,
-    Timeout
+    Timeout,
+    From
 ) ->
     %% Stop taking new connections on both transports first. Close the TCP
     %% listen socket so accept fails and acceptors exit, and close the QUIC
@@ -2778,18 +2790,49 @@ do_drain(
     ok = close_tcp(LSocket),
     ok = close_quic_accept_gate(QuicAcceptGate),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    #{client_counter := Counter, drain_table := Table} = ProtoOpts,
     notify_conns(Table, Deadline),
-    Reply = wait_for_drain(Counter, Deadline, Table),
+    self() ! drain_check,
+    State#state{
+        listen_socket = closed,
+        phase = draining,
+        drain = #{deadline => Deadline, waiters => [From]}
+    }.
+
+%% Check the draining connections: all gone, or past the deadline (the
+%% rest are killed), ends the drain; otherwise check again shortly.
+-spec check_drain(#state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
+check_drain(
+    #state{
+        proto_opts = #{client_counter := Counter, drain_table := Table},
+        drain = #{deadline := Deadline}
+    } = State
+) ->
+    case counters:get(Counter, 1) of
+        0 ->
+            finish_drain({ok, drained}, State);
+        N ->
+            Remaining = Deadline - erlang:monotonic_time(millisecond),
+            case Remaining =< 0 of
+                true ->
+                    _ = [exit(Pid, kill) || {Pid} <- ets:tab2list(Table)],
+                    finish_drain({timeout, N}, State);
+                false ->
+                    _ = erlang:send_after(min(50, Remaining), self(), drain_check),
+                    {noreply, State}
+            end
+    end.
+
+%% Answer every caller waiting on the drain, and stop.
+-spec finish_drain({ok, drained} | {timeout, non_neg_integer()}, #state{}) ->
+    {stop, normal, #state{}}.
+finish_drain(Reply, #state{quic_listener = QuicListener, drain = #{waiters := Waiters}} = State) ->
     %% Stop the QUIC pool LAST: its listeners link the connections they
-    %% spawned, so stopping it before the notify/wait above would kill
-    %% in-flight h3 conns instead of letting them drain (each sends
-    %% GOAWAY and closes once its requests finish).
+    %% spawned, so stopping it before the connections finished would kill
+    %% in-flight h3 conns instead of letting them drain (each sends GOAWAY
+    %% and closes once its requests finish).
     ok = stop_quic(QuicListener),
-    %% `phase = draining` was never observable here (the gen_server is
-    %% blocked in wait_for_drain and the local state isn't committed),
-    %% so settle straight to the final stopped state in one update.
-    {Reply, State#state{listen_socket = closed, quic_listener = undefined, phase = stopped}}.
+    _ = [gen_server:reply(From, Reply) || From <- Waiters],
+    {stop, normal, State#state{quic_listener = undefined, phase = stopped, drain = undefined}}.
 
 %% Best-effort broadcast to in-flight conns. Loop / SSE / WebSocket
 %% handlers can pattern-match on `{roadrunner_drain, Deadline}` in
@@ -2801,33 +2844,15 @@ notify_conns(Table, Deadline) ->
     _ = [Pid ! {roadrunner_drain, Deadline} || {Pid} <- ets:tab2list(Table)],
     ok.
 
-%% Poll the active-clients counter every 50ms (or whatever remains,
-%% if smaller) until it hits zero or the deadline expires.
--spec wait_for_drain(counters:counters_ref(), integer(), ets:table()) ->
-    {ok, drained} | {timeout, non_neg_integer()}.
-wait_for_drain(Counter, Deadline, Table) ->
-    case counters:get(Counter, 1) of
-        0 ->
-            {ok, drained};
-        N ->
-            Remaining = Deadline - erlang:monotonic_time(millisecond),
-            case Remaining =< 0 of
-                true ->
-                    _ = [exit(Pid, kill) || {Pid} <- ets:tab2list(Table)],
-                    {timeout, N};
-                false ->
-                    timer:sleep(min(50, Remaining)),
-                    wait_for_drain(Counter, Deadline, Table)
-            end
-    end.
-
 -doc false.
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 -doc false.
--spec handle_info(term(), #state{}) -> {noreply, #state{}}.
+-spec handle_info(term(), #state{}) -> {noreply, #state{}} | {stop, term(), #state{}}.
+handle_info(drain_check, #state{phase = draining} = State) ->
+    check_drain(State);
 handle_info(reconcile_slots, #state{reconciliation = disabled} = State) ->
     %% Race: a `slot_reconciliation` opt change between scheduling and
     %% receipt would surface as the timer firing in disabled state.
