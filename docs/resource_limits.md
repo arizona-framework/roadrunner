@@ -231,7 +231,9 @@ BEAM process limit (`+P`, default 262144), so under heavy multiplexing it
 can exhaust the VM-global process table — failing spawns everywhere, not
 just this listener — on top of unbounded handler memory.
 `max_concurrent_requests` caps that product directly: a listener-wide
-ceiling on live handler processes for the multiplexed protocols. Over the
+ceiling on live handler processes for the multiplexed protocols. It also
+counts a handler still running after its client reset the stream, which
+`max_concurrent_streams` no longer does. Over the
 ceiling, a new HTTP/2 or HTTP/3 stream is refused with `REFUSED_STREAM` /
 `H3_REQUEST_REJECTED` (both retry-safe per RFC 9113 §8.7) before any
 handler runs, and the refusal emits `request_throttled` and

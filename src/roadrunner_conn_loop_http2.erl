@@ -674,23 +674,26 @@ recv_more(
         recv_idle_expired(State)
     end.
 
-%% Idle-wait timeout selection. When no streams are in flight AND the
-%% listener opted into a `hibernate_after` shorter than the idle
+%% Idle-wait timeout selection. When no streams are in flight, no worker
+%% runs (one whose stream was reset may), AND the listener opted into a
+%% `hibernate_after` shorter than the idle
 %% timeout, park for that window so `recv_idle_expired/1` can
 %% hibernate. Otherwise the GOAWAY idle timeout applies: whenever
 %% streams are active, where worker messages are imminent and
 %% hibernating would be pointless, and when the idle timeout comes
 %% first anyway.
 -spec recv_timeout(#loop{}) -> non_neg_integer().
-recv_timeout(#loop{streams = Streams, hibernate_after = Ms, idle_timeout = T}) when
-    map_size(Streams) =:= 0, Ms > 0, Ms < T
+recv_timeout(#loop{
+    streams = Streams, worker_refs = Refs, hibernate_after = Ms, idle_timeout = T
+}) when
+    map_size(Streams) =:= 0, map_size(Refs) =:= 0, Ms > 0, Ms < T
 ->
     Ms;
 recv_timeout(#loop{idle_timeout = T}) ->
     T.
 
 %% Fired when `recv_more/1` sees no traffic for `recv_timeout/1`. With
-%% an empty streams map and `hibernate_after` the shorter wait, collapse
+%% no stream and no worker and `hibernate_after` the shorter wait, collapse
 %% the heap via hibernation; the socket is already armed
 %% (we reached recv_more through `arm_and_recv/1`), so the next inbound
 %% frame, or any worker / `'DOWN'` / drain message, wakes us and
@@ -705,8 +708,10 @@ recv_timeout(#loop{idle_timeout = T}) ->
 %% idle timeout pass, which closes the conn. Otherwise emit the idle
 %% GOAWAY now.
 -spec recv_idle_expired(#loop{}) -> no_return().
-recv_idle_expired(#loop{streams = Streams, hibernate_after = Ms, idle_timeout = T} = State) when
-    map_size(Streams) =:= 0, Ms > 0, Ms < T
+recv_idle_expired(
+    #loop{streams = Streams, worker_refs = Refs, hibernate_after = Ms, idle_timeout = T} = State
+) when
+    map_size(Streams) =:= 0, map_size(Refs) =:= 0, Ms > 0, Ms < T
 ->
     TRef = erlang:start_timer(T - Ms, self(), ?MODULE),
     erlang:hibernate(?MODULE, recv_more_hib, [State, TRef]);
@@ -909,9 +914,8 @@ handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) -
                     %% RFC 9113 §6.9.1: stream-level overflow is a
                     %% stream error, not a connection error. The stream's
                     %% worker may still be running, so tear the stream
-                    %% down the way a peer reset does: the worker is told
-                    %% and demonitored (its exit must not find the stream
-                    %% gone and take the conn down) and its slot released.
+                    %% down the way a peer reset does: the worker is told,
+                    %% and its slot is held until it ends.
                     _ = send_rst_stream(State, StreamId, flow_control_error),
                     frame_loop(reset_stream(State, StreamId));
                 New ->
@@ -935,8 +939,8 @@ handle_frame(
 ) ->
     %% RFC 9113 §5.3.1: a stream cannot depend on itself —
     %% stream-error PROTOCOL_ERROR. A stream we hold is torn down the way
-    %% a peer reset does (its worker told and demonitored, its slot
-    %% released), so no frame of ours follows the RST_STREAM.
+    %% a peer reset does (its worker told; its slot held until the worker
+    %% ends), so no frame of ours follows the RST_STREAM.
     _ = send_rst_stream(State, StreamId, protocol_error),
     case Streams of
         #{StreamId := _} -> frame_loop(reset_stream(State, StreamId));
@@ -2013,24 +2017,40 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
                 State#loop.overload
             ),
             Refs1 = maps:remove(MonRef, Refs),
-            case Reason of
-                normal ->
-                    finish_stream(State, StreamId, Refs1);
-                stream_reset ->
-                    %% The worker wrote to a stream whose response had
-                    %% already ended (a stream fun sending after its `fin`):
-                    %% `stream_open/2` told it the stream was reset, so it
-                    %% stopped. A reset of ours demonitors first, so it
-                    %% never gets here. The response on the wire is
-                    %% complete, so the stream ends as for a normal exit,
-                    %% never with an RST_STREAM after its END_STREAM (RFC
-                    %% 9113 §5.1: no frames on a closed stream).
-                    finish_stream(State, StreamId, Refs1);
-                _ ->
-                    abort_stream(State#loop{worker_refs = Refs1}, StreamId, internal_error)
+            case State#loop.streams of
+                #{StreamId := _} ->
+                    worker_ended(State, StreamId, Refs1, Reason);
+                #{} ->
+                    %% Its stream was reset while it ran (`reset_stream/2`):
+                    %% nothing is left to answer.
+                    State#loop{worker_refs = Refs1}
             end;
         #{} ->
             State
+    end.
+
+%% The stream of a worker that exited, by how it exited.
+-spec worker_ended(#loop{}, stream_id(), #{reference() => stream_id()}, term()) -> #loop{}.
+worker_ended(State, StreamId, Refs, normal) ->
+    finish_stream(State, StreamId, Refs);
+worker_ended(State, StreamId, Refs, stream_reset) ->
+    %% The worker wrote to a stream whose response had already ended (a
+    %% stream fun sending after its `fin`): `stream_open/2` told it the
+    %% stream was reset, so it stopped. The response on the wire is
+    %% complete, so the stream ends as for a normal exit, never with an
+    %% RST_STREAM after its END_STREAM (RFC 9113 §5.1: no frames on a
+    %% closed stream).
+    finish_stream(State, StreamId, Refs);
+worker_ended(#loop{streams = Streams} = State, StreamId, Refs, _Reason) ->
+    case Streams of
+        #{StreamId := #{state := closed}} ->
+            %% It ended abnormally after its response was complete
+            %% (killed, or taken down by a linked process): the stream
+            %% ends as for a normal exit, with no RST_STREAM on a stream
+            %% closed both ways (RFC 9113 §5.1).
+            worker_ended(State, StreamId, Refs, normal);
+        #{} ->
+            abort_stream(State#loop{worker_refs = Refs}, StreamId, internal_error)
     end.
 
 %% A worker exited normally. Its response is complete once our END_STREAM
@@ -2043,9 +2063,9 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
 %% without crashing (a stream fun or loop handler calling `exit(normal)`,
 %% a loop worker stopped by `sys:terminate/2`), so the stream is reset
 %% with INTERNAL_ERROR, as for a crash, instead of left open with the
-%% client waiting for an end that never comes. The stream is always still
-%% there: every path that drops a stream under a live worker demonitors
-%% that worker first (`reset_stream/2`). In manual body mode the response
+%% client waiting for an end that never comes. A stream reset while its
+%% worker ran is gone by then, and `handle_worker_down/3` only gives the
+%% slot back. In manual body mode the response
 %% can end before the client's body does (a handler answering without
 %% reading it all); RFC 9113 §8.1 lets the server then ask the client to
 %% stop sending with RST_STREAM(NO_ERROR).
@@ -2426,9 +2446,12 @@ uncount_stream(#loop{streams = Streams, live_streams = Live} = State, StreamId) 
 %% one for a stream-level flow-control error. Tell the worker (if any)
 %% to bail, then drop our stream entry. Pending sends get reset
 %% notifications so workers waiting on `h2_send_ack` unwind, as does a
-%% worker waiting on a manual-mode body read.
+%% worker waiting on a manual-mode body read. A worker still computing
+%% learns of it at its next write or read; it keeps its in-flight slot
+%% until it exits (`handle_worker_down/3`), so work a client abandons
+%% still counts toward `max_concurrent_requests` while it runs.
 reset_stream(State0, StreamId) ->
-    #loop{streams = Streams, worker_refs = Refs} = State = uncount_stream(State0, StreamId),
+    #loop{streams = Streams} = State = uncount_stream(State0, StreamId),
     #{
         StreamId := #{
             pending_sends := Pending,
@@ -2442,32 +2465,13 @@ reset_stream(State0, StreamId) ->
             #{reader := Reader} -> roadrunner_conn:send_body_error(Reader, StreamId, closed);
             _ -> ok
         end,
-    Refs1 =
+    _ =
         case WorkerRef of
-            undefined ->
-                %% RST landed before END_STREAM dispatched a worker.
-                Refs;
-            MonRef ->
-                _ = (WorkerPid ! {h2_stream_reset, StreamId}),
-                true = demonitor(MonRef, [flush]),
-                %% The worker held an in-flight slot. We demonitor it (so no
-                %% `DOWN` fires) and drop its ref here, so this is the only
-                %% place that can release the slot — `handle_worker_down`
-                %% never runs and `exit_clean` no longer sees the ref.
-                ok = roadrunner_conn:release_request_slot(
-                    State#loop.max_concurrent_requests,
-                    State#loop.inflight_counter,
-                    State#loop.overload
-                ),
-                maps:remove(MonRef, Refs)
+            %% RST landed before END_STREAM dispatched a worker.
+            undefined -> ok;
+            _MonRef -> WorkerPid ! {h2_stream_reset, StreamId}
         end,
-    withdraw_parked(
-        State#loop{
-            streams = maps:remove(StreamId, Streams),
-            worker_refs = Refs1
-        },
-        StreamId
-    ).
+    withdraw_parked(State#loop{streams = maps:remove(StreamId, Streams)}, StreamId).
 
 %% Called by `handle_worker_down/3` when a worker dies abnormally.
 %% Send RST_STREAM(error_code) to the peer and drop our state.

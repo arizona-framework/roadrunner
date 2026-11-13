@@ -83,6 +83,19 @@ paid once. `roadrunner_static` uses it this way. It is the handler's
 counterpart of a middleware's `init/1`; the name differs because a module
 can also be a `roadrunner_ws_handler`, whose `init/1` runs per WebSocket
 session.
+
+## When the client cancels a request
+
+Over HTTP/2, when the client cancels a request (`RST_STREAM`), the
+handler is told, not stopped. Its next write ends its process there,
+without a crash report; a body read that waits on the client fails with
+`{error, closed}`; a `{loop, ...}` handler gets
+`{roadrunner_disconnect, reset}` (see `c:handle_info/3`). Work the
+handler is in the middle of runs on, and whatever it answers is dropped.
+While the connection lasts, the request still counts toward
+`max_concurrent_requests` until the handler returns, so that limit also
+bounds the handlers a client leaves running by opening streams and
+resetting them.
 """.
 
 -export_type([send_fun/0, stream_fun/0, push_fun/0, sendfile_spec/0, response/0, result/0]).
