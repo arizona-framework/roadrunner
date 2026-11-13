@@ -102,6 +102,9 @@
     %% Local interface to bind. Unset binds all interfaces; set to a
     %% specific address (e.g. `{127,0,0,1}`) to bind that one only.
     ip => inet:ip_address(),
+    %% With an IPv6 `ip`, whether the socket serves IPv6 clients only. Unset,
+    %% the operating system decides.
+    ipv6_v6only => boolean(),
     %% The connection-id routing table. A SO_REUSEPORT pool injects one shared
     %% table (owned by the pool supervisor) so a datagram landing on any pool
     %% socket routes to the owning connection; a standalone listener omits it
@@ -194,11 +197,9 @@ init(
     process_flag(trap_exit, true),
     [Parent | _] = get('$ancestors'),
     ReusePort = maps:get(reuseport, Opts, false),
-    SocketOpts =
-        case Opts of
-            #{ip := IP} -> #{active => ?ACTIVE_N, reuseport => ReusePort, ip => IP};
-            #{} -> #{active => ?ACTIVE_N, reuseport => ReusePort}
-        end,
+    SocketOpts = (maps:with([ip, ipv6_v6only], Opts))#{
+        active => ?ACTIVE_N, reuseport => ReusePort
+    },
     case roadrunner_quic_socket:open(Port, SocketOpts) of
         {ok, Socket} ->
             {ok, {_Ip, BoundPort}} = roadrunner_quic_socket:sockname(Socket),

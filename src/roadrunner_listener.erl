@@ -293,12 +293,20 @@ Optional middleware and timing knobs (durations in milliseconds):
   depth). Default 1024. Raise it for connection bursts (load tests,
   health-check storms); Linux clamps the effective value at
   `net.core.somaxconn`.
-- `ip` — local interface to bind. Unset (the default) binds all
-  interfaces (`0.0.0.0` / `::`); set a specific address such as
-  `{127,0,0,1}` to restrict the listener to loopback, e.g. a
-  dev/admin/metrics endpoint that must not be reachable from the LAN.
-  Applies to every socket the listener binds: plain TCP, TLS, and the
-  HTTP/3 UDP socket.
+- `ip` — local interface to bind. Unset (the default) binds every IPv4
+  interface (`0.0.0.0`); set `{0,0,0,0,0,0,0,0}` (`::`) to bind every
+  IPv6 interface, or a specific address such as `{127,0,0,1}` to
+  restrict the listener to loopback, e.g. a dev/admin/metrics endpoint
+  that must not be reachable from the LAN. Applies to every socket the
+  listener binds: plain TCP, TLS, and the HTTP/3 UDP socket.
+- `ipv6_v6only` — with an IPv6 `ip`, `true` serves IPv6 clients only,
+  and `false` serves IPv4 clients too, as IPv4-mapped addresses
+  (`::ffff:a.b.c.d`). Unset, the operating system decides (on Linux,
+  `net.ipv6.bindv6only`, `false` by default). Set it to `true` to run
+  an IPv4 listener and an IPv6 listener on the same port: otherwise the
+  IPv6 one also claims the port for IPv4 and fails to start with
+  `eaddrinuse`. Applies to every socket the listener binds, like `ip`.
+  Setting it without an IPv6 `ip` fails the listener's start.
 - `recv_buffer` — the most bytes one read takes, default 64 KB. A TLS
   connection reads with a buffer of this size. A plain-TCP connection
   switches to it for good when a large request body comes in (HTTP/1.1)
@@ -469,10 +477,13 @@ ops-tuning rationale.
         | {queue, #{max_queued => pos_integer(), timeout => pos_integer()}}
         | {shed, #{retry_after => pos_integer()}},
     socket_backlog => pos_integer(),
-    %% Local interface to bind. Unset means all interfaces
-    %% (`0.0.0.0` / `::`). Set to `{127,0,0,1}` to restrict the
-    %% listener to loopback.
+    %% Local interface to bind. Unset means every IPv4 interface
+    %% (`0.0.0.0`). Set to `{127,0,0,1}` to restrict the listener to
+    %% loopback.
     ip => inet:ip_address(),
+    %% With an IPv6 `ip`, whether its sockets serve IPv6 clients only.
+    %% Unset, the operating system decides.
+    ipv6_v6only => boolean(),
     recv_buffer => pos_integer(),
     idle_recv_buffer => pos_integer(),
     min_bytes_per_second => non_neg_integer(),
@@ -1150,6 +1161,7 @@ init(#{port := Port} = Opts) ->
     %% (acceptor, overload queue, QUIC pool) exiting abnormally still takes
     %% the listener down with it (`handle_info/2`).
     _ = process_flag(trap_exit, true),
+    ok = validate_ipv6_v6only(Opts),
     ok = ensure_ssl_started(Opts),
     ListenerName = listener_name(),
     ProtoOpts = build_proto_opts(Opts, ListenerName),
@@ -1277,13 +1289,9 @@ start_quic(Port, Opts, Protocols, ProtoOpts, AcceptGate) ->
                 stream_credit => stream_credit(ProtoOpts),
                 accept_gate => AcceptGate
             },
-            %% Bind the QUIC pool to the same interface as the TCP socket
-            %% when `ip` is set, so an h3 listener honors loopback too.
-            PoolOptsIp =
-                case Opts of
-                    #{ip := IP} -> PoolOpts#{ip => IP};
-                    #{} -> PoolOpts
-                end,
+            %% Bind the QUIC pool like the TCP socket when `ip` and
+            %% `ipv6_v6only` are set, so an h3 listener honors them too.
+            PoolOptsIp = maps:merge(PoolOpts, maps:with([ip, ipv6_v6only], Opts)),
             Res = start_quic_pool(QuicPort, with_quic_secret(Opts, PoolOptsIp)),
             ok = close_quic_probe(Probe),
             Res
@@ -1331,11 +1339,7 @@ start_quic_pool(Port, PoolOpts) ->
 -spec resolve_quic_port(inet:port_number(), pos_integer(), opts()) ->
     {inet:port_number(), gen_udp:socket() | undefined}.
 resolve_quic_port(0, Listeners, Opts) when Listeners > 1 ->
-    IpOpts =
-        case Opts of
-            #{ip := IP} -> [{ip, IP}];
-            #{} -> []
-        end,
+    IpOpts = bind_opts(Opts, []),
     {ok, Picker} = gen_udp:open(0, IpOpts),
     {ok, Port} = inet:port(Picker),
     ok = gen_udp:close(Picker),
@@ -1637,15 +1641,35 @@ base_listen_opts(Opts, Buffer) ->
         {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)},
         {buffer, Buffer}
     ],
-    %% Prepend `{ip, IP}` only when the caller set it, so the default
-    %% list (and the default all-interfaces bind) is unchanged. Both
-    %% `gen_tcp:listen/2` and `ssl:listen/2` accept `{ip, _}`, and the
-    %% TLS path builds on this list, so a loopback bind covers HTTP and
-    %% HTTPS alike.
+    %% Both `gen_tcp:listen/2` and `ssl:listen/2` accept the bind
+    %% options, and the TLS path builds on this list, so a loopback bind
+    %% covers HTTP and HTTPS alike.
+    bind_opts(Opts, Base).
+
+%% `SocketOpts` with the options for the address a listener binds,
+%% `{ip, IP}` and `{ipv6_v6only, Bool}`, each only when the caller set it,
+%% so the default bind (every IPv4 interface) is unchanged. The TCP listen
+%% socket and the QUIC port probe both bind with them.
+-spec bind_opts(opts(), [Opt]) -> [Opt | {ip, inet:ip_address()} | {ipv6_v6only, boolean()}].
+bind_opts(Opts, SocketOpts) ->
+    maps:fold(
+        fun(Key, Value, Acc) -> [{Key, Value} | Acc] end,
+        SocketOpts,
+        maps:with([ip, ipv6_v6only], Opts)
+    ).
+
+%% `ipv6_v6only` is an IPv6 socket option, so it needs an IPv6 `ip`: unset,
+%% the listener binds IPv4, where the option does not exist.
+-spec validate_ipv6_v6only(opts()) -> ok.
+validate_ipv6_v6only(#{ipv6_v6only := V6Only} = Opts) when is_boolean(V6Only) ->
     case Opts of
-        #{ip := IP} -> [{ip, IP} | Base];
-        #{} -> Base
-    end.
+        #{ip := {_, _, _, _, _, _, _, _}} -> ok;
+        #{} -> error({listener_opt_conflict, ipv6_v6only, V6Only, no_ipv6_ip})
+    end;
+validate_ipv6_v6only(#{ipv6_v6only := Other}) ->
+    error({invalid_listener_opt, ipv6_v6only, Other});
+validate_ipv6_v6only(#{}) ->
+    ok.
 
 %% One acceptor per online scheduler, at most ?MAX_DEFAULT_NUM_ACCEPTORS.
 %% Every acceptor waits on the one listen socket, so acceptors beyond the

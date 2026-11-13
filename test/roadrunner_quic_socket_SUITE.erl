@@ -20,6 +20,7 @@ clause is unit-tested in `roadrunner_quic_socket_tests`.
     open_refuses_reuseaddr_port/1,
     open_with_custom_buffers/1,
     open_binds_to_ip/1,
+    ipv6_v6only_shares_port_with_ipv4/1,
     reuseport_allows_shared_bind/1,
     active_once_delivers_messages/1,
     active_n_batches_then_passive/1,
@@ -43,6 +44,7 @@ all() ->
         open_refuses_reuseaddr_port,
         open_with_custom_buffers,
         open_binds_to_ip,
+        ipv6_v6only_shares_port_with_ipv4,
         reuseport_allows_shared_bind,
         active_once_delivers_messages,
         active_n_batches_then_passive,
@@ -183,6 +185,21 @@ open_binds_to_ip(_Config) ->
     {ok, Socket} = roadrunner_quic_socket:open(0, #{ip => ?LOOPBACK}),
     ?assertMatch({ok, {?LOOPBACK, _Port}}, roadrunner_quic_socket:sockname(Socket)),
     ok = roadrunner_quic_socket:close(Socket).
+
+%% `ipv6_v6only => true` leaves the port's IPv4 side to another socket,
+%% where a dual-stack (`false`) socket claims it and fails to bind.
+ipv6_v6only_shares_port_with_ipv4(_Config) ->
+    Any6 = {0, 0, 0, 0, 0, 0, 0, 0},
+    {ok, V4} = roadrunner_quic_socket:open(0, #{ip => {0, 0, 0, 0}}),
+    {ok, {_Ip, Port}} = roadrunner_quic_socket:sockname(V4),
+    ?assertEqual(
+        {error, eaddrinuse},
+        roadrunner_quic_socket:open(Port, #{ip => Any6, ipv6_v6only => false})
+    ),
+    {ok, V6} = roadrunner_quic_socket:open(Port, #{ip => Any6, ipv6_v6only => true}),
+    ?assertMatch({ok, {Any6, Port}}, roadrunner_quic_socket:sockname(V6)),
+    ok = roadrunner_quic_socket:close(V6),
+    ok = roadrunner_quic_socket:close(V4).
 
 %% Two sockets share one concrete port when both set reuseport, the
 %% kernel-fan-out shape the listener pool relies on (validate_opt's
