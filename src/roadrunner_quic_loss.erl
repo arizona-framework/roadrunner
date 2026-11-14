@@ -29,6 +29,7 @@
     update_rtt/3,
     reset_rtt/2,
     get_pto/1,
+    pto_period/1,
     pto_deadline/1,
     on_pto_expired/1,
     oldest_ack_eliciting/1,
@@ -371,8 +372,11 @@ max_ack_delay`, doubled per consecutive PTO (RFC 9002 §6.2.1).
 get_pto(#loss{pto_count = Count} = Loss) ->
     pto_period(Loss) bsl Count.
 
-%% The probe timeout before backoff (RFC 9002 §6.2.1), also the base of the
-%% persistent congestion duration (§7.6.1).
+-doc """
+The probe timeout before backoff (RFC 9002 §6.2.1), also the base of the
+persistent congestion duration (§7.6.1) and of the idle timeout's floor
+(RFC 9000 §10.1).
+""".
 -spec pto_period(t()) -> non_neg_integer().
 pto_period(#loss{smoothed_rtt = SRtt, rtt_var = RttVar, max_ack_delay = MaxAckDelay}) ->
     SRtt + max(4 * RttVar, ?GRANULARITY) + MaxAckDelay.

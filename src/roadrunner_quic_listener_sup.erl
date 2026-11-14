@@ -56,6 +56,8 @@
     max_streams_bidi := non_neg_integer(),
     connection_handler := fun((pid()) -> {ok, pid()} | {error, term()}),
     pool_size := non_neg_integer(),
+    %% The max_idle_timeout transport parameter, in ms (RFC 9000 §10.1).
+    max_idle_timeout => pos_integer(),
     ip => inet:ip_address(),
     ipv6_v6only => boolean(),
     %% When a request stream's receive credit is granted back: as its data
@@ -167,6 +169,7 @@ listener_opts(Port, PoolOpts, Registry, ReusePort) ->
         max_streams_bidi := MaxStreamsBidi,
         connection_handler := Handler
     } = PoolOpts,
+    MaxIdleTimeout = maps:get(max_idle_timeout, PoolOpts, ?DEFAULT_MAX_IDLE_TIMEOUT),
     Base = #{
         port => Port,
         %% The native listener takes the full chain leaf-first; pool_opts keeps
@@ -175,7 +178,7 @@ listener_opts(Port, PoolOpts, Registry, ReusePort) ->
         priv_key => Key,
         %% QUIC v1 negotiates a single ALPN; the listener carries the chosen one.
         alpn => Alpn,
-        transport_params => transport_params(MaxStreamsBidi),
+        transport_params => transport_params(MaxStreamsBidi, MaxIdleTimeout),
         connection_handler => Handler,
         reuseport => ReusePort,
         registry => Registry
@@ -187,8 +190,9 @@ listener_opts(Port, PoolOpts, Registry, ReusePort) ->
         Base, maps:with([ip, ipv6_v6only, stream_credit, accept_gate], PoolOpts)
     ).
 
--spec transport_params(non_neg_integer()) -> roadrunner_quic_transport_params:params().
-transport_params(MaxStreamsBidi) ->
+-spec transport_params(non_neg_integer(), pos_integer()) ->
+    roadrunner_quic_transport_params:params().
+transport_params(MaxStreamsBidi, MaxIdleTimeout) ->
     #{
         initial_max_data => ?DEFAULT_INITIAL_MAX_DATA,
         initial_max_stream_data_bidi_local => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
@@ -196,5 +200,5 @@ transport_params(MaxStreamsBidi) ->
         initial_max_stream_data_uni => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => ?DEFAULT_INITIAL_MAX_STREAMS_UNI,
-        max_idle_timeout => ?DEFAULT_MAX_IDLE_TIMEOUT
+        max_idle_timeout => MaxIdleTimeout
     }.

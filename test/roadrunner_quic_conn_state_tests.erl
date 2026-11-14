@@ -2083,10 +2083,41 @@ idle_timeout_closes_test() ->
     %% A fired idle timer silently closes the connection (RFC 9000 §10.1, no
     %% CONNECTION_CLOSE) and surfaces {closed, {local, idle_timeout}}.
     {State, _ApSecret} = connected_with_owner(),
-    {State1, Effects} = ?M:handle_timeout(?NOW, idle, State),
+    {State1, Effects} = ?M:handle_timeout(?NOW + ?IDLE_TIMEOUT, idle, State),
     ?assertEqual(closed, ?M:phase(State1)),
     ?assertEqual([{emit, self(), {closed, {local, idle_timeout}}}], emits(Effects)),
     ?assertEqual([], sends(Effects)).
+
+idle_timeout_waits_three_ptos_test() ->
+    %% A negotiated idle timeout shorter than three PTOs is stretched to them
+    %% (RFC 9000 §10.1): the timer firing at the short deadline re-arms it at
+    %% the third PTO instead of closing, and the connection closes there.
+    {State, _Ctx} = new_conn([], #{
+        transport_params => maps:put(max_idle_timeout, 1, transport_params())
+    }),
+    {State1, Effects} = ?M:handle_timeout(?NOW + 1, idle, State),
+    ?assertNotEqual(closed, ?M:phase(State1)),
+    [{arm_timer, idle, Floor}] = Effects,
+    ?assert(Floor > ?NOW + 1),
+    {State2, _} = ?M:handle_timeout(Floor, idle, State1),
+    ?assertEqual(closed, ?M:phase(State2)).
+
+idle_floor_ignores_pto_backoff_test() ->
+    %% The three-PTO floor uses the PTO before backoff (RFC 9000 §10.1): a
+    %% peer gone silent while data is in flight backs the PTO off with every
+    %% probe, but the connection still closes at its idle timeout.
+    {State, _ServerApSecret} = connected_for_send(),
+    {State1, _} = ?M:handle_send(self(), make_ref(), 0, ~"unacked", false, ?NOW, State),
+    State2 = lists:foldl(
+        fun(N, S) ->
+            {S1, _} = ?M:handle_timeout(?NOW + N * 1000, pto, S),
+            S1
+        end,
+        State1,
+        lists:seq(1, 12)
+    ),
+    {State3, _} = ?M:handle_timeout(?NOW + ?IDLE_TIMEOUT, idle, State2),
+    ?assertEqual(closed, ?M:phase(State3)).
 
 idle_timer_armed_when_nothing_in_flight_test() ->
     %% With no ack-eliciting bytes in flight (the peer just acknowledged the
@@ -2990,7 +3021,7 @@ parked_reply_released_on_idle_timeout_test() ->
     Payload = binary:copy(~"x", 100000),
     {State1, E1} = ?M:handle_send(self(), Ref, 0, Payload, false, ?NOW, State),
     ?assertEqual([], replies_for(E1, Ref)),
-    {State2, E2} = ?M:handle_timeout(?NOW, idle, State1),
+    {State2, E2} = ?M:handle_timeout(?NOW + ?IDLE_TIMEOUT, idle, State1),
     ?assertEqual(closed, ?M:phase(State2)),
     ?assertEqual([{error, closed}], replies_for(E2, Ref)).
 
