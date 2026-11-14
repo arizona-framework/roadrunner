@@ -63,8 +63,9 @@ trailers: `OK` when the method returns normally, the status of an
 A call that fails before any response is answered Trailers-Only, the
 status in the response headers. The rest is answered as HTTP: `505` over
 HTTP/1.1, `405` for a method other than `POST`, `415` for a
-`content-type` none of the codecs speak, and the router's `404` for an
-unknown service. An unknown method of a known service is `UNIMPLEMENTED`,
+`content-type` none of the codecs speak, the router's `404` for an
+unknown service, and `500` for response headers over the client's
+SETTINGS_MAX_HEADER_LIST_SIZE. An unknown method of a known service is `UNIMPLEMENTED`,
 as is a `grpc-encoding` other than `identity`, `gzip` and `deflate`.
 
 A `grpc-timeout` is the call's deadline. A read still waiting then ends

@@ -332,6 +332,10 @@ Some requests are refused at the HTTP level, before any call starts:
 - an unknown service: the router's `404`, which gRPC clients read as
   `UNIMPLEMENTED`
 
+One more is answered at the HTTP level once the call runs: response
+headers too big for the client's `SETTINGS_MAX_HEADER_LIST_SIZE` cannot
+be sent, so the call gets a `500` and stops.
+
 ## Deadlines and cancellation
 
 A client sets a deadline with the `grpc-timeout` header. If a `recv/1` is
