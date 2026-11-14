@@ -359,8 +359,22 @@ send_emit(Worker, Protocol, Conn, StreamId, Handler) ->
                 {error, not_supported},
                 Worker:emit_handler_response(Conn, StreamId, Handler, Upgrade),
                 []
-            }
+            };
+        ({cancel_after, Ms}, _Req) ->
+            cancel_after(Protocol, Conn, StreamId, Ms)
     end.
+
+%% A timer that has the h2 connection cancel the stream
+%% (`roadrunner_conn_loop_http2:cancel_stream/2`). An h3 worker talks to
+%% the QUIC connection, not to the loop holding its stream, so HTTP/3 has
+%% no cancel yet.
+-spec cancel_after(h2 | h3, pid(), non_neg_integer(), non_neg_integer()) ->
+    {ok, reference()} | {error, not_supported}.
+cancel_after(h2, Conn, StreamId, Ms) ->
+    %% `erlang:send_after/3` takes at most 2^32 - 1 ms.
+    {ok, erlang:send_after(min(Ms, 16#FFFFFFFF), Conn, {roadrunner_cancel_stream, StreamId})};
+cancel_after(h3, _Conn, _StreamId, _Ms) ->
+    {error, not_supported}.
 
 %% A complete response's result: `ok` when its status went out, the
 %% header-limit error `start_stream/5` returns when a 500 did instead.

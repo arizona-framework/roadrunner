@@ -111,6 +111,14 @@ all_test_() ->
         fun stream_window_update_grows_window_synced/0,
         fun rst_stream_unknown_stream_ignored/0,
         fun body_withdraw_of_a_gone_stream_is_answered/0,
+        fun cancel_of_a_gone_stream_is_ignored/0,
+        fun cancel_after_a_complete_exchange_sends_nothing/0,
+        fun cancel_with_the_body_still_coming_ends_with_no_error/0,
+        fun frames_after_a_cancel_are_ignored/0,
+        fun cancel_during_trailer_continuation_keeps_the_conn/0,
+        fun worker_done_during_trailer_continuation_keeps_the_conn/0,
+        fun ignored_trailers_survive_the_old_worker_and_its_timer/0,
+        fun oldest_reset_stream_is_forgotten/0,
         fun headers_for_already_open_stream_without_end_stream_protocol_error/0,
         fun synthetic_send_data_after_reset/0,
         fun synthetic_send_headers_after_reset/0,
@@ -2646,6 +2654,225 @@ body_withdraw_of_a_gone_stream_is_answered() ->
     end,
     cleanup(Pid, Ref).
 
+cancel_of_a_gone_stream_is_ignored() ->
+    %% A cancel timer firing after its stream is gone (the response done
+    %% before the deadline, the timer not cancelled) sends nothing: the
+    %% next frame out is the PING's ACK, not an RST_STREAM.
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/")),
+    _ = expect_send(),
+    Pid ! {roadrunner_cancel_stream, 1},
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>}))),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
+    cleanup(Pid, Ref).
+
+cancel_after_a_complete_exchange_sends_nothing() ->
+    %% Both sides ended, the worker still running: no frame may go on a
+    %% closed stream (RFC 9113 §5.1), so the cancel sends nothing.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{dispatch => h2_test_dispatch()}),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/stream/fin-then-park")),
+    Worker = wait_for_register(roadrunner_h2_fin_park_test, 1000),
+    ok = flush_sends(),
+    Pid ! {roadrunner_cancel_stream, 1},
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>}))),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
+    Worker ! stop,
+    cleanup(Pid, Ref).
+
+cancel_with_the_body_still_coming_ends_with_no_error() ->
+    %% Our response is complete, the client's body is not: RST_STREAM with
+    %% NO_ERROR, which keeps the client from discarding the response (RFC
+    %% 9113 §8.1).
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{
+        dispatch => h2_test_dispatch(), body_buffering => manual
+    }),
+    serve_recv(ConnPid, open_headers(1, ~"/stream/fin-then-park")),
+    Worker = wait_for_register(roadrunner_h2_fin_park_test, 1000),
+    ok = flush_sends(),
+    Pid ! {roadrunner_cancel_stream, 1},
+    ?assertMatch(
+        {ok, {rst_stream, 1, no_error}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    Worker ! stop,
+    cleanup(Pid, Ref).
+
+frames_after_a_cancel_are_ignored() ->
+    %% DATA and trailers the client sent before it saw our RST_STREAM are
+    %% ignored (RFC 9113 §5.1): the DATA's bytes go back to the connection
+    %% window, and the trailers are still decoded, so a later request
+    %% that refers to their HPACK entry is understood (§4.3).
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{
+        dispatch => h2_test_dispatch(), body_buffering => manual
+    }),
+    Enc0 = roadrunner_http2_hpack:new_encoder(4096),
+    {H1, Enc1} = roadrunner_http2_hpack:encode(get_headers(~"/block"), Enc0),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode({headers, 1, 16#04, undefined, iolist_to_binary(H1)})
+        )
+    ),
+    Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+    Pid ! {roadrunner_cancel_stream, 1},
+    ?assertMatch(
+        {ok, {rst_stream, 1, cancel}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({data, 1, 0, ~"late"}))),
+    ?assertMatch(
+        {ok, {window_update, 0, 4}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    {T1, Enc2} = roadrunner_http2_hpack:encode([{~"x-late", ~"t"}], Enc1),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode(
+                {headers, 1, 16#04 bor 16#01, undefined, iolist_to_binary(T1)}
+            )
+        )
+    ),
+    {H3, _} = roadrunner_http2_hpack:encode(get_headers(~"/empty") ++ [{~"x-late", ~"t"}], Enc2),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(
+            roadrunner_http2_frame:encode(
+                {headers, 3, 16#04 bor 16#01, undefined, iolist_to_binary(H3)}
+            )
+        )
+    ),
+    ok = expect_response_headers(3, <<>>),
+    Worker ! release,
+    cleanup(Pid, Ref).
+
+cancel_during_trailer_continuation_keeps_the_conn() ->
+    %% The deadline fires while the client's trailers wait for their
+    %% CONTINUATION: the stream is reset, the block still decoded when it
+    %% completes, and the connection goes on.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{
+        dispatch => h2_test_dispatch(), body_buffering => manual
+    }),
+    serve_recv(ConnPid, open_headers(1, ~"/block")),
+    Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+    {First, Rest} = trailer_block_halves(),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(roadrunner_http2_frame:encode({headers, 1, 16#01, undefined, First}))
+    ),
+    Pid ! {roadrunner_cancel_stream, 1},
+    ?assertMatch(
+        {ok, {rst_stream, 1, cancel}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    serve_recv(
+        ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({continuation, 1, 16#04, Rest}))
+    ),
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>}))),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
+    Worker ! release,
+    cleanup(Pid, Ref).
+
+worker_done_during_trailer_continuation_keeps_the_conn() ->
+    %% The worker answers and ends while the client's trailers wait for
+    %% their CONTINUATION: the stream is complete, and the block is still
+    %% decoded when it completes, instead of failing the connection.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{
+        dispatch => h2_test_dispatch(), body_buffering => manual
+    }),
+    serve_recv(ConnPid, open_headers(1, ~"/block")),
+    Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+    WorkerRef = monitor(process, Worker),
+    {First, Rest} = trailer_block_halves(),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(roadrunner_http2_frame:encode({headers, 1, 16#01, undefined, First}))
+    ),
+    Worker ! release,
+    receive
+        {'DOWN', WorkerRef, process, Worker, normal} -> ok
+    after 1000 -> error(worker_did_not_finish)
+    end,
+    ok = await_end_stream(1, <<>>),
+    serve_recv(
+        ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({continuation, 1, 16#04, Rest}))
+    ),
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>}))),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
+    cleanup(Pid, Ref).
+
+ignored_trailers_survive_the_old_worker_and_its_timer() ->
+    %% Late trailers on a stream we reset sit under its id while their
+    %% CONTINUATION comes. The old worker's exit and a second deadline in
+    %% that window leave them alone: no frame goes out, and the block
+    %% completes without failing the connection.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{
+        dispatch => h2_test_dispatch(), body_buffering => manual
+    }),
+    serve_recv(ConnPid, open_headers(1, ~"/block")),
+    Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+    WorkerRef = monitor(process, Worker),
+    Pid ! {roadrunner_cancel_stream, 1},
+    ?assertMatch(
+        {ok, {rst_stream, 1, cancel}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    {First, Rest} = trailer_block_halves(),
+    serve_recv(
+        ConnPid,
+        iolist_to_binary(roadrunner_http2_frame:encode({headers, 1, 16#01, undefined, First}))
+    ),
+    Worker ! release,
+    receive
+        {'DOWN', WorkerRef, process, Worker, _} -> ok
+    after 1000 -> error(worker_did_not_finish)
+    end,
+    Pid ! {roadrunner_cancel_stream, 1},
+    serve_recv(
+        ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({continuation, 1, 16#04, Rest}))
+    ),
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>}))),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
+    cleanup(Pid, Ref).
+
+%% A trailer block split in two, for a HEADERS frame and its CONTINUATION.
+trailer_block_halves() ->
+    {Block, _} = roadrunner_http2_hpack:encode(
+        [{~"x-trailer", ~"one"}, {~"x-other", ~"two"}], roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    Bin = iolist_to_binary(Block),
+    Half = byte_size(Bin) div 2,
+    <<First:Half/binary, Rest/binary>> = Bin,
+    {First, Rest}.
+
+oldest_reset_stream_is_forgotten() ->
+    %% A conn remembers the last 128 streams it reset: DATA on one of them
+    %% is ignored, while DATA on an older one gets STREAM_CLOSED as on any
+    %% closed stream.
+    {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_max_concurrent_streams => 1}),
+    serve_recv(ConnPid, open_headers(1, ~"/")),
+    Refused = lists:seq(3, 3 + 2 * 128, 2),
+    lists:foreach(
+        fun(StreamId) ->
+            serve_recv(ConnPid, complete_get_headers(StreamId, ~"/")),
+            ?assertMatch(
+                {ok, {rst_stream, StreamId, refused_stream}, _},
+                roadrunner_http2_frame:parse(expect_send(), 16384)
+            )
+        end,
+        Refused
+    ),
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({data, 3, 16#01, ~"x"}))),
+    ?assertMatch(
+        {ok, {rst_stream, 3, stream_closed}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    Last = lists:last(Refused),
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({data, Last, 16#01, ~"x"}))),
+    ?assertMatch(
+        {ok, {window_update, 0, 1}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    cleanup(Pid, Ref).
+
 headers_for_already_open_stream_without_end_stream_protocol_error() ->
     %% Two HEADERS frames on the same stream without END_STREAM on
     %% either: the first opens the stream, the second is invalid
@@ -4169,13 +4396,13 @@ refused_stream_keeps_hpack_in_sync() ->
         {ok, {rst_stream, 3, refused_stream}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
     ),
     %% DATA the client already sent on the refused stream lands on a
-    %% closed stream (RFC 9113 §5.1.1), not an idle one: a stream error,
-    %% not GOAWAY.
+    %% stream we reset (RFC 9113 §5.1): ignored, not a GOAWAY, its byte
+    %% given back to the connection window.
     serve_recv(
         ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({data, 3, 16#01, ~"x"}))
     ),
     ?assertMatch(
-        {ok, {rst_stream, 3, stream_closed}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
+        {ok, {window_update, 0, 1}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
     ),
     %% Free the slot, then reuse the indexed entry.
     serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel}))),
@@ -5396,8 +5623,20 @@ expect_send() ->
     after 500 -> error(no_send)
     end.
 
-h2_test_dispatch() ->
-    {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1, undefined}.
+%% Wait until the conn has sent the frame that ends `StreamId` (END_STREAM),
+%% the response's frames arriving in one write or several.
+await_end_stream(StreamId, Buffer0) ->
+    Buffer = <<Buffer0/binary, (expect_send())/binary>>,
+    end_stream_in(StreamId, Buffer).
+
+end_stream_in(StreamId, <<Len:24, Type, Flags, _:1, StreamId:31, _:Len/binary, _/binary>>) when
+    Type =< 1, Flags band 16#01 =:= 16#01
+->
+    ok;
+end_stream_in(StreamId, <<Len:24, _:6/binary, _:Len/binary, Rest/binary>>) ->
+    end_stream_in(StreamId, Rest);
+end_stream_in(StreamId, Partial) ->
+    await_end_stream(StreamId, Partial).
 
 %% Drop every frame the conn has sent so far.
 flush_sends() ->
@@ -5405,6 +5644,21 @@ flush_sends() ->
         {roadrunner_fake_send, _Pid, _Data} -> flush_sends()
     after 0 -> ok
     end.
+
+h2_test_dispatch() ->
+    {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1, undefined}.
+
+%% A GET HEADERS frame on `StreamId` without END_STREAM: the request's
+%% body may still come.
+open_headers(StreamId, Path) ->
+    {Block, _} = roadrunner_http2_hpack:encode(
+        get_headers(Path), roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    iolist_to_binary(
+        roadrunner_http2_frame:encode(
+            {headers, StreamId, 16#04, undefined, iolist_to_binary(Block)}
+        )
+    ).
 
 drain_send(Timeout) ->
     receive
