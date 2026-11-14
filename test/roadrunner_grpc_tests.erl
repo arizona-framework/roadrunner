@@ -25,7 +25,47 @@ routes_test() ->
     ?assertError({invalid_grpc_opts, #{}}, ?M:routes(#{})),
     ?assertError({invalid_grpc_opts, #{services := x}}, ?M:routes(#{services => x})),
     ?assertError({invalid_grpc_opt, services, [nope]}, ?M:routes(#{services => [nope]})),
-    ?assertError({invalid_grpc_opt, services, ["x"]}, ?M:routes(#{services => ["x"]})).
+    ?assertError({invalid_grpc_opt, services, ["x"]}, ?M:routes(#{services => ["x"]})),
+    ?assertMatch(
+        [#{path := ~"/test.Runtime/:method", state := #{service := #{module := ?SVC}}}],
+        ?M:routes(#{services => [descriptor()]})
+    ),
+    Unnamed = maps:remove(name, descriptor()),
+    ?assertError({invalid_grpc_opt, services, [Unnamed]}, ?M:routes(#{services => [Unnamed]})),
+    Extra = (descriptor())#{nope => 1},
+    ?assertError({invalid_grpc_opt, services, [Extra]}, ?M:routes(#{services => [Extra]})).
+
+descriptor() ->
+    #{
+        name => ~"test.Runtime",
+        module => ?SVC,
+        rpcs => #{~"Echo" => #{function => unary, kind => unary, input => in, output => out}}
+    }.
+
+%% A descriptor's methods are checked against its module like a service
+%% module's; a descriptor without a name, with a key it does not know, with
+%% a module that does not exist or with methods that are not a map is
+%% refused.
+init_route_descriptor_test() ->
+    _ = ?M:init_route(#{service => descriptor()}),
+    Unnamed = maps:remove(name, descriptor()),
+    ?assertError({invalid_grpc_opt, service, Unnamed}, ?M:init_route(#{service => Unnamed})),
+    Extra = (descriptor())#{nope => 1},
+    ?assertError({invalid_grpc_opt, service, Extra}, ?M:init_route(#{service => Extra})),
+    Missing = (descriptor())#{module := no_such_module},
+    ?assertError({invalid_grpc_opt, service, Missing}, ?M:init_route(#{service => Missing})),
+    ?assertError(
+        {invalid_grpc_opt, service, {?SVC, []}},
+        ?M:init_route(#{service => (descriptor())#{rpcs := []}})
+    ),
+    ?assertError(
+        {invalid_grpc_opt, service, {?SVC, ~"Echo", _}},
+        ?M:init_route(#{
+            service => (descriptor())#{
+                rpcs := #{~"Echo" => #{function => nope, kind => unary, input => in, output => out}}
+            }
+        })
+    ).
 
 %% `health => true` adds the health service's route, with no codecs of
 %% the services' own; `false`, the default, none.
