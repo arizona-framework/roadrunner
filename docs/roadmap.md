@@ -192,22 +192,20 @@ implement the chosen path; tests for both successful upgrade and
 
 Unlocks `baseline-h3` and `static-h3`.
 
-### gRPC — large (roadrunner-side)
+### gRPC: the rest — medium
 
-**What:** A gRPC layer on top of the h2 stack: `application/grpc`
-content-type dispatch, length-prefixed framing inside h2 DATA,
-`grpc-status` trailers, server-streaming generators, plus a
-codegen story (rebar3 plugin or grpcbox-style runtime descriptors).
+**What:** `roadrunner_grpc` serves the four call kinds over HTTP/2 with
+pluggable codecs. Still to come: a call's `grpc-timeout` cancelling it at
+its deadline (`DEADLINE_EXCEEDED`, or the internal stream cancel for a
+response cut mid-message);
+per-message `gzip`/`deflate` compression; the health service; a guide in
+`docs/`; the Protocol Buffers adapter (`gpb`) and interop tests against the
+official client; server reflection; telemetry for calls and benchmarks.
 
 **HttpArena impact:** `unary-grpc`, `stream-grpc`, and their TLS
-variants.
+variants, once the Protocol Buffers adapter is on Hex.
 
-**Scope:** large. None of the bits are exotic, but there are a
-lot of them. The HTTP/2 groundwork is in: a handler can read its body
-while it streams the answer, move its body read deadline
-(`roadrunner_req:set_body_timeout/2`), and have its stream cancelled at a
-deadline (internal `roadrunner_send_writer:cancel_after/2`, to be made
-public with the gRPC layer). That cancel has no HTTP/3 counterpart yet.
+**Scope:** medium, in several PRs.
 
 ## Other
 

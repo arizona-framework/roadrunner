@@ -45,7 +45,10 @@ Add a new property:
     quic_transport_params_round_trips/1,
     quic_tls_hello_parse_never_crashes/1,
     quic_tls_auth_certificate_verify_roundtrips/1,
-    quic_stream_reassembles/1
+    quic_stream_reassembles/1,
+    grpc_frame_round_trips/1,
+    grpc_status_message_round_trips/1,
+    grpc_timeout_parse_never_crashes/1
 ]).
 
 suite() ->
@@ -81,7 +84,10 @@ all() ->
         quic_transport_params_round_trips,
         quic_tls_hello_parse_never_crashes,
         quic_tls_auth_certificate_verify_roundtrips,
-        quic_stream_reassembles
+        quic_stream_reassembles,
+        grpc_frame_round_trips,
+        grpc_status_message_round_trips,
+        grpc_timeout_parse_never_crashes
     ].
 
 init_per_suite(Config) ->
@@ -263,3 +269,12 @@ quic_stream_reassembles(Config) ->
         roadrunner_quic_stream_props:prop_reassembles_in_any_order(),
         Config
     ).
+
+grpc_frame_round_trips(Config) ->
+    ct_property_test:quickcheck(roadrunner_grpc_props:prop_frame_round_trips(), Config).
+
+grpc_status_message_round_trips(Config) ->
+    ct_property_test:quickcheck(roadrunner_grpc_props:prop_status_message_round_trips(), Config).
+
+grpc_timeout_parse_never_crashes(Config) ->
+    ct_property_test:quickcheck(roadrunner_grpc_props:prop_timeout_parse_never_crashes(), Config).
