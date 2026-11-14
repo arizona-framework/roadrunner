@@ -61,11 +61,11 @@ be sent (a CR or LF in its value). An unknown method of a known service
 is `UNIMPLEMENTED`, as is a `grpc-encoding` other than `identity`.
 
 A `grpc-timeout` is the call's deadline. A read still waiting then ends
-the call with `DEADLINE_EXCEEDED`; over HTTP/2, a call still running a
-second later is cancelled, as grpc-go does at the deadline: its stream is
-reset (`RST_STREAM` with `CANCEL`) and the method stops at its next write
-or read. Over HTTP/3 only the reads are bounded so far. Without a timeout a call may run for as long as
-the client stays connected. With `auto` buffering the deadline counts from
+the call with `DEADLINE_EXCEEDED`; a call still running a second later is
+cancelled, as grpc-go does at the deadline: its stream is reset
+(`RST_STREAM` with `CANCEL` over HTTP/2, `H3_REQUEST_CANCELLED` over
+HTTP/3) and the method stops at its next write or read. Without a timeout
+a call may run for as long as the client stays connected. With `auto` buffering the deadline counts from
 when the body was read, a little after the client's.
 
 ## The method's process
@@ -406,20 +406,18 @@ timeout(Value) ->
 
 %% When the call's timeout runs out. A call still running a little after
 %% (`?CANCEL_GRACE`, which leaves a read waiting at the deadline the time to
-%% end the call with `DEADLINE_EXCEEDED`) is cancelled where the protocol
-%% can cancel a stream (HTTP/2): the stream is reset and the method stops at
-%% its next write. The timer is cancelled when the call ends before
+%% end the call with `DEADLINE_EXCEEDED`) is cancelled: the stream is reset
+%% and the method stops at its next write or read. The timer is cancelled when the call ends before
 %% (`ended/1`).
 -spec deadline_after(non_neg_integer() | infinity, roadrunner_req:request()) ->
     integer() | infinity.
 deadline_after(infinity, _Req) ->
     infinity;
 deadline_after(Ms, Req) ->
-    _ =
-        case roadrunner_send_writer:cancel_after(Ms + ?CANCEL_GRACE, Req) of
-            {ok, Timer} -> put(?TIMER_KEY, Timer);
-            {error, not_supported} -> undefined
-        end,
+    %% A call runs over HTTP/2 or HTTP/3 (`handle/1` answers HTTP/1.1 with
+    %% 505), both of which can cancel a stream.
+    {ok, Timer} = roadrunner_send_writer:cancel_after(Ms + ?CANCEL_GRACE, Req),
+    _ = put(?TIMER_KEY, Timer),
     erlang:monotonic_time(millisecond) + Ms.
 
 -spec add_headers(roadrunner_http:headers(), stream()) -> stream().

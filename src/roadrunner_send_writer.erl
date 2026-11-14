@@ -96,8 +96,8 @@ status(#{send := #writer{}}) ->
 %% connection resets the stream and tells the process serving it, as for
 %% a client's reset (its next write or read fails). For a deadline on the
 %% request, such as gRPC's `grpc-timeout`. A deadline past the longest
-%% timer (about 49 days) waits that long. Only HTTP/2 streams can be
-%% cancelled; HTTP/1.1 and HTTP/3 return `{error, not_supported}`.
+%% timer (about 49 days) waits that long. HTTP/2 and HTTP/3 streams can be
+%% cancelled; HTTP/1.1 returns `{error, not_supported}`.
 -spec cancel_after(non_neg_integer(), roadrunner_req:request()) ->
     {ok, reference()} | {error, not_supported}.
 cancel_after(Ms, #{send := #writer{emit = Emit, owner = Owner}} = Req) when

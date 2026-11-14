@@ -15,6 +15,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
 
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2, end_per_testcase/2]).
 -export([
+    server_cancel_resets_an_unfinished_answer/1,
+    server_cancel_leaves_a_complete_answer/1,
     get_default/1,
     response_has_date/1,
     get_method/1,
@@ -135,6 +137,8 @@ suite() ->
 
 all() ->
     [
+        server_cancel_resets_an_unfinished_answer,
+        server_cancel_leaves_a_complete_answer,
         get_default,
         response_has_date,
         get_method,
@@ -1762,6 +1766,27 @@ retry_get(Conn, Path, Tries) ->
         Response ->
             Response
     end.
+
+%% A stream cancelled from the server side (`cancel_after/2`) while its
+%% answer is unfinished is reset with H3_REQUEST_CANCELLED (RFC 9114
+%% §4.1.1), and the connection goes on serving.
+server_cancel_resets_an_unfinished_answer(Config) ->
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(
+        Conn, headers(~"GET", ~"/cancel-unfinished")
+    ),
+    ?assertEqual(
+        {error, {stream_reset, ?H3_REQUEST_CANCELLED}},
+        roadrunner_quic_test_h3:collect(Conn, StreamId)
+    ),
+    ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+    close(Conn).
+
+%% A complete answer is left as it went out.
+server_cancel_leaves_a_complete_answer(Config) ->
+    Conn = connect(?config(port, Config)),
+    ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/cancel-answered"))),
+    close(Conn).
 
 stream_cancel(Config) ->
     Conn = connect(?config(port, Config)),

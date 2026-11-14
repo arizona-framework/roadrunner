@@ -204,9 +204,9 @@ send_fun({report, Pid, other_process}) ->
         Req
     end;
 send_fun({report, Pid, cancel_after}) ->
-    %% Over HTTP/2 the stream is cancelled at the deadline while the fun
-    %% is still sending, and its next write ends it; elsewhere cancelling
-    %% is not supported.
+    %% Over HTTP/2 and HTTP/3 the stream is cancelled at the deadline while
+    %% the fun is still sending, and its next write ends it; over HTTP/1.1
+    %% cancelling is not supported.
     fun(Req) ->
         case roadrunner_send_writer:cancel_after(50, Req) of
             {ok, TRef} when is_reference(TRef) ->
