@@ -277,6 +277,24 @@ workload reports false `slow_client` drops.
 
 **Scope:** small.
 
+### Keep counting a handler's slot after its connection closes — medium
+
+**What:** `max_concurrent_requests` counts a handler from dispatch until its
+process ends, but only while its connection lives: an HTTP/2 or HTTP/3
+connection that closes (the client drops TCP, or a drain ends it) gives back
+the slots of the handlers still running on it, which are monitored, not
+linked, so they run on uncounted. A client can open requests to slow
+handlers up to the limit, drop the connection, reconnect and repeat, piling
+up running handlers past `max_concurrent_requests`.
+
+**How:** release the slot from the worker itself when it ends (its own
+monitor of the slot, or a release in the worker's exit path), instead of in
+the connection's `exit_clean`, so the count follows the handler's life
+rather than the connection's.
+
+**Scope:** medium. The slot ownership moves from the connection to the
+worker on HTTP/2 and HTTP/3, the overload queue's grants included.
+
 ### Cheaper accepts under load — medium
 
 **What:** an acceptor still gives up its scheduler a few times per accept

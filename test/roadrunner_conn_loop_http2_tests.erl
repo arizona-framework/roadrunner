@@ -123,6 +123,9 @@ all_test_() ->
         fun other_expectation_gets_no_interim/0,
         fun over_inflight_ceiling_refused_and_throttled/0,
         fun reset_stream_releases_inflight_slot/0,
+        fun reset_stream_keeps_the_slot_of_a_working_handler/0,
+        fun crash_after_a_complete_exchange_sends_no_reset/0,
+        fun reset_handler_still_at_work_keeps_the_conn_awake/0,
         fun stream_slot_freed_when_response_ends_before_worker_down/0,
         fun peer_rst_frees_stream_slot/0,
         fun rst_during_stream_response_unwinds_worker/0,
@@ -2914,11 +2917,10 @@ over_inflight_ceiling_refused_and_throttled() ->
     end.
 
 reset_stream_releases_inflight_slot() ->
-    %% A peer RST_STREAM for a dispatched stream must release the in-flight
-    %% slot the worker held. `reset_stream/2` demonitors the worker (so no
-    %% `DOWN` fires) and drops the worker ref, so without an explicit release
-    %% on that path the slot leaks: the gauge would never return to 0 and a
-    %% later request would be wrongly refused.
+    %% A peer RST_STREAM for a dispatched stream releases the in-flight
+    %% slot the worker held once the worker exits: a `{loop, ...}` worker
+    %% gets its disconnect and ends, and its `DOWN` gives the slot back, so
+    %% a later request is admitted.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Inflight = counters:new(1, [write_concurrency]),
@@ -2941,8 +2943,7 @@ reset_stream_releases_inflight_slot() ->
         _ = wait_for_register(roadrunner_h2_loop_test, 1000),
         _ = drain_send(50),
         ?assertEqual(1, counters:get(Inflight, 1)),
-        %% Peer cancels stream 1. `reset_stream/2` tears the worker down
-        %% and must free the slot.
+        %% Peer cancels stream 1: the loop worker ends and frees the slot.
         Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
         serve_recv(ConnPid, Rst),
         ok = wait_inflight(Inflight, 0, 50),
@@ -2953,6 +2954,115 @@ reset_stream_releases_inflight_slot() ->
         ?assertEqual(0, atomics:get(Throttled, 1))
     after
         cleanup(Pid, Ref)
+    end.
+
+reset_stream_keeps_the_slot_of_a_working_handler() ->
+    %% A handler still computing when the peer resets its stream is told,
+    %% not stopped, and its work keeps counting toward
+    %% `max_concurrent_requests` until it returns: a stream opened meanwhile
+    %% is refused at the ceiling. The answer it then gives is dropped, and
+    %% its exit gives the slot back.
+    drain_mailbox(),
+    Inflight = counters:new(1, [write_concurrency]),
+    Throttled = atomics:new(1, [{signed, false}]),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{
+        max_concurrent_requests => 1,
+        inflight_counter => Inflight,
+        throttled_counter => Throttled,
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined}
+    }),
+    try
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        serve_recv(ConnPid, complete_get_headers(1, ~"/block")),
+        Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+        WorkerRef = monitor(process, Worker),
+        serve_recv(
+            ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel}))
+        ),
+        serve_recv(ConnPid, complete_get_headers(3, ~"/empty")),
+        ?assertMatch(
+            {ok, {rst_stream, 3, refused_stream}, _},
+            roadrunner_http2_frame:parse(expect_send(), 16384)
+        ),
+        ?assertEqual(1, atomics:get(Throttled, 1)),
+        ?assert(is_process_alive(Worker)),
+        ?assertEqual(1, counters:get(Inflight, 1)),
+        Worker ! release,
+        receive
+            {'DOWN', WorkerRef, process, Worker, normal} -> ok
+        after 1000 -> error(worker_did_not_finish)
+        end,
+        serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>}))),
+        ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
+        ?assertEqual(0, counters:get(Inflight, 1))
+    after
+        cleanup(Pid, Ref)
+    end.
+
+crash_after_a_complete_exchange_sends_no_reset() ->
+    %% A worker killed (a linked process crashing, say) once its response
+    %% is complete and the client ended its side: the stream is closed both
+    %% ways, so no RST_STREAM follows (RFC 9113 §5.1); the next frame out
+    %% is the PING's ACK.
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{
+        dispatch =>
+            {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                undefined}
+    }),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/stream/fin-then-park")),
+    Worker = wait_for_register(roadrunner_h2_fin_park_test, 1000),
+    ok = flush_sends(),
+    WorkerRef = monitor(process, Worker),
+    true = exit(Worker, kill),
+    receive
+        {'DOWN', WorkerRef, process, Worker, killed} -> ok
+    after 1000 -> error(worker_not_killed)
+    end,
+    serve_recv(ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({ping, 0, <<0:64>>}))),
+    ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
+    cleanup(Pid, Ref).
+
+reset_handler_still_at_work_keeps_the_conn_awake() ->
+    %% The client resets its only stream while the handler still works:
+    %% with no stream left but a worker running, the conn does not
+    %% hibernate (which would close it at the idle timeout, the worker's
+    %% slot given back while it runs) but checks the client with a PING.
+    drain_mailbox(),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 200),
+    try
+        {Pid, Ref, ConnPid} = start_http2_conn(#{
+            hibernate_after => 50,
+            dispatch =>
+                {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                    undefined}
+        }),
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        serve_recv(ConnPid, complete_get_headers(1, ~"/block")),
+        Worker = wait_for_register(roadrunner_h2_block_test, 1000),
+        serve_recv(
+            ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel}))
+        ),
+        try
+            ?assertMatch(<<0, 0, 8, 6, 0, 0:32, "rr-alive">>, expect_send())
+        after
+            Worker ! release,
+            cleanup(Pid, Ref)
+        end
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
     end.
 
 stream_slot_freed_when_response_ends_before_worker_down() ->
@@ -5200,6 +5310,13 @@ expect_send() ->
 
 h2_test_dispatch() ->
     {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1, undefined}.
+
+%% Drop every frame the conn has sent so far.
+flush_sends() ->
+    receive
+        {roadrunner_fake_send, _Pid, _Data} -> flush_sends()
+    after 0 -> ok
+    end.
 
 drain_send(Timeout) ->
     receive
