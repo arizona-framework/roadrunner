@@ -307,7 +307,8 @@ jobs:
   # gRPC interop with gRPC's own client: `grpc_interop.sh` builds the pinned
   # grpc-go interop client and runs the interop suite's server test cases
   # with it, against the TestService served through the Protocol Buffers
-  # adapter.
+  # adapter, then has grpcurl list, describe and call the services through
+  # server reflection.
   # The CT suites use roadrunner's own gRPC client, so a bug both sides
   # share passes them; this one is written by the gRPC team.
   grpc-interop:
