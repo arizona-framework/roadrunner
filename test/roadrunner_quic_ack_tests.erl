@@ -111,3 +111,18 @@ ack_delay_counts_from_the_largest_packet_test() ->
     ?assertEqual(15, ?M:ack_delay(Ack, 115)),
     %% A clock reading before the arrival never reports a negative delay.
     ?assertEqual(0, ?M:ack_delay(Ack, 90)).
+
+%% A number in any received range was received; one in a gap, below them all
+%% or above the largest was not (RFC 9000 §12.3).
+received_test() ->
+    Ack = lists:foldl(
+        fun(PN, A) -> ?M:record(PN, true, 0, A) end,
+        ?M:new(),
+        [2, 3, 7, 8, 9]
+    ),
+    ?assert(?M:received(8, Ack)),
+    ?assert(?M:received(2, Ack)),
+    ?assertNot(?M:received(5, Ack)),
+    ?assertNot(?M:received(0, Ack)),
+    ?assertNot(?M:received(10, Ack)),
+    ?assertNot(?M:received(0, ?M:new())).
