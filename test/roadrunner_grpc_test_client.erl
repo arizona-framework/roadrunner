@@ -10,7 +10,7 @@
 %% it waits are kept, in order, for `next_frame/1` to hand back.
 
 -export([
-    open/1,
+    open/1, open/2,
     start/4,
     send/3,
     finish/2,
@@ -28,13 +28,17 @@
 -define(MAX_FRAME, 16384).
 
 open(Port) ->
+    open(Port, []).
+
+%% With `Settings` sent too, such as a SETTINGS_MAX_HEADER_LIST_SIZE (id 6).
+open(Port, Settings) ->
     {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 5000),
     ok = gen_tcp:send(Sock, [
         ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
         %% Windows wide open (SETTINGS_INITIAL_WINDOW_SIZE, id 4, and the
         %% connection's), so responses never wait on a WINDOW_UPDATE this
         %% client does not send.
-        roadrunner_http2_frame:encode({settings, 0, [{4, 16#7FFFFFFF}]}),
+        roadrunner_http2_frame:encode({settings, 0, [{4, 16#7FFFFFFF} | Settings]}),
         roadrunner_http2_frame:encode({window_update, 0, 16#7FFFFFFF - 65535})
     ]),
     #{

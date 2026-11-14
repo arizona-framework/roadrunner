@@ -5,7 +5,7 @@
 
 -export([name/0, rpcs/0]).
 -export([unary/2, count/2, sum/1, chat/1, fail/2, crash/2, crash_after/2, meta/2, deadline/2, bad/2]).
--export([stop/2, bad_trailer/2, late_headers/2, stale_send/2, bad_name/2]).
+-export([stop/2, bad_trailer/2, late_headers/2, stale_send/2, bad_name/2, big_header/2]).
 -export([unsafe_header/2, unsafe_fail/2, busy/2, squeezed/2, late_compression/2]).
 -export([stale_compression/2, held/1, was_compressed/2]).
 
@@ -24,10 +24,11 @@ rpcs() ->
         ~"Deadline" => rpc(deadline, unary),
         ~"Bad" => rpc(bad, unary),
         ~"Stop" => rpc(stop, unary),
-        ~"BadTrailer" => rpc(bad_trailer, unary),
+        ~"BadTrailer" => rpc(bad_trailer, server_stream),
         ~"LateHeaders" => rpc(late_headers, server_stream),
         ~"StaleSend" => rpc(stale_send, server_stream),
         ~"BadName" => rpc(bad_name, unary),
+        ~"BigHeader" => rpc(big_header, unary),
         ~"UnsafeHeader" => rpc(unsafe_header, server_stream),
         ~"UnsafeFail" => rpc(unsafe_fail, unary),
         ~"Busy" => rpc(busy, unary),
@@ -97,8 +98,10 @@ bad(_Request, Stream) ->
 stop(_Request, _Stream) ->
     exit({shutdown, stopped}).
 
+%% A trailer value with a CR LF, after the response started.
 bad_trailer(Request, Stream) ->
-    {reply, Request, roadrunner_grpc:set_trailers([{~"x-bad", <<"a\r\nb">>}], Stream)}.
+    Stream1 = roadrunner_grpc:send(Request, Stream),
+    {ok, roadrunner_grpc:set_trailers([{~"x-bad", ~"a\r\nb"}], Stream1)}.
 
 late_headers(_Request, Stream) ->
     Stream1 = roadrunner_grpc:send(~"one", Stream),
@@ -114,12 +117,39 @@ bad_name(~"upper", Stream) ->
     {reply, ~"", roadrunner_grpc:set_headers([{~"X-Up", ~"v"}], Stream)};
 bad_name(~"reserved", Stream) ->
     {reply, ~"", roadrunner_grpc:set_headers([{~"grpc-status", ~"0"}], Stream)};
+bad_name(~"message-type", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_headers([{~"grpc-message-type", ~"x"}], Stream)};
+bad_name(~"newline", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_headers([{~"x-a\r\nb", ~"v"}], Stream)};
+bad_name(~"nul", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_trailers([{~"x-a", <<"a", 0, "b">>}], Stream)};
 bad_name(~"pseudo", Stream) ->
     {reply, ~"", roadrunner_grpc:set_headers([{~":path", ~"/"}], Stream)};
 bad_name(~"trailer", Stream) ->
-    {reply, ~"", roadrunner_grpc:set_trailers([{~"content-type", ~"x"}], Stream)}.
+    {reply, ~"", roadrunner_grpc:set_trailers([{~"content-type", ~"x"}], Stream)};
+bad_name(~"space", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_headers([{~"x a", ~"v"}], Stream)};
+bad_name(~"colon", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_headers([{~"x:a", ~"v"}], Stream)};
+bad_name(~"empty", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_headers([{~"", ~"v"}], Stream)};
+bad_name(~"leading-space", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_trailers([{~"x-a", ~" v"}], Stream)};
+bad_name(~"trailing-space", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_trailers([{~"x-a", ~"v "}], Stream)};
+bad_name(~"tab", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_headers([{~"x-a", ~"a\tb"}], Stream)};
+bad_name(~"non-ascii", Stream) ->
+    {reply, ~"", roadrunner_grpc:set_headers([{~"x-a", <<"caf", 16#C3, 16#A9>>}], Stream)};
+bad_name(~"good", Stream) ->
+    Stream1 = roadrunner_grpc:set_headers([{~"x.a_b-9", ~"a b ~"}, {~"x-e", ~""}], Stream),
+    {reply, ~"", Stream1}.
 
-%% A header value the connection will not send, ahead of a response...
+%% A header too big for a client that limits its header lists.
+big_header(_Request, Stream) ->
+    {reply, ~"", roadrunner_grpc:set_headers([{~"x-big", binary:copy(~"a", 500)}], Stream)}.
+
+%% A header value with a CR LF, ahead of a response...
 unsafe_header(_Request, Stream) ->
     Stream1 = roadrunner_grpc:set_headers([{~"x-a", <<"a\r\nb">>}], Stream),
     {ok, roadrunner_grpc:send(~"one", Stream1)}.

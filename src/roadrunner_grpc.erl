@@ -37,7 +37,8 @@ from starting:
 - `send_compression`: how the response messages are compressed, `gzip`,
   `deflate` or by default `identity`, none (see Compression)
 - `health`: `true` adds gRPC's health service (`roadrunner_grpc_health`)
-  to the routes; by default `false`
+  to the routes; by default `false`. The health route keeps the defaults:
+  the shared options apply to the services' routes
 - `max_content_length`: the most a call's requests may add up to, in bytes,
   for `routes/1` to set on each route in place of the listener's (10 MiB
   by default); past it the call ends with `RESOURCE_EXHAUSTED` with
@@ -62,15 +63,13 @@ trailers: `OK` when the method returns normally, the status of an
 A call that fails before any response is answered Trailers-Only, the
 status in the response headers. The rest is answered as HTTP: `505` over
 HTTP/1.1, `405` for a method other than `POST`, `415` for a
-`content-type` none of the codecs speak, the router's `404` for an
-unknown service, and `500` when a response header the method set cannot
-be sent (a CR or LF in its value). An unknown method of a known service
-is `UNIMPLEMENTED`, as is a `grpc-encoding` other than `identity`, `gzip`
-and `deflate`.
+`content-type` none of the codecs speak, and the router's `404` for an
+unknown service. An unknown method of a known service is `UNIMPLEMENTED`,
+as is a `grpc-encoding` other than `identity`, `gzip` and `deflate`.
 
 A `grpc-timeout` is the call's deadline. A read still waiting then ends
 the call with `DEADLINE_EXCEEDED`; a call still running a second later is
-cancelled, as grpc-go does at the deadline: its stream is reset
+cancelled, as grpc-go and grpc-java do at the deadline: its stream is reset
 (`RST_STREAM` with `CANCEL` over HTTP/2, `H3_REQUEST_CANCELLED` over
 HTTP/3) and the method stops at its next write or read. Without a timeout
 a call may run for as long as the client stays connected. With `auto` buffering the deadline counts from
@@ -104,10 +103,12 @@ server-streaming method's request among them.
 
 `metadata/1` is the request's custom metadata, without the HTTP/2 and gRPC
 headers; `set_headers/2` and `set_trailers/2` add the response's, with
-lowercase names other than the ones gRPC sets (`grpc-status`, say), which
-raise. A metadata name ending in `-bin` carries bytes: its value is base64
-on the wire and plain bytes here, both ways; a request's comma-separated
-values are each an entry, and one that is not base64 ends the call with
+names of `0-9`, `a-z`, `_`, `-` and `.` other than the ones gRPC sets
+(`grpc-status`, say) and values of printable ASCII with no space at either
+end; others raise, so the call ends `INTERNAL`.
+A metadata name ending in `-bin` carries bytes: its value is base64 on the
+wire and plain bytes here, both ways; a request's comma-separated values
+are each an entry, and one that is not base64 ends the call with
 `INTERNAL` before the method runs.
 """.
 
@@ -706,9 +707,7 @@ trailers_only(Status, Message, #stream{req = Req} = Stream) ->
     ok = written(roadrunner_send:reply(200, Headers, <<>>, Req)),
     Req.
 
-%% A write that could not go out stops the call: the client is gone, or a
-%% header the connection refused (a CR or LF in a value) has the response
-%% answered `500` in its place.
+%% A write that could not go out (the client is gone, say) stops the call.
 -spec written(ok | {error, term()}) -> ok.
 written(ok) -> ok;
 written({error, Reason}) -> stopped(Reason).
@@ -946,7 +945,10 @@ that checks how its client sends (gRPC's interop tests ask a server to);
 recv_compressed(#stream{compressed = Compressed}) ->
     Compressed.
 
--doc "Add trailers, sent after the status when the call ends.".
+-doc """
+Add trailers, sent after the status when the call ends; a `-bin` name's
+value is given as bytes and sent as base64.
+""".
 -spec set_trailers(roadrunner_http:headers(), stream()) -> stream().
 set_trailers(Trailers, #stream{trailers = Own} = Stream) ->
     Stream#stream{trailers = Own ++ wire(Trailers)}.
@@ -955,14 +957,13 @@ set_trailers(Trailers, #stream{trailers = Own} = Stream) ->
 wire(Headers) ->
     [{own_name(Name), wire_value(Name, Value)} || {Name, Value} <- Headers].
 
-%% A metadata name of the call's own: lowercase (RFC 9113 §8.2.1) and not one
-%% gRPC or HTTP/2 sets themselves.
+%% A metadata name of the call's own: gRPC's Header-Name (one or more of
+%% `0-9`, `a-z`, `_`, `-` and `.`, so lowercase and no pseudo-header), and
+%% not one gRPC or HTTP/2 sets themselves.
 -spec own_name(binary()) -> binary().
-own_name(<<":", _/binary>> = Name) ->
-    error({invalid_metadata, Name});
 own_name(Name) ->
     case
-        roadrunner_bin:ascii_lowercase(Name) =:= Name andalso
+        Name =/= <<>> andalso is_metadata_name(Name) andalso
             not lists:member(Name, [
                 ~"content-type",
                 ~"content-length",
@@ -971,19 +972,51 @@ own_name(Name) ->
                 ~"grpc-message",
                 ~"grpc-encoding",
                 ~"grpc-accept-encoding",
-                ~"grpc-timeout"
+                ~"grpc-timeout",
+                ~"grpc-message-type"
             ])
     of
         true -> Name;
         false -> error({invalid_metadata, Name})
     end.
 
+-spec is_metadata_name(binary()) -> boolean().
+is_metadata_name(<<C, Rest/binary>>) when
+    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse
+        C =:= $_ orelse C =:= $- orelse C =:= $.
+->
+    is_metadata_name(Rest);
+is_metadata_name(<<>>) ->
+    true;
+is_metadata_name(_) ->
+    false.
+
+%% A value as sent: a `-bin` one in base64, any other gRPC's ASCII-Value
+%% (printable ASCII, space included) with no space at either end (RFC 9113
+%% §8.2.1).
 -spec wire_value(binary(), binary()) -> binary().
 wire_value(Name, Value) ->
     case binary:longest_common_suffix([Name, ~"-bin"]) of
         4 -> base64:encode(Value, #{padding => false});
-        _ -> Value
+        _ -> ascii_value(Name, Value)
     end.
+
+-spec ascii_value(binary(), binary()) -> binary().
+ascii_value(Name, Value) ->
+    case is_ascii_value(Value) of
+        true -> Value;
+        false -> error({invalid_metadata, Name})
+    end.
+
+-spec is_ascii_value(binary()) -> boolean().
+is_ascii_value(<<$\s, _/binary>>) -> false;
+is_ascii_value(Value) -> is_printable(Value).
+
+-spec is_printable(binary()) -> boolean().
+is_printable(<<$\s>>) -> false;
+is_printable(<<C, Rest/binary>>) when C >= 16#20, C =< 16#7E -> is_printable(Rest);
+is_printable(<<>>) -> true;
+is_printable(_) -> false.
 
 -doc """
 When the call's `grpc-timeout` runs out, in `erlang:monotonic_time(millisecond)`,

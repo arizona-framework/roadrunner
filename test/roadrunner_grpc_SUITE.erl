@@ -40,7 +40,7 @@ fixture, under both body buffering modes.
     http3_calls/1,
     content_type_parameters/1,
     shutdown_exit_stops_the_call/1,
-    refused_trailer_stops_the_call/1,
+    unsafe_trailer_is_internal/1,
     headers_after_a_response_are_internal/1,
     undecodable_message_is_internal/1,
     client_reset_stops_the_read/1,
@@ -48,13 +48,14 @@ fixture, under both body buffering modes.
     stale_stream_sends_once/1,
     binary_metadata_splits_and_checks/1,
     content_type_ignores_case/1,
-    reserved_or_uppercase_metadata_is_internal/1,
+    invalid_metadata_is_internal/1,
     large_message_across_frames/1,
     client_reset_stops_the_writes/1,
     route_cap_lets_a_stream_past_the_listener_cap/1,
     missing_content_type_is_415/1,
     space_before_content_type_parameters/1,
-    unsendable_header_stops_the_call/1,
+    unsafe_header_is_internal/1,
+    head_over_the_client_limit_stops_the_call/1,
     deadline_cancels_a_running_call/1,
     compressed_requests_are_read/1,
     malformed_compressed_message_is_internal/1,
@@ -103,17 +104,18 @@ groups() ->
         metadata_round_trips,
         content_type_parameters,
         shutdown_exit_stops_the_call,
-        refused_trailer_stops_the_call,
+        unsafe_trailer_is_internal,
         headers_after_a_response_are_internal,
         undecodable_message_is_internal,
         stale_stream_sends_once,
         binary_metadata_splits_and_checks,
         content_type_ignores_case,
-        reserved_or_uppercase_metadata_is_internal,
+        invalid_metadata_is_internal,
         route_cap_lets_a_stream_past_the_listener_cap,
         missing_content_type_is_415,
         space_before_content_type_parameters,
-        unsendable_header_stops_the_call,
+        unsafe_header_is_internal,
+        head_over_the_client_limit_stops_the_call,
         deadline_cancels_a_running_call,
         compressed_requests_are_read,
         malformed_compressed_message_is_internal,
@@ -402,18 +404,28 @@ content_type_parameters(Config) ->
     ),
     ?assertEqual(~"application/grpc", header(~"content-type", Headers)).
 
+%% A response head over the client's SETTINGS_MAX_HEADER_LIST_SIZE cannot
+%% go out (RFC 9113 §6.5.2): it is answered 500 and the call stops.
+head_over_the_client_limit_stops_the_call(Config) ->
+    C = roadrunner_grpc_test_client:open(?config(port, Config), [{6, 200}]),
+    {Headers, _, _, _} = roadrunner_grpc_test_client:call(
+        C, 1, <<?SVC/binary, "BigHeader">>, [], [~"x"]
+    ),
+    ?assertEqual(~"500", header(~":status", Headers)).
+
 %% A method that stops the call on purpose (`exit({shutdown, _})`) gets no
 %% gRPC status: the request just ends, here before any response, as a 500.
 shutdown_exit_stops_the_call(Config) ->
     {Headers, _, _, _} = call(Config, ~"Stop", [~"x"]),
     ?assertEqual(~"500", header(~":status", Headers)).
 
-%% A trailer the connection will not send (a CR LF in its value) stops the
-%% call: the response ends without a status.
-refused_trailer_stops_the_call(Config) ->
-    {Headers, _, Trailers, _} = call(Config, ~"BadTrailer", [~"x"]),
+%% A trailer value with a CR LF raises in `set_trailers/2`, so the call ends
+%% INTERNAL after the message it sent.
+unsafe_trailer_is_internal(Config) ->
+    {Headers, [~"x"], Trailers, _} = call(Config, ~"BadTrailer", [~"x"]),
     ?assertEqual(~"200", header(~":status", Headers)),
-    ?assertNotMatch([_ | _], Trailers).
+    ?assertEqual(~"13", header(~"grpc-status", Trailers)),
+    ?assertNot(lists:keymember(~"x-bad", 1, Trailers)).
 
 headers_after_a_response_are_internal(Config) ->
     {_, [~"one"], Trailers, _} = call(Config, ~"LateHeaders", [~"x"]),
@@ -461,14 +473,33 @@ content_type_ignores_case(Config) ->
         ]),
     ?assertEqual(ok, binary_to_term(Reply)).
 
-reserved_or_uppercase_metadata_is_internal(Config) ->
+invalid_metadata_is_internal(Config) ->
     lists:foreach(
         fun(Which) ->
             {Headers, [], trailers_only, _} = call(Config, ~"BadName", [Which]),
             ?assertEqual(~"13", header(~"grpc-status", Headers))
         end,
-        [~"upper", ~"reserved", ~"pseudo", ~"trailer"]
-    ).
+        [
+            ~"upper",
+            ~"reserved",
+            ~"message-type",
+            ~"newline",
+            ~"nul",
+            ~"pseudo",
+            ~"trailer",
+            ~"space",
+            ~"colon",
+            ~"empty",
+            ~"leading-space",
+            ~"trailing-space",
+            ~"tab",
+            ~"non-ascii"
+        ]
+    ),
+    {Headers, [~""], Trailers, _} = call(Config, ~"BadName", [~"good"]),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)),
+    ?assertEqual(~"a b ~", header(~"x.a_b-9", Headers)),
+    ?assertEqual(~"", header(~"x-e", Headers)).
 
 %% A message over one DATA frame's 16 KB arrives in pieces and reads whole.
 large_message_across_frames(Config) ->
@@ -513,16 +544,20 @@ space_before_content_type_parameters(Config) ->
     ]),
     ?assertEqual(~"application/grpc", header(~"content-type", Tab)).
 
-%% A response header the connection will not send stops the call, ahead of
-%% a response or of an error status alike: it is answered 500.
-unsendable_header_stops_the_call(Config) ->
-    {Stream, _, _, _} = call(Config, ~"UnsafeHeader", [~"x"]),
-    ?assertEqual(~"500", header(~":status", Stream)),
-    {Fail, _, _, _} = call(Config, ~"UnsafeFail", [~"x"]),
-    ?assertEqual(~"500", header(~":status", Fail)).
+%% A response header value with a CR LF raises in `set_headers/2`, ahead of
+%% a response or of an error status alike: the call ends INTERNAL.
+unsafe_header_is_internal(Config) ->
+    lists:foreach(
+        fun(Method) ->
+            {Headers, [], trailers_only, _} = call(Config, Method, [~"x"]),
+            ?assertEqual(~"13", header(~"grpc-status", Headers)),
+            ?assertNot(lists:keymember(~"x-a", 1, Headers))
+        end,
+        [~"UnsafeHeader", ~"UnsafeFail"]
+    ).
 
 %% A call still running at its deadline has its stream reset (CANCEL), as
-%% grpc-java does; the method is not waited for.
+%% grpc-go and grpc-java do; the method is not waited for.
 deadline_cancels_a_running_call(Config) ->
     {_, [], {rst, cancel}, _} = call(Config, ~"Busy", [{~"grpc-timeout", ~"100m"}], [~"x"]).
 
