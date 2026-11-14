@@ -196,7 +196,7 @@ Unlocks `baseline-h3` and `static-h3`.
 
 **What:** `roadrunner_grpc` serves the four call kinds over HTTP/2 and
 HTTP/3 with pluggable codecs, and cancels a call at its `grpc-timeout`.
-Still to come: a guide in `docs/`; the Protocol Buffers adapter
+Still to come: the Protocol Buffers adapter
 (`grpc_protobuf/`, built and tested only in the `test` profile today) as a
 package of its own; server reflection; telemetry for calls and benchmarks.
 
