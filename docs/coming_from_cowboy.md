@@ -289,7 +289,12 @@ Notable differences:
   `{ok, multipart, Parts, Req}`
 - By default the whole body is read before the handler runs, up to
   `max_content_length`. Set `body_buffering => manual` to read it yourself
-  with `read_body/2` and its `length` option
+  with `read_body/2` and its `length` option. Cowboy's per-call `read_body`
+  `timeout` has no per-call twin: `roadrunner_req:set_body_timeout/2` sets
+  one deadline for every read after it (by default the request's read
+  deadline, from `request_timeout`), so call it before each read to limit
+  each one. There is no `period`: `read_body/2` with `length` waits for that
+  many bytes or the end of the body
 - The request is a map, like Cowboy's. You can match on it
   (`#{method := ~"GET"} = Req`), but the `roadrunner_req` functions are the
   supported way to read it

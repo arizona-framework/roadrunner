@@ -574,8 +574,11 @@ slot, until the client or its connection goes away, so set it only where
 a long, quiet body is expected. The connection's own limits still apply:
 on HTTP/1.1 the listener's `min_bytes_per_second`, as an average from the
 start of the body, waiting included (a long, quiet body there needs
-`min_bytes_per_second => 0`), and on HTTP/3 the QUIC idle timeout, which
-a client keeps from passing by sending PINGs. Once the response is out,
+`min_bytes_per_second => 0`); on HTTP/2, a PING after each
+`keep_alive_timeout` of silence, the connection closing if the next one
+passes with no answer, so a client that answers the PING keeps the
+request for as long as it stays connected; and on HTTP/3 the QUIC idle timeout,
+which a client keeps from passing by sending PINGs. Once the response is out,
 what is left of an unread body is drained by the request's own deadline
 at the latest.
 

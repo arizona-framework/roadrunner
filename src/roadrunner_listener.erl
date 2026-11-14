@@ -197,7 +197,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   the PROXY protocol, the same bound covers the header read that
   precedes the handshake. Default 5 s.
 - `keep_alive_timeout` — idle timeout between requests on a
-  keep-alive conn. Default 60 s.
+  keep-alive conn: on HTTP/1.1 between one request and the next, on
+  HTTP/2 how long the connection may stay quiet before it is closed with
+  a GOAWAY, or, while a handler is still at work, checked with a PING (at
+  least 1 s there, so a client has time to send its first request and to
+  answer the PING). Default 60 s.
 - `num_acceptors` — size of the acceptor pool. Default: one per online
   scheduler, at most 10. Every acceptor waits on the same listen socket, so
   more acceptors than schedulers only adds contention: on one or two

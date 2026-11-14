@@ -15,6 +15,16 @@ shape.
     {roadrunner_handler:response(), roadrunner_req:request()}.
 handle(#{target := ~"/empty"} = Req) ->
     {{200, [], ~""}, Req};
+handle(#{target := ~"/untimed-report"} = Req) ->
+    %% Give the body reads no deadline, read, and tell the registered test
+    %% process how the read ended.
+    Result =
+        case roadrunner_req:read_body(roadrunner_req:set_body_timeout(infinity, Req)) of
+            {ok, Body, _} -> {ok, iolist_size(Body)};
+            {error, _} = E -> E
+        end,
+    roadrunner_h2_untimed_test ! {read_result, Result},
+    {{200, [], ~"ok"}, Req};
 handle(#{target := ~"/block"} = Req) ->
     %% Park the worker before responding so the stream stays
     %% half-closed-remote while a test sends a protocol-violating DATA

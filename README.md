@@ -169,9 +169,9 @@ handle(Req) ->
 ```
 
 `read_form/1` decodes both urlencoded and `multipart/form-data` bodies. With
-`body_buffering => manual`, `read_body/2` reads the body in chunks, and
+`body_buffering => manual`, `read_body/2` reads the body in chunks,
 `roadrunner_multipart:read_part/1` streams a multipart body one part at a
-time.
+time, and `roadrunner_req:set_body_timeout/2` gives a long upload more time.
 
 ### Responses
 

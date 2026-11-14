@@ -85,6 +85,8 @@ all_test_() ->
         fun data_without_end_stream_continues_loop/0,
         fun continuation_without_end_headers_continues_loop/0,
         fun idle_timeout_emits_goaway/0,
+        fun idle_timeout_is_the_keep_alive_timeout/0,
+        fun zero_keep_alive_timeout_still_serves_h2/0,
         fun settings_ack_first_frame_triggers_goaway/0,
         fun handshake_closed_during_partial_preface/0,
         fun handshake_error_during_partial_preface/0,
@@ -102,6 +104,7 @@ all_test_() ->
         fun hibernate_after_past_idle_timeout_emits_goaway/0,
         fun idle_timeout_with_open_stream_emits_goaway/0,
         fun idle_timeout_waits_for_a_running_worker/0,
+        fun untimed_body_read_lasts_while_the_client_answers/0,
         fun idle_timeout_closes_when_the_liveness_ping_goes_unanswered/0,
         fun idle_timeout_after_the_handler_ends_is_a_plain_idle_close/0,
         fun rst_stream_active_stream_synced/0,
@@ -2059,8 +2062,45 @@ frame_loop_parse_error_triggers_goaway() ->
     after 500 -> error(process_did_not_exit)
     end.
 
+idle_timeout_is_the_keep_alive_timeout() ->
+    %% The listener's `keep_alive_timeout` is the connection's idle
+    %% timeout: a quiet conn is closed once it passes, with a GOAWAY. 1 s
+    %% is the shortest an HTTP/2 conn takes.
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{keep_alive_timeout => 1_000}),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    GoAway =
+        receive
+            {roadrunner_fake_send, _, Data} -> iolist_to_binary(Data)
+        after 3_000 -> error(no_goaway)
+        end,
+    ?assertMatch(<<0, 0, 8, 7, 0, 0:32, _:32, 0:32>>, GoAway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(process_did_not_exit)
+    end.
+
+zero_keep_alive_timeout_still_serves_h2() ->
+    %% A `keep_alive_timeout` of 0 (no keep-alive wait on HTTP/1.1) leaves
+    %% HTTP/2 its shortest idle wait instead of none: the conn does not
+    %% close before the client's first request, and serves it.
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{keep_alive_timeout => 0}),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    ?assertEqual(undefined, drain_send(100)),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/")),
+    ok = expect_response_headers(1, <<>>),
+    cleanup(Pid, Ref).
+
 runtime_idle_timeout_emits_goaway() ->
-    %% Override the 30-s idle timeout with a 100-ms test deadline
+    %% Override the idle timeout with a 100-ms test deadline
     %% so the `after` branch in `recv_more/1` fires fast.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
@@ -2331,6 +2371,54 @@ idle_timeout_waits_for_a_running_worker() ->
         after 1000 -> error(process_did_not_exit)
         end
     after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+untimed_body_read_lasts_while_the_client_answers() ->
+    %% A handler that gives its body reads no deadline
+    %% (`roadrunner_req:set_body_timeout(infinity, _)`) waits on a quiet
+    %% client past the idle timeout as long as the client answers the
+    %% liveness PING; once it stops answering, the conn closes and the
+    %% read fails.
+    drain_mailbox(),
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 100),
+    try
+        true = register(roadrunner_h2_untimed_test, self()),
+        {Pid, Ref, ConnPid} = start_http2_conn(#{
+            body_buffering => manual,
+            dispatch =>
+                {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                    undefined}
+        }),
+        _ = expect_send(),
+        serve_recv(ConnPid, ?PREFACE),
+        serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+        _ = expect_send(),
+        {Block, _} = roadrunner_http2_hpack:encode(
+            get_headers(~"/untimed-report"), roadrunner_http2_hpack:new_encoder(4096)
+        ),
+        serve_recv(
+            ConnPid,
+            iolist_to_binary(
+                roadrunner_http2_frame:encode(
+                    {headers, 1, 16#04, undefined, iolist_to_binary(Block)}
+                )
+            )
+        ),
+        ok = ack_liveness_ping(ConnPid),
+        ?assertMatch(<<0, 0, 8, 6, 0, 0:32, "rr-alive">>, expect_send()),
+        ?assertMatch(<<0, 0, 8, 7, 0, 0:32, _:32, 0:32>>, expect_send()),
+        expect_close(),
+        receive
+            {read_result, Result} -> ?assertEqual({error, closed}, Result)
+        after 1000 -> error(no_read_result)
+        end,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(process_did_not_exit)
+        end
+    after
+        true = unregister(roadrunner_h2_untimed_test),
         persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
     end.
 
