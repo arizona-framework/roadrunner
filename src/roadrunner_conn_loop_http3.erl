@@ -388,6 +388,8 @@ loop(#h3{conn = Conn} = State) ->
             loop(skip_continue(State, StreamId));
         {roadrunner_slot, StreamId, Outcome} ->
             loop(handle_slot(State, StreamId, Outcome));
+        {roadrunner_cancel_stream, StreamId} ->
+            loop(cancel_stream(State, StreamId));
         {roadrunner_drain, Deadline} ->
             drain(State, Deadline)
         %% No catch-all: like the h2 connection loop, the owner uses a
@@ -1336,6 +1338,24 @@ handle_stop_sending(#h3{streams = Streams, worker_pids = WorkerPids} = State, St
                 #{StreamId := Stream} -> stop_unanswered(State1, StreamId, Stream);
                 #{} -> State1
             end
+    end.
+
+%% Cancel a request stream at its worker's deadline
+%% (`roadrunner_send_writer:cancel_after/2`), as the peer cancelling it
+%% would: the response, if not complete, is reset with H3_REQUEST_CANCELLED
+%% (RFC 9114 §4.1.1, `cancel_response/2`), the worker is told so its next
+%% write or read fails, and its read stops, the rest of the request being
+%% discarded once it ends. The slot is held until then (`cancelled`). A
+%% stream gone, or cancelled already, is left alone: ids are never reused.
+-spec cancel_stream(#h3{}, non_neg_integer()) -> #h3{}.
+cancel_stream(#h3{worker_pids = WorkerPids, cancelled = Cancelled} = State, StreamId) ->
+    case WorkerPids of
+        #{StreamId := WorkerPid} when not is_map_key(StreamId, Cancelled) ->
+            ok = cancel_response(State, StreamId),
+            _ = (WorkerPid ! {roadrunner_stream_reset, StreamId}),
+            reading_stopped(State#h3{cancelled = Cancelled#{StreamId => []}}, StreamId);
+        #{} ->
+            State
     end.
 
 %% A request stream not dispatched whose answer the peer will not read. One

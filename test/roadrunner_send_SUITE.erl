@@ -71,7 +71,7 @@ groups() ->
         {http2, [],
             common() ++ multiplexed() ++
                 [client_reset_ends_the_fun, cancel_after_resets_the_stream]},
-        {http3, [], common() ++ multiplexed() ++ [cancel_after_is_not_supported]}
+        {http3, [], common() ++ multiplexed() ++ [cancel_after_resets_the_stream]}
     ].
 
 common() ->
@@ -441,11 +441,15 @@ client_reset_ends_the_fun(Config) ->
     end.
 
 cancel_after_resets_the_stream(Config) ->
-    %% At the deadline the connection resets the stream with CANCEL, cutting
-    %% the response the fun was still sending.
-    ?assertMatch(
-        {[200], _, <<"first", _/binary>>, {reset, cancel}}, get(Config, ~"/cancel-after")
-    ),
+    %% At the deadline the connection resets the stream, cutting the
+    %% response the fun was still sending: with CANCEL over HTTP/2, with
+    %% H3_REQUEST_CANCELLED over HTTP/3 (RFC 9114 §4.1.1).
+    Code =
+        case ?config(protocol, Config) of
+            http2 -> cancel;
+            http3 -> 16#010C
+        end,
+    ?assertMatch({[200], _, <<"first", _/binary>>, {reset, Code}}, get(Config, ~"/cancel-after")),
     ?assertEqual(armed, result()).
 
 cancel_after_is_not_supported(Config) ->

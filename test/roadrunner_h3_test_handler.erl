@@ -13,6 +13,36 @@ only h3-legal headers (no `connection` / `keep-alive`, which RFC 9114
 
 -spec handle(roadrunner_req:request()) ->
     {roadrunner_handler:response(), roadrunner_req:request()}.
+handle(#{target := ~"/cancel-unfinished"} = Req) ->
+    %% Starts the answer, then has its stream cancelled, twice (the second
+    %% finds it cancelled already), and waits to be told.
+    {
+        {send, [], fun(R) ->
+            {ok, Send} = roadrunner_send:stream(200, [], R),
+            ok = Send(~"part", nofin),
+            {ok, _} = roadrunner_send_writer:cancel_after(0, R),
+            {ok, _} = roadrunner_send_writer:cancel_after(0, R),
+            receive
+                {roadrunner_stream_reset, _} -> R
+            end
+        end},
+        Req
+    };
+handle(#{target := ~"/cancel-answered"} = Req) ->
+    %% Answers in full, then has its stream cancelled: nothing to reset,
+    %% but the fun is told, and tells the test (registered as
+    %% `h3_cancel_test`) what it saw.
+    {
+        {send, [], fun(R) ->
+            ok = roadrunner_send:reply(200, [], ~"ok", R),
+            Armed = roadrunner_send_writer:cancel_after(0, R),
+            receive
+                {roadrunner_stream_reset, _} -> h3_cancel_test ! {cancel_answered, Armed, told}
+            end,
+            R
+        end},
+        Req
+    };
 handle(#{target := ~"/echo"} = Req) ->
     {{200, [{~"content-type", ~"text/plain"}], roadrunner_req:body(Req)}, Req};
 handle(#{target := ~"/method"} = Req) ->
