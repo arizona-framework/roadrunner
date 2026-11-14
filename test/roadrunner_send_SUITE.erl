@@ -37,6 +37,7 @@ fun does.
     unsafe_reply_is_500/1,
     missing_file_is_500/1,
     calls_from_another_process_raise/1,
+    monitor_connection_by_protocol/1,
     reply_before_reading_sends_no_continue/1,
     continue_goes_before_a_reply_after_reading/1,
     short_file_is_500/1,
@@ -98,6 +99,7 @@ common() ->
         missing_file_is_500,
         short_file_is_500,
         calls_from_another_process_raise,
+        monitor_connection_by_protocol,
         status_follows_the_response,
         reply_before_reading_sends_no_continue,
         continue_goes_before_a_reply_after_reading
@@ -207,6 +209,7 @@ routes(TestPid, File) ->
         {~"/big-file", ?H, {report, TestPid, {big_file, File}}},
         {~"/until-reset", ?H, {report, TestPid, until_reset}},
         {~"/cancel-after", ?H, {report, TestPid, cancel_after}},
+        {~"/monitor-connection", ?H, {report, TestPid, monitor_connection}},
         {~"/upgrade", ?H, {report, TestPid, upgrade}},
         {~"/missing-file", ?H, {report, TestPid, {file, {missing_file(File), 0, 4}}}},
         {~"/short-file", ?H, {report, TestPid, {file, {File, 6, 4}}}},
@@ -314,8 +317,18 @@ short_file_is_500(Config) ->
     ?assertEqual({error, file_too_short}, result()),
     ?assertEqual({500, buffered}, stopped()).
 
+%% Over HTTP/2 and HTTP/3 a fun can monitor its connection's process; over
+%% HTTP/1.1 it runs in it.
+monitor_connection_by_protocol(Config) ->
+    ?assertMatch({[200], _, ~"ok", complete}, get(Config, ~"/monitor-connection")),
+    case ?config(protocol, Config) of
+        http1 -> ?assertEqual({error, not_supported}, result());
+        _ -> ?assertMatch({ok, Ref} when is_reference(Ref), result())
+    end.
+
 calls_from_another_process_raise(Config) ->
     ?assertMatch({[200], _, ~"own", complete}, get(Config, ~"/other-process")),
+    ?assertEqual({raised, not_in_send_fun}, result()),
     ?assertEqual({raised, not_in_send_fun}, result()),
     ?assertEqual({raised, not_in_send_fun}, result()),
     ?assertEqual({raised, not_in_send_fun}, result()),

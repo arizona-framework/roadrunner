@@ -13,7 +13,7 @@
 
 -include_lib("kernel/include/file.hrl").
 
--export([inform/3, final/3, status/1, cancel_after/2, run/5, started/2]).
+-export([inform/3, final/3, status/1, cancel_after/2, monitor_connection/1, run/5, started/2]).
 
 -export_type([writer/0, op/0, emit/0, sent/0, outcome/0]).
 
@@ -38,7 +38,8 @@
     | {sendfile, roadrunner_http:status(), roadrunner_http:headers(),
         roadrunner_handler:sendfile_spec()}
     | {websocket, module(), term(), roadrunner_ws_handler:upgrade_opts()}
-    | {cancel_after, non_neg_integer()}.
+    | {cancel_after, non_neg_integer()}
+    | monitor_connection.
 
 %% A protocol's writer for each call, given the request the fun holds then.
 %% `inform` returns the call's result; a final response returns it with the
@@ -105,6 +106,16 @@ cancel_after(Ms, #{send := #writer{emit = Emit, owner = Owner}} = Req) when
 ->
     Emit({cancel_after, Ms}, Req);
 cancel_after(_Ms, #{send := #writer{owner = Owner}}) when Owner =/= self() ->
+    error(not_in_send_fun).
+
+%% Monitor the process the request's connection lives in, so a fun that
+%% waits on its own messages learns, with the `'DOWN'`, that the connection
+%% went away. Over HTTP/1.1 the fun runs in that process itself, so it ends
+%% with it: `{error, not_supported}`.
+-spec monitor_connection(roadrunner_req:request()) -> {ok, reference()} | {error, not_supported}.
+monitor_connection(#{send := #writer{emit = Emit, owner = Owner}} = Req) when Owner =:= self() ->
+    Emit(monitor_connection, Req);
+monitor_connection(#{send := #writer{}}) ->
     error(not_in_send_fun).
 
 %% The final response, with the tuple's headers added: sent, or answered

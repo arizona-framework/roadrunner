@@ -1539,6 +1539,9 @@ send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
         ({cancel_after, _Ms}, _Req) ->
             %% The fun runs in the connection process itself: nothing
             %% could stop it at the deadline.
+            {error, not_supported};
+        (monitor_connection, _Req) ->
+            %% It ends with the connection process it runs in.
             {error, not_supported}
     end.
 

@@ -34,6 +34,8 @@ and a bad one stops the listener from starting:
   with `RESOURCE_EXHAUSTED`
 - `send_compression`: how the response messages are compressed, `gzip`,
   `deflate` or by default `identity`, none (see Compression)
+- `health`: `true` adds gRPC's health service (`roadrunner_grpc_health`)
+  to the routes; by default `false`
 - `max_content_length`: the most a call's requests may add up to, in bytes,
   for `routes/1` to set on each route in place of the listener's (10 MiB
   by default); past it the call ends with `RESOURCE_EXHAUSTED` with
@@ -78,7 +80,8 @@ when the body was read, a little after the client's.
 messages at the same time; and the stream belongs to the call's process,
 which is the one to `send/2`. A client that cancels the call (or goes
 away) stops the method on its next write, quietly: there is no one left to
-answer. A request that ends the call (too large, malformed, past its
+answer. A method that waits on messages of its own learns of it with
+`cancelled/2`. A request that ends the call (too large, malformed, past its
 deadline) is thrown out of `recv/1` to end the call with its status, so a
 method should not catch everything around `recv/1`.
 
@@ -108,7 +111,7 @@ values are each an entry, and one that is not base64 ends the call with
 
 -export([routes/1, init_route/1, handle/1]).
 -export([recv/1, send/2, send/3, metadata/1, set_headers/2, set_trailers/2, deadline/1, peer/1]).
--export([set_send_compression/2]).
+-export([set_send_compression/2, cancelled/2]).
 
 -export_type([opts/0, status/0, stream/0, encoding/0]).
 
@@ -117,6 +120,8 @@ values are each an entry, and one that is not base64 ends the call with
 -define(SEND_KEY, {?MODULE, send}).
 %% Where it keeps the timer that cancels the call at its deadline.
 -define(TIMER_KEY, {?MODULE, deadline_timer}).
+%% And its monitor of the connection (`cancelled/2`).
+-define(CONN_KEY, {?MODULE, connection}).
 %% How long after its deadline a call still running is cancelled. The
 %% client stopped waiting at the deadline; the cancel ends the stream and
 %% stops the method at its next write or read, after a read waiting at the
@@ -132,7 +137,9 @@ every service (see the moduledoc).
     services := [module()],
     codecs => [module()],
     max_message_size => pos_integer(),
-    max_content_length => non_neg_integer()
+    max_content_length => non_neg_integer(),
+    send_compression => encoding(),
+    health => boolean()
 }.
 
 -doc """
@@ -174,6 +181,8 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
     output :: term(),
     max_message_size :: pos_integer(),
     deadline :: integer() | infinity,
+    %% The monitor of the client's connection (`cancelled/2`).
+    connection = undefined :: reference() | undefined,
     %% The request's custom metadata, `-bin` values decoded.
     metadata = [] :: roadrunner_http:headers(),
     %% Request bytes read and not yet a whole message.
@@ -204,18 +213,37 @@ other options its state.
 """.
 -spec routes(opts()) -> roadrunner_router:routes().
 routes(#{services := Services} = Opts) when is_list(Services) ->
-    Shared = maps:without([services, max_content_length], Opts),
+    Shared = maps:without([services, max_content_length, health], Opts),
     Limits = maps:with([max_content_length], Opts),
-    [
-        Limits#{
-            path => <<"/", (service_name(Service, Services))/binary, "/:method">>,
-            handler => ?MODULE,
-            state => Shared#{service => Service}
-        }
-     || Service <- Services
-    ];
+    health_route(Opts) ++
+        [
+            Limits#{
+                path => <<"/", (service_name(Service, Services))/binary, "/:method">>,
+                handler => ?MODULE,
+                state => Shared#{service => Service}
+            }
+         || Service <- Services
+        ];
 routes(Opts) ->
     error({invalid_grpc_opts, Opts}).
+
+%% The health service's route, with `health => true`: it speaks its own
+%% protobuf messages, so it takes the raw codec whatever the services use.
+-spec health_route(map()) -> roadrunner_router:routes().
+health_route(#{health := true}) ->
+    [
+        #{
+            path => <<"/", (roadrunner_grpc_health:name())/binary, "/:method">>,
+            handler => ?MODULE,
+            state => #{service => roadrunner_grpc_health}
+        }
+    ];
+health_route(#{health := false}) ->
+    [];
+health_route(#{health := Other}) ->
+    error({invalid_grpc_opt, health, Other});
+health_route(#{}) ->
+    [].
 
 -spec service_name(term(), [term()]) -> binary().
 service_name(Service, Services) ->
@@ -407,7 +435,8 @@ call(Req, ContentType, Codec, #route{service = Service, rpcs = Rpcs} = Route) ->
             req = roadrunner_req:set_body_timeout(Timeout, Req),
             input = In,
             output = Out,
-            deadline = deadline_after(Timeout, Req)
+            deadline = deadline_after(Timeout, Req),
+            connection = watch_connection(Req)
         },
         finish(run(Kind, Service, Function, Stream))
     catch
@@ -588,7 +617,47 @@ ended(Req) ->
             undefined -> ok;
             Timer -> erlang:cancel_timer(Timer, [{async, true}, {info, false}])
         end,
+    _ =
+        case erase(?CONN_KEY) of
+            undefined -> true;
+            Ref -> demonitor(Ref, [flush])
+        end,
     Req.
+
+%% Monitor the client's connection for the call (`cancelled/2`). A call
+%% runs over HTTP/2 or HTTP/3 (`handle/1` answers HTTP/1.1 with 505), both of
+%% which can be monitored.
+-spec watch_connection(roadrunner_req:request()) -> reference().
+watch_connection(Req) ->
+    {ok, Ref} = roadrunner_send_writer:monitor_connection(Req),
+    _ = put(?CONN_KEY, Ref),
+    Ref.
+
+-doc """
+Whether `Message`, one the method's process received, says the call is
+over: the client cancelled it (its stream reset) or its connection went
+away. A method that waits on messages of its own, such as a server stream
+pushing events, checks each one with it and returns when it is `true`, as
+there is no one left to answer:
+
+```erlang
+events(Stream) ->
+    receive
+        {event, Data} ->
+            events(roadrunner_grpc:send(Data, Stream));
+        Other ->
+            case roadrunner_grpc:cancelled(Other, Stream) of
+                true -> {ok, Stream};
+                false -> events(Stream)
+            end
+    end.
+```
+""".
+-spec cancelled(term(), stream()) -> boolean().
+cancelled({h2_stream_reset, _StreamId}, _Stream) -> true;
+cancelled({roadrunner_stream_reset, _StreamId}, _Stream) -> true;
+cancelled({'DOWN', Ref, process, _Pid, _Reason}, #stream{connection = Ref}) -> true;
+cancelled(_Message, _Stream) -> false.
 
 -spec finish(status(), binary(), stream()) -> roadrunner_req:request().
 finish(Status, Message, #stream{send = undefined} = Stream) ->

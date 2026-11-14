@@ -178,7 +178,8 @@ send_fun({report, Pid, other_process}) ->
             Self ! {other, raised(fun() -> roadrunner_send:reply(200, [], ~"other", Req) end)},
             Self ! {other, raised(fun() -> roadrunner_send:inform(103, [], Req) end)},
             Self ! {other, raised(fun() -> roadrunner_send:status(Req) end)},
-            Self ! {other, raised(fun() -> roadrunner_send_writer:cancel_after(10, Req) end)}
+            Self ! {other, raised(fun() -> roadrunner_send_writer:cancel_after(10, Req) end)},
+            Self ! {other, raised(fun() -> roadrunner_send_writer:monitor_connection(Req) end)}
         end),
         Pid !
             {send_result,
@@ -200,7 +201,20 @@ send_fun({report, Pid, other_process}) ->
                 receive
                     {other, R4} -> R4
                 end},
+        Pid !
+            {send_result,
+                receive
+                    {other, R5} -> R5
+                end},
         ok = roadrunner_send:reply(200, [], ~"own", Req),
+        Req
+    end;
+send_fun({report, Pid, monitor_connection}) ->
+    %% A monitor of the connection's process over HTTP/2 and HTTP/3; over
+    %% HTTP/1.1 the fun runs in that process, so none.
+    fun(Req) ->
+        Pid ! {send_result, roadrunner_send_writer:monitor_connection(Req)},
+        ok = roadrunner_send:reply(200, [], ~"ok", Req),
         Req
     end;
 send_fun({report, Pid, cancel_after}) ->
