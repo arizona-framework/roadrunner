@@ -55,7 +55,14 @@ fixture, under both body buffering modes.
     missing_content_type_is_415/1,
     space_before_content_type_parameters/1,
     unsendable_header_stops_the_call/1,
-    deadline_cancels_a_running_call/1
+    deadline_cancels_a_running_call/1,
+    compressed_requests_are_read/1,
+    malformed_compressed_message_is_internal/1,
+    compressed_bomb_is_resource_exhausted/1,
+    response_compressed_when_the_client_reads_it/1,
+    compression_after_a_response_is_internal/1,
+    messages_follow_the_announced_encoding/1,
+    route_compression_applies/1
 ]).
 
 -define(SVC, ~"/test.Echo/").
@@ -102,7 +109,14 @@ groups() ->
         missing_content_type_is_415,
         space_before_content_type_parameters,
         unsendable_header_stops_the_call,
-        deadline_cancels_a_running_call
+        deadline_cancels_a_running_call,
+        compressed_requests_are_read,
+        malformed_compressed_message_is_internal,
+        compressed_bomb_is_resource_exhausted,
+        response_compressed_when_the_client_reads_it,
+        compression_after_a_response_is_internal,
+        messages_follow_the_announced_encoding,
+        route_compression_applies
     ],
     [
         {auto, [], Common},
@@ -141,6 +155,7 @@ start(Config, Protocols, Mode) ->
             services => [roadrunner_grpc_test_service],
             codecs => [roadrunner_grpc_codec_raw, roadrunner_grpc_test_codec],
             max_message_size => 100_000,
+            send_compression => gzip,
             max_content_length => 300_000
         })
     }),
@@ -242,7 +257,8 @@ content_type_picks_the_codec(Config) ->
 unsupported_encoding_is_unimplemented(Config) ->
     {Headers, [], trailers_only, _} = call(Config, ~"Unary", [{~"grpc-encoding", ~"snappy"}], [~"x"]),
     ?assertEqual(~"12", header(~"grpc-status", Headers)),
-    ?assertEqual(~"identity", header(~"grpc-accept-encoding", Headers)),
+    ?assertEqual(~"identity,gzip,deflate", header(~"grpc-accept-encoding", Headers)),
+    ?assertMatch({match, _}, re:run(header(~"grpc-message", Headers), "supported")),
     {_, [~"x"], _, _} = call(Config, ~"Unary", [{~"grpc-encoding", ~"identity"}], [~"x"]).
 
 compressed_message_is_internal(Config) ->
@@ -491,6 +507,83 @@ unsendable_header_stops_the_call(Config) ->
 deadline_cancels_a_running_call(Config) ->
     {_, [], {rst, cancel}, _} = call(Config, ~"Busy", [{~"grpc-timeout", ~"100m"}], [~"x"]).
 
+%% gzip and deflate (the zlib structure) messages are read; an uncompressed
+%% one in a compressed call too, its flag saying so.
+compressed_requests_are_read(Config) ->
+    Payload = binary:copy(~"hello ", 50),
+    lists:foreach(
+        fun({Encoding, Compressed}) ->
+            Body = iolist_to_binary(roadrunner_grpc_frame:encode(true, Compressed)),
+            {_, [Echo], Trailers, _} = raw_call(
+                Config, ~"Unary", [{~"grpc-encoding", Encoding}], Body
+            ),
+            ?assertEqual(Payload, Echo),
+            ?assertEqual(~"0", header(~"grpc-status", Trailers))
+        end,
+        [{~"gzip", zlib:gzip(Payload)}, {~"deflate", zlib:compress(Payload)}]
+    ),
+    {_, [~"plain"], _, _} = call(Config, ~"Unary", [{~"grpc-encoding", ~"gzip"}], [~"plain"]).
+
+%% Bytes that do not inflate, raw deflate included (gRPC's deflate is the
+%% zlib structure), end the call INTERNAL.
+malformed_compressed_message_is_internal(Config) ->
+    lists:foreach(
+        fun({Encoding, Bytes}) ->
+            Body = iolist_to_binary(roadrunner_grpc_frame:encode(true, Bytes)),
+            {Headers, [], trailers_only, _} =
+                raw_call(Config, ~"Unary", [{~"grpc-encoding", Encoding}], Body),
+            ?assertEqual(~"13", header(~"grpc-status", Headers))
+        end,
+        [{~"gzip", ~"not gzip"}, {~"deflate", zlib:zip(~"raw deflate")}]
+    ).
+
+%% A small message that inflates past max_message_size is refused as it
+%% inflates.
+compressed_bomb_is_resource_exhausted(Config) ->
+    Bomb = zlib:gzip(binary:copy(<<0>>, 200_000)),
+    Body = iolist_to_binary(roadrunner_grpc_frame:encode(true, Bomb)),
+    {Headers, [], trailers_only, _} = raw_call(
+        Config, ~"Unary", [{~"grpc-encoding", ~"gzip"}], Body
+    ),
+    ?assertEqual(~"8", header(~"grpc-status", Headers)).
+
+%% The answer is compressed when the client reads the encoding, a message
+%% sent with `compress => false` excepted, and sent as it is when not.
+response_compressed_when_the_client_reads_it(Config) ->
+    Payload = binary:copy(~"squeeze me ", 20),
+    {Headers, [{compressed, Gz}, Payload], _, _} =
+        call(Config, ~"Squeezed", [{~"grpc-accept-encoding", ~"identity, gzip"}], [~"gzip"]),
+    ?assertEqual(~"gzip", header(~"grpc-encoding", Headers)),
+    ?assertEqual(Payload, zlib:gunzip(Gz)),
+    {_, [{compressed, Z}, Payload], _, _} =
+        call(Config, ~"Squeezed", [{~"grpc-accept-encoding", ~"deflate"}], [~"deflate"]),
+    ?assertEqual(Payload, zlib:uncompress(Z)),
+    {Plain, [Payload, Payload], _, _} = call(Config, ~"Squeezed", [~"gzip"]),
+    ?assertEqual(undefined, header(~"grpc-encoding", Plain)).
+
+compression_after_a_response_is_internal(Config) ->
+    {_, [~"one"], Trailers, _} = call(Config, ~"LateCompression", [~"x"]),
+    ?assertEqual(~"13", header(~"grpc-status", Trailers)).
+
+%% A message sent from a copy of the stream set to compress, after the
+%% headers went out uncompressed, goes out uncompressed: it follows what the
+%% headers announced.
+messages_follow_the_announced_encoding(Config) ->
+    {Headers, [~"one", ~"two"], _, _} =
+        call(Config, ~"StaleCompression", [{~"grpc-accept-encoding", ~"gzip"}], [~"x"]),
+    ?assertEqual(undefined, header(~"grpc-encoding", Headers)).
+
+%% The route's `send_compression` (gzip here) applies when the client reads
+%% it, and every response advertises what it reads.
+route_compression_applies(Config) ->
+    {Headers, [{compressed, Gz}], _, _} =
+        call(Config, ~"Unary", [{~"grpc-accept-encoding", ~"gzip"}], [~"hi"]),
+    ?assertEqual(~"gzip", header(~"grpc-encoding", Headers)),
+    ?assertEqual(~"identity,gzip,deflate", header(~"grpc-accept-encoding", Headers)),
+    ?assertEqual(~"hi", zlib:gunzip(Gz)),
+    {Plain, [~"hi"], _, _} = call(Config, ~"Unary", [~"hi"]),
+    ?assertEqual(undefined, header(~"grpc-encoding", Plain)).
+
 %% --- helpers ---
 
 open(Config) ->
@@ -505,7 +598,10 @@ call(Config, Method, Extra, Messages) ->
     ).
 
 raw_call(Config, Method, Bytes) ->
-    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, Method/binary>>, []),
+    raw_call(Config, Method, [], Bytes).
+
+raw_call(Config, Method, Extra, Bytes) ->
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, Method/binary>>, Extra),
     C1 = roadrunner_grpc_test_client:send(C0, 1, Bytes),
     roadrunner_grpc_test_client:response(roadrunner_grpc_test_client:finish(C1, 1), 1).
 
