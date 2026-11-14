@@ -1525,6 +1525,25 @@ coalesced_packet_from_another_address_dropped_test() ->
     ?assertEqual([{emit, self(), {connected, expected_info()}}], emits(Effects)),
     ?assertEqual({ok, ?PEER}, ?M:peername(State2)).
 
+path_validation_interval_takes_the_peer_max_ack_delay_test() ->
+    %% The interval between challenges is at least the new path's probe
+    %% timeout from the initial RTT (RFC 9000 §8.2.4), padded with the peer's
+    %% max_ack_delay: 333 + 664 + 1000 = 1997 ms. A 10 ms RTT sample first
+    %% keeps the current path's own probe timeout (1030 ms) below it, so a
+    %% default padding would challenge again by 1100 ms.
+    {State, ClientApSecret, ServerApSecret, CID1} =
+        connected_with_client_spare(#{transport_params => #{max_ack_delay => 1000}}),
+    {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"a", false, ?NOW, State),
+    Ack = [{ack, largest_app_pn(Sent, ServerApSecret), 0, 0, [], undefined}],
+    {State2, _} = ?M:handle_datagram(
+        ?NOW + 10, ?PEER, app_datagram(Ack, 3, ClientApSecret), State1
+    ),
+    Move = app_datagram_to(CID1, [ping | padding(1100)], 4, ClientApSecret),
+    {State3, Effects3} = ?M:handle_datagram(?NOW + 10, ?PEER2, Move, State2),
+    [_First] = challenge_data(sends(Effects3), ServerApSecret),
+    {_State4, Effects4} = ?M:handle_timeout(?NOW + 10 + 1100, path, State3),
+    ?assertEqual([], challenge_data(sends(Effects4), ServerApSecret)).
+
 failed_validation_returns_to_old_path_test() ->
     %% RFC 9000 §8.2.4 / §9.3.2: the new path is challenged again each
     %% interval with fresh data, and when the validation gives up the
@@ -2131,6 +2150,41 @@ idle_floor_ignores_pto_backoff_test() ->
     ),
     {State3, _} = ?M:handle_timeout(?NOW + ?IDLE_TIMEOUT, idle, State2),
     ?assertEqual(closed, ?M:phase(State3)).
+
+peer_max_ack_delay_pads_the_probe_timeout_test() ->
+    %% The application space pads its probe timeout with the peer's
+    %% advertised max_ack_delay (RFC 9002 §6.2.1), not the 25 ms default.
+    Default = pto_after_samples(#{}, 0),
+    Padded = pto_after_samples(#{transport_params => #{max_ack_delay => 1000}}, 0),
+    ?assertEqual(975, Padded - Default).
+
+peer_ack_delay_exponent_decodes_ack_delays_test() ->
+    %% The ACK Delay field is scaled by the peer's ack_delay_exponent (RFC
+    %% 9000 §19.3): 1000 at exponent 3 is 8 ms, taken off the second, 200 ms
+    %% sample (192: smoothed RTT 111, variance 60, PTO 376); at exponent 20
+    %% it is capped at max_ack_delay's 25 ms (175: 109 and 56, PTO 358).
+    Scaled = pto_after_samples(#{}, 1000),
+    Huge = pto_after_samples(#{transport_params => #{ack_delay_exponent => 20}}, 1000),
+    ?assertEqual(18, Scaled - Huge).
+
+%% The probe timeout armed after two 1-RTT RTT samples, of 100 ms and then
+%% 200 ms, each ACK carrying `DelayField`, on a connection whose ClientHello
+%% takes `HelloOpts`.
+pto_after_samples(HelloOpts, DelayField) ->
+    {State0, ClientApSecret, ServerApSecret} = connect_owned(#{}, HelloOpts),
+    {State1, Sent1} = ?M:handle_send(self(), make_ref(), 0, ~"a", false, ?NOW, State0),
+    Ack1 = [{ack, largest_app_pn(Sent1, ServerApSecret), DelayField, 0, [], undefined}],
+    {State2, _} = ?M:handle_datagram(
+        ?NOW + 100, ?PEER, app_datagram(Ack1, 9, ClientApSecret), State1
+    ),
+    {State3, Sent2} = ?M:handle_send(self(), make_ref(), 0, ~"b", false, ?NOW + 200, State2),
+    Ack2 = [{ack, largest_app_pn(Sent2, ServerApSecret), DelayField, 0, [], undefined}],
+    {State4, _} = ?M:handle_datagram(
+        ?NOW + 400, ?PEER, app_datagram(Ack2, 10, ClientApSecret), State3
+    ),
+    {_State5, Effects} = ?M:handle_send(self(), make_ref(), 0, ~"c", false, ?NOW + 400, State4),
+    [At] = [A || {arm_timer, pto, A} <- Effects],
+    At.
 
 idle_timer_armed_when_nothing_in_flight_test() ->
     %% With no ack-eliciting bytes in flight (the peer just acknowledged the
@@ -4354,7 +4408,10 @@ handshaking_owned(Extra, HelloOpts) ->
 %% Connected with this process as owner, plus the spare connection id
 %% (sequence number 1) the server issued on confirmation.
 connected_with_spare() ->
-    {State, Effects, ClientApSecret, ServerApSecret} = connect_owned_effects(#{}, #{}),
+    connected_with_spare(#{}).
+
+connected_with_spare(HelloOpts) ->
+    {State, Effects, ClientApSecret, ServerApSecret} = connect_owned_effects(#{}, HelloOpts),
     [{new_connection_id, 1, 0, CID1, _Token}] = new_cids(Effects, ServerApSecret),
     {State, ClientApSecret, ServerApSecret, CID1}.
 
@@ -4454,7 +4511,10 @@ sends_to(Addr, Effects) ->
 %% Connected with a spare id from each side: the server's (sequence number
 %% 1, returned) and the client's (?CLIENT_SPARE, sequence number 1).
 connected_with_client_spare() ->
-    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_spare(),
+    connected_with_client_spare(#{}).
+
+connected_with_client_spare(HelloOpts) ->
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_spare(HelloOpts),
     New = {new_connection_id, 1, 0, ?CLIENT_SPARE, <<1:128>>},
     {State1, _} = ?M:handle_datagram(?NOW, ?PEER, to_scid([New], 1, ClientApSecret), State),
     {State1, ClientApSecret, ServerApSecret, CID1}.

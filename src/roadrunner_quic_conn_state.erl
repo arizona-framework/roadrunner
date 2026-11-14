@@ -625,11 +625,17 @@ initial_amp(#{address_validated := true}) ->
 initial_amp(#{}) ->
     roadrunner_quic_amp:new().
 
+%% A handshake-time space (Initial, Handshake), whose packets the peer
+%% acknowledges at once (RFC 9000 §13.2.1, `roadrunner_quic_loss:new/1`).
 -spec new_space() -> #space{}.
 new_space() ->
+    new_space(roadrunner_quic_loss:new(#{handshake => true})).
+
+-spec new_space(roadrunner_quic_loss:t()) -> #space{}.
+new_space(Loss) ->
     #space{
         ack = roadrunner_quic_ack:new(),
-        loss = roadrunner_quic_loss:new(#{}),
+        loss = Loss,
         crypto = roadrunner_quic_stream:new()
     }.
 
@@ -2119,7 +2125,9 @@ start_validation(Now, Stage, State) ->
     #space{loss = Loss} = space(application, State),
     Interval = max(
         roadrunner_quic_loss:get_pto(Loss),
-        roadrunner_quic_loss:get_pto(roadrunner_quic_loss:new(#{}))
+        roadrunner_quic_loss:get_pto(
+            roadrunner_quic_loss:new(maps:with([max_ack_delay], State#state.peer_params))
+        )
     ),
     queue_challenge(State#state{
         validation = #validation{
@@ -2448,7 +2456,7 @@ process_handshake(
             %% Lower the idle timeout to the negotiated minimum (RFC 9000 §10.1)
             %% now that the peer's advertised value is known.
             IdleTimeout = negotiated_idle_timeout(OurParams, PeerParams),
-            State1 = install_keys(
+            State0 = install_keys(
                 Installs,
                 State#state{
                     tls = Tls1,
@@ -2461,6 +2469,7 @@ process_handshake(
                     idle_deadline = State#state.last_rx + IdleTimeout
                 }
             ),
+            State1 = peer_ack_delay(State0),
             State2 = queue_crypto(initial, InitialFlight, State1),
             queue_crypto(handshake, HandshakeFlight, State2);
         {retry, HelloRetryRequest, Tls1} ->
@@ -2533,12 +2542,36 @@ connection_keys(Aead, Secret, Direction) ->
         roadrunner_quic_keys:traffic_keys(Aead, Secret), Direction
     ).
 
+%% The application space opens when its keys install, after the ClientHello
+%% brought the peer's transport parameters: it times its probes and reads
+%% ACK delays by the peer's max_ack_delay and ack_delay_exponent (RFC 9000
+%% §18.2), the defaults when absent. Initial and Handshake open at birth.
 -spec ensure_space(level(), t()) -> t().
-ensure_space(Level, #state{spaces = Spaces} = State) ->
-    case Spaces of
-        #{Level := _} -> State;
-        #{} -> State#state{spaces = Spaces#{Level => new_space()}}
-    end.
+ensure_space(application, #state{spaces = #{application := _}} = State) ->
+    State;
+ensure_space(application, #state{spaces = Spaces, peer_params = PeerParams} = State) ->
+    Loss = roadrunner_quic_loss:new(maps:with([max_ack_delay, ack_delay_exponent], PeerParams)),
+    State#state{spaces = Spaces#{application => new_space(Loss)}};
+ensure_space(_Level, State) ->
+    State.
+
+%% The handshake-time spaces open before the peer's transport parameters
+%% arrive. Its max_ack_delay still sets their persistent congestion duration
+%% (RFC 9002 §7.6.1), and its exponent decodes their ACKs (RFC 9000 §19.3).
+-spec peer_ack_delay(t()) -> t().
+peer_ack_delay(#state{peer_params = PeerParams, spaces = Spaces} = State) ->
+    Params = maps:with([max_ack_delay, ack_delay_exponent], PeerParams),
+    State#state{
+        spaces = maps:map(
+            fun
+                (application, Space) ->
+                    Space;
+                (_Level, #space{loss = Loss} = Space) ->
+                    Space#space{loss = roadrunner_quic_loss:set_ack_delay(Params, Loss)}
+            end,
+            Spaces
+        )
+    }.
 
 %% Forget a packet-number space and its keys (RFC 9001 §4.9).
 -spec discard_space(level(), t()) -> t().

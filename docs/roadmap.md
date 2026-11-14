@@ -126,6 +126,10 @@ need.
   ack-eliciting packet sent since the last receive, and only on a packet
   that was processed (today any datagram restarts it, one that fails to
   decrypt included) — small
+- One RTT estimate per path (RFC 9002 §5): each packet number space keeps
+  its own, so the application space starts from the 333 ms initial RTT
+  rather than the handshake's samples, and its first probe timeouts run
+  long — small
 
 ### Throughput levers identified by profiling
 
