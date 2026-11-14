@@ -17,6 +17,7 @@ otherwise.
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("gpb/descr_src/gpb_descriptor.hrl").
 
 -export([suite/0, all/0, groups/0, init_per_suite/1, end_per_suite/1]).
 -export([
@@ -40,11 +41,13 @@ otherwise.
     unsupported_response_type/1,
     cancel_after_begin/1,
     timeout_on_sleeping_server/1,
+    reflection/1,
     official_client/1,
     adapter_eunit/1
 ]).
 
 -define(PB, test_pb).
+-define(F, roadrunner_grpc_reflection_test_files).
 -define(SVC, ~"/grpc.testing.TestService/").
 
 %% The server cases gRPC's interop clients run against a server.
@@ -97,7 +100,8 @@ groups() ->
             unimplemented_service,
             unsupported_response_type,
             cancel_after_begin,
-            timeout_on_sleeping_server
+            timeout_on_sleeping_server,
+            reflection
         ]}
     ].
 
@@ -107,7 +111,7 @@ init_per_suite(Config) ->
         port => 0,
         protocols => [http2],
         body_buffering => manual,
-        routes => roadrunner_grpc_protobuf_interop:routes()
+        routes => roadrunner_grpc_protobuf_interop:routes(#{reflection => true})
     }),
     %% The suite's processes come and go per case; the listener stays.
     true = unlink(Pid),
@@ -389,6 +393,54 @@ client_result(Port, Output) ->
 
 %% The adapter's eunit tests: `rebar3 eunit` runs `src/` and `test/` only,
 %% and `--dir grpc_protobuf/test` would run the core's twice.
+%% Server reflection describes TestService with the files the gpb module
+%% gave: gpb's own descriptor module reads each one, and the imports a file
+%% names come with it.
+reflection(Config) ->
+    [Services, Method, Message] = reflection_info(Config, [
+        ?F:field(7, <<>>),
+        ?F:field(4, ~"grpc.testing.TestService.UnaryCall"),
+        ?F:field(4, ~"grpc.testing.SimpleRequest")
+    ]),
+    [List] = ?F:values(6, Services),
+    ?assert(
+        lists:member(
+            [{1, ~"grpc.testing.TestService"}],
+            [?F:fields(Service) || Service <- ?F:values(1, ?F:fields(List))]
+        )
+    ),
+    [Test, Empty, Messages] = reflected_files(Method),
+    #'FileDescriptorProto'{
+        name = "grpc/testing/test.proto",
+        package = "grpc.testing",
+        dependency = ["empty.proto", "messages.proto"],
+        service = Services1
+    } = Test,
+    [#'MethodDescriptorProto'{input_type = ".grpc.testing.SimpleRequest"}] = [
+        Rpc
+     || #'ServiceDescriptorProto'{name = "TestService", method = Rpcs} <- Services1,
+        #'MethodDescriptorProto'{name = "UnaryCall"} = Rpc <- Rpcs
+    ],
+    #'FileDescriptorProto'{name = "empty.proto"} = Empty,
+    #'FileDescriptorProto'{name = "messages.proto", message_type = Types} = Messages,
+    ?assert(lists:keymember("SimpleRequest", #'DescriptorProto'.name, Types)),
+    %% messages.proto went out with the method's file already.
+    ?assertEqual([Messages], reflected_files(Message)).
+
+reflected_files(Response) ->
+    [Files] = ?F:values(4, Response),
+    [
+        gpb_descriptor:decode_msg(File, 'FileDescriptorProto')
+     || File <- ?F:values(1, ?F:fields(Files))
+    ].
+
+reflection_info(Config, Requests) ->
+    {_, Responses, Trailers, _} = roadrunner_grpc_test_client:call(
+        open(Config), 1, ~"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo", Requests
+    ),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)),
+    [?F:fields(Response) || Response <- Responses].
+
 adapter_eunit(_Config) ->
     ok = eunit:test(roadrunner_grpc_protobuf_tests, []).
 

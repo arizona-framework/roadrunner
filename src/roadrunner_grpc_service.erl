@@ -63,10 +63,12 @@ roadrunner_grpc:routes(#{services => [
 -type rpc() :: #{function := atom(), kind := kind(), input := term(), output := term()}.
 
 -doc """
-A service given as data: its full name, its methods, and the module whose
-functions they call.
+A service given as data: its full name, its methods, the module whose
+functions they call, and maybe its `files`, as `files/0` returns them.
 """.
--type descriptor() :: #{name := binary(), module := module(), rpcs := #{binary() => rpc()}}.
+-type descriptor() :: #{
+    name := binary(), module := module(), rpcs := #{binary() => rpc()}, files => [binary()]
+}.
 
 -doc """
 The service's full name, `package.Service` as the `.proto` file declares
@@ -76,3 +78,14 @@ it, the first segment of a call's path.
 
 -doc "The service's methods, by the method name a call's path ends with.".
 -callback rpcs() -> #{binary() => rpc()}.
+
+-doc """
+The `.proto` files of the service, for gRPC's server reflection
+(`roadrunner_grpc_reflection`): each one a serialized
+`google.protobuf.FileDescriptorProto`, the file that declares the service
+and the files it imports. Optional: reflection leaves a service without
+it out of its list, since a client could not describe it.
+""".
+-callback files() -> [binary()].
+
+-optional_callbacks([files/0]).

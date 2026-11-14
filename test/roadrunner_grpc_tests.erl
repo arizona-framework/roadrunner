@@ -83,6 +83,70 @@ routes_health_test() ->
     ?assertEqual([], ?M:routes(#{services => [], health => false})),
     ?assertError({invalid_grpc_opt, health, yes}, ?M:routes(#{services => [], health => yes})).
 
+%% `reflection => true` adds reflection's two routes, after the health
+%% service's, each answering from every service, the health service and
+%% its own among them; `false`, the default, none.
+routes_reflection_test() ->
+    [V1, V1Alpha] = Own = roadrunner_grpc_reflection:services(),
+    Described = [?SVC, roadrunner_grpc_health | Own],
+    ?assertMatch(
+        [
+            #{state := #{service := roadrunner_grpc_health}},
+            #{
+                path := ~"/grpc.reflection.v1.ServerReflection/:method",
+                handler := ?M,
+                state := #{service := V1, reflection := Described}
+            },
+            #{
+                path := ~"/grpc.reflection.v1alpha.ServerReflection/:method",
+                state := #{service := V1Alpha, reflection := Described}
+            },
+            #{state := #{service := ?SVC}}
+        ],
+        ?M:routes(#{services => [?SVC], health => true, reflection => true})
+    ),
+    ?assertMatch(
+        [_, _], ?M:routes(#{services => [], reflection => true})
+    ),
+    ?assertEqual([], ?M:routes(#{services => [], reflection => false})),
+    ?assertError(
+        {invalid_grpc_opt, reflection, yes}, ?M:routes(#{services => [], reflection => yes})
+    ),
+    %% The routes compile, the index built from the services' files.
+    _ = [
+        ?M:init_route(State)
+     || #{state := State} <- ?M:routes(#{services => [?SVC], health => true, reflection => true})
+    ],
+    ok.
+
+%% A descriptor's `files` are FileDescriptorProtos: not a list of binaries,
+%% the routes refuse it; bytes that do not read as one, the reflection
+%% route does. A reflection route's services that are not a list, it
+%% refuses too.
+reflection_files_test() ->
+    WithFiles = (descriptor())#{files => [roadrunner_grpc_reflection_test_files:ext()]},
+    ?assertMatch([_], ?M:routes(#{services => [WithFiles]})),
+    _ = ?M:init_route(#{service => WithFiles}),
+    NotList = (descriptor())#{files => x},
+    ?assertError({invalid_grpc_opt, services, [NotList]}, ?M:routes(#{services => [NotList]})),
+    ?assertError({invalid_grpc_opt, service, NotList}, ?M:init_route(#{service => NotList})),
+    NotBinaries = (descriptor())#{files => [x]},
+    ?assertError(
+        {invalid_grpc_opt, services, [NotBinaries]}, ?M:routes(#{services => [NotBinaries]})
+    ),
+    Malformed = (descriptor())#{files => [<<10, 9, "ab">>]},
+    [Own | _] = roadrunner_grpc_reflection:services(),
+    ?assertError(
+        {invalid_grpc_opt, service, Malformed},
+        ?M:init_route(#{service => Own, reflection => [Malformed]})
+    ),
+    ?assertError(
+        {invalid_grpc_opt, reflection, true}, ?M:init_route(#{service => Own, reflection => true})
+    ),
+    %% A service module without files/0 gives none.
+    _ = ?M:init_route(#{service => Own, reflection => [roadrunner_grpc_unexported_service]}),
+    ok.
+
 %% A codec module that does not exist, and a service whose rpcs/0 is not a
 %% map, are refused.
 init_route_missing_codec_and_bad_rpcs_test() ->

@@ -30,6 +30,22 @@ introspection functions (also the default). Each method's message types
 are `{GpbModule, MessageName}`, which is how the codec knows the module
 to call: `GpbModule:encode_msg(Message, MessageName)` and
 `GpbModule:decode_msg(Bytes, MessageName)`.
+
+Generated with gpb's `descriptor` option too, the module describes its
+`.proto` files, which the service then gives as its `files` for gRPC's
+server reflection (`roadrunner_grpc_reflection`). Two things in gpb's
+descriptions are put the way protoc writes them, which tools such as
+`grpcurl` expect:
+
+- gpb names a file after its package's path
+  (`helloworld/helloworld.proto`) yet its imports as written
+  (`import "common.proto"`): a file another one imports is named as that
+  import names it, so the import is found; a file none imports keeps gpb's
+  name
+- gpb declares a map field's entry as a message of the file
+  (`MapFieldEntry_1_3`, its key and value required): each map field gets
+  its entry inside its own message, named after the field (`labels` has
+  `LabelsEntry`), its key and value optional
 """.
 
 -behaviour(roadrunner_grpc_codec).
@@ -39,6 +55,9 @@ to call: `GpbModule:encode_msg(Message, MessageName)` and
 -export([snake_case/1]).
 
 -export_type([message_type/0, opts/0]).
+
+%% A protobuf field: its number, its bytes as they are, and its value.
+-type proto_field() :: {pos_integer(), binary(), binary() | non_neg_integer()}.
 
 -define(UPPER(C), (C >= $A andalso C =< $Z)).
 -define(LOWER_OR_DIGIT(C), (C >= $a andalso C =< $z orelse C >= $0 andalso C =< $9)).
@@ -115,20 +134,237 @@ service(GpbModule, Service, Module, Opts) when is_atom(GpbModule), is_atom(Modul
     _ = code:ensure_loaded(Module),
     Methods = [rpc(GpbModule, ServiceName, Def, Naming) || Def <- Rpcs],
     ok = check_unique_functions(Methods),
-    #{
+    with_files(GpbModule, #{
         name => GpbModule:service_name_to_fqbin(ServiceName),
         module => Module,
         rpcs => maps:from_list([
             Method
          || {_, Rpc} = Method <- Methods, kept(Module, Rpc, Unexported)
         ])
-    };
+    });
 service(_GpbModule, _Service, _Module, Opts) when not is_map(Opts) ->
     error({invalid_grpc_protobuf_opts, Opts});
 service(GpbModule, _Service, _Module, _Opts) when not is_atom(GpbModule) ->
     error({invalid_gpb_module, GpbModule});
 service(_GpbModule, _Service, Module, _Opts) ->
     error({invalid_module, Module}).
+
+%% The service with the serialized FileDescriptorProtos of the module's
+%% `.proto` files as its `files`, when gpb's `descriptor` option generated
+%% them, put the way protoc writes them (see the moduledoc).
+-spec with_files(module(), roadrunner_grpc_service:descriptor()) ->
+    roadrunner_grpc_service:descriptor().
+with_files(GpbModule, Service) ->
+    case erlang:function_exported(GpbModule, descriptor, 1) of
+        true ->
+            Protos = [
+                {Proto, fields(GpbModule:descriptor(Proto))}
+             || Proto <- GpbModule:get_all_proto_names()
+            ],
+            Imports = [Import || {_, Fields} <- Protos, {3, _, Import} <- Fields],
+            Service#{
+                files => [
+                    file(file_name(Proto, string(1, Fields), Imports), Fields)
+                 || {Proto, Fields} <- Protos
+                ]
+            };
+        false ->
+            Service
+    end.
+
+%% The name a file is imported by, its base name without `.proto` being
+%% gpb's name for it; gpb's own name when no file imports it.
+-spec file_name(string(), binary(), [binary()]) -> binary().
+file_name(Proto, GpbName, Imports) ->
+    case
+        [
+            Import
+         || Import <- Imports, filename:basename(Import, ~".proto") =:= list_to_binary(Proto)
+        ]
+    of
+        [Import | _] -> Import;
+        [] -> GpbName
+    end.
+
+%% A FileDescriptorProto named `Name` (1), its map entries (top-level
+%% messages, 4, whose MessageOptions, 7, say `map_entry`, 7) moved into the
+%% messages whose map fields use them.
+-spec file(binary(), [proto_field()]) -> binary().
+file(Name, Fields) ->
+    Scope =
+        case string(2, Fields) of
+            <<>> -> <<>>;
+            Package -> <<".", Package/binary>>
+        end,
+    Entries =
+        #{
+            <<Scope/binary, ".", (string(1, fields(Message)))/binary>> => Message
+         || {4, _, Message} <- Fields, map_entry(Message)
+        },
+    iolist_to_binary([
+        field(1, Name)
+        | [
+            file_field(Field, Scope, Entries)
+         || {Number, _, _} = Field <- Fields, Number =/= 1
+        ]
+    ]).
+
+-spec file_field(proto_field(), binary(), #{binary() => binary()}) -> iodata().
+file_field({_, Raw, _}, _Scope, Entries) when map_size(Entries) =:= 0 ->
+    Raw;
+file_field({4, _Raw, Message}, Scope, Entries) ->
+    case map_entry(Message) of
+        true -> [];
+        false -> field(4, message(Message, Scope, Entries))
+    end;
+file_field({_, Raw, _}, _Scope, _Entries) ->
+    Raw.
+
+%% A DescriptorProto in `Scope`: each map field (2) gets its entry as a
+%% nested message (3), nested messages the same within the message.
+-spec message(binary(), binary(), #{binary() => binary()}) -> iodata().
+message(Message, Scope, Entries) ->
+    Fields = fields(Message),
+    FullName = <<Scope/binary, ".", (string(1, Fields))/binary>>,
+    Own = [
+        {Raw, Field, FieldName, Entry}
+     || {2, Raw, Field} <- Fields,
+        #{6 := TypeName, 1 := FieldName} <- [last_values(fields(Field))],
+        #{TypeName := Entry} <- [Entries]
+    ],
+    [
+        [
+            case Number of
+                2 -> field_descriptor(Raw, Value, Own, FullName);
+                3 -> field(3, message(Value, FullName, Entries));
+                _ -> Raw
+            end
+         || {Number, Raw, Value} <- Fields
+        ],
+        [field(3, entry(Entry, entry_name(FieldName))) || {_, _, FieldName, Entry} <- Own]
+    ].
+
+%% A field: a map field's `type_name` (6) names its own entry, and a
+%% group's (`type` 10) name (1) is its message's name lowercased, as protoc
+%% has it (gpb gives the message's name as it is).
+-spec field_descriptor(binary(), binary(), [{binary(), binary(), binary(), binary()}], binary()) ->
+    iodata().
+field_descriptor(Raw, Field, Own, FullName) ->
+    case lists:keyfind(Raw, 1, Own) of
+        {Raw, Field, FieldName, _Entry} ->
+            field(2, [
+                [FieldRaw || {Number, FieldRaw, _} <- fields(Field), Number =/= 6],
+                field(6, <<FullName/binary, ".", (entry_name(FieldName))/binary>>)
+            ]);
+        false ->
+            case last_values(fields(Field)) of
+                #{5 := 10} -> field(2, group_field(Field));
+                #{} -> Raw
+            end
+    end.
+
+-spec group_field(binary()) -> iodata().
+group_field(Field) ->
+    [
+        case Number of
+            1 -> field(1, roadrunner_bin:ascii_lowercase(Value));
+            _ -> FieldRaw
+        end
+     || {Number, FieldRaw, Value} <- fields(Field)
+    ].
+
+%% A map entry named `Name` (1), its fields' (2) `label` (4)
+%% LABEL_OPTIONAL (1).
+-spec entry(binary(), binary()) -> iodata().
+entry(Entry, Name) ->
+    [
+        field(1, Name)
+        | [
+            case Number of
+                1 ->
+                    [];
+                2 ->
+                    field(2, [
+                        [Raw || {N, Raw, _} <- fields(Field), N =/= 4],
+                        [4 bsl 3, 1]
+                    ]);
+                _ ->
+                    FieldRaw
+            end
+         || {Number, FieldRaw, Field} <- fields(Entry)
+        ]
+    ].
+
+%% protoc's name for a map field's entry: `foo_bar` has `FooBarEntry`.
+-spec entry_name(binary()) -> binary().
+entry_name(FieldName) ->
+    <<(camel_case(FieldName, true))/binary, "Entry">>.
+
+-spec camel_case(binary(), boolean()) -> binary().
+camel_case(<<"_", Rest/binary>>, _Capital) ->
+    camel_case(Rest, true);
+camel_case(<<C, Rest/binary>>, true) when C >= $a, C =< $z ->
+    <<(C - 32), (camel_case(Rest, false))/binary>>;
+camel_case(<<C, Rest/binary>>, _Capital) ->
+    <<C, (camel_case(Rest, false))/binary>>;
+camel_case(<<>>, _Capital) ->
+    <<>>.
+
+%% Whether a DescriptorProto is a map entry: its MessageOptions (7) say
+%% `map_entry` (7).
+-spec map_entry(binary()) -> boolean().
+map_entry(Message) ->
+    lists:member(1, [Value || {7, _, Options} <- fields(Message), {7, _, Value} <- fields(Options)]).
+
+%% The last value of each field.
+-spec last_values([proto_field()]) -> #{pos_integer() => binary() | non_neg_integer()}.
+last_values(Fields) ->
+    maps:from_list([{Number, Value} || {Number, _, Value} <- Fields]).
+
+%% A length-delimited field's last value, the empty one when absent.
+-spec string(pos_integer(), [proto_field()]) -> binary().
+string(Number, Fields) ->
+    case last_values(Fields) of
+        #{Number := Value} -> Value;
+        #{} -> <<>>
+    end.
+
+%% A length-delimited field.
+-spec field(pos_integer(), iodata()) -> iodata().
+field(Number, Value) ->
+    [varint((Number bsl 3) bor 2), varint(iolist_size(Value)), Value].
+
+-spec varint(non_neg_integer()) -> binary().
+varint(N) when N < 128 -> <<N>>;
+varint(N) -> <<1:1, (N band 127):7, (varint(N bsr 7))/binary>>.
+
+%% A descriptor message's fields, each its number, its bytes as they are
+%% and its value; descriptors hold varints and length-delimited fields only,
+%% at the levels read here.
+-spec fields(binary()) -> [proto_field()].
+fields(<<>>) ->
+    [];
+fields(Bytes) ->
+    {Key, Rest} = read_varint(Bytes, 0, 0),
+    {Value, Rest1} =
+        case Key band 7 of
+            0 ->
+                read_varint(Rest, 0, 0);
+            2 ->
+                {Len, Rest0} = read_varint(Rest, 0, 0),
+                <<Payload:Len/binary, After/binary>> = Rest0,
+                {Payload, After}
+        end,
+    Size = byte_size(Bytes) - byte_size(Rest1),
+    <<Raw:Size/binary, _/binary>> = Bytes,
+    [{Key bsr 3, Raw, Value} | fields(Rest1)].
+
+-spec read_varint(binary(), non_neg_integer(), non_neg_integer()) ->
+    {non_neg_integer(), binary()}.
+read_varint(<<1:1, Low:7, Rest/binary>>, Shift, Acc) ->
+    read_varint(Rest, Shift + 7, Acc bor (Low bsl Shift));
+read_varint(<<0:1, Low:7, Rest/binary>>, Shift, Acc) ->
+    {Acc bor (Low bsl Shift), Rest}.
 
 %% A gpb module generated with services: `get_service_def/1` is what tells
 %% them.

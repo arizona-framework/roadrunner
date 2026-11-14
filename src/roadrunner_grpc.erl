@@ -37,8 +37,9 @@ from starting:
 - `send_compression`: how the response messages are compressed, `gzip`,
   `deflate` or by default `identity`, none (see Compression)
 - `health`: `true` adds gRPC's health service (`roadrunner_grpc_health`)
-  to the routes; by default `false`. The health route keeps the defaults:
-  the shared options apply to the services' routes
+  to the routes; by default `false`
+- `reflection`: `true` adds gRPC's server reflection
+  (`roadrunner_grpc_reflection`) to the routes; by default `false`
 - `max_content_length`: the most a call's requests may add up to, in bytes,
   for `routes/1` to set on each route in place of the listener's (10 MiB
   by default); past it the call ends with `RESOURCE_EXHAUSTED` with
@@ -46,6 +47,9 @@ from starting:
   the body is read before the call starts. A client or
   bidi stream that lives long can carry more than that over its life, so
   set it to what such a call may total
+
+The health and reflection routes keep the defaults: the shared options
+apply to the services' routes.
 
 ## Body buffering
 
@@ -118,6 +122,7 @@ are each an entry, and one that is not base64 ends the call with
 -export([routes/1, init_route/1, handle/1]).
 -export([recv/1, send/2, send/3, metadata/1, set_headers/2, set_trailers/2, deadline/1, peer/1]).
 -export([set_send_compression/2, cancelled/2, recv_compressed/1]).
+-export([reflection_index/1]).
 
 -export_type([opts/0, status/0, stream/0, encoding/0]).
 
@@ -133,7 +138,7 @@ are each an entry, and one that is not base64 ends the call with
 %% stops the method at its next write or read, after a read waiting at the
 %% deadline had the time to answer.
 -define(CANCEL_GRACE, 1000).
--define(OPTS, [service, codecs, max_message_size, send_compression]).
+-define(OPTS, [service, codecs, max_message_size, send_compression, reflection]).
 
 -doc """
 The options `routes/1` takes: `services`, and the route options shared by
@@ -145,7 +150,8 @@ every service (see the moduledoc).
     max_message_size => pos_integer(),
     max_content_length => non_neg_integer(),
     send_compression => encoding(),
-    health => boolean()
+    health => boolean(),
+    reflection => boolean()
 }.
 
 -doc """
@@ -176,7 +182,9 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
     rpcs :: #{binary() => {atom(), roadrunner_grpc_service:kind(), term(), term()}},
     codecs :: #{binary() => module()},
     max_message_size :: pos_integer(),
-    send_compression :: encoding()
+    send_compression :: encoding(),
+    %% What the reflection service answers from, on its own routes.
+    reflection = undefined :: roadrunner_grpc_reflection:index() | undefined
 }).
 
 -record(stream, {
@@ -221,9 +229,11 @@ other options its state.
 """.
 -spec routes(opts()) -> roadrunner_router:routes().
 routes(#{services := Services} = Opts) when is_list(Services) ->
-    Shared = maps:without([services, max_content_length, health], Opts),
+    Shared = maps:without([services, max_content_length, health, reflection], Opts),
     Limits = maps:with([max_content_length], Opts),
-    health_route(Opts) ++
+    Health = health_route(Opts),
+    Health ++
+        reflection_routes(Opts, Services, Health) ++
         [
             Limits#{
                 path => <<"/", (service_name(Service, Services))/binary, "/:method">>,
@@ -253,11 +263,35 @@ health_route(#{health := Other}) ->
 health_route(#{}) ->
     [].
 
+%% Reflection's routes, with `reflection => true`: its own two versions,
+%% answering from every service the routes serve, the health service and
+%% reflection itself among them. Like the health service, it takes the raw
+%% codec.
+-spec reflection_routes(map(), [term()], roadrunner_router:routes()) -> roadrunner_router:routes().
+reflection_routes(#{reflection := true}, Services, Health) ->
+    Own = roadrunner_grpc_reflection:services(),
+    Described = Services ++ [Service || #{state := #{service := Service}} <- Health] ++ Own,
+    [
+        #{
+            path => <<"/", Name/binary, "/:method">>,
+            handler => ?MODULE,
+            state => #{service => Service, reflection => Described}
+        }
+     || #{name := Name} = Service <- Own
+    ];
+reflection_routes(#{reflection := false}, _Services, _Health) ->
+    [];
+reflection_routes(#{reflection := Other}, _Services, _Health) ->
+    error({invalid_grpc_opt, reflection, Other});
+reflection_routes(#{}, _Services, _Health) ->
+    [].
+
 -spec service_name(term(), [term()]) -> binary().
-service_name(#{name := Name, module := Module, rpcs := Rpcs} = Service, _Services) when
-    is_binary(Name), is_atom(Module), is_map(Rpcs), map_size(Service) =:= 3
-->
-    Name;
+service_name(#{name := Name, rpcs := Rpcs} = Service, Services) when is_map(Rpcs) ->
+    case descriptor(Service) of
+        true -> Name;
+        false -> error({invalid_grpc_opt, services, Services})
+    end;
 service_name(Service, Services) ->
     maybe
         true ?= is_atom(Service),
@@ -286,7 +320,8 @@ init_route(#{service := Service} = Opts) ->
         rpcs = rpcs(Module, Rpcs),
         codecs = codecs(maps:get(codecs, Opts, [roadrunner_grpc_codec_raw])),
         max_message_size = max_message_size(Opts),
-        send_compression = send_compression(Opts)
+        send_compression = send_compression(Opts),
+        reflection = reflection(Opts)
     };
 init_route(Opts) ->
     error({invalid_grpc_opts, Opts}).
@@ -304,13 +339,54 @@ check_known_opts(Opts) ->
 service(Service) when is_atom(Service) ->
     ok = loaded(Service, Service),
     {Service, Service:rpcs()};
-service(#{name := Name, module := Module, rpcs := Rpcs} = Service) when
-    is_binary(Name), is_atom(Module), map_size(Service) =:= 3
-->
-    ok = loaded(Module, Service),
-    {Module, Rpcs};
+service(#{module := Module, rpcs := Rpcs} = Service) ->
+    case descriptor(Service) of
+        true ->
+            ok = loaded(Module, Service),
+            {Module, Rpcs};
+        false ->
+            error({invalid_grpc_opt, service, Service})
+    end;
 service(Service) ->
     error({invalid_grpc_opt, service, Service}).
+
+%% A service given as data: its name, module and methods, and maybe its
+%% files (`roadrunner_grpc_service:descriptor/0`), nothing else.
+-spec descriptor(map()) -> boolean().
+descriptor(#{name := Name, module := Module} = Service) when is_binary(Name), is_atom(Module) ->
+    case Service of
+        #{files := Files} ->
+            map_size(Service) =:= 4 andalso is_list(Files) andalso
+                lists:all(fun erlang:is_binary/1, Files);
+        #{} ->
+            map_size(Service) =:= 3
+    end;
+descriptor(#{}) ->
+    false.
+
+%% The reflection service's index, on its routes: each service's name and
+%% files, a module's from its `files/0`, a descriptor's from its `files`.
+-spec reflection(map()) -> roadrunner_grpc_reflection:index() | undefined.
+reflection(#{reflection := Services}) when is_list(Services) ->
+    roadrunner_grpc_reflection:index([
+        {service_name(Service, Services), Service, service_files(Service)}
+     || Service <- Services
+    ]);
+reflection(#{reflection := Other}) ->
+    error({invalid_grpc_opt, reflection, Other});
+reflection(#{}) ->
+    undefined.
+
+-spec service_files(module() | roadrunner_grpc_service:descriptor()) -> term().
+service_files(#{files := Files}) ->
+    Files;
+service_files(#{}) ->
+    [];
+service_files(Module) ->
+    case erlang:function_exported(Module, files, 0) of
+        true -> Module:files();
+        false -> []
+    end.
 
 -spec loaded(module(), term()) -> ok.
 loaded(Module, Service) ->
@@ -1026,6 +1102,13 @@ or `infinity` without one.
 -spec deadline(stream()) -> integer() | infinity.
 deadline(#stream{deadline = Deadline}) ->
     Deadline.
+
+%% The reflection service's index, from its route.
+-doc false.
+-spec reflection_index(stream()) -> roadrunner_grpc_reflection:index().
+reflection_index(#stream{req = Req}) ->
+    #route{reflection = Index} = roadrunner_req:state(Req),
+    Index.
 
 -doc "The client's address.".
 -spec peer(stream()) -> {inet:ip_address(), inet:port_number()} | undefined.
