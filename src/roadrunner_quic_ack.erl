@@ -19,7 +19,7 @@
 %% `ack_deadline/2` when that delay runs out. `ack_delay/2` is how long the
 %% largest packet has waited, for the ACK frame's ACK Delay field.
 
--export([new/0, record/4, largest/1, ranges/1, needs_ack/1, mark_ack_sent/1, to_ack/1]).
+-export([new/0, record/4, received/2, largest/1, ranges/1, needs_ack/1, mark_ack_sent/1, to_ack/1]).
 -export([ack_due/3, ack_deadline/2, ack_delay/2]).
 
 -export_type([t/0, range/0]).
@@ -93,6 +93,21 @@ out_of_order(PN, Largest) -> PN < Largest orelse PN > Largest + 1.
 -spec largest(t()) -> non_neg_integer() | undefined.
 largest(#ack{ranges = []}) -> undefined;
 largest(#ack{ranges = [{_Start, End} | _]}) -> End.
+
+-doc """
+Whether packet number `PN` was already received in this space, so that a
+copy of it is discarded (RFC 9000 §12.3). Every received number stays in
+the ranges, so none is ever taken for new. A number above the largest, the
+usual case, is answered by the first range.
+""".
+-spec received(non_neg_integer(), t()) -> boolean().
+received(PN, #ack{ranges = Ranges}) ->
+    in_ranges(PN, Ranges).
+
+-spec in_ranges(non_neg_integer(), [range()]) -> boolean().
+in_ranges(PN, [{Start, End} | _]) when PN >= Start, PN =< End -> true;
+in_ranges(PN, [{Start, _End} | Rest]) when PN < Start -> in_ranges(PN, Rest);
+in_ranges(_PN, _Ranges) -> false.
 
 -doc "The received ranges, each an inclusive `{Start, End}`, highest first.".
 -spec ranges(t()) -> [range()].

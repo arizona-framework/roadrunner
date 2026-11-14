@@ -1369,12 +1369,20 @@ process_outcome(_Now, {frame_error, Level, _Reason}, State) ->
 -spec process_packet(integer(), roadrunner_quic_recv:decoded(), t()) -> t().
 process_packet(Now, #{level := Level, pn := PN, frames := Frames}, #state{spaces = Spaces} = State) ->
     case Spaces of
-        #{Level := _} ->
-            State1 = on_path(Now, Level, PN, Frames, validate_on_handshake(Level, State)),
-            State2 = lists:foldl(
-                fun(Frame, S) -> process_frame(Now, Level, Frame, S) end, State1, Frames
-            ),
-            record_received(Now, Level, PN, Frames, State2);
+        #{Level := #space{ack = Ack}} ->
+            case roadrunner_quic_ack:received(PN, Ack) of
+                false ->
+                    State1 = on_path(Now, Level, PN, Frames, validate_on_handshake(Level, State)),
+                    State2 = lists:foldl(
+                        fun(Frame, S) -> process_frame(Now, Level, Frame, S) end, State1, Frames
+                    ),
+                    record_received(Now, Level, PN, Frames, State2);
+                true ->
+                    %% A copy of a packet already processed, which an attacker
+                    %% on the path can replay: discarded, now that it is
+                    %% unprotected (RFC 9000 §12.3), so it acts on nothing.
+                    State
+            end;
         #{} ->
             %% A packet for a discarded space (e.g. a late Initial); ignore.
             State

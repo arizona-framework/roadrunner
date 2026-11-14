@@ -1260,6 +1260,19 @@ path_challenge_answered_test() ->
     %% The datagram carrying it fills 1200 bytes (§8.2.2 MUST).
     ?assertEqual([1200], [byte_size(D) || D <- path_datagrams(sends(Effects), ServerApSecret)]).
 
+replayed_packet_is_discarded_test() ->
+    %% RFC 9000 §12.3: a packet whose number was already processed in its
+    %% space is discarded once it is unprotected, so a copy (one an attacker
+    %% on the path replays, say) acts on nothing: here, its PATH_CHALLENGE
+    %% gets no second PATH_RESPONSE.
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Challenge = app_datagram([{path_challenge, ~"8 bytes!"}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Challenge, State),
+    {_State2, Effects} = ?M:handle_datagram(?NOW + 10, ?PEER, Challenge, State1),
+    ?assertNot(
+        lists:member({path_response, ~"8 bytes!"}, sent_app_frames(Effects, ServerApSecret))
+    ).
+
 lost_path_response_not_resent_test() ->
     %% RFC 9000 §13.3: a PATH_RESPONSE is sent once. With a later packet
     %% acknowledged, the probe timeout finds the response's packet lost and
@@ -3530,8 +3543,10 @@ coalesced_initial_error_then_handshake_does_not_crash_test() ->
     CloseFrame = iolist_to_binary(
         roadrunner_quic_frame:encode({connection_close, application, 7, undefined, <<>>})
     ),
+    %% Numbered after the ClientHello's packet 0, which it would otherwise
+    %% copy (a duplicate is discarded, RFC 9000 §12.3).
     BadInitial = ?TC:seal_raw(
-        initial, 0, roadrunner_quic_keys:initial_client(?DCID), CloseFrame, ?DCID, ?SCID
+        initial, 1, roadrunner_quic_keys:initial_client(?DCID), CloseFrame, ?DCID, ?SCID
     ),
     HandshakePing = ?TC:seal(
         handshake,
