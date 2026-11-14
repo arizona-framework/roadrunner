@@ -1250,6 +1250,74 @@ cwnd_after_spread_losses(Spread) ->
     {State5, _} = ?M:handle_datagram(?NOW + 30 + Spread, ?PEER, Ack4, State4),
     ?M:cwnd(State5).
 
+ack_frame_fits_a_packet_however_many_gaps_test() ->
+    %% A client may skip packet numbers (RFC 9000 §12.3), and each gap is one
+    %% more range to acknowledge. The ACK frame still fits in one packet:
+    %% older ranges are left out (§13.2.3), so every datagram stays within
+    %% the 1200 bytes any path carries (§14).
+    {State, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Gappy = lists:foldl(
+        fun(PN, S) ->
+            {S1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], PN, ClientApSecret), S),
+            S1
+        end,
+        State,
+        lists:seq(10, 3000, 2)
+    ),
+    {_State1, Effects} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([ping], 3002, ClientApSecret), Gappy
+    ),
+    Sizes = [byte_size(D) || D <- sends(Effects)],
+    ?assertNotEqual([], Sizes),
+    ?assert(lists:all(fun(Size) -> Size =< 1200 end, Sizes)).
+
+acknowledged_ack_forgets_its_ranges_test() ->
+    %% Once the peer acknowledges a packet of ours carrying an ACK frame, the
+    %% packet numbers that frame acknowledged are no longer acknowledged
+    %% (RFC 9000 §13.2.4).
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], 5, ClientApSecret), State),
+    {State3, Sent} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram([ping], 7, ClientApSecret), State1
+    ),
+    [{ack, 7, _, _, [_], _}] = [
+        F
+     || {ack, _, _, _, _, _} = F <- sent_app_frames(Sent, ServerApSecret)
+    ],
+    AckOfAck = [{ack, largest_app_pn(Sent, ServerApSecret), 0, 0, [], undefined}, ping],
+    {State4, _} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram(AckOfAck, 9, ClientApSecret), State3
+    ),
+    {State5, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], 10, ClientApSecret), State4),
+    {_State6, Sent2} = ?M:handle_timeout(?NOW + 20, ack, State5),
+    %% 9..10, then 7 (the top range when the ACK was acknowledged stays); 5 is
+    %% forgotten.
+    ?assertMatch(
+        [{ack, 10, _, 1, [{0, 0}], _}],
+        [F || {ack, _, _, _, _, _} = F <- sent_app_frames(Sent2, ServerApSecret)]
+    ).
+
+acknowledged_challenge_keeps_unreported_ranges_test() ->
+    %% A path challenge repeats an ACK of the first range only, so the client
+    %% acknowledging it must not forget the ranges below (RFC 9000 §13.2.4
+    %% forgets what an acknowledged ACK frame reported): 5 is still
+    %% acknowledged after.
+    {State, ClientApSecret, ServerApSecret, CID1} = connected_with_client_spare(),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], 5, ClientApSecret), State),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], 7, ClientApSecret), State1),
+    Move = app_datagram_to(CID1, [ping | padding(1100)], 8, ClientApSecret),
+    {State3, Moved} = ?M:handle_datagram(?NOW, ?PEER2, Move, State2),
+    [_] = challenge_data(sends(Moved), ServerApSecret),
+    AckChallenge = [{ack, largest_app_pn(Moved, ServerApSecret), 0, 0, [], undefined}, ping],
+    {State4, _} = ?M:handle_datagram(
+        ?NOW, ?PEER, app_datagram(AckChallenge, 9, ClientApSecret), State3
+    ),
+    {State5, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram([ping], 10, ClientApSecret), State4),
+    {_State6, Sent} = ?M:handle_timeout(?NOW + 20, ack, State5),
+    Acks = [F || {ack, _, _, _, _, _} = F <- sent_app_frames(Sent, ServerApSecret)],
+    %% 7..10, then 5 (and the client's earlier packets below).
+    ?assertMatch([{ack, 10, _, 3, [{0, 0} | _], _}], Acks).
+
 path_challenge_answered_test() ->
     %% RFC 9000 §8.2.2: a PATH_CHALLENGE gets a PATH_RESPONSE echoing its data.
     {State, ClientApSecret, ServerApSecret} = connect_owned(),

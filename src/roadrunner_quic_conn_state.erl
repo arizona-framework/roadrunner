@@ -2583,12 +2583,13 @@ apply_ack(Now, Level, Ack, Space, #state{cc = Cc} = State) ->
         {error, negative_ack_range} ->
             %% RFC 9000 §19.3.1: a range reaching below packet number 0.
             connection_fatal(Level, frame_encoding_error, State);
-        {Loss, _Acked, Lost} ->
+        {Loss, Acked, Lost} ->
             Cc1 = apply_cc_signal(roadrunner_quic_loss:cc_signal(Loss), Now, Cc),
             put_space(
                 Level,
                 Space#space{
                     loss = Loss,
+                    ack = forget_acked_ranges(Acked, Space#space.ack),
                     pending = lists:reverse(retransmittable(Lost, State), Space#space.pending)
                 },
                 State#state{cc = Cc1}
@@ -3580,6 +3581,24 @@ ack_in_phase(application, [{ack, _, _, _, _, _} | _], #state{update_acked = fals
     State#state{update_acked = true};
 ack_in_phase(_Level, _Frames, State) ->
     State.
+
+%% The peer acknowledged packets of ours that carried ACK frames: the packet
+%% numbers those frames covered need acknowledging no more (RFC 9000
+%% §13.2.4).
+-spec forget_acked_ranges([[roadrunner_quic_frame:frame()]], roadrunner_quic_ack:t()) ->
+    roadrunner_quic_ack:t().
+forget_acked_ranges(Acked, Ack) ->
+    case [Largest || [{ack, Largest, _, _, _, _} | Frames] <- Acked, complete_ack(Frames)] of
+        [] -> Ack;
+        Largests -> roadrunner_quic_ack:forget_through(lists:max(Largests), Ack)
+    end.
+
+%% Whether the ACK frame at the head of a packet carried every range kept: one
+%% a path challenge repeats carries its first range only (`path_ack/2`), so
+%% forgetting up to its largest could drop ranges it never reported.
+-spec complete_ack([roadrunner_quic_frame:frame()]) -> boolean().
+complete_ack([{path_challenge, _} | _]) -> false;
+complete_ack(_Frames) -> true.
 
 %% The ACK frame for a space with an ack-eliciting packet awaiting one, with
 %% the ACK Delay the largest packet has waited (RFC 9000 §13.2.5, §19.3).
