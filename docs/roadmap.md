@@ -196,9 +196,10 @@ Unlocks `baseline-h3` and `static-h3`.
 
 **What:** `roadrunner_grpc` serves the four call kinds over HTTP/2 and
 HTTP/3 with pluggable codecs, and cancels a call at its `grpc-timeout`.
-Still to come: per-message `gzip`/`deflate` compression; the health service; a guide in
-`docs/`; the Protocol Buffers adapter (`gpb`) and interop tests against the
-official client; server reflection; telemetry for calls and benchmarks.
+Still to come: a guide in `docs/`; the Protocol Buffers adapter
+(`grpc_protobuf/`, built and tested only in the `test` profile today) as a
+package of its own; a CI job running gRPC's official interop client against
+it; server reflection; telemetry for calls and benchmarks.
 
 **HttpArena impact:** `unary-grpc`, `stream-grpc`, and their TLS
 variants, once the Protocol Buffers adapter is on Hex.
