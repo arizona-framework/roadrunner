@@ -17,7 +17,14 @@
 
 -export([connect/2, connect/3, close/1]).
 -export([get/2, post/3, request/3]).
--export([open_request/2, open_request/3, send_data/4, collect/2, cancel/2, get_peer_settings/1]).
+-export([
+    open_request/2, open_request/3,
+    send_data/4,
+    collect/2,
+    collect_all/2,
+    cancel/2,
+    get_peer_settings/1
+]).
 -export([grant_stream_credit/3]).
 
 -define(COLLECT_TIMEOUT, 5000).
@@ -128,6 +135,40 @@ resets the stream. Stream data for other streams stays in the mailbox.
 -spec collect(pid(), non_neg_integer()) -> response() | timeout | {error, term()}.
 collect(Conn, StreamId) ->
     collect(Conn, StreamId, <<>>).
+
+-doc """
+Collect the response on `StreamId` as `{HeaderBlocks, Body}`: every
+HEADERS frame decoded, in order (the response headers, then any trailers),
+and the DATA bytes.
+""".
+-spec collect_all(pid(), non_neg_integer()) -> {[headers()], binary()} | timeout | {error, term()}.
+collect_all(Conn, StreamId) ->
+    case collect_bytes(Conn, StreamId, <<>>) of
+        {ok, Bytes} ->
+            Frames = decode_frames(Bytes),
+            Blocks = [
+                begin
+                    {ok, Headers} = roadrunner_qpack:decode(Block),
+                    Headers
+                end
+             || {headers, Block} <- Frames
+            ],
+            {Blocks, response_body(Frames)};
+        Other ->
+            Other
+    end.
+
+collect_bytes(Conn, StreamId, Acc) ->
+    receive
+        {quic_test_stream, Conn, StreamId, Data, true} ->
+            {ok, <<Acc/binary, Data/binary>>};
+        {quic_test_stream, Conn, StreamId, Data, false} ->
+            collect_bytes(Conn, StreamId, <<Acc/binary, Data/binary>>);
+        {quic_test_stream_reset, Conn, StreamId, ErrorCode} ->
+            {error, {stream_reset, ErrorCode}}
+    after ?COLLECT_TIMEOUT ->
+        timeout
+    end.
 
 %% =============================================================================
 %% Peer settings
