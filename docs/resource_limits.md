@@ -96,6 +96,23 @@ When a cap closes a connection, roadrunner emits the
 `size`) so oversize and flood attempts are visible to your event
 handler.
 
+## gRPC limits
+
+`roadrunner_grpc` adds a per-message cap on top of the body cap. Both are
+set in the map given to `roadrunner_grpc:routes/1`, for every service in
+it. See the [gRPC guide](grpc.md).
+
+| Limit | Default | What it bounds |
+|---|---|---|
+| `max_message_size` | 4 MB | one request message, both as it arrives and after it is decompressed; over it the call ends with `RESOURCE_EXHAUSTED` |
+| `max_content_length` | the listener's | all of a call's request messages together, set on each gRPC route; over it the call ends with `RESOURCE_EXHAUSTED` with `body_buffering => manual`, and is answered 413 with `auto` |
+
+A compressed message is inflated in bounded chunks against
+`max_message_size`, so a small message cannot expand into unbounded
+memory. A client stream or bidi stream that lives long can send more
+than the listener's body cap over its life; raise `max_content_length`
+on its routes to what such a call may total.
+
 ## HTTP/2 framing limits
 
 The framing layer enforces these. The ones with a `SETTINGS` counterpart
