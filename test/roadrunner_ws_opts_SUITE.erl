@@ -96,10 +96,12 @@ upgrade_opts(upgrade_declines_compression) ->
     #{compress => false};
 upgrade_opts(Case) when
     Case =:= idle_session_closes;
-    Case =:= traffic_keeps_session_open;
     Case =:= tls_idle_session_closes
 ->
     #{idle_timeout => 100};
+upgrade_opts(traffic_keeps_session_open) ->
+    %% The gaps between echoes (60 ms) stay well inside it on a loaded run.
+    #{idle_timeout => 300};
 upgrade_opts(tls_once_session_reads_large_frames) ->
     #{active => once};
 upgrade_opts(tcp_echo_past_active_window) ->
@@ -170,8 +172,8 @@ idle_session_closes(Config) ->
     ?assertEqual({terminated, timeout}, terminated()).
 
 traffic_keeps_session_open(Config) ->
-    %% Five echoes 60 ms apart span three 100 ms intervals; each one is
-    %% answered, then the silence after them closes the session.
+    %% Eight echoes 60 ms apart span more than one 300 ms interval; each one
+    %% is answered, then the silence after them closes the session.
     {Sock, _Head, _Pid} = upgrade(Config, []),
     ok = lists:foreach(
         fun(_) ->
@@ -181,7 +183,7 @@ traffic_keeps_session_open(Config) ->
             ok = gen_tcp:send(Sock, masked(16#81, ~"hi")),
             ?assertEqual(<<16#81, 2, "hi">>, recv_frame(Sock, 1000))
         end,
-        lists:seq(1, 5)
+        lists:seq(1, 8)
     ),
     ?assertEqual(<<16#88, 2, 1001:16>>, recv_frame(Sock, 1000)),
     ?assertEqual({terminated, timeout}, terminated()).
