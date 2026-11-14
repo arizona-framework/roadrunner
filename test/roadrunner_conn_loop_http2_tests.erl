@@ -85,6 +85,8 @@ all_test_() ->
         fun data_without_end_stream_continues_loop/0,
         fun continuation_without_end_headers_continues_loop/0,
         fun idle_timeout_emits_goaway/0,
+        fun idle_timeout_is_the_keep_alive_timeout/0,
+        fun zero_keep_alive_timeout_still_serves_h2/0,
         fun settings_ack_first_frame_triggers_goaway/0,
         fun handshake_closed_during_partial_preface/0,
         fun handshake_error_during_partial_preface/0,
@@ -2056,8 +2058,45 @@ frame_loop_parse_error_triggers_goaway() ->
     after 500 -> error(process_did_not_exit)
     end.
 
+idle_timeout_is_the_keep_alive_timeout() ->
+    %% The listener's `keep_alive_timeout` is the connection's idle
+    %% timeout: a quiet conn is closed once it passes, with a GOAWAY. 1 s
+    %% is the shortest an HTTP/2 conn takes.
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{keep_alive_timeout => 1_000}),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    GoAway =
+        receive
+            {roadrunner_fake_send, _, Data} -> iolist_to_binary(Data)
+        after 3_000 -> error(no_goaway)
+        end,
+    ?assertMatch(<<0, 0, 8, 7, 0, 0:32, _:32, 0:32>>, GoAway),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(process_did_not_exit)
+    end.
+
+zero_keep_alive_timeout_still_serves_h2() ->
+    %% A `keep_alive_timeout` of 0 (no keep-alive wait on HTTP/1.1) leaves
+    %% HTTP/2 its shortest idle wait instead of none: the conn does not
+    %% close before the client's first request, and serves it.
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{keep_alive_timeout => 0}),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    ?assertEqual(undefined, drain_send(100)),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/")),
+    ok = expect_response_headers(1, <<>>),
+    cleanup(Pid, Ref).
+
 runtime_idle_timeout_emits_goaway() ->
-    %% Override the 30-s idle timeout with a 100-ms test deadline
+    %% Override the idle timeout with a 100-ms test deadline
     %% so the `after` branch in `recv_more/1` fires fast.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),

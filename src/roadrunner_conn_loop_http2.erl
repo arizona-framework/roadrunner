@@ -86,9 +86,16 @@
 %% Read-deadline caps for the handshake and idle states. Tests
 %% override via `persistent_term:put/2` on `{?MODULE, handshake_timeout}`
 %% / `{?MODULE, idle_timeout}` so the timeout branches are exercisable
-%% without forcing 10–30 s waits per case.
+%% without forcing 10–60 s waits per case. The idle one is the listener's
+%% `keep_alive_timeout`; the default stands in for a conn started without
+%% it, and matches the listener's.
 -define(HANDSHAKE_TIMEOUT_DEFAULT, 10_000).
--define(IDLE_TIMEOUT_DEFAULT, 30_000).
+-define(IDLE_TIMEOUT_DEFAULT, 60_000).
+%% The shortest idle wait an HTTP/2 conn takes from `keep_alive_timeout`:
+%% shorter would close it before a client's first request, or before a
+%% client could answer the liveness PING. A value of 0 means "no keep-alive
+%% wait" on HTTP/1.1, which has no HTTP/2 counterpart.
+-define(MIN_IDLE_TIMEOUT, 1_000).
 
 %% Opaque data of the PING a conn still serving sends when its idle timeout
 %% passes with nothing heard (`recv_idle_expired/1`).
@@ -439,7 +446,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
     MaxConcReq = maps:get(max_concurrent_requests, ProtoOpts, infinity),
     InflightCounter = maps:get(inflight_counter, ProtoOpts, undefined),
     HandshakeTimeout = handshake_timeout(),
-    IdleTimeout = idle_timeout(),
+    IdleTimeout = idle_timeout(ProtoOpts),
     State = #loop{
         socket = Socket,
         proto_opts = ProtoOpts,
@@ -534,9 +541,18 @@ server_settings_frame(MaxStreams, MaxHeaderListSize) ->
 handshake_timeout() ->
     persistent_term:get({?MODULE, handshake_timeout}, ?HANDSHAKE_TIMEOUT_DEFAULT).
 
--spec idle_timeout() -> non_neg_integer().
-idle_timeout() ->
-    persistent_term:get({?MODULE, idle_timeout}, ?IDLE_TIMEOUT_DEFAULT).
+%% The listener's `keep_alive_timeout`: how long a connection may stay
+%% quiet before it is closed, or, with a handler still at work, checked
+%% with a liveness PING (`recv_idle_expired/1`). Tests shorten it through
+%% `persistent_term`.
+-spec idle_timeout(map()) -> non_neg_integer().
+idle_timeout(ProtoOpts) ->
+    case persistent_term:get({?MODULE, idle_timeout}, undefined) of
+        undefined ->
+            max(maps:get(keep_alive_timeout, ProtoOpts, ?IDLE_TIMEOUT_DEFAULT), ?MIN_IDLE_TIMEOUT);
+        Override ->
+            Override
+    end.
 
 -spec handshake_phase_preface(#loop{}) -> no_return().
 handshake_phase_preface(#loop{buffer = <<?PREFACE, Rest/binary>>} = State) ->

@@ -104,6 +104,16 @@ dynamic table, responses use the static table). Remaining work:
 - WebTransport / Extended CONNECT (RFC 9220) and HTTP datagrams
   (RFC 9297)
 
+### HTTP/3 idle timeout from `keep_alive_timeout` — small
+
+**What:** an HTTP/3 connection's idle timeout is the QUIC `max_idle_timeout`,
+fixed at 30 s (`roadrunner_quic_listener_sup`), while HTTP/2 takes it from the
+listener's `keep_alive_timeout`. Wire the option through to the transport
+parameter, mapping 0 carefully: on HTTP/1.1 it means "no keep-alive wait",
+while a QUIC `max_idle_timeout` of 0 disables the idle timeout.
+
+**Scope:** small.
+
 ## Native QUIC transport follow-ups
 
 The HTTP/3 path runs on the native `roadrunner_quic_*` stack end to end, with no
