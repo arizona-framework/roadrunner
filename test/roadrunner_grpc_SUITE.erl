@@ -331,6 +331,11 @@ http3_calls(Config) ->
     ?assertEqual(~"0", header(~"grpc-status", CountTrailers)),
     {[Only], <<>>} = h3_call(Conn, ~"Fail", [~"x"]),
     ?assertEqual(~"5", header(~"grpc-status", Only)),
+    %% A call still running at its deadline is cancelled (H3_REQUEST_CANCELLED).
+    ?assertEqual(
+        {error, {stream_reset, 16#010C}},
+        h3_call(Conn, ~"Busy", [{~"grpc-timeout", ~"100m"}], [~"x"])
+    ),
     _ = roadrunner_quic_test_h3:close(Conn),
     ok.
 
