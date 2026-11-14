@@ -19,15 +19,24 @@
 %% `ack_deadline/2` when that delay runs out. `ack_delay/2` is how long the
 %% largest packet has waited, for the ACK frame's ACK Delay field.
 
--export([new/0, record/4, received/2, largest/1, ranges/1, needs_ack/1, mark_ack_sent/1, to_ack/1]).
+-export([new/0, record/4, received/2, forget_through/2, largest/1, ranges/1, needs_ack/1]).
+-export([mark_ack_sent/1, to_ack/1]).
 -export([ack_due/3, ack_deadline/2, ack_delay/2]).
 
 -export_type([t/0, range/0]).
 
 -type range() :: {Start :: non_neg_integer(), End :: non_neg_integer()}.
 
+%% The most ranges remembered, which keeps an ACK frame well inside one
+%% packet (RFC 9000 §13.2.3): a peer that skips packet numbers makes one
+%% range per gap.
+-define(MAX_RANGES, 32).
+
 -record(ack, {
     ranges = [] :: [range()],
+    %% Packet numbers below it are no longer tracked, and count as received:
+    %% a packet numbered there is discarded (RFC 9000 §12.3).
+    floor = 0 :: non_neg_integer(),
     pending = false :: boolean(),
     %% Ack-eliciting packets received since the last ACK was sent.
     eliciting = 0 :: non_neg_integer(),
@@ -55,7 +64,9 @@ makes `needs_ack/1` true.
 -spec record(non_neg_integer(), boolean(), integer(), t()) -> t().
 record(PN, AckEliciting, Now, #ack{ranges = Ranges} = Ack) ->
     Largest = largest(Ack),
-    Ack1 = Ack#ack{ranges = add(PN, Ranges), largest_at = largest_at(PN, Largest, Now, Ack)},
+    Ack1 = capped(PN, Largest, Ack#ack{
+        ranges = add(PN, Ranges), largest_at = largest_at(PN, Largest, Now, Ack)
+    }),
     case AckEliciting of
         true -> eliciting(PN, Largest, Now, Ack1);
         false -> Ack1
@@ -96,13 +107,52 @@ largest(#ack{ranges = [{_Start, End} | _]}) -> End.
 
 -doc """
 Whether packet number `PN` was already received in this space, so that a
-copy of it is discarded (RFC 9000 §12.3). Every received number stays in
-the ranges, so none is ever taken for new. A number above the largest, the
-usual case, is answered by the first range.
+copy of it is discarded (RFC 9000 §12.3): it is in the ranges, or below the
+floor the ranges no longer reach, which counts as received. A number above
+the largest, the usual case, is answered by the first range.
 """.
 -spec received(non_neg_integer(), t()) -> boolean().
+received(PN, #ack{floor = Floor}) when PN < Floor ->
+    true;
 received(PN, #ack{ranges = Ranges}) ->
     in_ranges(PN, Ranges).
+
+-doc """
+Stop tracking the packet numbers up to `Largest`, the Largest Acknowledged
+of an ACK frame the peer has acknowledged (RFC 9000 §13.2.3, §13.2.4): later
+ACK frames leave them out. The top range stays, so there is always a
+largest to acknowledge, and the numbers forgotten count as received.
+""".
+-spec forget_through(non_neg_integer(), t()) -> t().
+forget_through(Largest, #ack{ranges = [Top | Rest], floor = Floor} = Ack) when Largest >= Floor ->
+    Ack#ack{ranges = [Top | above(Largest, Rest)], floor = Largest + 1};
+forget_through(_Largest, Ack) ->
+    Ack.
+
+%% The part of `Ranges` above `Largest`.
+-spec above(non_neg_integer(), [range()]) -> [range()].
+above(Largest, [{Start, End} | Rest]) when Start > Largest ->
+    [{Start, End} | above(Largest, Rest)];
+above(Largest, [{_Start, End} | _]) when End > Largest ->
+    [{Largest + 1, End}];
+above(_Largest, _Ranges) ->
+    [].
+
+%% A packet number that left a gap, above the largest or within the ranges,
+%% may have made one range more than ?MAX_RANGES: the lowest goes, and the
+%% floor rises past it. The usual next-in-order packet only extends the top
+%% range, so it skips the count.
+-spec capped(non_neg_integer(), non_neg_integer() | undefined, t()) -> t().
+capped(PN, Largest, Ack) when PN =:= Largest + 1 ->
+    Ack;
+capped(_PN, _Largest, #ack{ranges = Ranges} = Ack) ->
+    case length(Ranges) > ?MAX_RANGES of
+        true ->
+            {Kept, [{_Start, End} | _]} = lists:split(?MAX_RANGES, Ranges),
+            Ack#ack{ranges = Kept, floor = End + 1};
+        false ->
+            Ack
+    end.
 
 -spec in_ranges(non_neg_integer(), [range()]) -> boolean().
 in_ranges(PN, [{Start, End} | _]) when PN >= Start, PN =< End -> true;

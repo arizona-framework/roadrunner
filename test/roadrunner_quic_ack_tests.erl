@@ -126,3 +126,30 @@ received_test() ->
     ?assertNot(?M:received(0, Ack)),
     ?assertNot(?M:received(10, Ack)),
     ?assertNot(?M:received(0, ?M:new())).
+
+%% Packet numbers acknowledged by an ACK frame the peer has acknowledged are
+%% forgotten (RFC 9000 §13.2.4): a range straddling the frame's Largest
+%% Acknowledged keeps its upper part, the top range stays whole, and the
+%% numbers forgotten count as received. An older frame's acknowledgment
+%% then changes nothing.
+forget_through_test() ->
+    Ack = record_all([1, 2, 4, 5, 6, 8, 10, 11], ?M:new()),
+    Forgot = ?M:forget_through(5, Ack),
+    ?assertEqual([{10, 11}, {8, 8}, {6, 6}], ?M:ranges(Forgot)),
+    ?assert(?M:received(3, Forgot)),
+    ?assertNot(?M:received(7, Forgot)),
+    ?assertEqual(Forgot, ?M:forget_through(4, Forgot)),
+    ?assertEqual([{10, 11}], ?M:ranges(?M:forget_through(11, Forgot))).
+
+%% A peer skipping packet numbers makes a range per gap; past 32 the lowest
+%% is dropped and counts as received (RFC 9000 §13.2.3, §12.3).
+ranges_capped_test() ->
+    Ack = record_all(lists:seq(0, 70, 2), ?M:new()),
+    Ranges = ?M:ranges(Ack),
+    ?assertEqual(32, length(Ranges)),
+    ?assertEqual({70, 70}, hd(Ranges)),
+    ?assertEqual({8, 8}, lists:last(Ranges)),
+    %% The floor sits just past the highest dropped range, {6, 6}.
+    ?assert(?M:received(6, Ack)),
+    ?assertNot(?M:received(7, Ack)),
+    ?assertNot(?M:received(9, Ack)).
