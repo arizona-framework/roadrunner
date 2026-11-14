@@ -6,7 +6,7 @@
 -export([name/0, rpcs/0]).
 -export([unary/2, count/2, sum/1, chat/1, fail/2, crash/2, crash_after/2, meta/2, deadline/2, bad/2]).
 -export([stop/2, bad_trailer/2, late_headers/2, stale_send/2, bad_name/2]).
--export([unsafe_header/2, unsafe_fail/2]).
+-export([unsafe_header/2, unsafe_fail/2, busy/2]).
 
 name() -> ~"test.Echo".
 
@@ -28,7 +28,8 @@ rpcs() ->
         ~"StaleSend" => rpc(stale_send, server_stream),
         ~"BadName" => rpc(bad_name, unary),
         ~"UnsafeHeader" => rpc(unsafe_header, server_stream),
-        ~"UnsafeFail" => rpc(unsafe_fail, unary)
+        ~"UnsafeFail" => rpc(unsafe_fail, unary),
+        ~"Busy" => rpc(busy, unary)
     }.
 
 rpc(Function, Kind) ->
@@ -117,3 +118,10 @@ unsafe_header(_Request, Stream) ->
 %% ...or of an error status.
 unsafe_fail(_Request, Stream) ->
     {error, not_found, ~"gone", roadrunner_grpc:set_headers([{~"x-a", <<"a\r\nb">>}], Stream)}.
+
+%% Works on and on, past any deadline, without writing.
+busy(_Request, Stream) ->
+    receive
+        never_sent -> ok
+    after 5000 -> {reply, ~"late", Stream}
+    end.

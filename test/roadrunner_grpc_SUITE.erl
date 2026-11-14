@@ -54,7 +54,8 @@ fixture, under both body buffering modes.
     route_cap_lets_a_stream_past_the_listener_cap/1,
     missing_content_type_is_415/1,
     space_before_content_type_parameters/1,
-    unsendable_header_stops_the_call/1
+    unsendable_header_stops_the_call/1,
+    deadline_cancels_a_running_call/1
 ]).
 
 -define(SVC, ~"/test.Echo/").
@@ -100,7 +101,8 @@ groups() ->
         route_cap_lets_a_stream_past_the_listener_cap,
         missing_content_type_is_415,
         space_before_content_type_parameters,
-        unsendable_header_stops_the_call
+        unsendable_header_stops_the_call,
+        deadline_cancels_a_running_call
     ],
     [
         {auto, [], Common},
@@ -320,7 +322,7 @@ http1_is_505(Config) ->
 %% trailers, a failing one is Trailers-Only.
 http3_calls(Config) ->
     {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, ?config(port, Config)),
-    {[Headers, Trailers], Body} = h3_call(Conn, ~"Unary", [~"hi"]),
+    {[Headers, Trailers], Body} = h3_call(Conn, ~"Unary", [{~"grpc-timeout", ~"10S"}], [~"hi"]),
     ?assertEqual(~"200", header(~":status", Headers)),
     ?assertEqual([~"hi"], roadrunner_grpc_test_client:messages(Body)),
     ?assertEqual(~"0", header(~"grpc-status", Trailers)),
@@ -333,6 +335,9 @@ http3_calls(Config) ->
     ok.
 
 h3_call(Conn, Method, Messages) ->
+    h3_call(Conn, Method, [], Messages).
+
+h3_call(Conn, Method, Extra, Messages) ->
     Fields = [
         {~":method", ~"POST"},
         {~":scheme", ~"https"},
@@ -340,6 +345,7 @@ h3_call(Conn, Method, Messages) ->
         {~":path", <<?SVC/binary, Method/binary>>},
         {~"content-type", ~"application/grpc"},
         {~"te", ~"trailers"}
+        | Extra
     ],
     {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, Fields, false),
     ok = roadrunner_quic_test_h3:send_data(
@@ -474,6 +480,11 @@ unsendable_header_stops_the_call(Config) ->
     ?assertEqual(~"500", header(~":status", Stream)),
     {Fail, _, _, _} = call(Config, ~"UnsafeFail", [~"x"]),
     ?assertEqual(~"500", header(~":status", Fail)).
+
+%% A call still running at its deadline has its stream reset (CANCEL), as
+%% grpc-java does; the method is not waited for.
+deadline_cancels_a_running_call(Config) ->
+    {_, [], {rst, cancel}, _} = call(Config, ~"Busy", [{~"grpc-timeout", ~"100m"}], [~"x"]).
 
 %% --- helpers ---
 
