@@ -62,7 +62,8 @@ fixture, under both body buffering modes.
     response_compressed_when_the_client_reads_it/1,
     compression_after_a_response_is_internal/1,
     messages_follow_the_announced_encoding/1,
-    route_compression_applies/1
+    route_compression_applies/1,
+    body_past_the_window_waits_for_the_reader/1
 ]).
 
 -define(SVC, ~"/test.Echo/").
@@ -128,7 +129,8 @@ groups() ->
                     client_reset_stops_the_read,
                     body_over_the_cap_is_resource_exhausted,
                     large_message_across_frames,
-                    client_reset_stops_the_writes
+                    client_reset_stops_the_writes,
+                    body_past_the_window_waits_for_the_reader
                 ]}
     ].
 
@@ -583,6 +585,43 @@ route_compression_applies(Config) ->
     ?assertEqual(~"hi", zlib:gunzip(Gz)),
     {Plain, [~"hi"], _, _} = call(Config, ~"Unary", [~"hi"]),
     ?assertEqual(undefined, header(~"grpc-encoding", Plain)).
+
+%% A body past the stream's first window (65535 bytes) waits for the
+%% method to read before the rest goes out (RFC 9113 §6.9): the method
+%% reads nothing until the connection has taken a whole window of its
+%% DATA, so a client that sent on regardless would overrun the window and
+%% have the stream reset (FLOW_CONTROL_ERROR).
+body_past_the_window_waits_for_the_reader(Config) ->
+    Client = self(),
+    Gate = spawn_link(fun() -> gate(Client, 0, undefined) end),
+    true = register(roadrunner_grpc_held, Gate),
+    Parse = {roadrunner_http2_frame, parse, 2},
+    1 = erlang:trace_pattern(Parse, [{'_', [], [{return_trace}]}], [global]),
+    _ = erlang:trace(all, true, [call, {tracer, Gate}]),
+    Part = binary:copy(~"x", 50_000),
+    try
+        {_, [Sum], Trailers, _} = call(Config, ~"Held", [Part, Part, Part, Part]),
+        ?assertEqual(200_000, byte_size(Sum)),
+        ?assertEqual(~"0", header(~"grpc-status", Trailers))
+    after
+        _ = erlang:trace(all, false, [call]),
+        _ = erlang:trace_pattern(Parse, false, [global])
+    end.
+
+%% Lets the `Held` method read once the server has parsed a whole window
+%% of DATA on stream 1, counted from the frames its connection parses.
+gate(_Client, Taken, Worker) when Taken >= 65535, is_pid(Worker) ->
+    Worker ! go,
+    ok;
+gate(Client, Taken, Worker) ->
+    receive
+        {held, Pid} ->
+            gate(Client, Taken, Pid);
+        {trace, Pid, return_from, _, {ok, {data, 1, _, _, FlowLen}, _}} when Pid =/= Client ->
+            gate(Client, Taken + FlowLen, Worker);
+        _Other ->
+            gate(Client, Taken, Worker)
+    end.
 
 %% --- helpers ---
 
