@@ -267,16 +267,18 @@ say_hello(Name, Stream0) ->
 - a request `-bin` value with several comma-separated parts gives one
   entry per part; one that is not valid base64 ends the call with
   `INTERNAL` before the method runs
-- names you set must be lowercase and cannot be a pseudo-header or a name
-  gRPC sets itself (`grpc-status`, `grpc-message`, `grpc-encoding`,
-  `grpc-accept-encoding`, `grpc-timeout`, `content-type`,
-  `content-length`, `te`); such a name raises `{invalid_metadata, Name}`
+- names you set are made of `0-9`, `a-z`, `_`, `-` and `.`, and cannot
+  be a name gRPC or HTTP/2 sets itself (`grpc-status`, `grpc-message`,
+  `grpc-encoding`, `grpc-accept-encoding`, `grpc-timeout`,
+  `grpc-message-type`, `content-type`, `content-length`, `te`)
+- values you set, other than `-bin` ones, are printable ASCII with no
+  space at either end
+- a name or value that breaks these rules raises
+  `{invalid_metadata, Name}` from `set_headers/2` or `set_trailers/2`, so
+  the call ends with `INTERNAL`
 - headers go out with the first response, so `set_headers/2` after the
   first `send/2` raises `headers_already_sent` (and the call ends with
-  `INTERNAL`); trailers can be added
-  until the method returns
-- a value with a CR or LF cannot be sent: in a response header, the call
-  is answered `500`; in a trailer, the call ends without its trailers
+  `INTERNAL`); trailers can be added until the method returns
 
 `roadrunner_grpc:peer/1` returns the client's address as
 `{IP, Port}`.
@@ -329,6 +331,10 @@ Some requests are refused at the HTTP level, before any call starts:
 - a `content-type` none of the codecs speak: `415`
 - an unknown service: the router's `404`, which gRPC clients read as
   `UNIMPLEMENTED`
+
+One more is answered at the HTTP level once the call runs: response
+headers too big for the client's `SETTINGS_MAX_HEADER_LIST_SIZE` cannot
+be sent, so the call gets a `500` and stops.
 
 ## Deadlines and cancellation
 
