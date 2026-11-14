@@ -455,16 +455,17 @@
     %% advertised max_idle_timeout and the peer's, set from our value at birth and
     %% lowered to the negotiated minimum once the ClientHello delivers the peer's.
     idle_timeout :: non_neg_integer(),
-    %% Absolute time (ms) the connection idle-times-out; reset to Now +
-    %% idle_timeout on every received datagram (RFC 9000 §10.1). Always set
-    %% (from new/2's birth time), so it is the timer floor when nothing is in
-    %% flight. Also restarting it on the first ack-eliciting send since the
-    %% last receive (§10.1) is a follow-up; receive-only is conservative
-    %% (it closes no later than a strict implementation would).
+    %% Absolute time (ms) the connection idle-times-out: idle_since plus
+    %% idle_timeout. Always set (from new/2's birth time), so it is the timer
+    %% floor when nothing is in flight.
     idle_deadline :: integer(),
-    %% When the last datagram was received (birth time before the first),
-    %% what the idle deadline counts from.
-    last_rx :: integer()
+    %% When the idle timer last restarted (RFC 9000 §10.1): on a packet
+    %% received and processed successfully, or on the first ack-eliciting
+    %% packet sent after one; the birth time before either.
+    idle_since :: integer(),
+    %% Whether an ack-eliciting packet went out since a packet was last
+    %% processed, so a later one does not restart the idle timer again.
+    eliciting_sent = false :: boolean()
 }).
 
 -type stream() :: {roadrunner_quic_stream:t(), roadrunner_quic_flow:t()}.
@@ -614,7 +615,7 @@ new(
         cc = roadrunner_quic_cc_newreno:new(),
         idle_timeout = IdleTimeout,
         idle_deadline = Now + IdleTimeout,
-        last_rx = Now
+        idle_since = Now
     }.
 
 %% A client whose first Initial carried a token that validated its address
@@ -690,13 +691,11 @@ handle_datagram(Now, Peer, Datagram, State0) ->
         amp = Amp,
         recv_keys = RecvKeys,
         phase = Before,
-        idle_timeout = IdleTimeout,
         peer = Current,
         probe_path = Probe
     } = State = expire_previous_keys(Now, State0),
     Size = byte_size(Datagram),
     DCID = datagram_dcid(Datagram),
-    Deadline = Now + IdleTimeout,
     %% Only bytes from an address count toward what may be sent to it (RFC
     %% 9000 §8.1): a datagram from elsewhere leaves the current path's
     %% budget alone.
@@ -705,8 +704,6 @@ handle_datagram(Now, Peer, Datagram, State0) ->
             Current ->
                 State#state{
                     amp = roadrunner_quic_amp:received(Size, Amp),
-                    idle_deadline = Deadline,
-                    last_rx = Now,
                     rx_dcid = DCID,
                     rx_peer = Peer,
                     rx_size = Size
@@ -714,8 +711,6 @@ handle_datagram(Now, Peer, Datagram, State0) ->
             _ ->
                 State#state{
                     probe_path = probe_received(Peer, Size, Probe),
-                    idle_deadline = Deadline,
-                    last_rx = Now,
                     rx_dcid = DCID,
                     rx_peer = Peer,
                     rx_size = Size
@@ -1378,7 +1373,8 @@ process_packet(Now, #{level := Level, pn := PN, frames := Frames}, #state{spaces
         #{Level := #space{ack = Ack}} ->
             case roadrunner_quic_ack:received(PN, Ack) of
                 false ->
-                    State1 = on_path(Now, Level, PN, Frames, validate_on_handshake(Level, State)),
+                    State0 = restart_idle(Now, State#state{eliciting_sent = false}),
+                    State1 = on_path(Now, Level, PN, Frames, validate_on_handshake(Level, State0)),
                     State2 = lists:foldl(
                         fun(Frame, S) -> process_frame(Now, Level, Frame, S) end, State1, Frames
                     ),
@@ -1386,13 +1382,19 @@ process_packet(Now, #{level := Level, pn := PN, frames := Frames}, #state{spaces
                 true ->
                     %% A copy of a packet already processed, which an attacker
                     %% on the path can replay: discarded, now that it is
-                    %% unprotected (RFC 9000 §12.3), so it acts on nothing.
+                    %% unprotected (RFC 9000 §12.3), so it acts on nothing,
+                    %% the idle timer included (§10.1).
                     State
             end;
         #{} ->
             %% A packet for a discarded space (e.g. a late Initial); ignore.
             State
     end.
+
+%% Restart the idle timer (RFC 9000 §10.1).
+-spec restart_idle(integer(), t()) -> t().
+restart_idle(Now, #state{idle_timeout = IdleTimeout} = State) ->
+    State#state{idle_since = Now, idle_deadline = Now + IdleTimeout}.
 
 %% RFC 9001 §6.1: the peer MUST NOT update its keys before the handshake is
 %% confirmed (at the server, once it completes, §4.1.2), nor update again
@@ -2466,7 +2468,7 @@ process_handshake(
                     peer_max_streams_uni = maps:get(initial_max_streams_uni, PeerParams, 0),
                     conn_flow = ConnFlow,
                     idle_timeout = IdleTimeout,
-                    idle_deadline = State#state.last_rx + IdleTimeout
+                    idle_deadline = State#state.idle_since + IdleTimeout
                 }
             ),
             State1 = peer_ack_delay(State0),
@@ -3653,7 +3655,16 @@ record_one_sent(
     Loss = roadrunner_quic_loss:on_packet_sent(
         PN, Len, AckEliciting, Frames, Now, Space#space.loss
     ),
-    put_space(Level, Space#space{loss = Loss}, State).
+    eliciting_sent(Now, AckEliciting, put_space(Level, Space#space{loss = Loss}, State)).
+
+%% The first ack-eliciting packet sent since one was processed restarts the
+%% idle timer (RFC 9000 §10.1), so new activity is not cut off by the idle
+%% period of the quiet before it.
+-spec eliciting_sent(integer(), boolean(), t()) -> t().
+eliciting_sent(Now, true, #state{eliciting_sent = false} = State) ->
+    restart_idle(Now, State#state{eliciting_sent = true});
+eliciting_sent(_Now, _AckEliciting, State) ->
+    State.
 
 %% =============================================================================
 %% Timers
@@ -3677,13 +3688,13 @@ handle_timeout(Now, pto, State) ->
     State1 = lists:foldl(fun(Level, S) -> on_pto(Now, Level, S) end, State, present_levels(State)),
     {State2, Effects} = send_pass(Now, rechallenge_stranded(State1)),
     {State2#state{probes = 0}, Effects};
-handle_timeout(Now, idle, #state{last_rx = LastRx, idle_timeout = IdleTimeout} = State) ->
+handle_timeout(Now, idle, #state{idle_since = Since, idle_timeout = IdleTimeout} = State) ->
     %% The idle period is at least three PTOs, before backoff (RFC 9000
     %% §10.1), so a short negotiated timeout cannot end a connection before
     %% its probes could be answered. Checked only when the timer fires, off
-    %% the per-datagram path. The PTO only changes on a receive, which moves
-    %% last_rx too, so a deadline moved here is not moved again.
-    case LastRx + max(IdleTimeout, 3 * max_pto_period(State)) of
+    %% the per-datagram path. The PTO only changes on a receive, which
+    %% restarts the timer too, so a deadline moved here is not moved again.
+    case Since + max(IdleTimeout, 3 * max_pto_period(State)) of
         Deadline when Deadline > Now ->
             State1 = State#state{idle_deadline = Deadline},
             {State1, timer_effects(State1)};

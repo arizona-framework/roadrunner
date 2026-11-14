@@ -122,10 +122,6 @@ need.
   transfer that fills a non-zero window — already emits the frame on the
   flow's blocked transition; this remainder is the never-sent-a-byte case a
   conformant peer never produces — small
-- Idle timer restarts (RFC 9000 §10.1): restart it on the first
-  ack-eliciting packet sent since the last receive, and only on a packet
-  that was processed (today any datagram restarts it, one that fails to
-  decrypt included) — small
 - One RTT estimate per path (RFC 9002 §5): each packet number space keeps
   its own, so the application space starts from the 333 ms initial RTT
   rather than the handshake's samples, and its first probe timeouts run
