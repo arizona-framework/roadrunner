@@ -20,6 +20,7 @@ fun does.
     stream_sends_the_body/1,
     open_stream_is_ended/1,
     stream_sends_trailers/1,
+    unsafe_trailers_cut_the_stream/1,
     sendfile_sends_the_range/1,
     head_reply_has_no_body/1,
     head_sendfile_has_no_body/1,
@@ -83,6 +84,7 @@ common() ->
         stream_sends_the_body,
         open_stream_is_ended,
         stream_sends_trailers,
+        unsafe_trailers_cut_the_stream,
         sendfile_sends_the_range,
         head_reply_has_no_body,
         head_sendfile_has_no_body,
@@ -187,6 +189,7 @@ routes(TestPid, File) ->
         {~"/stream", ?H, stream},
         {~"/open", ?H, stream_left_open},
         {~"/trailers", ?H, stream_trailers},
+        {~"/bad-trailers", ?H, stream_bad_trailers},
         {~"/file", ?H, {sendfile, File}},
         {~"/nothing", ?H, nothing},
         {~"/shutdown-after-reply", ?H, shutdown_after_reply},
@@ -245,6 +248,14 @@ open_stream_is_ended(Config) ->
 
 stream_sends_trailers(Config) ->
     ?assertMatch({[200], _, ~"body", complete}, get(Config, ~"/trailers")).
+
+unsafe_trailers_cut_the_stream(Config) ->
+    %% Trailers with a CR or LF crash the send: the body is not ended as if
+    %% complete. HTTP/1.1 closes without the last chunk; HTTP/2 and HTTP/3
+    %% reset the stream.
+    {[200], _, ~"body", End} = get(Config, ~"/bad-trailers"),
+    ?assertNotEqual(complete, End),
+    ?assertMatch({header_injection, value, _}, crashed()).
 
 sendfile_sends_the_range(Config) ->
     ?assertMatch({[200], _, ~"cdef", complete}, get(Config, ~"/file")),

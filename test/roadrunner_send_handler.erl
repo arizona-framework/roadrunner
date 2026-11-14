@@ -56,6 +56,13 @@ send_fun(stream_trailers) ->
         ok = Send(~"body", {fin, [{~"x-sum", ~"1"}]}),
         Req
     end;
+send_fun(stream_bad_trailers) ->
+    fun(Req) ->
+        {ok, Send} = roadrunner_send:stream(200, [{~"trailer", ~"x-bad"}], Req),
+        ok = Send(~"body", nofin),
+        ok = Send(<<>>, {fin, [{~"x-bad", ~"a\r\nb"}]}),
+        Req
+    end;
 send_fun({sendfile, File}) ->
     fun(Req) ->
         Headers = [{~"content-type", ~"text/plain"}, {~"content-length", ~"4"}],
