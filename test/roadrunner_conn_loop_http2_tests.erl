@@ -2794,7 +2794,7 @@ worker_done_during_trailer_continuation_keeps_the_conn() ->
         {'DOWN', WorkerRef, process, Worker, normal} -> ok
     after 1000 -> error(worker_did_not_finish)
     end,
-    ok = flush_sends(),
+    ok = await_end_stream(1, <<>>),
     serve_recv(
         ConnPid, iolist_to_binary(roadrunner_http2_frame:encode({continuation, 1, 16#04, Rest}))
     ),
@@ -5622,6 +5622,21 @@ expect_send() ->
         {roadrunner_fake_send, _Pid, Data} -> iolist_to_binary(Data)
     after 500 -> error(no_send)
     end.
+
+%% Wait until the conn has sent the frame that ends `StreamId` (END_STREAM),
+%% the response's frames arriving in one write or several.
+await_end_stream(StreamId, Buffer0) ->
+    Buffer = <<Buffer0/binary, (expect_send())/binary>>,
+    end_stream_in(StreamId, Buffer).
+
+end_stream_in(StreamId, <<Len:24, Type, Flags, _:1, StreamId:31, _:Len/binary, _/binary>>) when
+    Type =< 1, Flags band 16#01 =:= 16#01
+->
+    ok;
+end_stream_in(StreamId, <<Len:24, _:6/binary, _:Len/binary, Rest/binary>>) ->
+    end_stream_in(StreamId, Rest);
+end_stream_in(StreamId, Partial) ->
+    await_end_stream(StreamId, Partial).
 
 %% Drop every frame the conn has sent so far.
 flush_sends() ->
