@@ -60,10 +60,13 @@ unknown service, and `500` when a response header the method set cannot
 be sent (a CR or LF in its value). An unknown method of a known service
 is `UNIMPLEMENTED`, as is a `grpc-encoding` other than `identity`.
 
-A `grpc-timeout` bounds the call's reads, `DEADLINE_EXCEEDED` when it runs
-out; without one a call may read for as long as the client stays
-connected. With `auto` buffering the deadline counts from when the body
-was read, a little after the client's.
+A `grpc-timeout` is the call's deadline. A read still waiting then ends
+the call with `DEADLINE_EXCEEDED`; over HTTP/2, a call still running a
+second later is cancelled, as grpc-go does at the deadline: its stream is
+reset (`RST_STREAM` with `CANCEL`) and the method stops at its next write
+or read. Over HTTP/3 only the reads are bounded so far. Without a timeout a call may run for as long as
+the client stays connected. With `auto` buffering the deadline counts from
+when the body was read, a little after the client's.
 
 ## The method's process
 
@@ -96,6 +99,13 @@ values are each an entry, and one that is not base64 ends the call with
 -define(MAX_MESSAGE_SIZE, 4194304).
 %% Where the call's process keeps the response's body writer once it started.
 -define(SEND_KEY, {?MODULE, send}).
+%% Where it keeps the timer that cancels the call at its deadline.
+-define(TIMER_KEY, {?MODULE, deadline_timer}).
+%% How long after its deadline a call still running is cancelled. The
+%% client stopped waiting at the deadline; the cancel ends the stream and
+%% stops the method at its next write or read, after a read waiting at the
+%% deadline had the time to answer.
+-define(CANCEL_GRACE, 1000).
 -define(OPTS, [service, codecs, max_message_size]).
 
 -doc """
@@ -356,7 +366,7 @@ call(Req, ContentType, Codec, #route{service = Service, rpcs = Rpcs} = Route) ->
             req = roadrunner_req:set_body_timeout(Timeout, Req),
             input = In,
             output = Out,
-            deadline = deadline_after(Timeout)
+            deadline = deadline_after(Timeout, Req)
         },
         finish(run(Kind, Service, Function, Stream))
     catch
@@ -394,9 +404,23 @@ timeout(Value) ->
         error -> throw({?MODULE, internal, <<"malformed grpc-timeout ", Value/binary>>, []})
     end.
 
--spec deadline_after(non_neg_integer() | infinity) -> integer() | infinity.
-deadline_after(infinity) -> infinity;
-deadline_after(Ms) -> erlang:monotonic_time(millisecond) + Ms.
+%% When the call's timeout runs out. A call still running a little after
+%% (`?CANCEL_GRACE`, which leaves a read waiting at the deadline the time to
+%% end the call with `DEADLINE_EXCEEDED`) is cancelled where the protocol
+%% can cancel a stream (HTTP/2): the stream is reset and the method stops at
+%% its next write. The timer is cancelled when the call ends before
+%% (`ended/1`).
+-spec deadline_after(non_neg_integer() | infinity, roadrunner_req:request()) ->
+    integer() | infinity.
+deadline_after(infinity, _Req) ->
+    infinity;
+deadline_after(Ms, Req) ->
+    _ =
+        case roadrunner_send_writer:cancel_after(Ms + ?CANCEL_GRACE, Req) of
+            {ok, Timer} -> put(?TIMER_KEY, Timer);
+            {error, not_supported} -> undefined
+        end,
+    erlang:monotonic_time(millisecond) + Ms.
 
 -spec add_headers(roadrunner_http:headers(), stream()) -> stream().
 add_headers(Headers, #stream{headers = Own} = Stream) ->
@@ -483,6 +507,11 @@ finish({error, Status, Message, Stream}) ->
 -spec ended(roadrunner_req:request()) -> roadrunner_req:request().
 ended(Req) ->
     _ = erase(?SEND_KEY),
+    _ =
+        case erase(?TIMER_KEY) of
+            undefined -> ok;
+            Timer -> erlang:cancel_timer(Timer, [{async, true}, {info, false}])
+        end,
     Req.
 
 -spec finish(status(), binary(), stream()) -> roadrunner_req:request().

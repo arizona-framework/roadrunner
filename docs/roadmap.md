@@ -195,9 +195,9 @@ Unlocks `baseline-h3` and `static-h3`.
 ### gRPC: the rest — medium
 
 **What:** `roadrunner_grpc` serves the four call kinds over HTTP/2 with
-pluggable codecs. Still to come: a call's `grpc-timeout` cancelling it at
-its deadline (`DEADLINE_EXCEEDED`, or the internal stream cancel for a
-response cut mid-message);
+pluggable codecs, and cancels a call at its `grpc-timeout` over HTTP/2.
+Still to come: the same cancel over HTTP/3, which needs a server-side
+stream cancel there (`H3_REQUEST_CANCELLED`);
 per-message `gzip`/`deflate` compression; the health service; a guide in
 `docs/`; the Protocol Buffers adapter (`gpb`) and interop tests against the
 official client; server reflection; telemetry for calls and benchmarks.
