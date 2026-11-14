@@ -106,7 +106,7 @@ start(
         ?MODULE,
         init,
         [self(), Conn, StreamId, Req, Dispatch, MaxFieldSection, HeapFloor],
-        [monitor | SpawnOpts]
+        roadrunner_stream_worker:spawn_opts(SpawnOpts, HeapFloor)
     ).
 
 -doc false.

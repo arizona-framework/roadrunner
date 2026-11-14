@@ -118,7 +118,7 @@ start(
         ?MODULE,
         init,
         [ConnPid, StreamId, Req, Dispatch, peer_limit(PeerLimit, ProtoOpts), HeapFloor],
-        [monitor | SpawnOpts]
+        roadrunner_stream_worker:spawn_opts(SpawnOpts, HeapFloor)
     ).
 
 %% The client's limit, paired with the `alt-svc` value the conn adds to

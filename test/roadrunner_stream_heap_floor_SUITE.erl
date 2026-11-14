@@ -1,10 +1,13 @@
 -module(roadrunner_stream_heap_floor_SUITE).
 -moduledoc """
-The heap floor of HTTP/2 stream workers (`handler_spawn.heap_floor`): each
-worker raises its connection's floor to the heap its request needed, up to
-the cap, and the next worker starts at that size; every 16th stream starts
-at the base and learns it again. Over h2c, and over HTTP/3 with the native
-test client (`roadrunner_quic_test_h3`), with `roadrunner_heap_floor_handler`.
+The heap floor of HTTP/2 stream workers (`handler_spawn.heap_floor`): a
+worker that collected raises its connection's floor, up to the cap, and the
+workers after it start at that size; every 16th stream starts at half the
+floor and lowers it to that when it runs without collecting. Over h2c, and
+over HTTP/3 with the native test client (`roadrunner_quic_test_h3`), with
+`roadrunner_heap_floor_handler`. A worker sets the floor as it ends, after
+its response, so each case waits for a worker to end before the next
+request.
 """.
 
 -behaviour(ct_suite).
@@ -16,7 +19,16 @@ test client (`roadrunner_quic_test_h3`), with `roadrunner_heap_floor_handler`.
 -export([
     floor_rises_after_a_large_request/1,
     floor_rises_after_a_large_send_fun/1,
+    floor_rises_after_short_lived_garbage/1,
+    floor_rises_after_a_short_streamed_send_fun/1,
     floor_stops_at_the_cap/1,
+    floor_stays_under_half_the_max_heap_size/1,
+    floor_cap_follows_the_max_heap_size/1,
+    spawn_follows_a_changed_default_max_heap_size/1,
+    worker_at_the_cap_drops_its_min_heap_size/1,
+    long_streams_leave_the_floor/1,
+    long_send_streams_leave_the_floor/1,
+    relearning_holds_a_large_request_to_the_cap/1,
     floor_off/1,
     floor_starts_at_the_spawn_min_heap_size/1,
     floor_off_when_the_cap_is_under_the_spawn_min_heap_size/1,
@@ -35,7 +47,16 @@ all() ->
     [
         floor_rises_after_a_large_request,
         floor_rises_after_a_large_send_fun,
+        floor_rises_after_short_lived_garbage,
+        floor_rises_after_a_short_streamed_send_fun,
         floor_stops_at_the_cap,
+        floor_stays_under_half_the_max_heap_size,
+        floor_cap_follows_the_max_heap_size,
+        spawn_follows_a_changed_default_max_heap_size,
+        worker_at_the_cap_drops_its_min_heap_size,
+        long_streams_leave_the_floor,
+        long_send_streams_leave_the_floor,
+        relearning_holds_a_large_request_to_the_cap,
         floor_off,
         floor_starts_at_the_spawn_min_heap_size,
         floor_off_when_the_cap_is_under_the_spawn_min_heap_size,
@@ -54,7 +75,12 @@ init_per_testcase(Case, Config) ->
                 {~"/alloc", ?H, {alloc, self()}},
                 {~"/send_alloc", ?H, {send_alloc, self()}},
                 {~"/gated", ?H, {gated_alloc, self()}},
-                {~"/report", ?H, report}
+                {~"/garbage", ?H, {garbage, self()}},
+                {~"/heap", ?H, {heap, self()}},
+                {~"/min_heap", ?H, {min_heap, self()}},
+                {~"/stream_garbage", ?H, {stream_garbage, self()}},
+                {~"/send_stream_garbage", ?H, {send_stream_garbage, self()}},
+                {~"/send_stream_alloc", ?H, {send_stream_alloc, self()}}
             ]
         })
     ),
@@ -73,6 +99,22 @@ protocol_opts(_Case) ->
 
 listener_opts(floor_stops_at_the_cap) ->
     #{handler_spawn => #{heap_floor => #{max => 1000}}};
+listener_opts(floor_stays_under_half_the_max_heap_size) ->
+    %% `kill => false`: the 40,000-word request outgrows the limit.
+    #{
+        handler_spawn => #{
+            opts => [
+                {fullsweep_after, 0},
+                {max_heap_size, #{size => 20000, kill => false, error_logger => false}}
+            ]
+        }
+    };
+listener_opts(relearning_holds_a_large_request_to_the_cap) ->
+    #{
+        handler_spawn => #{heap_floor => #{max => 1000}},
+        max_header_count => 1000,
+        max_header_list_size => 1000000
+    };
 listener_opts(floor_off) ->
     #{handler_spawn => #{heap_floor => false}};
 listener_opts(floor_starts_at_the_spawn_min_heap_size) ->
@@ -96,24 +138,34 @@ floor_rises_after_a_large_request(Config) ->
     ?assert(Floor =< 46422).
 
 %% A `{send, ...}` fun does the request's work after the handler returns:
-%% the floor is the heap the fun needed. The worker raises it once the fun
-%% has answered, so the next request waits for the worker to end.
+%% the worker raises the floor once the fun has answered.
 floor_rises_after_a_large_send_fun(Config) ->
     C = open(Config),
     {_, C1} = response(send_get(C, 3, ~"/send_alloc"), 3),
-    Worker =
-        receive
-            {conn, Pid} -> Pid
-        after 5000 -> ct:fail(no_alloc)
-        end,
-    MRef = monitor(process, Worker),
-    receive
-        {'DOWN', MRef, process, Worker, _} -> ok
-    after 5000 -> ct:fail(worker_alive)
-    end,
+    ok = await_worker(),
     {Floor, _} = report(C1, 5),
     ?assert(Floor > base()),
     ?assert(Floor =< 46422).
+
+%% A request that keeps little live ends with a small heap however often it
+%% collected; that it collected is what raises the floor. Stream 1 relearns,
+%% so it reads that from `garbage_collection_info`'s `recent_size` rather
+%% than its heap's size.
+floor_rises_after_short_lived_garbage(Config) ->
+    C = open(Config),
+    {_, C1} = response(send_get(C, 1, ~"/garbage"), 1),
+    ok = await_worker(),
+    {Floor, _} = report(C1, 3),
+    ?assert(Floor > base()).
+
+%% A `{send, ...}` fun whose streamed body took little work, as a gRPC
+%% unary call's does, teaches the floor what it did after the body started.
+floor_rises_after_a_short_streamed_send_fun(Config) ->
+    C = open(Config),
+    {_, C1} = response(send_get(C, 3, ~"/send_stream_alloc"), 3),
+    ok = await_worker(),
+    {Floor, _} = report(C1, 5),
+    ?assert(Floor > rounded(5000)).
 
 %% A worker started at the cap answers without reading its heap; the next
 %% one starts at the cap too.
@@ -124,10 +176,119 @@ floor_stops_at_the_cap(Config) ->
     {Floor, _} = report(C2, 5),
     ?assertEqual(rounded(1000), Floor).
 
+%% A process cannot start with a `min_heap_size` over its `max_heap_size`:
+%% the floor stays under half of it, so the workers it sizes still start.
+floor_stays_under_half_the_max_heap_size(Config) ->
+    C = open(Config),
+    C1 = alloc(C, 1),
+    {Floor, C2} = report(C1, 3),
+    ?assertEqual(rounded(10000), Floor),
+    {Next, _} = report(C2, 5),
+    ?assertEqual(Floor, Next).
+
+floor_cap_follows_the_max_heap_size(_Config) ->
+    Cap = fun(SpawnOpts) ->
+        {_Cell, _Base, Max} = roadrunner_stream_worker:conn_heap_floor(#{
+            heap_floor => 46422, handler_spawn_opts => SpawnOpts
+        }),
+        Max
+    end,
+    ?assertEqual(10000, Cap([{max_heap_size, 20000}])),
+    ?assertEqual(10000, Cap([{max_heap_size, #{size => 20000}}])),
+    ?assertEqual(46422, Cap([{max_heap_size, #{size => 0}}])),
+    ?assertEqual(46422, Cap([])),
+    ?assertEqual(
+        undefined,
+        roadrunner_stream_worker:conn_heap_floor(#{
+            heap_floor => 46422, handler_spawn_opts => [{max_heap_size, 400}]
+        })
+    ),
+    Default = erlang:system_flag(max_heap_size, 30000),
+    try
+        ?assertEqual(15000, Cap([]))
+    after
+        erlang:system_flag(max_heap_size, Default)
+    end.
+
+%% The emulator's default `max_heap_size` lowered while a connection lives
+%% applies at the next spawn: the floor the spawn asks for stays under half
+%% of it, or is left out when that is not above the base, so the spawn
+%% cannot fail.
+spawn_follows_a_changed_default_max_heap_size(_Config) ->
+    Base = base(),
+    HeapFloor = {atomics:new(1, []), 40000, Base, 46422, false},
+    Default = erlang:system_flag(max_heap_size, 30000),
+    try
+        ?assertEqual(
+            [monitor, {min_heap_size, 15000}],
+            roadrunner_stream_worker:spawn_opts([], HeapFloor)
+        ),
+        {Pid, Ref} = spawn_opt(fun() -> ok end, roadrunner_stream_worker:spawn_opts([], HeapFloor)),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        end,
+        _ = erlang:system_flag(max_heap_size, 400),
+        ?assertEqual([monitor], roadrunner_stream_worker:spawn_opts([], HeapFloor))
+    after
+        erlang:system_flag(max_heap_size, Default)
+    end.
+
+%% A worker started at the cap lowers its `min_heap_size` to the base, so
+%% one that lives on does not hold the cap's heap after it collects.
+worker_at_the_cap_drops_its_min_heap_size(Config) ->
+    C = open(Config),
+    C1 = alloc(C, 1),
+    {Floor, C2} = report(C1, 3),
+    ?assertEqual(46422, Floor),
+    {MinHeap, _} = min_heap(C2, 5),
+    ?assertEqual(base(), MinHeap).
+
+%% A streamed body collects however large the floor: only what the handler
+%% did before it started teaches the floor, so 17 streams that each make
+%% about 160,000 words of garbage leave it at most a step or two over the
+%% base (a worker can still collect at the base before its body starts).
+long_streams_leave_the_floor(Config) ->
+    long_streams(Config, ~"/stream_garbage").
+
+%% The same for a `{send, ...}` fun that streams its body.
+long_send_streams_leave_the_floor(Config) ->
+    long_streams(Config, ~"/send_stream_garbage").
+
+long_streams(Config, Path) ->
+    C = open(Config),
+    C1 = lists:foldl(
+        fun(Id, Acc) ->
+            {_, Acc1} = response(send_get(Acc, Id, Path), Id),
+            ok = await_worker(),
+            Acc1
+        end,
+        C,
+        lists:seq(1, 33, 2)
+    ),
+    {Floor, _} = report(C1, 35),
+    ?assert(Floor =< 610).
+
+%% Stream 1 relearns at the base. Spawned with a request of 180
+%% headers, its worker starts above the cap; running without collecting, it
+%% lowers the floor to the cap, not to that size.
+relearning_holds_a_large_request_to_the_cap(Config) ->
+    C = open(Config),
+    Extra = [
+        {<<"x-header-", (integer_to_binary(N))/binary>>, binary:copy(~"v", 40)}
+     || N <- lists:seq(1, 180)
+    ],
+    {Body, C1} = response(send_get(C, 1, ~"/heap", Extra), 1),
+    ok = await_worker(),
+    ?assert(binary_to_integer(Body) > rounded(1000)),
+    {Floor, _} = report(C1, 3),
+    ?assertEqual(rounded(1000), Floor).
+
 floor_off(Config) ->
     C = open(Config),
     C1 = alloc(C, 1),
-    {Floor, _} = report(C1, 3),
+    {_, C2} = response(send_get(C1, 3, ~"/send_stream_alloc"), 3),
+    ok = await_worker(),
+    {Floor, _} = report(C2, 5),
     ?assertEqual(base(), Floor).
 
 floor_starts_at_the_spawn_min_heap_size(Config) ->
@@ -144,16 +305,17 @@ floor_off_when_the_cap_is_under_the_spawn_min_heap_size(Config) ->
     {Floor, _} = report(C1, 3),
     ?assertEqual(rounded(2000), Floor).
 
-%% Stream 33 is the 17th: it starts at the base and resets the floor.
+%% Stream 33 is the 17th: it starts at half the floor and, running without
+%% collecting, lowers the floor to that.
 floor_relearns_every_16_streams(Config) ->
     C = open(Config),
     C1 = alloc(C, 1),
     {Floors, C2} = lists:mapfoldl(fun(Id, Acc) -> report(Acc, Id) end, C1, lists:seq(3, 31, 2)),
-    ?assert(lists:all(fun(Floor) -> Floor > base() end, Floors)),
+    ?assertEqual([46422], lists:usort(Floors)),
     {Relearned, C3} = report(C2, 33),
-    ?assertEqual(base(), Relearned),
+    ?assertEqual(rounded(46422 div 2), Relearned),
     {Next, _} = report(C3, 35),
-    ?assertEqual(base(), Next).
+    ?assertEqual(Relearned, Next).
 
 %% A worker that started before a larger one raised the floor, and needed
 %% less than that, leaves the higher floor in place.
@@ -169,11 +331,12 @@ smaller_need_leaves_a_higher_floor(Config) ->
     {Floor, C3} = report(C2, 5),
     Gated ! go,
     {_, C4} = response(C3, 1),
+    ok = await_down(Gated),
     {After, _} = report(C4, 7),
     ?assertEqual(Floor, After).
 
 %% HTTP/3 request streams count up by 4 (0, 4, 8, ...); the first one
-%% relearns, so the floor starts at the base.
+%% relearns, from half the base floor: the base.
 h3_floor_rises_after_a_large_request(Config) ->
     Conn = h3_connect(Config),
     ?assertEqual(base(), h3_report(Conn)),
@@ -183,13 +346,13 @@ h3_floor_rises_after_a_large_request(Config) ->
     ?assert(Floor =< 46422),
     ok = roadrunner_quic_test_h3:close(Conn).
 
-%% Stream 64 is the 17th: it starts at the base and resets the floor.
+%% Stream 64 is the 17th: it starts at half the floor.
 h3_floor_relearns_every_16_streams(Config) ->
     Conn = h3_connect(Config),
     ok = h3_alloc(Conn),
     Floors = [h3_report(Conn) || _ <- lists:seq(2, 16)],
-    ?assert(lists:all(fun(Floor) -> Floor > base() end, Floors)),
-    ?assertEqual(base(), h3_report(Conn)),
+    ?assertEqual([46422], lists:usort(Floors)),
+    ?assertEqual(rounded(46422 div 2), h3_report(Conn)),
     ok = roadrunner_quic_test_h3:close(Conn).
 
 %% =============================================================================
@@ -228,22 +391,45 @@ open(Config) ->
 
 alloc(C, StreamId) ->
     {_, C1} = response(send_get(C, StreamId, ~"/alloc"), StreamId),
-    receive
-        {conn, _Worker} -> C1
-    after 5000 -> ct:fail(no_alloc)
-    end.
+    ok = await_worker(),
+    C1.
 
-%% The `min_heap_size` the stream's worker started at.
+%% The heap the stream's worker started at.
 report(C, StreamId) ->
-    {Body, C1} = response(send_get(C, StreamId, ~"/report"), StreamId),
+    {Body, C1} = response(send_get(C, StreamId, ~"/heap"), StreamId),
+    ok = await_worker(),
     {binary_to_integer(Body), C1}.
 
-send_get(#{sock := Sock, enc := Enc} = C, StreamId, Path) ->
+%% The `min_heap_size` the stream's worker runs with.
+min_heap(C, StreamId) ->
+    {Body, C1} = response(send_get(C, StreamId, ~"/min_heap"), StreamId),
+    ok = await_worker(),
+    {binary_to_integer(Body), C1}.
+
+%% Waits for the worker that just answered to end, having set the floor.
+await_worker() ->
+    receive
+        {conn, Worker} -> await_down(Worker)
+    after 5000 -> ct:fail(no_worker)
+    end.
+
+await_down(Worker) ->
+    MRef = monitor(process, Worker),
+    receive
+        {'DOWN', MRef, process, Worker, _} -> ok
+    after 5000 -> ct:fail(worker_alive)
+    end.
+
+send_get(C, StreamId, Path) ->
+    send_get(C, StreamId, Path, []).
+
+send_get(#{sock := Sock, enc := Enc} = C, StreamId, Path, Extra) ->
     Fields = [
         {~":method", ~"GET"},
         {~":scheme", ~"http"},
         {~":authority", ~"x"},
         {~":path", Path}
+        | Extra
     ],
     {Block, Enc1} = roadrunner_http2_hpack:encode(Fields, Enc),
     %% END_HEADERS | END_STREAM
@@ -289,12 +475,10 @@ h3_connect(Config) ->
 
 h3_alloc(Conn) ->
     {200, _Headers, _Body} = roadrunner_quic_test_h3:get(Conn, ~"/alloc"),
-    receive
-        {conn, _Worker} -> ok
-    after 5000 -> ct:fail(no_alloc)
-    end.
+    await_worker().
 
-%% The `min_heap_size` the stream's worker started at.
+%% The heap the stream's worker started at.
 h3_report(Conn) ->
-    {200, _Headers, Body} = roadrunner_quic_test_h3:get(Conn, ~"/report"),
+    {200, _Headers, Body} = roadrunner_quic_test_h3:get(Conn, ~"/heap"),
+    ok = await_worker(),
     binary_to_integer(Body).

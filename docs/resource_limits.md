@@ -467,16 +467,30 @@ last request left either way: 1000 connections idle after a large JSON
 response held the same memory. Set `heap_floor => false` to turn it off.
 
 HTTP/2 and HTTP/3 run each request in a stream worker of its own, which
-lives for that request alone, so there the connection keeps the floor:
-each worker raises it to the heap its request needed, the next worker
-starts at that size, and every 16th stream starts at the base and
-learns it again. On the arena-style JSON load over h2c (32 streams per
-connection, 3 alternating rounds at 64 connections, one at 256):
+lives for that request alone, so there the connection keeps the floor and
+starts each worker at it. A worker's heap at the end of its request says
+little of what the request needed, since a full sweep can shrink it back
+toward what is live, so a worker instead tells whether it collected at all: one
+that did raises the floor by half, and the workers after it raise it again
+until they run without collecting. Every 16th stream starts at half the
+floor and, if it runs without collecting, lowers the floor to that, so a
+connection whose requests got smaller stops sizing workers for the larger
+ones. A streamed or file response teaches the floor only what happened
+before its body started, since a long stream collects however large the
+floor, and every worker drops its `min_heap_size` back to the base once
+it has started, so a stream that lives on holds only what it keeps live.
+With a `max_heap_size` in `handler_spawn`'s `opts` (or the emulator's
+default, read again at each spawn), the floor is at most half of it, as
+a process cannot start with a `min_heap_size` above it.
 
-| connections | without the floor | with it | peak memory |
-| --- | --- | --- | --- |
-| 64 | 28.8k-29.1k req/s | 36.7k-36.9k req/s (+27%) | about the same |
-| 256 | 28.9k req/s | 36.4k req/s (+26%) | 254 MiB instead of 281 MiB |
+Compared with learning from the heap left at the end of a request, over
+h2c with 16 connections and a fresh server per run, a JSON response used
+about 15% less CPU per request (most of its collections gone), a gRPC
+unary call about 5% less, and a bare hello response about 1% more. Tail
+latency stayed the same or got better. Peak memory under load rose about
+7-13%, as each worker starts with the floor's heap; idle connections hold
+no workers, so they cost the same. A load that mixes in large responses
+sees about the same CPU, as those responses dominate its cost.
 
 A WebSocket session keeps a floor too, learned from its `handle_info/2`
 calls, where a server push is usually built: a message from another
