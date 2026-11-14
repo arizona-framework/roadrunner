@@ -7,7 +7,7 @@
 -export([unary/2, count/2, sum/1, chat/1, fail/2, crash/2, crash_after/2, meta/2, deadline/2, bad/2]).
 -export([stop/2, bad_trailer/2, late_headers/2, stale_send/2, bad_name/2]).
 -export([unsafe_header/2, unsafe_fail/2, busy/2, squeezed/2, late_compression/2]).
--export([stale_compression/2, held/1]).
+-export([stale_compression/2, held/1, was_compressed/2]).
 
 name() -> ~"test.Echo".
 
@@ -34,7 +34,8 @@ rpcs() ->
         ~"Squeezed" => rpc(squeezed, server_stream),
         ~"LateCompression" => rpc(late_compression, server_stream),
         ~"StaleCompression" => rpc(stale_compression, server_stream),
-        ~"Held" => rpc(held, client_stream)
+        ~"Held" => rpc(held, client_stream),
+        ~"WasCompressed" => rpc(was_compressed, unary)
     }.
 
 rpc(Function, Kind) ->
@@ -65,6 +66,9 @@ chat(Stream) ->
         {ok, M, Stream1} -> chat(roadrunner_grpc:send(M, Stream1));
         {eof, Stream1} -> {ok, Stream1}
     end.
+
+was_compressed(_Request, Stream) ->
+    {reply, atom_to_binary(roadrunner_grpc:recv_compressed(Stream)), Stream}.
 
 fail(_Request, Stream) ->
     {error, not_found, ~"no such thing: café 100%", Stream}.

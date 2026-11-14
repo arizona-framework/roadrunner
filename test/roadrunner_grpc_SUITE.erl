@@ -63,8 +63,12 @@ fixture, under both body buffering modes.
     compression_after_a_response_is_internal/1,
     messages_follow_the_announced_encoding/1,
     route_compression_applies/1,
-    body_past_the_window_waits_for_the_reader/1
+    body_past_the_window_waits_for_the_reader/1,
+    recv_tells_a_compressed_message/1,
+    descriptor_service_calls/1
 ]).
+
+-define(RUNTIME, ~"/test.Runtime/").
 
 -define(SVC, ~"/test.Echo/").
 
@@ -117,7 +121,9 @@ groups() ->
         response_compressed_when_the_client_reads_it,
         compression_after_a_response_is_internal,
         messages_follow_the_announced_encoding,
-        route_compression_applies
+        route_compression_applies,
+        recv_tells_a_compressed_message,
+        descriptor_service_calls
     ],
     [
         {auto, [], Common},
@@ -154,7 +160,18 @@ start(Config, Protocols, Mode) ->
         body_buffering => Mode,
         max_content_length => 50_000,
         routes => roadrunner_grpc:routes(#{
-            services => [roadrunner_grpc_test_service],
+            services => [
+                roadrunner_grpc_test_service,
+                #{
+                    name => ~"test.Runtime",
+                    module => roadrunner_grpc_test_service,
+                    rpcs => #{
+                        ~"Echo" => #{
+                            function => unary, kind => unary, input => in, output => out
+                        }
+                    }
+                }
+            ],
             codecs => [roadrunner_grpc_codec_raw, roadrunner_grpc_test_codec],
             max_message_size => 100_000,
             send_compression => gzip,
@@ -622,6 +639,21 @@ gate(Client, Taken, Worker) ->
         _Other ->
             gate(Client, Taken, Worker)
     end.
+
+%% `recv_compressed/1` says how the message read last came: flagged
+%% compressed or not, the call's grpc-encoding aside.
+recv_tells_a_compressed_message(Config) ->
+    Gzip = [{~"grpc-encoding", ~"gzip"}],
+    Body = iolist_to_binary(roadrunner_grpc_frame:encode(true, zlib:gzip(~"x"))),
+    {_, [~"true"], _, _} = raw_call(Config, ~"WasCompressed", Gzip, Body),
+    {_, [~"false"], _, _} = call(Config, ~"WasCompressed", Gzip, [~"x"]).
+
+%% A service given as a descriptor map is routed and called like a module.
+descriptor_service_calls(Config) ->
+    {_, [~"hi"], Trailers, _} = roadrunner_grpc_test_client:call(
+        open(Config), 1, <<?RUNTIME/binary, "Echo">>, [], [~"hi"]
+    ),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)).
 
 %% --- helpers ---
 

@@ -36,15 +36,37 @@ that crashes ends the call with `INTERNAL`.
 
 `input` and `output` are given to the call's `roadrunner_grpc_codec` as
 the message types; the raw codec ignores them.
+
+## A service built at runtime
+
+A service whose methods are only known at runtime, read from a schema say,
+is given to `roadrunner_grpc:routes/1` as a `t:descriptor/0` in place of a
+module: the name and methods the callbacks would return, and the module
+that holds the method functions.
+
+```erlang
+roadrunner_grpc:routes(#{services => [
+    #{name => ~"helloworld.Greeter",
+      module => greeter_impl,
+      rpcs => #{~"SayHello" => #{function => say_hello, kind => unary,
+                                 input => hello_request, output => hello_reply}}}
+]}).
+```
 """.
 
--export_type([rpc/0, kind/0]).
+-export_type([rpc/0, kind/0, descriptor/0]).
 
 -doc "How a method's requests and responses flow.".
 -type kind() :: unary | server_stream | client_stream | bidi_stream.
 
 -doc "A method: its function in the service module, its kind and message types.".
 -type rpc() :: #{function := atom(), kind := kind(), input := term(), output := term()}.
+
+-doc """
+A service given as data: its full name, its methods, and the module whose
+functions they call.
+""".
+-type descriptor() :: #{name := binary(), module := module(), rpcs := #{binary() => rpc()}}.
 
 -doc """
 The service's full name, `package.Service` as the `.proto` file declares

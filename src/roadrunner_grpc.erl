@@ -23,9 +23,11 @@ hands a method the bytes.
 
 ## Options
 
-`routes/1` takes `services`, the service modules, and passes the rest to
-every service's route; `init_route/1` checks them when the routes compile,
-and a bad one stops the listener from starting:
+`routes/1` takes `services`, the service modules (or
+`t:roadrunner_grpc_service:descriptor/0` maps, for a service built at
+runtime), and passes the rest to every service's route; `init_route/1`
+checks them when the routes compile, and a bad one stops the listener
+from starting:
 
 - `codecs`: the `roadrunner_grpc_codec` modules the services speak, by
   default `[roadrunner_grpc_codec_raw]`
@@ -94,7 +96,9 @@ all three in `grpc-accept-encoding`. Its own messages are compressed with
 the route's `send_compression`, or what `set_send_compression/2` picks for
 the call, when the client's `grpc-accept-encoding` lists it, and sent as
 they are otherwise; `send/3` with `#{compress => false}` sends one as it
-is, to keep a secret out of a compressed stream.
+is, to keep a secret out of a compressed stream. `recv_compressed/1` says
+whether the message `recv/1` returned last came compressed, a unary or
+server-streaming method's request among them.
 
 ## Metadata
 
@@ -111,7 +115,7 @@ values are each an entry, and one that is not base64 ends the call with
 
 -export([routes/1, init_route/1, handle/1]).
 -export([recv/1, send/2, send/3, metadata/1, set_headers/2, set_trailers/2, deadline/1, peer/1]).
--export([set_send_compression/2, cancelled/2]).
+-export([set_send_compression/2, cancelled/2, recv_compressed/1]).
 
 -export_type([opts/0, status/0, stream/0, encoding/0]).
 
@@ -134,7 +138,7 @@ The options `routes/1` takes: `services`, and the route options shared by
 every service (see the moduledoc).
 """.
 -type opts() :: #{
-    services := [module()],
+    services := [module() | roadrunner_grpc_service:descriptor()],
     codecs => [module()],
     max_message_size => pos_integer(),
     max_content_length => non_neg_integer(),
@@ -189,6 +193,8 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
     buffer = <<>> :: binary(),
     %% Whether the request body has ended.
     eof = false :: boolean(),
+    %% Whether the message `recv/1` returned last came compressed.
+    compressed = false :: boolean(),
     %% How the client compresses its messages (its `grpc-encoding`).
     recv_encoding = identity :: encoding(),
     %% How the response's messages are compressed, and the encodings the
@@ -246,6 +252,10 @@ health_route(#{}) ->
     [].
 
 -spec service_name(term(), [term()]) -> binary().
+service_name(#{name := Name, module := Module, rpcs := Rpcs} = Service, _Services) when
+    is_binary(Name), is_atom(Module), is_map(Rpcs), map_size(Service) =:= 3
+->
+    Name;
 service_name(Service, Services) ->
     maybe
         true ?= is_atom(Service),
@@ -266,21 +276,16 @@ service's methods by name and the codecs by subtype. A bad option raises
 the listener from starting.
 """.
 -spec init_route(map()) -> #route{}.
-init_route(#{service := Service} = Opts) when is_atom(Service) ->
+init_route(#{service := Service} = Opts) ->
     ok = check_known_opts(Opts),
-    case code:ensure_loaded(Service) of
-        {module, Service} -> ok;
-        {error, _} -> error({invalid_grpc_opt, service, Service})
-    end,
+    {Module, Rpcs} = service(Service),
     #route{
-        service = Service,
-        rpcs = rpcs(Service),
+        service = Module,
+        rpcs = rpcs(Module, Rpcs),
         codecs = codecs(maps:get(codecs, Opts, [roadrunner_grpc_codec_raw])),
         max_message_size = max_message_size(Opts),
         send_compression = send_compression(Opts)
     };
-init_route(#{service := Service}) ->
-    error({invalid_grpc_opt, service, Service});
 init_route(Opts) ->
     error({invalid_grpc_opts, Opts}).
 
@@ -291,8 +296,30 @@ check_known_opts(Opts) ->
         [Key | _] -> error({unknown_grpc_opt, Key})
     end.
 
--spec rpcs(module()) -> #{binary() => {atom(), roadrunner_grpc_service:kind(), term(), term()}}.
-rpcs(Service) ->
+%% The module that holds the methods, and the methods: a service module's
+%% own, or a descriptor's.
+-spec service(term()) -> {module(), term()}.
+service(Service) when is_atom(Service) ->
+    ok = loaded(Service, Service),
+    {Service, Service:rpcs()};
+service(#{name := Name, module := Module, rpcs := Rpcs} = Service) when
+    is_binary(Name), is_atom(Module), map_size(Service) =:= 3
+->
+    ok = loaded(Module, Service),
+    {Module, Rpcs};
+service(Service) ->
+    error({invalid_grpc_opt, service, Service}).
+
+-spec loaded(module(), term()) -> ok.
+loaded(Module, Service) ->
+    case code:ensure_loaded(Module) of
+        {module, Module} -> ok;
+        {error, _} -> error({invalid_grpc_opt, service, Service})
+    end.
+
+-spec rpcs(module(), term()) ->
+    #{binary() => {atom(), roadrunner_grpc_service:kind(), term(), term()}}.
+rpcs(Service, Rpcs) ->
     maps:map(
         fun
             (Name, #{function := Function, kind := Kind, input := In, output := Out} = Rpc) when
@@ -307,8 +334,8 @@ rpcs(Service) ->
             (Name, Rpc) ->
                 error({invalid_grpc_opt, service, {Service, Name, Rpc}})
         end,
-        case Service:rpcs() of
-            Rpcs when is_map(Rpcs) -> Rpcs;
+        case Rpcs of
+            #{} -> Rpcs;
             Other -> error({invalid_grpc_opt, service, {Service, Other}})
         end
     ).
@@ -731,12 +758,12 @@ running out while it waits with `DEADLINE_EXCEEDED`.
 recv(#stream{buffer = Buffer, max_message_size = Max} = Stream) ->
     case roadrunner_grpc_frame:decode(Buffer, Max) of
         {ok, false, Bytes, Rest} ->
-            {ok, decode(Bytes, Stream), Stream#stream{buffer = Rest}};
+            {ok, decode(Bytes, Stream), Stream#stream{buffer = Rest, compressed = false}};
         {ok, true, _Bytes, _Rest} when Stream#stream.recv_encoding =:= identity ->
             abort(internal, ~"compressed message without a grpc-encoding to read it", Stream);
         {ok, true, Compressed, Rest} ->
             Bytes = decompressed(Compressed, Stream),
-            {ok, decode(Bytes, Stream), Stream#stream{buffer = Rest}};
+            {ok, decode(Bytes, Stream), Stream#stream{buffer = Rest, compressed = true}};
         {error, message_too_large} ->
             abort(resource_exhausted, ~"request message too large", Stream);
         {error, bad_compressed_flag} ->
@@ -909,6 +936,15 @@ set_send_compression(Encoding, #stream{accepted = Accepted} = Stream) when
         undefined -> Stream#stream{send_encoding = sendable(Encoding, Accepted)};
         _Send -> error(headers_already_sent)
     end.
+
+-doc """
+Whether the message `recv/1` returned last came compressed, for a method
+that checks how its client sends (gRPC's interop tests ask a server to);
+`false` before the first.
+""".
+-spec recv_compressed(stream()) -> boolean().
+recv_compressed(#stream{compressed = Compressed}) ->
+    Compressed.
 
 -doc "Add trailers, sent after the status when the call ends.".
 -spec set_trailers(roadrunner_http:headers(), stream()) -> stream().
