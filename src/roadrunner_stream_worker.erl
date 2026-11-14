@@ -173,7 +173,8 @@ start_at_heap_floor({_Cell, Floor, Base, _Cap}) when Floor > Base ->
 start_at_heap_floor(_HeapFloor) ->
     ok.
 
-%% Sampled when the handler returns, before the response is encoded. Two
+%% Sampled when the handler returns, before the response is encoded, or
+%% once a `{send, ...}` fun, which does the request's work, has run. Two
 %% workers raising at once can leave the smaller of their sizes; the next
 %% worker that needs more raises it again.
 -spec raise_heap_floor(heap_floor()) -> ok.
@@ -235,8 +236,8 @@ invoke(
 ) ->
     try Pipeline(Req) of
         {{send, Headers, Fun}, Req2} when is_list(Headers), is_function(Fun, 1) ->
-            ok = raise_heap_floor(HeapFloor),
-            run_send(Worker, Protocol, Conn, StreamId, Handler, Req2, Headers, Fun, Span);
+            ok = run_send(Worker, Protocol, Conn, StreamId, Handler, Req2, Headers, Fun, Span),
+            raise_heap_floor(HeapFloor);
         {Response0, Req2} ->
             ok = raise_heap_floor(HeapFloor),
             %% A handler-returned 1xx or unsafe header becomes a 500 here,
