@@ -18,6 +18,7 @@ fixture, under both body buffering modes.
     client_stream/1,
     bidi_stream/1,
     bidi_interleaves/1,
+    prefix_across_frames/1,
     error_status_is_trailers_only/1,
     crash_is_internal/1,
     crash_after_a_response_is_internal_in_trailers/1,
@@ -133,6 +134,7 @@ groups() ->
             Common ++
                 [
                     bidi_interleaves,
+                    prefix_across_frames,
                     timeout_ends_a_waiting_read,
                     client_reset_stops_the_read,
                     body_over_the_cap_is_resource_exhausted,
@@ -215,6 +217,22 @@ bidi_interleaves(Config) ->
     {Echo, C2} = next_message(C1),
     ?assertEqual(~"ping", Echo),
     C3 = roadrunner_grpc_test_client:send(C2, 1, frame(~"pong")),
+    {Echo2, C4} = next_message(C3),
+    ?assertEqual(~"pong", Echo2),
+    {Trailers, _} = roadrunner_grpc_test_client:trailers(
+        roadrunner_grpc_test_client:finish(C4, 1), 1
+    ),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)).
+
+%% A message whose 5-byte prefix is split across DATA frames reads whole:
+%% the first frame ends two bytes into the second message's prefix.
+prefix_across_frames(Config) ->
+    <<Head:2/binary, Tail/binary>> = frame(~"pong"),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "Chat">>, []),
+    C1 = roadrunner_grpc_test_client:send(C0, 1, <<(frame(~"ping"))/binary, Head/binary>>),
+    {Echo, C2} = next_message(C1),
+    ?assertEqual(~"ping", Echo),
+    C3 = roadrunner_grpc_test_client:send(C2, 1, Tail),
     {Echo2, C4} = next_message(C3),
     ?assertEqual(~"pong", Echo2),
     {Trailers, _} = roadrunner_grpc_test_client:trailers(
