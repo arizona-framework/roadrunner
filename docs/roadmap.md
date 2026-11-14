@@ -104,16 +104,6 @@ dynamic table, responses use the static table). Remaining work:
 - WebTransport / Extended CONNECT (RFC 9220) and HTTP datagrams
   (RFC 9297)
 
-### HTTP/3 idle timeout from `keep_alive_timeout` — small
-
-**What:** an HTTP/3 connection's idle timeout is the QUIC `max_idle_timeout`,
-fixed at 30 s (`roadrunner_quic_listener_sup`), while HTTP/2 takes it from the
-listener's `keep_alive_timeout`. Wire the option through to the transport
-parameter, mapping 0 carefully: on HTTP/1.1 it means "no keep-alive wait",
-while a QUIC `max_idle_timeout` of 0 disables the idle timeout.
-
-**Scope:** small.
-
 ## Native QUIC transport follow-ups
 
 The HTTP/3 path runs on the native `roadrunner_quic_*` stack end to end, with no
@@ -132,6 +122,15 @@ need.
   transfer that fills a non-zero window — already emits the frame on the
   flow's blocked transition; this remainder is the never-sent-a-byte case a
   conformant peer never produces — small
+- Keep-alive PING while a handler works: an HTTP/3 connection whose client
+  sends nothing closes at its idle timeout even with a handler still at
+  work, where HTTP/2 checks the client with a PING. Send a QUIC PING (RFC
+  9000 §10.1.2) before the idle deadline while a request is open, early
+  enough to beat the client's own idle timer — medium
+- Idle timer restarts (RFC 9000 §10.1): restart it on the first
+  ack-eliciting packet sent since the last receive, and only on a packet
+  that was processed (today any datagram restarts it, one that fails to
+  decrypt included) — small
 
 ### Throughput levers identified by profiling
 

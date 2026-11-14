@@ -52,6 +52,7 @@
     drop_fin/2,
     server_cids/1,
     reset_tokens/1,
+    max_idle_timeout/1,
     new_tokens/1,
     use_server_cid/2,
     retire_connection_id/2,
@@ -144,6 +145,8 @@
     next_cid_seq = 1 :: pos_integer(),
     %% The server's stateless reset tokens (RFC 9000 §10.3).
     reset_tokens = [] :: [binary()],
+    %% The server's max_idle_timeout transport parameter, 0 when absent.
+    max_idle_timeout = 0 :: non_neg_integer(),
     %% The address validation tokens the server sent, newest first (RFC 9000
     %% §19.7).
     new_tokens = [] :: [binary()],
@@ -291,6 +294,11 @@ ids NEW_CONNECTION_ID carried, newest first.
 -spec reset_tokens(pid()) -> [binary()].
 reset_tokens(Pid) ->
     call(Pid, reset_tokens).
+
+-doc "The max_idle_timeout the server advertised (RFC 9000 §18.2), 0 when absent.".
+-spec max_idle_timeout(pid()) -> non_neg_integer().
+max_idle_timeout(Pid) ->
+    call(Pid, max_idle_timeout).
 
 -doc """
 The address validation tokens the server sent with NEW_TOKEN (RFC 9000
@@ -563,7 +571,8 @@ complete(Conn, ServerHelloFramed, HandshakeBytes) ->
             ),
             {continue, Conn1#conn{
                 finished_sent = true,
-                reset_tokens = param_reset_token(ServerParams),
+                reset_tokens = transport_param(16#02, ServerParams),
+                max_idle_timeout = param_max_idle_timeout(ServerParams),
                 app_server_keys = keys_for(application, server, Installs),
                 app_client_keys = keys_for(application, client, Installs)
             }};
@@ -571,18 +580,29 @@ complete(Conn, ServerHelloFramed, HandshakeBytes) ->
             {error, Reason}
     end.
 
-%% The stateless_reset_token transport parameter (id 0x02, RFC 9000 §18.2)
-%% among the server's, as a list of zero or one token.
--spec param_reset_token(binary()) -> [binary()].
-param_reset_token(<<>>) ->
+%% The value of transport parameter `Id` (RFC 9000 §18) among the server's,
+%% as a list of zero or one value: 0x02 is stateless_reset_token.
+-spec transport_param(non_neg_integer(), binary()) -> [binary()].
+transport_param(_Id, <<>>) ->
     [];
-param_reset_token(Params) ->
-    {ok, Id, AfterId} = roadrunner_quic_varint:decode(Params),
+transport_param(Id, Params) ->
+    {ok, ParamId, AfterId} = roadrunner_quic_varint:decode(Params),
     {ok, Len, AfterLen} = roadrunner_quic_varint:decode(AfterId),
     <<Value:Len/binary, Rest/binary>> = AfterLen,
-    case Id of
-        16#02 -> [Value];
-        _ -> param_reset_token(Rest)
+    case ParamId of
+        Id -> [Value];
+        _ -> transport_param(Id, Rest)
+    end.
+
+%% The max_idle_timeout transport parameter (id 0x01, a varint), 0 when absent.
+-spec param_max_idle_timeout(binary()) -> non_neg_integer().
+param_max_idle_timeout(Params) ->
+    case transport_param(16#01, Params) of
+        [] ->
+            0;
+        [Value] ->
+            {ok, Ms, <<>>} = roadrunner_quic_varint:decode(Value),
+            Ms
     end.
 
 %% Send a bare Handshake-level PING to validate the client's address, lifting
@@ -698,6 +718,9 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
             connected_loop(Conn);
         {reset_tokens, From, Ref} ->
             From ! {Ref, Conn#conn.reset_tokens},
+            connected_loop(Conn);
+        {max_idle_timeout, From, Ref} ->
+            From ! {Ref, Conn#conn.max_idle_timeout},
             connected_loop(Conn);
         {new_tokens, From, Ref} ->
             From ! {Ref, Conn#conn.new_tokens},

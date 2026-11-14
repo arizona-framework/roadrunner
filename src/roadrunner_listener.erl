@@ -53,6 +53,8 @@ All duration and interval values in `opts()` are in milliseconds —
 %% covers slow real clients.
 -define(DEFAULT_TLS_HANDSHAKE_TIMEOUT, 5000).
 -define(DEFAULT_KEEP_ALIVE_TIMEOUT, 60000).
+%% The floor of an HTTP/3 connection's idle timeout, as HTTP/2's.
+-define(MIN_QUIC_IDLE_TIMEOUT, 1000).
 %% A conn killed outright (`exit(Pid, kill)`, a `max_heap_size` kill) skips
 %% its exit path and leaks a slot and a drain-registry row for the life of
 %% the listener; only the reaper gives them back, so it runs by default.
@@ -199,9 +201,12 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `keep_alive_timeout` — idle timeout between requests on a
   keep-alive conn: on HTTP/1.1 between one request and the next, on
   HTTP/2 how long the connection may stay quiet before it is closed with
-  a GOAWAY, or, while a handler is still at work, checked with a PING (at
-  least 1 s there, so a client has time to send its first request and to
-  answer the PING). Default 60 s.
+  a GOAWAY, or, while a handler is still at work, checked with a PING
+  (at least 1 s, so a client has time to send its first request and to
+  answer the PING), and on HTTP/3 the QUIC idle timeout the server
+  offers (at least 1 s; the connection uses the smaller of it and the
+  client's, and closes once it passes with nothing received, even with
+  a handler still at work). Default 60 s.
 - `num_acceptors` — size of the acceptor pool. Default: one per online
   scheduler, at most 10. Every acceptor waits on the same listen socket, so
   more acceptors than schedulers only adds contention: on one or two
@@ -1292,12 +1297,16 @@ start_quic(Port, Opts, Protocols, ProtoOpts, AcceptGate) ->
             Listeners = maps:get(http3_listeners, ProtoOpts, ?DEFAULT_H3_LISTENERS),
             {QuicPort, Probe} = resolve_quic_port(Port, Listeners, Opts),
             MaxStreamsBidi = maps:get(http3_max_streams_bidi, ProtoOpts, ?H3_MAX_STREAMS_BIDI),
+            #{keep_alive_timeout := KeepAliveTimeout} = ProtoOpts,
             PoolOpts = #{
                 cert => Cert,
                 key => Key,
                 cert_chain => CertChain,
                 alpn => [~"h3"],
                 max_streams_bidi => MaxStreamsBidi,
+                %% As on HTTP/2, at least 1 s: 0 means "no keep-alive wait" on
+                %% HTTP/1.1, but a QUIC max_idle_timeout of 0 means no limit.
+                max_idle_timeout => max(KeepAliveTimeout, ?MIN_QUIC_IDLE_TIMEOUT),
                 connection_handler => Handler,
                 pool_size => Listeners - 1,
                 %% In manual body mode a request stream's credit is granted

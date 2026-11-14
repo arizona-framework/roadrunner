@@ -66,6 +66,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     other_expectation_gets_no_interim/1,
     oversized_headers_431/1,
     advertises_max_field_section_size/1,
+    idle_timeout_is_the_keep_alive_timeout/1,
     advertises_grease_setting/1,
     field_section_too_large_431/1,
     protocols_tuple_form/1,
@@ -178,6 +179,7 @@ all() ->
         other_expectation_gets_no_interim,
         oversized_headers_431,
         advertises_max_field_section_size,
+        idle_timeout_is_the_keep_alive_timeout,
         advertises_grease_setting,
         field_section_too_large_431,
         protocols_tuple_form,
@@ -276,6 +278,7 @@ init_per_testcase(Case, Config) when
     Case =:= refused_request_with_fin_is_dropped;
     Case =:= oversized_headers_431;
     Case =:= advertises_max_field_section_size;
+    Case =:= idle_timeout_is_the_keep_alive_timeout;
     Case =:= field_section_too_large_431
 ->
     Config;
@@ -1126,6 +1129,25 @@ advertises_max_field_section_size(_Config) ->
         ?assertEqual(54321, maps:get(max_field_section_size, Settings))
     after
         close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+idle_timeout_is_the_keep_alive_timeout(_Config) ->
+    %% The QUIC max_idle_timeout the server offers (RFC 9000 §10.1) is the
+    %% listener's keep_alive_timeout, at least 1 s: a 0 there means "no
+    %% keep-alive wait" on HTTP/1.1, while a 0 here would mean no limit.
+    ?assertEqual(60000, offered_idle_timeout(#{})),
+    ?assertEqual(2500, offered_idle_timeout(#{keep_alive_timeout => 2500})),
+    ?assertEqual(1000, offered_idle_timeout(#{keep_alive_timeout => 0})).
+
+offered_idle_timeout(Opts) ->
+    Name = listener_name(idle_timeout_is_the_keep_alive_timeout),
+    {ok, _} = start_h3(Name, Opts),
+    Conn = ll_connect(roadrunner_listener:port(Name)),
+    try
+        roadrunner_quic_test_conn:max_idle_timeout(Conn)
+    after
+        ll_close(Conn),
         roadrunner_listener:stop(Name)
     end.
 

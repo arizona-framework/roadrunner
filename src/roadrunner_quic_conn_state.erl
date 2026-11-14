@@ -461,7 +461,10 @@
     %% flight. Also restarting it on the first ack-eliciting send since the
     %% last receive (§10.1) is a follow-up; receive-only is conservative
     %% (it closes no later than a strict implementation would).
-    idle_deadline :: integer()
+    idle_deadline :: integer(),
+    %% When the last datagram was received (birth time before the first),
+    %% what the idle deadline counts from.
+    last_rx :: integer()
 }).
 
 -type stream() :: {roadrunner_quic_stream:t(), roadrunner_quic_flow:t()}.
@@ -609,7 +612,8 @@ new(
         stream_credit = maps:get(stream_credit, Config, on_receipt),
         cc = roadrunner_quic_cc_newreno:new(),
         idle_timeout = IdleTimeout,
-        idle_deadline = Now + IdleTimeout
+        idle_deadline = Now + IdleTimeout,
+        last_rx = Now
     }.
 
 %% A client whose first Initial carried a token that validated its address
@@ -695,6 +699,7 @@ handle_datagram(Now, Peer, Datagram, State0) ->
                 State#state{
                     amp = roadrunner_quic_amp:received(Size, Amp),
                     idle_deadline = Deadline,
+                    last_rx = Now,
                     rx_dcid = DCID,
                     rx_peer = Peer,
                     rx_size = Size
@@ -703,6 +708,7 @@ handle_datagram(Now, Peer, Datagram, State0) ->
                 State#state{
                     probe_path = probe_received(Peer, Size, Probe),
                     idle_deadline = Deadline,
+                    last_rx = Now,
                     rx_dcid = DCID,
                     rx_peer = Peer,
                     rx_size = Size
@@ -2390,7 +2396,8 @@ process_handshake(
                     %% (absent -> 0, RFC 9000 §18.2).
                     peer_max_streams_uni = maps:get(initial_max_streams_uni, PeerParams, 0),
                     conn_flow = ConnFlow,
-                    idle_timeout = IdleTimeout
+                    idle_timeout = IdleTimeout,
+                    idle_deadline = State#state.last_rx + IdleTimeout
                 }
             ),
             State2 = queue_crypto(initial, InitialFlight, State1),
@@ -2735,6 +2742,16 @@ closing_phase(_State) -> closed.
 -spec drain_deadline(integer(), t()) -> integer().
 drain_deadline(Now, State) ->
     Now + 3 * max_pto(State).
+
+-spec max_pto_period(t()) -> non_neg_integer().
+max_pto_period(#state{spaces = Spaces}) ->
+    maps:fold(
+        fun(_Level, #space{loss = Loss}, Acc) ->
+            max(Acc, roadrunner_quic_loss:pto_period(Loss))
+        end,
+        0,
+        Spaces
+    ).
 
 -spec max_pto(t()) -> non_neg_integer().
 max_pto(#state{spaces = Spaces}) ->
@@ -3560,8 +3577,19 @@ handle_timeout(Now, pto, State) ->
     State1 = lists:foldl(fun(Level, S) -> on_pto(Now, Level, S) end, State, present_levels(State)),
     {State2, Effects} = send_pass(Now, rechallenge_stranded(State1)),
     {State2#state{probes = 0}, Effects};
-handle_timeout(_Now, idle, State) ->
-    close_silently(idle_timeout, State);
+handle_timeout(Now, idle, #state{last_rx = LastRx, idle_timeout = IdleTimeout} = State) ->
+    %% The idle period is at least three PTOs, before backoff (RFC 9000
+    %% §10.1), so a short negotiated timeout cannot end a connection before
+    %% its probes could be answered. Checked only when the timer fires, off
+    %% the per-datagram path. The PTO only changes on a receive, which moves
+    %% last_rx too, so a deadline moved here is not moved again.
+    case LastRx + max(IdleTimeout, 3 * max_pto_period(State)) of
+        Deadline when Deadline > Now ->
+            State1 = State#state{idle_deadline = Deadline},
+            {State1, timer_effects(State1)};
+        _Deadline ->
+            close_silently(idle_timeout, State)
+    end;
 handle_timeout(_Now, Kind, #state{phase = Phase} = State) when
     Kind =:= ack orelse Kind =:= path, Phase =:= closed orelse Phase =:= draining
 ->
