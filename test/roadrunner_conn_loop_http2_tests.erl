@@ -370,7 +370,7 @@ streaming_response_strips_connection_specific_fields() ->
     %% the streaming response's HEADERS and its trailers; the legit
     %% `x-checksum` trailer rides through.
     {Pid, Ref} = run_stream_request(~"/stream/strip"),
-    Bin = collect_send_bytes(<<>>),
+    Bin = collect_until_end_stream(<<>>),
     Dec0 = roadrunner_http2_hpack:new_decoder(4096),
     {ok, {headers, 1, _, _, StatusHpack}, Rest1} =
         roadrunner_http2_frame:parse(Bin, 16384),
@@ -5903,6 +5903,30 @@ run_stream_request(Path, PrefaceSettings, ExtraOpts) ->
 collect_response_frames() ->
     Bin = collect_send_bytes(<<>>),
     parse_frames(Bin).
+
+%% Everything the conn sends up to the frame that ends a stream (its
+%% END_STREAM), however long the response takes: a quiet spell between its
+%% frames on a loaded run would otherwise cut it short.
+collect_until_end_stream(Acc) ->
+    receive
+        {roadrunner_fake_send, _Pid, Data} ->
+            Acc1 = <<Acc/binary, (iolist_to_binary(Data))/binary>>,
+            case ends_stream(Acc1) of
+                true -> Acc1;
+                false -> collect_until_end_stream(Acc1)
+            end
+    after 5000 ->
+        Acc
+    end.
+
+ends_stream(<<Len:24, Type, Flags, _:32, _:Len/binary, _/binary>>) when
+    Type =< 1, Flags band 16#01 =:= 16#01
+->
+    true;
+ends_stream(<<Len:24, _:6/binary, _:Len/binary, Rest/binary>>) ->
+    ends_stream(Rest);
+ends_stream(_Partial) ->
+    false.
 
 collect_send_bytes(Acc) ->
     receive
