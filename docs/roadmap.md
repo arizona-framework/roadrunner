@@ -122,11 +122,6 @@ need.
   transfer that fills a non-zero window — already emits the frame on the
   flow's blocked transition; this remainder is the never-sent-a-byte case a
   conformant peer never produces — small
-- Keep-alive PING while a handler works: an HTTP/3 connection whose client
-  sends nothing closes at its idle timeout even with a handler still at
-  work, where HTTP/2 checks the client with a PING. Send a QUIC PING (RFC
-  9000 §10.1.2) before the idle deadline while a request is open, early
-  enough to beat the client's own idle timer — medium
 - Idle timer restarts (RFC 9000 §10.1): restart it on the first
   ack-eliciting packet sent since the last receive, and only on a packet
   that was processed (today any datagram restarts it, one that fails to

@@ -205,8 +205,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   (at least 1 s, so a client has time to send its first request and to
   answer the PING), and on HTTP/3 the QUIC idle timeout the server
   offers (at least 1 s; the connection uses the smaller of it and the
-  client's, and closes once it passes with nothing received, even with
-  a handler still at work). Default 60 s.
+  client's, and closes once it passes with nothing received; a client
+  waiting on a response keeps it open, as RFC 9114 §5.1 expects of it,
+  while the server does not). Default 60 s.
 - `num_acceptors` — size of the acceptor pool. Default: one per online
   scheduler, at most 10. Every acceptor waits on the same listen socket, so
   more acceptors than schedulers only adds contention: on one or two
