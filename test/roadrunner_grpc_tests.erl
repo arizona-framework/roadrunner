@@ -41,6 +41,11 @@ init_route_missing_codec_and_bad_rpcs_test() ->
 
 init_route_test() ->
     _ = ?M:init_route(#{service => ?SVC}),
+    _ = ?M:init_route(#{service => ?SVC, send_compression => gzip}),
+    ?assertError(
+        {invalid_grpc_opt, send_compression, brotli},
+        ?M:init_route(#{service => ?SVC, send_compression => brotli})
+    ),
     _ = ?M:init_route(#{
         service => ?SVC, codecs => [roadrunner_grpc_test_codec], max_message_size => 1
     }).

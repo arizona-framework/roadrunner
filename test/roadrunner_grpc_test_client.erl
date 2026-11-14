@@ -119,6 +119,7 @@ trailers(C, StreamId) ->
 messages(Body) ->
     case roadrunner_grpc_frame:decode(Body, 16#FFFFFFFF) of
         {ok, false, M, Rest} -> [M | messages(Rest)];
+        {ok, true, M, Rest} -> [{compressed, M} | messages(Rest)];
         more -> []
     end.
 

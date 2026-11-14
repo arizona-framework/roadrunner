@@ -6,7 +6,8 @@
 -export([name/0, rpcs/0]).
 -export([unary/2, count/2, sum/1, chat/1, fail/2, crash/2, crash_after/2, meta/2, deadline/2, bad/2]).
 -export([stop/2, bad_trailer/2, late_headers/2, stale_send/2, bad_name/2]).
--export([unsafe_header/2, unsafe_fail/2, busy/2]).
+-export([unsafe_header/2, unsafe_fail/2, busy/2, squeezed/2, late_compression/2]).
+-export([stale_compression/2]).
 
 name() -> ~"test.Echo".
 
@@ -29,7 +30,10 @@ rpcs() ->
         ~"BadName" => rpc(bad_name, unary),
         ~"UnsafeHeader" => rpc(unsafe_header, server_stream),
         ~"UnsafeFail" => rpc(unsafe_fail, unary),
-        ~"Busy" => rpc(busy, unary)
+        ~"Busy" => rpc(busy, unary),
+        ~"Squeezed" => rpc(squeezed, server_stream),
+        ~"LateCompression" => rpc(late_compression, server_stream),
+        ~"StaleCompression" => rpc(stale_compression, server_stream)
     }.
 
 rpc(Function, Kind) ->
@@ -125,3 +129,24 @@ busy(_Request, Stream) ->
         never_sent -> ok
     after 5000 -> {reply, ~"late", Stream}
     end.
+
+%% Compresses its answer as the request names, the second message sent
+%% uncompressed whatever the call's compression.
+squeezed(Name, Stream0) ->
+    Encoding = maps:get(Name, #{~"gzip" => gzip, ~"deflate" => deflate, ~"identity" => identity}),
+    Stream1 = roadrunner_grpc:set_send_compression(Encoding, Stream0),
+    Payload = binary:copy(~"squeeze me ", 20),
+    Stream2 = roadrunner_grpc:send(Payload, Stream1),
+    {ok, roadrunner_grpc:send(Payload, Stream2, #{compress => false})}.
+
+late_compression(_Request, Stream0) ->
+    Stream1 = roadrunner_grpc:send(~"one", Stream0),
+    {ok, roadrunner_grpc:set_send_compression(gzip, Stream1)}.
+
+%% Sends first from the copy before its compression was set, then from the
+%% copy after: the headers went out uncompressed, so both messages do.
+stale_compression(_Request, Stream0) ->
+    Plain = roadrunner_grpc:set_send_compression(identity, Stream0),
+    Gzip = roadrunner_grpc:set_send_compression(gzip, Stream0),
+    _ = roadrunner_grpc:send(~"one", Plain),
+    {ok, roadrunner_grpc:send(~"two", Gzip)}.

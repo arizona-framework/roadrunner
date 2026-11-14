@@ -30,7 +30,10 @@ and a bad one stops the listener from starting:
 - `codecs`: the `roadrunner_grpc_codec` modules the services speak, by
   default `[roadrunner_grpc_codec_raw]`
 - `max_message_size`: the largest request message, in bytes, by default
-  4 MiB; a larger one ends the call with `RESOURCE_EXHAUSTED`
+  4 MiB, compressed and decompressed alike; a larger one ends the call
+  with `RESOURCE_EXHAUSTED`
+- `send_compression`: how the response messages are compressed, `gzip`,
+  `deflate` or by default `identity`, none (see Compression)
 - `max_content_length`: the most a call's requests may add up to, in bytes,
   for `routes/1` to set on each route in place of the listener's (10 MiB
   by default); past it the call ends with `RESOURCE_EXHAUSTED` with
@@ -58,7 +61,8 @@ HTTP/1.1, `405` for a method other than `POST`, `415` for a
 `content-type` none of the codecs speak, the router's `404` for an
 unknown service, and `500` when a response header the method set cannot
 be sent (a CR or LF in its value). An unknown method of a known service
-is `UNIMPLEMENTED`, as is a `grpc-encoding` other than `identity`.
+is `UNIMPLEMENTED`, as is a `grpc-encoding` other than `identity`, `gzip`
+and `deflate`.
 
 A `grpc-timeout` is the call's deadline. A read still waiting then ends
 the call with `DEADLINE_EXCEEDED`; a call still running a second later is
@@ -78,6 +82,17 @@ answer. A request that ends the call (too large, malformed, past its
 deadline) is thrown out of `recv/1` to end the call with its status, so a
 method should not catch everything around `recv/1`.
 
+## Compression
+
+A request's messages may be compressed with `gzip` or `deflate` (the zlib
+structure, gRPC's compression.md), as its `grpc-encoding` says; one that
+does not decompress ends the call with `INTERNAL`. A response says it reads
+all three in `grpc-accept-encoding`. Its own messages are compressed with
+the route's `send_compression`, or what `set_send_compression/2` picks for
+the call, when the client's `grpc-accept-encoding` lists it, and sent as
+they are otherwise; `send/3` with `#{compress => false}` sends one as it
+is, to keep a secret out of a compressed stream.
+
 ## Metadata
 
 `metadata/1` is the request's custom metadata, without the HTTP/2 and gRPC
@@ -92,9 +107,10 @@ values are each an entry, and one that is not base64 ends the call with
 -behaviour(roadrunner_handler).
 
 -export([routes/1, init_route/1, handle/1]).
--export([recv/1, send/2, metadata/1, set_headers/2, set_trailers/2, deadline/1, peer/1]).
+-export([recv/1, send/2, send/3, metadata/1, set_headers/2, set_trailers/2, deadline/1, peer/1]).
+-export([set_send_compression/2]).
 
--export_type([opts/0, status/0, stream/0]).
+-export_type([opts/0, status/0, stream/0, encoding/0]).
 
 -define(MAX_MESSAGE_SIZE, 4194304).
 %% Where the call's process keeps the response's body writer once it started.
@@ -106,7 +122,7 @@ values are each an entry, and one that is not base64 ends the call with
 %% stops the method at its next write or read, after a read waiting at the
 %% deadline had the time to answer.
 -define(CANCEL_GRACE, 1000).
--define(OPTS, [service, codecs, max_message_size]).
+-define(OPTS, [service, codecs, max_message_size, send_compression]).
 
 -doc """
 The options `routes/1` takes: `services`, and the route options shared by
@@ -146,7 +162,8 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
     service :: module(),
     rpcs :: #{binary() => {atom(), roadrunner_grpc_service:kind(), term(), term()}},
     codecs :: #{binary() => module()},
-    max_message_size :: pos_integer()
+    max_message_size :: pos_integer(),
+    send_compression :: encoding()
 }).
 
 -record(stream, {
@@ -163,6 +180,12 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
     buffer = <<>> :: binary(),
     %% Whether the request body has ended.
     eof = false :: boolean(),
+    %% How the client compresses its messages (its `grpc-encoding`).
+    recv_encoding = identity :: encoding(),
+    %% How the response's messages are compressed, and the encodings the
+    %% client reads (its `grpc-accept-encoding`).
+    send_encoding = identity :: encoding(),
+    accepted = [] :: [encoding()],
     headers = [] :: roadrunner_http:headers(),
     trailers = [] :: roadrunner_http:headers(),
     %% The response's body writer once its headers went out.
@@ -170,6 +193,9 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
 }).
 
 -opaque stream() :: #stream{}.
+
+-doc "How a message is compressed: `identity` (not), `gzip` or `deflate`.".
+-type encoding() :: identity | gzip | deflate.
 
 -doc """
 The routes for `Opts`'s `services`, one per service, at
@@ -222,7 +248,8 @@ init_route(#{service := Service} = Opts) when is_atom(Service) ->
         service = Service,
         rpcs = rpcs(Service),
         codecs = codecs(maps:get(codecs, Opts, [roadrunner_grpc_codec_raw])),
-        max_message_size = max_message_size(Opts)
+        max_message_size = max_message_size(Opts),
+        send_compression = send_compression(Opts)
     };
 init_route(#{service := Service}) ->
     error({invalid_grpc_opt, service, Service});
@@ -280,6 +307,16 @@ codec_subtype(Codec, Codecs) when is_atom(Codec) ->
     end;
 codec_subtype(_Codec, Codecs) ->
     error({invalid_grpc_opt, codecs, Codecs}).
+
+-spec send_compression(map()) -> encoding().
+send_compression(#{send_compression := Encoding}) when
+    Encoding =:= identity; Encoding =:= gzip; Encoding =:= deflate
+->
+    Encoding;
+send_compression(#{send_compression := Encoding}) ->
+    error({invalid_grpc_opt, send_compression, Encoding});
+send_compression(#{}) ->
+    identity.
 
 -spec max_message_size(map()) -> pos_integer().
 max_message_size(#{max_message_size := Size}) when is_integer(Size), Size > 0 ->
@@ -359,9 +396,13 @@ call(Req, ContentType, Codec, #route{service = Service, rpcs = Rpcs} = Route) ->
     },
     try
         {Function, Kind, In, Out} = rpc(Method, Rpcs),
-        ok = identity_encoding(roadrunner_req:header(~"grpc-encoding", Req)),
+        RecvEncoding = recv_encoding(roadrunner_req:header(~"grpc-encoding", Req)),
+        Accepted = accepted(roadrunner_req:header(~"grpc-accept-encoding", Req)),
         Timeout = timeout(roadrunner_req:header(~"grpc-timeout", Req)),
         Stream = Stream0#stream{
+            recv_encoding = RecvEncoding,
+            accepted = Accepted,
+            send_encoding = sendable(Route#route.send_compression, Accepted),
             metadata = request_metadata(roadrunner_req:headers(Req)),
             req = roadrunner_req:set_body_timeout(Timeout, Req),
             input = In,
@@ -383,17 +424,54 @@ rpc(Method, Rpcs) ->
         #{} -> throw({?MODULE, unimplemented, <<"unknown method ", Method/binary>>, []})
     end.
 
--spec identity_encoding(binary() | undefined) -> ok.
-identity_encoding(undefined) ->
-    ok;
-identity_encoding(~"identity") ->
-    ok;
-identity_encoding(Encoding) ->
-    throw(
-        {?MODULE, unimplemented, <<"unsupported grpc-encoding ", Encoding/binary>>, [
-            {~"grpc-accept-encoding", ~"identity"}
-        ]}
-    ).
+%% The client's `grpc-encoding`: one roadrunner reads, or the call ends
+%% `UNIMPLEMENTED` naming the ones it does (gRPC's compression.md).
+-spec recv_encoding(binary() | undefined) -> encoding().
+recv_encoding(undefined) ->
+    identity;
+recv_encoding(Encoding) ->
+    case encoding(Encoding) of
+        unknown ->
+            Supported = roadrunner_grpc_compress:encodings(),
+            throw(
+                {?MODULE, unimplemented,
+                    <<"unsupported grpc-encoding ", Encoding/binary, "; supported: ",
+                        Supported/binary>>,
+                    []}
+            );
+        Known ->
+            Known
+    end.
+
+-spec encoding(binary()) -> encoding() | unknown.
+encoding(~"identity") -> identity;
+encoding(~"gzip") -> gzip;
+encoding(~"deflate") -> deflate;
+encoding(_Other) -> unknown.
+
+%% The encodings the client reads, from its `grpc-accept-encoding`.
+-spec accepted(binary() | undefined) -> [encoding()].
+accepted(undefined) ->
+    [];
+accepted(Value) ->
+    [
+        Encoding
+     || Part <- binary:split(Value, ~",", [global]),
+        Encoding <- [encoding(roadrunner_bin:trim_ows(Part))],
+        Encoding =/= unknown
+    ].
+
+%% A response is compressed only with an encoding the client reads, and
+%% sent as it is otherwise (gRPC's compression.md).
+-spec sendable(encoding(), [encoding()]) ->
+    encoding().
+sendable(identity, _Accepted) ->
+    identity;
+sendable(Encoding, Accepted) ->
+    case lists:member(Encoding, Accepted) of
+        true -> Encoding;
+        false -> identity
+    end.
 
 -spec timeout(binary() | undefined) -> non_neg_integer() | infinity.
 timeout(undefined) ->
@@ -518,7 +596,7 @@ finish(Status, Message, #stream{send = undefined} = Stream) ->
     %% crashing or aborting: the writer is kept where the call can find it.
     case get(?SEND_KEY) of
         undefined -> trailers_only(Status, Message, Stream);
-        Send -> finish(Status, Message, Stream#stream{send = Send})
+        {Send, _Encoding} -> finish(Status, Message, Stream#stream{send = Send})
     end;
 finish(Status, Message, #stream{send = Send, req = Req} = Stream) ->
     ok = written(Send(<<>>, {fin, status_headers(Status, Message, Stream)})),
@@ -544,8 +622,17 @@ stopped(Reason) ->
     exit({shutdown, {grpc_send, Reason}}).
 
 -spec response_headers(stream()) -> roadrunner_http:headers().
-response_headers(#stream{content_type = ContentType, headers = Headers}) ->
-    [{~"content-type", ContentType} | Headers].
+response_headers(#stream{content_type = ContentType, headers = Headers, send_encoding = Encoding}) ->
+    [
+        {~"content-type", ContentType},
+        {~"grpc-accept-encoding", roadrunner_grpc_compress:encodings()}
+        | encoding_header(Encoding, Headers)
+    ].
+
+-spec encoding_header(encoding(), roadrunner_http:headers()) ->
+    roadrunner_http:headers().
+encoding_header(identity, Headers) -> Headers;
+encoding_header(Encoding, Headers) -> [{~"grpc-encoding", atom_to_binary(Encoding)} | Headers].
 
 -spec status_headers(status(), binary(), stream()) -> roadrunner_http:headers().
 status_headers(Status, Message, #stream{trailers = Trailers}) ->
@@ -576,14 +663,25 @@ recv(#stream{buffer = Buffer, max_message_size = Max} = Stream) ->
     case roadrunner_grpc_frame:decode(Buffer, Max) of
         {ok, false, Bytes, Rest} ->
             {ok, decode(Bytes, Stream), Stream#stream{buffer = Rest}};
-        {ok, true, _Bytes, _Rest} ->
-            abort(internal, ~"compressed message without grpc-encoding", Stream);
+        {ok, true, _Bytes, _Rest} when Stream#stream.recv_encoding =:= identity ->
+            abort(internal, ~"compressed message without a grpc-encoding to read it", Stream);
+        {ok, true, Compressed, Rest} ->
+            Bytes = decompressed(Compressed, Stream),
+            {ok, decode(Bytes, Stream), Stream#stream{buffer = Rest}};
         {error, message_too_large} ->
             abort(resource_exhausted, ~"request message too large", Stream);
         {error, bad_compressed_flag} ->
             abort(internal, ~"malformed request message", Stream);
         more ->
             read_more(Stream)
+    end.
+
+-spec decompressed(binary(), stream()) -> binary().
+decompressed(Compressed, #stream{recv_encoding = Encoding, max_message_size = Max} = Stream) ->
+    case roadrunner_grpc_compress:decompress(Encoding, Compressed, Max) of
+        {ok, Bytes} -> Bytes;
+        {error, too_large} -> abort(resource_exhausted, ~"request message too large", Stream);
+        {error, malformed} -> abort(internal, ~"request message does not decompress", Stream)
     end.
 
 -spec decode(binary(), stream()) -> term().
@@ -628,27 +726,48 @@ Send a response message, the response's headers going first with the
 first one. A client that went away stops the call.
 """.
 -spec send(term(), stream()) -> stream().
-send(Message, #stream{codec = Codec, output = Out} = Stream) ->
-    Frame = roadrunner_grpc_frame:encode(false, Codec:encode(Out, Message)),
-    #stream{send = Send} = Stream1 = started(Stream),
+send(Message, Stream) ->
+    send(Message, Stream, #{}).
+
+-doc """
+`send/2`, with `#{compress => false}` sending this message uncompressed
+whatever the call's compression (`set_send_compression/2`): gRPC's way to
+keep a message with a secret out of a compressed stream (BEAST/CRIME).
+""".
+-spec send(term(), stream(), #{compress => boolean()}) -> stream().
+send(Message, #stream{codec = Codec, output = Out} = Stream0, Opts) ->
+    Bytes = Codec:encode(Out, Message),
+    #stream{send = Send, send_encoding = Encoding} = Stream = started(Stream0),
+    Frame =
+        case {Encoding, Opts} of
+            {identity, _} ->
+                roadrunner_grpc_frame:encode(false, Bytes);
+            {_, #{compress := false}} ->
+                roadrunner_grpc_frame:encode(false, Bytes);
+            {_, _} ->
+                roadrunner_grpc_frame:encode(
+                    true, roadrunner_grpc_compress:compress(Encoding, Bytes)
+                )
+        end,
     ok = written(Send(Frame, nofin)),
-    Stream1.
+    Stream.
 
 %% The response's headers go out once: a stream copy from before the first
-%% send still finds the writer the call keeps.
+%% send still finds the writer the call keeps, and the encoding its headers
+%% announced, which every message after follows.
 -spec started(stream()) -> stream().
-started(#stream{req = Req} = Stream) ->
+started(#stream{req = Req, send_encoding = Encoding} = Stream) ->
     case get(?SEND_KEY) of
         undefined ->
             case roadrunner_send:stream(200, response_headers(Stream), Req) of
                 {ok, Send} ->
-                    _ = put(?SEND_KEY, Send),
+                    _ = put(?SEND_KEY, {Send, Encoding}),
                     Stream#stream{send = Send};
                 {error, Reason} ->
                     stopped(Reason)
             end;
-        Send ->
-            Stream#stream{send = Send}
+        {Send, Announced} ->
+            Stream#stream{send = Send, send_encoding = Announced}
     end.
 
 -doc """
@@ -703,6 +822,22 @@ Add response headers, before the first response message goes out; a
 set_headers(Headers, #stream{headers = Own} = Stream) ->
     case get(?SEND_KEY) of
         undefined -> Stream#stream{headers = Own ++ wire(Headers)};
+        _Send -> error(headers_already_sent)
+    end.
+
+-doc """
+Compress the call's response messages with `Encoding` (`gzip` or
+`deflate`), or not (`identity`), in place of the route's
+`send_compression`; before the first response message, as the response's
+headers say it. An encoding the client did not list in its
+`grpc-accept-encoding` is not used: the messages go out uncompressed.
+""".
+-spec set_send_compression(encoding(), stream()) -> stream().
+set_send_compression(Encoding, #stream{accepted = Accepted} = Stream) when
+    Encoding =:= identity; Encoding =:= gzip; Encoding =:= deflate
+->
+    case get(?SEND_KEY) of
+        undefined -> Stream#stream{send_encoding = sendable(Encoding, Accepted)};
         _Send -> error(headers_already_sent)
     end.
 
