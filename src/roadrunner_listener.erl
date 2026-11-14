@@ -189,7 +189,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the deadline the
   request's read started with (this timeout for a connection's first
   request, `keep_alive_timeout` after). `roadrunner_req:set_body_timeout/2`
-  changes it per request. Default 30 s.
+  changes it per request. Default 30 s, at most `16#FFFFFFFF` ms (about
+  49 days, the longest a `receive` waits).
 - `tls_handshake_timeout` — bound on the TLS handshake (TLS listeners
   only). The handshake runs in the connection process, not the
   acceptor, so a slow or silent peer never blocks other connections
@@ -197,7 +198,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   reported as a per-connection `{handshake, timeout}` accept error,
   releasing its `max_clients` slot. On a TLS listener that also reads
   the PROXY protocol, the same bound covers the header read that
-  precedes the handshake. Default 5 s.
+  precedes the handshake. Default 5 s, at most `16#FFFFFFFF` ms.
 - `keep_alive_timeout` — idle timeout between requests on a
   keep-alive conn: on HTTP/1.1 between one request and the next, on
   HTTP/2 how long the connection may stay quiet before it is closed with
@@ -207,7 +208,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   offers (at least 1 s; the connection uses the smaller of it and the
   client's, and closes once it passes with nothing received; a client
   waiting on a response keeps it open, as RFC 9114 §5.1 expects of it,
-  while the server does not). Default 60 s.
+  while the server does not). Default 60 s, at most `16#FFFFFFFF` ms.
 - `num_acceptors` — size of the acceptor pool. Default: one per online
   scheduler, at most 10. Every acceptor waits on the same listen socket, so
   more acceptors than schedulers only adds contention: on one or two
@@ -479,9 +480,9 @@ ops-tuning rationale.
     middlewares => roadrunner_middleware:middleware_list(),
     max_content_length => non_neg_integer(),
     ws => ws_opts(),
-    request_timeout => non_neg_integer(),
-    tls_handshake_timeout => pos_integer(),
-    keep_alive_timeout => non_neg_integer(),
+    request_timeout => 0..16#FFFFFFFF,
+    tls_handshake_timeout => 1..16#FFFFFFFF,
+    keep_alive_timeout => 0..16#FFFFFFFF,
     num_acceptors => pos_integer(),
     max_keep_alive_requests => pos_integer(),
     max_clients => pos_integer(),
@@ -1807,6 +1808,15 @@ maybe_tls_upgrade(#{proxy_protocol := true} = ProtoOpts, #{tls := UserTlsOpts}, 
 maybe_tls_upgrade(ProtoOpts, _Opts, _Protocols) ->
     ProtoOpts.
 
+%% A timeout option in ms, from `Min` up to the longest a `receive` waits
+%% (`16#FFFFFFFF`), as every connection arms its waits from it.
+-spec timeout_opt(atom(), opts(), non_neg_integer(), 0 | 1) -> non_neg_integer().
+timeout_opt(Key, Opts, Default, Min) ->
+    case maps:get(Key, Opts, Default) of
+        Ms when is_integer(Ms), Ms >= Min, Ms =< 16#FFFFFFFF -> Ms;
+        Other -> error({invalid_listener_opt, Key, Other})
+    end.
+
 %% Validate the opt-in `proxy_protocol` listener opt. It is a TCP-stream
 %% feature (an L4 balancer prepends the header before the first byte), so it
 %% conflicts with an HTTP/3-only (UDP) listener; on a mixed `[http1, http3]`
@@ -1878,7 +1888,7 @@ build_proto_opts(Opts, ListenerName) ->
         validate_overload_mode(
             maps:get(overload_mode, Opts, refuse),
             MaxConcurrentRequests,
-            maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT)
+            timeout_opt(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT, 0)
         ),
         MaxConcurrentRequests,
         InflightCounter
@@ -1921,11 +1931,11 @@ build_proto_opts(Opts, ListenerName) ->
             ws_active => WsActive,
             ws_heap_floor_min => WsHeapFloorMin,
             ws_heap_floor_max => WsHeapFloorMax,
-            request_timeout => maps:get(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT),
+            request_timeout => timeout_opt(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT, 0),
             tls_handshake_timeout =>
-                maps:get(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT),
+                timeout_opt(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT, 1),
             keep_alive_timeout =>
-                maps:get(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT),
+                timeout_opt(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT, 0),
             max_keep_alive_requests =>
                 maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
             max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),

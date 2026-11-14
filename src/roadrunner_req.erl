@@ -561,7 +561,8 @@ read_body_chunked(Req) ->
 -doc """
 Set how long the rest of the body may take to read, from now: the
 reads that follow fail with `{error, request_timeout}` once it has
-passed, or never with `infinity`. It replaces the deadline the request
+passed, or never with `infinity`. A timeout is at most `16#FFFFFFFF` ms
+(about 49 days), the longest a `receive` waits. It replaces the deadline the request
 got from the listener (`request_timeout`, see `roadrunner_listener`) for
 this request, which a request whose body streams for long, such as a
 gRPC client stream, can outlive.
@@ -592,16 +593,18 @@ handle(Req0) ->
     stream_in(Req).
 ```
 """.
--spec set_body_timeout(timeout(), request()) -> request().
+-spec set_body_timeout(infinity | 0..16#FFFFFFFF, request()) -> request().
 set_body_timeout(Timeout, #{body_reader := BS} = Req) ->
     Req#{body_reader := BS#{deadline := deadline(Timeout)}};
-set_body_timeout(Timeout, Req) when Timeout =:= infinity; is_integer(Timeout), Timeout >= 0 ->
+set_body_timeout(Timeout, Req) when
+    Timeout =:= infinity; is_integer(Timeout), Timeout >= 0, Timeout =< 16#FFFFFFFF
+->
     Req.
 
--spec deadline(timeout()) -> deadline().
+-spec deadline(infinity | 0..16#FFFFFFFF) -> deadline().
 deadline(infinity) ->
     infinity;
-deadline(Ms) when is_integer(Ms), Ms >= 0 ->
+deadline(Ms) when is_integer(Ms), Ms >= 0, Ms =< 16#FFFFFFFF ->
     erlang:monotonic_time(millisecond) + Ms.
 
 -doc """

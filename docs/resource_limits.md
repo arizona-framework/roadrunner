@@ -200,7 +200,7 @@ table.
 | `max_clients` | 16384 | yes | concurrent connection cap per listener |
 | `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3, every protocol in `shed` mode) |
 | `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |
-| `request_timeout` | 30 s | yes | header-read timeout on a fresh connection; in `manual` body mode, also how long the body may take to read (on HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the request's read deadline, which is `keep_alive_timeout` for a connection's later requests), which `roadrunner_req:set_body_timeout/2` changes per request |
+| `request_timeout` | 30 s | yes | header-read timeout on a fresh connection; in `manual` body mode, also how long the body may take to read (on HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the request's read deadline, which is `keep_alive_timeout` for a connection's later requests), which `roadrunner_req:set_body_timeout/2` changes per request; at most `16#FFFFFFFF` ms, as `keep_alive_timeout` and `tls_handshake_timeout` |
 | `keep_alive_timeout` | 60 s | yes | idle timeout between requests (on HTTP/2 and HTTP/3, of the whole connection, at least 1 s; an HTTP/2 connection with a handler still at work gets a PING instead, while on HTTP/3 the client waiting on a response keeps the connection open, as RFC 9114 §5.1 expects of it) |
 | `max_keep_alive_requests` | 1000 | yes | requests served per connection before close |
 | `min_bytes_per_second` | 100 | yes (0 disables) | slow-loris guard on the request-read phase |
