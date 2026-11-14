@@ -1564,8 +1564,9 @@ reply_body(_Method, Body) -> Body.
 %% the final response. The per-request keep-alive decision already reaches the
 %% wire whenever the client or handler set `Connection: close`; the gap is a
 %% *server-initiated* close the client cannot infer — reaching
-%% `max_keep_alive_requests` on a connection that was otherwise keep-alive. Add
-%% the header there (and only there) so a fronting proxy (nginx, ngrok) stops
+%% `max_keep_alive_requests` on a connection that was otherwise keep-alive, or
+%% the other cases `with_close_if_closing/3` lists. Add the header there (and
+%% only there) so a fronting proxy (nginx, ngrok) stops
 %% reusing a connection we are about to close, instead of racing a request onto
 %% it. Buffered + sendfile share Content-Length framing and are keep-alive
 %% eligible, so they get the header here. Websocket has already switched
@@ -1587,7 +1588,8 @@ ensure_close_signaled(_S, _Req, Response) ->
 %% the handler answered without asking for a body the client holds back
 %% for a 100 Continue (`read_body/8`; RFC 9110 §10.1.1 asks a server
 %% answering before the body to say whether it closes), or the request
-%% declared a manual-mode body over its cap, which is never read, so the
+%% declared a manual-mode body over its cap, which is never read, or a read
+%% of its manual-mode body failed (`roadrunner_conn:read_failed/1`), so the
 %% connection cannot go on past it. In the common case the
 %% response has no `connection` header, so the prepend is the only token; if a
 %% handler set one explicitly, `close` is the first token on the wire and takes
@@ -1605,10 +1607,35 @@ with_close_if_closing(
 ) when N > Max ->
     with_close(Req, Headers);
 with_close_if_closing(
+    #loop_state{body_buffering = manual} = S, #{body_reader := #{framing := none}} = Req, Headers
+) ->
+    %% No body, so no read to fail: the common bodyless request skips the
+    %% lookup below.
+    close_at_ceiling(S, Req, Headers);
+with_close_if_closing(
+    #loop_state{body_buffering = manual} = S, #{body_reader := Reader} = Req, Headers
+) ->
+    %% A read of the body failed: where the rest of it starts is unknown,
+    %% so the connection closes after this response instead of draining it
+    %% (`drain_latest/1`), and says so (RFC 9112 §9.6).
+    case roadrunner_conn:read_failed(Reader) of
+        true -> with_close(Req, Headers);
+        false -> close_at_ceiling(S, Req, Headers)
+    end;
+with_close_if_closing(S, Req, Headers) ->
+    close_at_ceiling(S, Req, Headers).
+
+%% The response that reaches `max_keep_alive_requests` is the
+%% connection's last.
+-spec close_at_ceiling(#loop_state{}, roadrunner_req:request(), roadrunner_http:headers()) ->
+    roadrunner_http:headers().
+close_at_ceiling(
     #loop_state{requests_served = Served, max_keep_alive_requests = Max}, Req, Headers
-) when Served >= Max ->
+) when
+    Served >= Max
+->
     with_close(Req, Headers);
-with_close_if_closing(_S, _Req, Headers) ->
+close_at_ceiling(_S, _Req, Headers) ->
     Headers.
 
 -spec with_close(roadrunner_req:request(), roadrunner_http:headers()) ->

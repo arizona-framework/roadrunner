@@ -15,6 +15,7 @@ a drain that waited on the handler's `infinity` would fail the case.
 -export([suite/0, all/0, init_per_testcase/2, end_per_testcase/2]).
 -export([
     moved_deadline_ends_the_read/1,
+    send_reply_after_a_failed_read_says_close/1,
     unread_body_is_drained_within_the_request_deadline/1
 ]).
 
@@ -26,6 +27,7 @@ suite() ->
 all() ->
     [
         moved_deadline_ends_the_read,
+        send_reply_after_a_failed_read_says_close,
         unread_body_is_drained_within_the_request_deadline
     ].
 
@@ -37,6 +39,7 @@ init_per_testcase(_Case, Config) ->
         request_timeout => 200,
         routes => [
             {~"/retimed", ?H, {retimed, self()}},
+            {~"/retimed-send", ?H, {retimed_send, self()}},
             {~"/answer-unread", ?H, answer_unread}
         ]
     }),
@@ -51,13 +54,29 @@ end_per_testcase(_Case, Config) ->
 
 moved_deadline_ends_the_read(Config) ->
     %% The handler gives its reads no time, though the listener's
-    %% `request_timeout` would: the read times out at once.
+    %% `request_timeout` would: the read times out at once. The failed read
+    %% ends the body, so the answer says the connection closes, and it does.
     Sock = ?config(sock, Config),
     ok = gen_tcp:send(Sock, head(~"/retimed", 4)),
     receive
         {read_result, Result} -> ?assertEqual({error, request_timeout}, Result)
     after 5000 -> ct:fail(no_read_result)
-    end.
+    end,
+    Reply = recv_until_closed(Sock, <<>>),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+    ?assertMatch({match, _}, re:run(Reply, "(?i)\r\nconnection: close\r\n")).
+
+send_reply_after_a_failed_read_says_close(Config) ->
+    %% The same from a `{send, ...}` fun replying after its read failed.
+    Sock = ?config(sock, Config),
+    ok = gen_tcp:send(Sock, head(~"/retimed-send", 4)),
+    receive
+        {read_result, Result} -> ?assertEqual({error, request_timeout}, Result)
+    after 5000 -> ct:fail(no_read_result)
+    end,
+    Reply = recv_until_closed(Sock, <<>>),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, Reply),
+    ?assertMatch({match, _}, re:run(Reply, "(?i)\r\nconnection: close\r\n")).
 
 unread_body_is_drained_within_the_request_deadline(Config) ->
     %% The handler answers without reading, after giving its reads no

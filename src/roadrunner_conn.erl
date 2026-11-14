@@ -66,6 +66,7 @@
     make_body_reader/6,
     make_reader_recv/2,
     latest_reader/1,
+    read_failed/1,
     stream_body_reader/5,
     with_body_reader/5,
     with_arrived_body_reader/4,
@@ -1586,6 +1587,16 @@ latest_reader(BS) ->
         {{failed, Id, Reason}, #{id := Id}} -> {failed, Reason};
         {{failed, _OtherId, _Reason}, _} -> BS;
         {Latest, _} -> Latest
+    end.
+
+%% Whether a read of this reader's body failed (`remember_reader/2`), which
+%% ends the body: the connection then closes after its response.
+-doc false.
+-spec read_failed(roadrunner_req:body_reader()) -> boolean().
+read_failed(#{id := Id}) ->
+    case get(?READER_PDKEY) of
+        {failed, Id, _Reason} -> true;
+        _ -> false
     end.
 
 -doc """
