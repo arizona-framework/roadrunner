@@ -7,7 +7,7 @@
 -export([unary/2, count/2, sum/1, chat/1, fail/2, crash/2, crash_after/2, meta/2, deadline/2, bad/2]).
 -export([stop/2, bad_trailer/2, late_headers/2, stale_send/2, bad_name/2]).
 -export([unsafe_header/2, unsafe_fail/2, busy/2, squeezed/2, late_compression/2]).
--export([stale_compression/2]).
+-export([stale_compression/2, held/1]).
 
 name() -> ~"test.Echo".
 
@@ -33,7 +33,8 @@ rpcs() ->
         ~"Busy" => rpc(busy, unary),
         ~"Squeezed" => rpc(squeezed, server_stream),
         ~"LateCompression" => rpc(late_compression, server_stream),
-        ~"StaleCompression" => rpc(stale_compression, server_stream)
+        ~"StaleCompression" => rpc(stale_compression, server_stream),
+        ~"Held" => rpc(held, client_stream)
     }.
 
 rpc(Function, Kind) ->
@@ -150,3 +151,11 @@ stale_compression(_Request, Stream0) ->
     Gzip = roadrunner_grpc:set_send_compression(gzip, Stream0),
     _ = roadrunner_grpc:send(~"one", Plain),
     {ok, roadrunner_grpc:send(~"two", Gzip)}.
+
+%% Reads nothing until the process registered as `roadrunner_grpc_held`
+%% lets it, then sums like `Sum`.
+held(Stream) ->
+    roadrunner_grpc_held ! {held, self()},
+    receive
+        go -> sum(Stream)
+    end.
