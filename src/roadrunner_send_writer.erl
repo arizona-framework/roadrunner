@@ -210,8 +210,9 @@ record(Kind, Result, Status, Headers) ->
     _ = put(?KEY, {sent, Kind, Status, Headers}),
     Result.
 
-%% The stream's `Send`, which marks the stream complete once a `fin` goes
-%% out, so `run/5` does not end it again.
+%% The stream's `Send`, which marks the stream complete once a `fin` call
+%% returns, so `run/5` does not end it again. A call that crashes (unsafe
+%% trailers) leaves it open, so the crash cuts the stream.
 -spec ended_on_fin(
     roadrunner_handler:send_fun(), roadrunner_http:status(), roadrunner_http:headers()
 ) -> roadrunner_handler:send_fun().
@@ -220,8 +221,9 @@ ended_on_fin(Send, Status, Headers) ->
         (Data, nofin) ->
             Send(Data, nofin);
         (Data, Fin) ->
+            Result = Send(Data, Fin),
             _ = put(?KEY, {sent, stream, Status, Headers}),
-            Send(Data, Fin)
+            Result
     end.
 
 -spec unsent() -> ok.
