@@ -165,6 +165,14 @@ set_body_timeout_without_a_reader_test() ->
     ?assertEqual(Req, roadrunner_req:set_body_timeout(1000, Req)),
     ?assertEqual(Req, roadrunner_req:set_body_timeout(infinity, Req)).
 
+%% A timeout longer than a `receive` can wait fails at the call, on either
+%% shape, rather than when a later read arms its wait.
+set_body_timeout_over_the_receive_limit_test() ->
+    Req = #{body_reader => roadrunner_conn:stream_body_reader(self(), 7, deadline(0), 64, false)},
+    #{body_reader := #{deadline := _}} = roadrunner_req:set_body_timeout(16#FFFFFFFF, Req),
+    ?assertError(function_clause, roadrunner_req:set_body_timeout(16#100000000, Req)),
+    ?assertError(function_clause, roadrunner_req:set_body_timeout(16#100000000, #{body => ~""})).
+
 %% --- helpers ---
 
 %% A request whose reader's recv hands out `Script`, one entry a call:

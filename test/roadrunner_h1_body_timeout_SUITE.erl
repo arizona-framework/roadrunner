@@ -3,8 +3,10 @@
 `roadrunner_req:set_body_timeout/2` over HTTP/1.1 in manual body mode: a
 handler moves the deadline of its body reads, and the drain of a body the
 handler left unread stays within the request's own deadline, whatever the
-handler moved its reads to. The listener's `request_timeout` is short, so
-a drain that waited on the handler's `infinity` would fail the case.
+handler moved its reads to. Where a handler moves its reads to no time,
+the listener's `request_timeout` is long, so only the move can end the
+read in time; where it moves them to `infinity`, it is short, so a drain
+that waited on the handler's `infinity` would fail the case.
 """.
 
 -behaviour(ct_suite).
@@ -31,12 +33,12 @@ all() ->
         unread_body_is_drained_within_the_request_deadline
     ].
 
-init_per_testcase(_Case, Config) ->
+init_per_testcase(Case, Config) ->
     {ok, _} = roadrunner_listener:start_link(?MODULE, #{
         port => 0,
         protocols => [{http1, #{linger_timeout => 100}}],
         body_buffering => manual,
-        request_timeout => 200,
+        request_timeout => request_timeout(Case),
         routes => [
             {~"/retimed", ?H, {retimed, self()}},
             {~"/retimed-send", ?H, {retimed_send, self()}},
@@ -47,6 +49,9 @@ init_per_testcase(_Case, Config) ->
         {127, 0, 0, 1}, roadrunner_listener:port(?MODULE), [binary, {active, false}], 5000
     ),
     [{sock, Sock} | Config].
+
+request_timeout(unread_body_is_drained_within_the_request_deadline) -> 200;
+request_timeout(_Case) -> 60_000.
 
 end_per_testcase(_Case, Config) ->
     ok = gen_tcp:close(?config(sock, Config)),
