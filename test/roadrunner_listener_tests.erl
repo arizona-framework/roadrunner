@@ -607,6 +607,36 @@ listener_rejects_invalid_http2_active_test() ->
         [true, false, 0, -1, 32768, 1.5, ~"16"]
     ).
 
+listener_timeouts_reject_values_a_receive_cannot_wait_test() ->
+    %% Every connection arms its waits from these, so a value a `receive`
+    %% cannot take (over `16#FFFFFFFF` ms) fails the start, as does one under
+    %% the option's floor.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun({Key, Bad}) ->
+            R = roadrunner_listener:start_link(listener_test_timeout_invalid, #{
+                port => 0, Key => Bad, routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, Key, Bad}, _Stack}}, R)
+        end,
+        [
+            {request_timeout, 16#100000000},
+            {request_timeout, -1},
+            {request_timeout, infinity},
+            {keep_alive_timeout, 16#100000000},
+            {tls_handshake_timeout, 0},
+            {tls_handshake_timeout, 16#100000000}
+        ]
+    ),
+    {ok, _} = roadrunner_listener:start_link(listener_test_timeout_max, #{
+        port => 0,
+        request_timeout => 16#FFFFFFFF,
+        keep_alive_timeout => 16#FFFFFFFF,
+        tls_handshake_timeout => 16#FFFFFFFF,
+        routes => roadrunner_hello_handler
+    }),
+    ok = roadrunner_listener:stop(listener_test_timeout_max).
+
 listener_http1_active_threads_into_proto_opts_test() ->
     %% Bare `http1` leaves the read mode to the connection (by transport);
     %% `once` and an explicit count flatten through verbatim.
