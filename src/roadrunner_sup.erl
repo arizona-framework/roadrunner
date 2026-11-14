@@ -18,9 +18,10 @@ start_link() ->
 -spec init([]) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
 init([]) ->
     %% Listeners are added dynamically via roadrunner:start_listener/2. The
-    %% static children are the `Date` header clock and the static-file
-    %% metadata cache table owner. one_for_one isolates per-listener
-    %% crashes; a static child only restarts on its own crash.
+    %% static children are the `Date` header clock, the static-file
+    %% metadata cache table owner and the gRPC health statuses' owner.
+    %% one_for_one isolates per-listener crashes; a static child only
+    %% restarts on its own crash.
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
@@ -42,6 +43,14 @@ init([]) ->
         shutdown => 5000,
         modules => [roadrunner_static_cache]
     },
-    {ok, {SupFlags, [Clock, StaticCache]}}.
+    GrpcHealth = #{
+        id => roadrunner_grpc_health_store,
+        start => {roadrunner_grpc_health_store, start_link, []},
+        type => worker,
+        restart => permanent,
+        shutdown => 5000,
+        modules => [roadrunner_grpc_health_store]
+    },
+    {ok, {SupFlags, [Clock, StaticCache, GrpcHealth]}}.
 
 %% internal functions

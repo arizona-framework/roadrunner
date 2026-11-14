@@ -27,6 +27,22 @@ routes_test() ->
     ?assertError({invalid_grpc_opt, services, [nope]}, ?M:routes(#{services => [nope]})),
     ?assertError({invalid_grpc_opt, services, ["x"]}, ?M:routes(#{services => ["x"]})).
 
+%% `health => true` adds the health service's route, with no codecs of
+%% the services' own; `false`, the default, none.
+routes_health_test() ->
+    ?assertEqual(
+        [
+            #{
+                path => ~"/grpc.health.v1.Health/:method",
+                handler => ?M,
+                state => #{service => roadrunner_grpc_health}
+            }
+        ],
+        ?M:routes(#{services => [], health => true})
+    ),
+    ?assertEqual([], ?M:routes(#{services => [], health => false})),
+    ?assertError({invalid_grpc_opt, health, yes}, ?M:routes(#{services => [], health => yes})).
+
 %% A codec module that does not exist, and a service whose rpcs/0 is not a
 %% map, are refused.
 init_route_missing_codec_and_bad_rpcs_test() ->

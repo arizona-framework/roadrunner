@@ -361,7 +361,11 @@ send_emit(Worker, Protocol, Conn, StreamId, Handler) ->
                 []
             };
         ({cancel_after, Ms}, _Req) ->
-            cancel_after(Protocol, Conn, StreamId, Ms)
+            cancel_after(Protocol, Conn, StreamId, Ms);
+        (monitor_connection, _Req) ->
+            %% The h2 connection, or the QUIC connection an h3 stream rides
+            %% on: either exits when the client's connection goes away.
+            {ok, monitor(process, Conn)}
     end.
 
 %% A timer that has the loop holding the stream cancel it: the h2
