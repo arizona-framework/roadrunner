@@ -11,6 +11,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
+-define(H3_REQUEST_CANCELLED, 16#010C).
+
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2, end_per_testcase/2]).
 -export([
     get_default/1,
@@ -35,6 +37,11 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     loop_filters_otp/1,
     loop_conn_close_stops_worker/1,
     loop_stream_reset_delivers_disconnect/1,
+    reset_cancels_the_response/1,
+    stop_sending_cancels_the_response/1,
+    stop_sending_and_reset_cancel_once/1,
+    reset_of_an_unanswered_request_cancels_it/1,
+    stop_sending_while_the_body_comes_keeps_the_conn/1,
     loop_push_flushes_per_event/1,
     loop_backpressure_reset_while_parked/1,
     stream_response/1,
@@ -82,6 +89,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     max_concurrent_requests_shed/1,
     max_concurrent_requests_queue/1,
     max_concurrent_requests_queue_expires/1,
+    stop_sending_withdraws_a_parked_request/1,
     max_concurrent_requests_queue_stale_grant/1,
     max_concurrent_requests_queue_survives_drain/1,
     stream_cancel/1,
@@ -105,6 +113,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     peer_control_stream_closed/1,
     unknown_uni_stream_ignored/1,
     peer_control_stream_reset/1,
+    peer_stops_our_control_stream/1,
     noncritical_uni_stream_reset/1,
     drain/1,
     refuse_request_during_drain/1,
@@ -147,6 +156,11 @@ all() ->
         loop_filters_otp,
         loop_conn_close_stops_worker,
         loop_stream_reset_delivers_disconnect,
+        reset_cancels_the_response,
+        stop_sending_cancels_the_response,
+        stop_sending_and_reset_cancel_once,
+        reset_of_an_unanswered_request_cancels_it,
+        stop_sending_while_the_body_comes_keeps_the_conn,
         loop_push_flushes_per_event,
         loop_backpressure_reset_while_parked,
         stream_response,
@@ -194,6 +208,7 @@ all() ->
         max_concurrent_requests_shed,
         max_concurrent_requests_queue,
         max_concurrent_requests_queue_expires,
+        stop_sending_withdraws_a_parked_request,
         max_concurrent_requests_queue_stale_grant,
         max_concurrent_requests_queue_survives_drain,
         stream_cancel,
@@ -217,6 +232,7 @@ all() ->
         peer_control_stream_closed,
         unknown_uni_stream_ignored,
         peer_control_stream_reset,
+        peer_stops_our_control_stream,
         noncritical_uni_stream_reset,
         drain,
         refuse_request_during_drain,
@@ -268,6 +284,7 @@ init_per_testcase(Case, Config) when
     Case =:= max_concurrent_requests_shed;
     Case =:= max_concurrent_requests_queue;
     Case =:= max_concurrent_requests_queue_expires;
+    Case =:= stop_sending_withdraws_a_parked_request;
     Case =:= max_concurrent_requests_queue_stale_grant;
     Case =:= max_concurrent_requests_queue_survives_drain;
     Case =:= crashed_worker_frees_its_slot;
@@ -569,6 +586,82 @@ loop_stream_reset_delivers_disconnect(Config) ->
         ct:fail(loop_worker_did_not_exit)
     end,
     true = unregister(roadrunner_h3_loop_observer),
+    close(Conn).
+
+reset_cancels_the_response(Config) ->
+    %% A client cancelling its request with RESET_STREAM alone, while the
+    %% handler still works on it: the server abandons the response with
+    %% RESET_STREAM(H3_REQUEST_CANCELLED) on its side too (RFC 9114
+    %% §4.1.1), and the handler's eventual answer goes nowhere.
+    cancels_the_response(Config, fun(Conn, StreamId) ->
+        roadrunner_quic_test_conn:reset_stream(Conn, StreamId, ?H3_REQUEST_CANCELLED)
+    end).
+
+stop_sending_cancels_the_response(Config) ->
+    %% A STOP_SENDING alone calls for a RESET_STREAM back (RFC 9000 §3.5).
+    cancels_the_response(Config, fun(Conn, StreamId) ->
+        roadrunner_quic_test_conn:stop_sending(Conn, StreamId, ?H3_REQUEST_CANCELLED)
+    end).
+
+stop_sending_and_reset_cancel_once(Config) ->
+    %% The cancel RFC 9114 §4.1.1 recommends, STOP_SENDING and RESET_STREAM
+    %% together: our side is reset once, not once per frame.
+    cancels_the_response(Config, fun(Conn, StreamId) ->
+        ok = roadrunner_quic_test_conn:stop_sending(Conn, StreamId, ?H3_REQUEST_CANCELLED),
+        roadrunner_quic_test_conn:reset_stream(Conn, StreamId, ?H3_REQUEST_CANCELLED)
+    end).
+
+cancels_the_response(Config, Cancel) ->
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/block")),
+    Worker = wait_for_register(roadrunner_h3_block_test, 1000),
+    WorkerRef = monitor(process, Worker),
+    ok = Cancel(Conn, StreamId),
+    ?assertEqual(?H3_REQUEST_CANCELLED, server_reset(Conn, StreamId)),
+    Worker ! release,
+    receive
+        {'DOWN', WorkerRef, process, Worker, Reason} -> ?assertEqual(normal, Reason)
+    after 5000 ->
+        ct:fail(worker_did_not_finish)
+    end,
+    %% The connection keeps serving, and the handler's late answer never
+    %% reached the wire: nothing more came on the reset stream.
+    ?assertMatch({200, _, _}, get(Conn, ~"/")),
+    receive
+        {quic_test_stream, Conn, StreamId, Late, _} -> ct:fail({data_after_reset, Late})
+    after 0 -> ok
+    end,
+    receive
+        {quic_test_stream_reset, Conn, StreamId, _} = Again -> ct:fail({second_reset, Again})
+    after 0 -> ok
+    end,
+    close(Conn).
+
+reset_of_an_unanswered_request_cancels_it(Config) ->
+    %% A request still being received (no FIN yet, so not dispatched) and
+    %% then reset is never answered: its response side is reset too.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"POST", ~"/"), false),
+    ok = roadrunner_quic_test_conn:reset_stream(Conn, StreamId, ?H3_REQUEST_CANCELLED),
+    ?assertEqual(?H3_REQUEST_CANCELLED, server_reset(Conn, StreamId)),
+    close(Conn).
+
+stop_sending_while_the_body_comes_keeps_the_conn(Config) ->
+    %% A client that stops reading the answer to a request it is still
+    %% uploading (STOP_SENDING alone): the server resets its side, asks the
+    %% client to stop too, and drops what the client still sends instead of
+    %% taking it for a new request, so the connection goes on.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"POST", ~"/"), false),
+    ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"part1", false),
+    ok = roadrunner_quic_test_conn:stop_sending(Conn, StreamId, ?H3_REQUEST_CANCELLED),
+    ?assertEqual(?H3_REQUEST_CANCELLED, server_reset(Conn, StreamId)),
+    receive
+        {quic_test_stop_sending, Conn, StreamId, _} -> ok
+    after 5000 -> ct:fail(no_stop_sending)
+    end,
+    ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"part2", true),
+    ?assertMatch({200, _, _}, get(Conn, ~"/")),
     close(Conn).
 
 loop_push_flushes_per_event(Config) ->
@@ -1514,6 +1607,35 @@ max_concurrent_requests_queue(_Config) ->
         roadrunner_listener:stop(Name)
     end.
 
+stop_sending_withdraws_a_parked_request(_Config) ->
+    %% A complete request parked for an in-flight slot, whose client then
+    %% stops reading the answer: it leaves the queue, its side is reset,
+    %% and the slot freed later goes to no one. Were it dispatched, the
+    %% parked `/block` would hold the only slot and the last request could
+    %% not be served.
+    Name = listener_name(stop_sending_withdraws_a_parked_request),
+    {ok, _} = start_h3(Name, #{
+        max_concurrent_requests => 1,
+        overload_mode => {queue, #{max_queued => 4, timeout => 5000}}
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        {ok, _} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/block")),
+        Worker = wait_for_register(roadrunner_h3_block_test, 1000),
+        {ok, Parked} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/block")),
+        ok = roadrunner_quic_test_conn:stop_sending(Conn, Parked, ?H3_REQUEST_CANCELLED),
+        ?assertEqual(?H3_REQUEST_CANCELLED, server_reset(Conn, Parked)),
+        Worker ! release,
+        ?assertMatch({200, _, _}, get(Conn, ~"/")),
+        receive
+            {quic_test_stream, Conn, Parked, Late, _} -> ct:fail({parked_answered, Late})
+        after 0 -> ok
+        end
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
 max_concurrent_requests_queue_expires(_Config) ->
     %% Nothing frees a slot before the deadline, so a parked request falls
     %% back to exactly the refusal `refuse` mode would have produced.
@@ -1907,6 +2029,15 @@ peer_control_stream_reset(Config) ->
     _ = roadrunner_quic_test_conn:reset_stream(Conn, StreamId, 0),
     ll_await_closed(Conn).
 
+peer_stops_our_control_stream(Config) ->
+    %% STOP_SENDING on our control stream (id 3) asks us to close a
+    %% critical stream → H3_CLOSED_CRITICAL_STREAM connection error (RFC
+    %% 9114 §6.2.1).
+    Conn = ll_connect(?config(port, Config)),
+    ?assertEqual({200, ~"ok"}, ll_get(Conn, ~"/")),
+    _ = roadrunner_quic_test_conn:stop_sending(Conn, 3, 0),
+    ll_await_closed(Conn).
+
 noncritical_uni_stream_reset(Config) ->
     %% RESET_STREAM on a non-critical uni stream just drops its state;
     %% the connection keeps serving.
@@ -2223,6 +2354,14 @@ try_connect(Port) ->
 close(Conn) ->
     _ = roadrunner_quic_test_h3:close(Conn),
     ok.
+
+%% The error code of the server's RESET_STREAM on `StreamId`.
+server_reset(Conn, StreamId) ->
+    receive
+        {quic_test_stream_reset, Conn, StreamId, Code} -> Code
+    after 5000 ->
+        ct:fail(no_server_reset)
+    end.
 
 get(Conn, Path) ->
     {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", Path)),

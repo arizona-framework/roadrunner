@@ -931,6 +931,9 @@ handle_app_frame({stream, StreamId, Offset, Data, Fin}, Conn) ->
 handle_app_frame({reset_stream, StreamId, ErrorCode, _FinalSize}, #conn{owner = Owner} = Conn) ->
     _ = Owner ! {quic_test_stream_reset, self(), StreamId, ErrorCode},
     Conn;
+handle_app_frame({stop_sending, StreamId, ErrorCode}, #conn{owner = Owner} = Conn) ->
+    _ = Owner ! {quic_test_stop_sending, self(), StreamId, ErrorCode},
+    Conn;
 handle_app_frame({connection_close, _Domain, ErrorCode, _FrameType, _Reason}, Conn) ->
     _ = Conn#conn.owner ! {quic_test_closed, self(), ErrorCode},
     Conn;

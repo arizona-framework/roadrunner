@@ -20,6 +20,7 @@
 %%   {quic, Conn, {stream_opened, StreamId}}    peer opened a stream
 %%   {quic, Conn, {stream_data, StreamId, Bin, Fin}}
 %%   {quic, Conn, {stream_reset, StreamId, ErrorCode}}
+%%   {quic, Conn, {stop_sending, StreamId, ErrorCode}}
 %%   {quic, Conn, {peer_changed, Peer}}         client moved (RFC 9000 §9)
 %%   {quic, Conn, {closed, Reason}}             connection closed
 %%
@@ -109,6 +110,7 @@
 -define(H3_SETTINGS_ERROR, 16#0109).
 -define(H3_MISSING_SETTINGS, 16#010A).
 -define(H3_REQUEST_REJECTED, 16#010B).
+-define(H3_REQUEST_CANCELLED, 16#010C).
 -define(H3_MESSAGE_ERROR, 16#010E).
 -define(H3_QPACK_DECOMPRESSION_FAILED, 16#0200).
 -define(H3_QPACK_ENCODER_STREAM_ERROR, 16#0201).
@@ -192,9 +194,14 @@
     streams = #{} :: #{non_neg_integer() => map()},
     %% Worker monitor ref => StreamId, for correlating `'DOWN'`.
     worker_refs = #{} :: #{reference() => non_neg_integer()},
-    %% StreamId => worker pid, so a peer RESET_STREAM on a dispatched
-    %% stream can be routed to its worker (`{roadrunner_stream_reset, _}`).
+    %% StreamId => worker pid, so a peer reset of a dispatched stream can
+    %% be routed to its worker (`{roadrunner_stream_reset, _}`).
     worker_pids = #{} :: #{non_neg_integer() => pid()},
+    %% Dispatched streams whose response was cancelled (`cancel_response/2`):
+    %% released to the QUIC connection once their worker ends
+    %% (`release_cancelled/2`), so a write after the reset finds the stream
+    %% stopped rather than opening it again.
+    cancelled = #{} :: #{non_neg_integer() => []},
     %% StreamId => peer-uni-stream state (see `uni_event/4`).
     uni = #{} :: #{non_neg_integer() => uni_state()},
     %% Critical stream roles already claimed, so a duplicate control or
@@ -357,6 +364,11 @@ loop(#h3{conn = Conn} = State) ->
             end;
         {quic, Conn, {stream_reset, StreamId, _ErrorCode}} ->
             case handle_stream_reset(State, StreamId) of
+                {conn_error, Code, Reason} -> conn_error(State, Code, Reason);
+                State1 -> loop(State1)
+            end;
+        {quic, Conn, {stop_sending, StreamId, _ErrorCode}} ->
+            case handle_stop_sending(State, StreamId) of
                 {conn_error, Code, Reason} -> conn_error(State, Code, Reason);
                 State1 -> loop(State1)
             end;
@@ -1002,6 +1014,9 @@ deliver(
 %% kept, so the client soon stops sending.
 -spec body_over_cap(#h3{}, non_neg_integer(), map(), boolean()) -> #h3{}.
 body_over_cap(#h3{streams = Streams} = State, StreamId, #{reader := Reader} = Stream0, Fin) ->
+    %% The rest of it, trailers included, is dropped undecoded: the encoder
+    %% is told now (RFC 9204 §4.4.2).
+    ok = stream_cancellation(State, StreamId),
     ok = roadrunner_conn:send_body_error(Reader, StreamId, content_length_too_large),
     Refused = Stream0#{
         buf := <<>>,
@@ -1264,19 +1279,27 @@ handle_stream_reset(#h3{uni = Uni} = State0, StreamId) ->
                 State = not_blocked(State0, StreamId),
             case WorkerPids of
                 #{StreamId := WorkerPid} ->
-                    %% Peer cancelled a dispatched request stream. Tell the
-                    %% worker so a `{loop, ...}` handler gets its disconnect;
-                    %% the worker's normal exit then releases the slot and
-                    %% drops the stream via `handle_worker_down/3` (no RST
-                    %% back — the peer already reset it).
+                    %% Peer cancelled a dispatched request stream. Abandon
+                    %% the response (`cancel_response/2`) and tell the
+                    %% worker, so a `{loop, ...}` handler gets its
+                    %% disconnect and a write or read fails; the worker's
+                    %% exit then releases the slot and drops the stream via
+                    %% `handle_worker_down/3`.
+                    ok = cancel_response(State, StreamId),
                     _ = (WorkerPid ! {roadrunner_stream_reset, StreamId}),
-                    reading_reset(State, StreamId);
+                    Cancelled = State#h3.cancelled,
+                    reading_reset(State#h3{cancelled = Cancelled#{StreamId => []}}, StreamId);
                 _ ->
                     %% Still mid-receive, parked for a slot, or already
                     %% gone. Drop the frame-accumulation entry and
                     %% withdraw any parked request; a grant already in
                     %% flight still arrives and `handle_slot/3` gives
-                    %% that slot back.
+                    %% that slot back. A request not answered yet never
+                    %% will be: abandon its response too, and with no
+                    %% worker left to write, release the stream. An answer
+                    %% already complete (its FIN out) is left as it is
+                    %% (`do_reset_stream` sends nothing on it).
+                    ok = cancel_and_release(State, StreamId),
                     ok = roadrunner_conn:cancel_slot_wait(State#h3.overload, StreamId),
                     State#h3{
                         streams = maps:remove(StreamId, Streams),
@@ -1284,6 +1307,123 @@ handle_stream_reset(#h3{uni = Uni} = State0, StreamId) ->
                     }
             end
     end.
+
+%% A peer STOP_SENDING (RFC 9000 §3.5): it will not read our response. The
+%% QUIC connection already reset our sending side; the request side may
+%% still be sending, so the stream is not dropped but left to discard what
+%% comes (`drop_stream/2` asks the peer to stop and marks it `discarding`),
+%% or its next bytes would be taken for a new request. A dispatched request
+%% is cancelled as for a RESET_STREAM: its worker is told and its reads
+%% fail. Our own unidirectional streams (control, QPACK encoder and
+%% decoder) are all critical: the peer may not stop one (RFC 9114 §6.2.1).
+-spec handle_stop_sending(#h3{}, non_neg_integer()) -> handle_result().
+handle_stop_sending(_State, StreamId) when StreamId rem 4 =:= 3 ->
+    {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer stopped a critical stream"};
+handle_stop_sending(#h3{streams = Streams, worker_pids = WorkerPids} = State, StreamId) ->
+    ok = release_unwritten(State, StreamId),
+    case WorkerPids of
+        #{StreamId := WorkerPid} ->
+            _ = (WorkerPid ! {roadrunner_stream_reset, StreamId}),
+            Cancelled = State#h3.cancelled,
+            reading_stopped(State#h3{cancelled = Cancelled#{StreamId => []}}, StreamId);
+        #{} ->
+            %% Not dispatched: a request parked for an in-flight slot leaves
+            %% the queue, its answer unwanted (`awaiting_slot` holds a
+            %% complete auto-mode one; a manual-mode one keeps its stream).
+            ok = roadrunner_conn:cancel_slot_wait(State#h3.overload, StreamId),
+            State1 = State#h3{awaiting_slot = maps:remove(StreamId, State#h3.awaiting_slot)},
+            case Streams of
+                #{StreamId := Stream} -> stop_unanswered(State1, StreamId, Stream);
+                #{} -> State1
+            end
+    end.
+
+%% A request stream not dispatched whose answer the peer will not read. One
+%% blocked on QPACK inserts holds its end in its `blocked` marker, which
+%% `drop_stream/2` reads; any other is still receiving its request, unless
+%% it ended (a manual-mode stream's `fin`): the rest is then discarded.
+-spec stop_unanswered(#h3{}, non_neg_integer(), map()) -> #h3{}.
+stop_unanswered(State, _StreamId, #{frame_state := discarding}) ->
+    %% Answered already, its body being discarded: the peer was asked to
+    %% stop then.
+    State;
+stop_unanswered(#h3{blocked = Blocked} = State, StreamId, Stream) ->
+    case {is_map_key(StreamId, Blocked), maps:get(fin, Stream, false)} of
+        {true, _} ->
+            drop_stream(State, StreamId);
+        {false, true} ->
+            ok = stream_cancellation(State, StreamId),
+            drop_stream(State, StreamId);
+        {false, false} ->
+            discard_stream(State, StreamId, Stream)
+    end.
+
+%% The QUIC connection reset our side for the STOP_SENDING; a stream no
+%% worker writes to (none dispatched, or it is gone) is released now, a
+%% dispatched one when its worker ends (`release_cancelled/2`).
+-spec release_unwritten(#h3{}, non_neg_integer()) -> ok.
+release_unwritten(#h3{conn = Conn, worker_pids = WorkerPids}, StreamId) ->
+    case WorkerPids of
+        #{StreamId := _} -> ok;
+        #{} -> roadrunner_quic:release_stream(Conn, StreamId)
+    end.
+
+%% A reader of a stream whose response the peer stopped: its read fails,
+%% but the stream keeps its end of body as it is, so the rest the peer
+%% sends is discarded once the worker ends (`drop_stream/2`).
+-spec reading_stopped(#h3{}, non_neg_integer()) -> #h3{}.
+reading_stopped(#h3{blocked = Blocked} = State, StreamId) when is_map_key(StreamId, Blocked) ->
+    %% Its trailers wait on QPACK inserts: they are dropped undecoded, so
+    %% the stream stops being blocked (no Section Acknowledgment may follow
+    %% the Stream Cancellation sent below, RFC 9204 §4.4.1), keeping the
+    %% end of body its marker held.
+    #h3{streams = #{StreamId := #{blocked := {_Ric, Fin, _Held}}}} = State,
+    #h3{streams = #{StreamId := Stream} = Streams} = State1 = forget_blocked(State, StreamId),
+    reading_stopped(State1#h3{streams = Streams#{StreamId := Stream#{fin => Fin}}}, StreamId);
+reading_stopped(#h3{streams = Streams} = State, StreamId) ->
+    case Streams of
+        #{StreamId := #{reader := Reader} = Stream} ->
+            %% Its trailers, if they come, are dropped undecoded: the
+            %% encoder is told now (RFC 9204 §4.4.2).
+            ok = stream_cancellation(State, StreamId),
+            ok = roadrunner_conn:send_body_error(Reader, StreamId, closed),
+            State#h3{
+                streams = Streams#{StreamId := Stream#{reader := undefined, body_error := closed}}
+            };
+        _ ->
+            State
+    end.
+
+%% A request the peer cancelled (RESET_STREAM or STOP_SENDING, RFC 9114
+%% §4.1.1) is not answered, or not any further: after a RESET_STREAM, reset
+%% our sending side with H3_REQUEST_CANCELLED, so the stream's response
+%% direction ends too instead of staying open. After a STOP_SENDING the QUIC
+%% layer has already sent that RESET_STREAM back, with the peer's own code
+%% (RFC 9000 §3.5), so this one finds the send side ended and sends
+%% nothing. Only for a stream whose answer is not complete: one already
+%% answered (`discarding` the rest of its body, or gone) has its FIN out.
+-spec cancel_response(#h3{}, non_neg_integer()) -> ok.
+cancel_response(#h3{conn = Conn}, StreamId) ->
+    _ = roadrunner_quic:reset_stream(Conn, StreamId, ?H3_REQUEST_CANCELLED),
+    ok.
+
+%% `cancel_response/2` for a stream no worker writes to: released to the
+%% QUIC connection at once.
+-spec cancel_and_release(#h3{}, non_neg_integer()) -> ok.
+cancel_and_release(#h3{conn = Conn} = State, StreamId) ->
+    ok = cancel_response(State, StreamId),
+    roadrunner_quic:release_stream(Conn, StreamId).
+
+%% A cancelled stream's worker ended: it writes no more, so the QUIC
+%% connection may drop the stream once the peer's side ends too.
+-spec release_cancelled(#h3{}, non_neg_integer()) -> #h3{}.
+release_cancelled(#h3{conn = Conn, cancelled = Cancelled} = State, StreamId) when
+    is_map_key(StreamId, Cancelled)
+->
+    ok = roadrunner_quic:release_stream(Conn, StreamId),
+    State#h3{cancelled = maps:remove(StreamId, Cancelled)};
+release_cancelled(State, _StreamId) ->
+    State.
 
 %% RFC 9114 §7.2.8: HTTP/2-reserved frame types → H3_FRAME_UNEXPECTED; a
 %% frame past the size we buffer is our own limit, not a malformed frame
@@ -1974,9 +2114,10 @@ handle_worker_down(#h3{worker_refs = WorkerRefs, worker_pids = WorkerPids} = Sta
     ok = roadrunner_conn:release_request_slot(
         State#h3.max_concurrent_requests, State#h3.inflight_counter, State#h3.overload
     ),
-    State1 = State#h3{
-        worker_refs = WorkerRefs1, worker_pids = maps:remove(StreamId, WorkerPids)
-    },
+    State1 = release_cancelled(
+        State#h3{worker_refs = WorkerRefs1, worker_pids = maps:remove(StreamId, WorkerPids)},
+        StreamId
+    ),
     case Reason of
         normal ->
             drop_stream(State1, StreamId);
@@ -1989,8 +2130,21 @@ handle_worker_down(#h3{worker_refs = WorkerRefs, worker_pids = WorkerPids} = Sta
 %% Reset a request stream we stop serving, with a QPACK Stream
 %% Cancellation (RFC 9204 §4.4.2): it may hold sections never decoded.
 -spec reset_and_drop(#h3{}, non_neg_integer(), non_neg_integer()) -> #h3{}.
-reset_and_drop(#h3{conn = Conn} = State, StreamId, ErrorCode) ->
+reset_and_drop(#h3{conn = Conn, worker_pids = WorkerPids} = State0, StreamId, ErrorCode) ->
     _ = roadrunner_quic:reset_stream(Conn, StreamId, ErrorCode),
+    %% Released to the QUIC connection once no worker writes to it: now if
+    %% none runs (none ran, or it is gone), else when it ends
+    %% (`release_cancelled/2`), so its writes keep failing until then
+    %% instead of finding the stream pruned.
+    State =
+        case WorkerPids of
+            #{StreamId := _} ->
+                Cancelled = State0#h3.cancelled,
+                State0#h3{cancelled = Cancelled#{StreamId => []}};
+            #{} ->
+                ok = roadrunner_quic:release_stream(Conn, StreamId),
+                State0
+        end,
     ok = stream_cancellation(State, StreamId),
     drop_stream(State, StreamId).
 
@@ -2076,21 +2230,28 @@ drop_stream(#h3{blocked = Blocked, streams = Streams} = State, StreamId) when
             true -> stream_cancellation(State1, StreamId);
             false -> ok
         end,
-    drop_stream(State1#h3{streams = Streams1#{StreamId := Stream#{fin := Fin}}}, StreamId);
-drop_stream(#h3{conn = Conn, streams = Streams} = State, StreamId) ->
+    drop_stream(State1#h3{streams = Streams1#{StreamId := Stream#{fin => Fin}}}, StreamId);
+drop_stream(#h3{streams = Streams} = State, StreamId) ->
     case Streams of
         #{StreamId := #{frame_state := discarding}} ->
             State;
         #{StreamId := #{fin := false} = Stream} ->
-            _ = roadrunner_quic:stop_sending(Conn, StreamId, ?H3_NO_ERROR),
-            ok = stream_cancellation(State, StreamId),
-            Discarding = Stream#{
-                frame_state := discarding, buf := <<>>, body := [], reader := undefined
-            },
-            State#h3{streams = Streams#{StreamId := Discarding}};
+            discard_stream(State, StreamId, Stream);
         _ ->
             State#h3{streams = maps:remove(StreamId, Streams)}
     end.
+
+%% A request stream whose request side is still sending, though we serve it
+%% no further: ask the peer to stop, and keep the stream to discard what it
+%% still sends, which would otherwise be taken for a new request.
+-spec discard_stream(#h3{}, non_neg_integer(), map()) -> #h3{}.
+discard_stream(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream) ->
+    _ = roadrunner_quic:stop_sending(Conn, StreamId, ?H3_NO_ERROR),
+    ok = stream_cancellation(State, StreamId),
+    Discarding = Stream#{
+        frame_state => discarding, buf => <<>>, body => [], reader => undefined
+    },
+    State#h3{streams = Streams#{StreamId := Discarding}}.
 
 -spec terminate(#h3{}, roadrunner_event_handler:close_reason()) -> ok.
 terminate(

@@ -39,6 +39,18 @@ handle(#{target := ~"/big-observed"} = Req) ->
     %% so the test can wait for that worker to exit.
     _ = (roadrunner_h3_big_observer ! {big_worker, self()}),
     {{200, [{~"content-type", ~"application/octet-stream"}], binary:copy(<<"x">>, 100_000)}, Req};
+handle(#{target := ~"/block"} = Req) ->
+    %% Park the worker in the handler so a test can cancel the request
+    %% while it is still computing its answer; `release` lets it answer.
+    try
+        unregister(roadrunner_h3_block_test)
+    catch
+        _:_ -> ok
+    end,
+    true = register(roadrunner_h3_block_test, self()),
+    receive
+        release -> {{200, [], ~"ok"}, Req}
+    end;
 handle(#{target := ~"/slow"} = Req) ->
     %% Sleeps so a test can cancel the stream before the worker sends,
     %% exercising the response path's tolerance of a gone stream.

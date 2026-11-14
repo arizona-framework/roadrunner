@@ -28,6 +28,7 @@ the server's decoder stream for the instructions it answers with.
     request_ended_before_blocked_trailers/1,
     section_before_blocked_trailers_fails/1,
     manual_blocked_trailers/1,
+    manual_stop_sending_while_trailers_blocked/1,
     manual_worker_done_while_blocked/1,
     drain_waits_for_blocked_stream/1,
     drain_deadline_ends_blocked_stream/1,
@@ -78,6 +79,7 @@ all() ->
         request_ended_before_blocked_trailers,
         section_before_blocked_trailers_fails,
         manual_blocked_trailers,
+        manual_stop_sending_while_trailers_blocked,
         manual_worker_done_while_blocked,
         drain_waits_for_blocked_stream,
         drain_deadline_ends_blocked_stream,
@@ -123,6 +125,7 @@ http3_opts(_Case) -> #{}.
 %% request is served while it waits.
 listener_opts(blocked_request_waits_for_inserts) -> #{max_concurrent_requests => 1};
 listener_opts(manual_blocked_trailers) -> manual_opts();
+listener_opts(manual_stop_sending_while_trailers_blocked) -> manual_opts();
 listener_opts(manual_worker_done_while_blocked) -> manual_opts();
 listener_opts(_Case) -> #{}.
 
@@ -475,6 +478,29 @@ manual_blocked_trailers(Config) ->
     ok = await_decoder(Conn, <<16#01>>),
     ok = await_decoder(Conn, section_ack(StreamId)),
     ?assertEqual({200, ~"4"}, response(Conn, StreamId)),
+    close(Conn).
+
+manual_stop_sending_while_trailers_blocked(Config) ->
+    %% A manual-mode request whose trailers wait on an insert, and whose
+    %% client then stops reading the answer: the trailers are cancelled
+    %% (Stream Cancellation) and never acknowledged, so the insert that
+    %% would have unblocked them is acknowledged on its own (Insert Count
+    %% Increment), with no Section Acknowledgment for a cancelled stream.
+    Conn = connect(Config),
+    Encoder = insert_two(Conn),
+    ok = await_decoder(Conn, <<16#03, 16#02>>),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(
+        Conn, StreamId, [headers_frame(post_section(~"/read")), data_frame(~"body")], false
+    ),
+    ok = await_decoder(Conn, section_ack(StreamId)),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, headers_frame(section(3, [16#80])), true),
+    {200, ~"ok"} = request(Conn, roadrunner_qpack:encode(headers(~"/")), true),
+    ok = roadrunner_quic_test_conn:stop_sending(Conn, StreamId, ?H3_REQUEST_CANCELLED),
+    ok = await_decoder(Conn, stream_cancellation(StreamId)),
+    ok = roadrunner_quic_test_conn:send(Conn, Encoder, third_insert(), false),
+    ok = await_decoder(Conn, <<16#01>>),
+    {200, ~"ok"} = request(Conn, roadrunner_qpack:encode(headers(~"/")), true),
     close(Conn).
 
 manual_worker_done_while_blocked(Config) ->

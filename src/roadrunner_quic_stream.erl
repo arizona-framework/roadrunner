@@ -36,10 +36,13 @@
     finish/1,
     next_frame/2,
     stop_sending/1,
+    release/1,
     send_pending/1,
     send_abandoned/1,
     send_owed/1,
     send_offset/1,
+    send_ended/1,
+    answered/1,
     recv_offset/1,
     is_terminal/1
 ]).
@@ -74,7 +77,10 @@
     %% reset abandoned the send side). Distinguishes an aborted send from a
     %% naturally drained one, so a deferred backpressure reply releases with
     %% an error rather than ok. See `send_abandoned/1`.
-    send_stopped = false :: boolean()
+    send_stopped = false :: boolean(),
+    %% Set by release/1: the owner will write no more on a stream whose send
+    %% side was reset, so it may be pruned once its receive side ends.
+    released = false :: boolean()
 }).
 
 -opaque t() :: #stream{}.
@@ -228,19 +234,55 @@ send_owed(#stream{offset = 0, segments = [], final_size = undefined}) -> false;
 send_owed(#stream{}) -> true.
 
 -doc """
-Whether both directions are finished, so the stream can be pruned: the send FIN
-is on the wire (`fin_sent`) and the receive side has reached its final size and
-either delivered its FIN or been reset (RFC 9000 §3). A send side abandoned via
-STOP_SENDING without a FIN is conservatively not terminal (it lingers rather
-than risk pruning a stream still in use).
+Whether the send side is over: its FIN is on the wire, or it was abandoned
+with a RESET_STREAM (`stop_sending/1`, after a peer STOP_SENDING or a local
+reset). Nothing more may be sent on it, a RESET_STREAM included (RFC 9000
+§3.1).
+""".
+-spec send_ended(t()) -> boolean().
+send_ended(#stream{fin_sent = FinSent, send_stopped = Stopped}) ->
+    FinSent orelse Stopped.
+
+-doc """
+Whether the owner has given the whole response, its FIN queued if not yet on
+the wire (flow control can hold the end back), or the send side is over
+(`send_ended/1`). A complete response is not one to cancel: the peer keeps it
+(RFC 9114 §4.1.1). One the peer reset its side of no longer goes out
+(`send_abandoned/1`), so a queued FIN then does not count: the send side must
+still be ended.
+""".
+-spec answered(t()) -> boolean().
+answered(#stream{send_fin = Fin, aborted = Aborted} = Stream) ->
+    (Fin andalso not Aborted) orelse send_ended(Stream).
+
+-doc """
+The owner is done writing to the stream: one whose send side was reset may
+now be pruned once its receive side ends (`is_terminal/1`). Until then a
+reset stream is kept, so a late write finds it stopped instead of opening it
+again from offset 0.
+""".
+-spec release(t()) -> t().
+release(#stream{} = Stream) ->
+    Stream#stream{released = true}.
+
+-doc """
+Whether both directions are finished, so the stream can be pruned: the send
+FIN is on the wire, or the send side was reset and the owner released it
+(`release/1`), and the receive side has reached its final size and either
+delivered its FIN or been reset (RFC 9000 §3).
 """.
 -spec is_terminal(t()) -> boolean().
 is_terminal(#stream{
-    fin_sent = true, final_size = FinalSize, fin_delivered = FinDelivered, aborted = Aborted
+    fin_sent = FinSent,
+    send_stopped = Stopped,
+    released = Released,
+    final_size = FinalSize,
+    fin_delivered = FinDelivered,
+    aborted = Aborted
 }) when
     FinalSize =/= undefined
 ->
-    FinDelivered orelse Aborted;
+    (FinSent orelse (Stopped andalso Released)) andalso (FinDelivered orelse Aborted);
 is_terminal(#stream{}) ->
     false.
 

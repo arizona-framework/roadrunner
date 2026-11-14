@@ -22,6 +22,8 @@ picks what the handler does with the body:
 - `stream_echo`: start a streamed answer, then read the body and stream it
   back
 - `read_then_stream`: read the body, then stream it back
+- `{stream_after_read, Pid}`: read the body, then start a streamed answer
+  and write to it, sending `Pid` `{read_result, _}` and `{write_result, _}`
 - `echo_pieces`: a `{send, ...}` fun that starts a streamed answer, then
   sends back each piece of the body as it arrives, ending with it
 - `{retimed, Pid}`: give the reads no time at all, then `{report, Pid}`
@@ -73,6 +75,23 @@ behave({retimed, Pid}, Req) ->
     behave({report, Pid}, roadrunner_req:set_body_timeout(0, Req));
 behave(answer_unread, Req) ->
     {roadrunner_resp:text(400, ~"no"), roadrunner_req:set_body_timeout(infinity, Req)};
+behave({stream_after_read, Pid}, Req) ->
+    Fun = fun(Req0) ->
+        Read =
+            case roadrunner_req:read_body(Req0) of
+                {ok, Body, _} -> {ok, iolist_size(Body)};
+                {error, _} = E -> E
+            end,
+        Pid ! {read_result, Read},
+        Write =
+            case roadrunner_send:stream(200, [], Req0) of
+                {ok, Send} -> Send(~"late", nofin);
+                {error, _} = Refused -> Refused
+            end,
+        Pid ! {write_result, Write},
+        Req0
+    end,
+    {{send, [], Fun}, Req};
 behave(read_then_stream, Req) ->
     {ok, Body, _} = roadrunner_req:read_body(Req),
     Fun = fun(Send) ->

@@ -520,6 +520,7 @@
     | {stream_opened, non_neg_integer()}
     | {stream_data, non_neg_integer(), binary(), boolean()}
     | {stream_reset, non_neg_integer(), non_neg_integer()}
+    | {stop_sending, non_neg_integer(), non_neg_integer()}
     | {peer_changed, address()}
     | {closed, {peer, non_neg_integer() | stateless_reset} | {local, atom()} | drained}.
 
@@ -987,6 +988,7 @@ with async `{emit, _, _}` effects, so it never blocks on the owner.
         | {set_owner, pid()}
         | open_uni
         | {reset_stream, non_neg_integer(), non_neg_integer()}
+        | {release_stream, non_neg_integer()}
         | {stop_sending, non_neg_integer(), non_neg_integer()}
         | {close, non_neg_integer()}
         | {close, non_neg_integer(), binary()}
@@ -1016,6 +1018,15 @@ handle_call(From, Ref, open_uni, Now, #state{next_uni = Id, peer_max_streams_uni
 handle_call(From, Ref, {reset_stream, Sid, ErrorCode}, Now, State) ->
     {State1, SendEffects} = do_reset_stream(Sid, ErrorCode, Now, State),
     {State1, [{reply, From, Ref, ok} | SendEffects]};
+handle_call(From, Ref, {release_stream, Sid}, _Now, #state{streams = Streams} = State) ->
+    State1 =
+        case Streams of
+            #{Sid := {Stream, Flow}} ->
+                put_stream(Sid, roadrunner_quic_stream:release(Stream), Flow, State);
+            #{} ->
+                State
+        end,
+    {State1, [{reply, From, Ref, ok}]};
 handle_call(From, Ref, {stop_sending, Sid, ErrorCode}, Now, State) ->
     {State1, SendEffects} = do_stop_sending(Sid, ErrorCode, Now, State),
     {State1, [{reply, From, Ref, ok} | SendEffects]};
@@ -1097,13 +1108,34 @@ send_owner_close(ErrorCode, Reason, Now, #state{peer_scid = DCID, scid = SCID} =
 %% Final Size, queue the frame at the application level, and flush it. The h3
 %% layer uses this to abort a response stream.
 -spec do_reset_stream(non_neg_integer(), non_neg_integer(), integer(), t()) -> {t(), [effect()]}.
-do_reset_stream(Sid, ErrorCode, Now, State) ->
-    {Stream, Flow, State1} = stream_for_send(Sid, State),
+do_reset_stream(Sid, ErrorCode, Now, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Sid := {Stream, Flow}} ->
+            case roadrunner_quic_stream:answered(Stream) of
+                true ->
+                    %% Its response is complete (its FIN out, or queued behind
+                    %% flow control), or it was reset already: a complete
+                    %% response is the peer's to keep (RFC 9114 §4.1.1), and
+                    %% nothing more may go on a reset side (RFC 9000 §3.1).
+                    {State, []};
+                false ->
+                    send_pass(Now, reset_send_side(Sid, ErrorCode, Stream, Flow, State))
+            end;
+        #{} ->
+            %% Pruned, both sides finished: there is no send side to reset,
+            %% and one made up now would carry a wrong final size.
+            {State, []}
+    end.
+
+%% Abandon a send side and queue its RESET_STREAM, the bytes already sent
+%% as its final size.
+-spec reset_send_side(
+    non_neg_integer(), non_neg_integer(), roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()
+) -> t().
+reset_send_side(Sid, ErrorCode, Stream, Flow, State) ->
     FinalSize = roadrunner_quic_stream:send_offset(Stream),
-    Stream1 = roadrunner_quic_stream:stop_sending(Stream),
-    State2 = put_stream(Sid, Stream1, Flow, State1),
-    State3 = queue_frame(application, {reset_stream, Sid, ErrorCode, FinalSize}, State2),
-    send_pass(Now, State3).
+    State1 = put_stream(Sid, roadrunner_quic_stream:stop_sending(Stream), Flow, State),
+    queue_frame(application, {reset_stream, Sid, ErrorCode, FinalSize}, State1).
 
 %% Ask the peer to stop sending on a stream with a STOP_SENDING (RFC 9000
 %% §19.5): queue the frame at the application level and flush it. The h3 layer
@@ -1194,9 +1226,30 @@ park_send(_Sid, _From, _Ref, _State) ->
     {reply, ok}.
 
 %% Append outbound bytes to a stream's send buffer (creating the stream on
-%% first reference) and flag the FIN when this is the final write.
+%% first reference) and flag the FIN when this is the final write. A write
+%% to a send side already over (FIN out, or reset) is dropped: nothing more
+%% may go on it (RFC 9000 §3.1), and keeping the bytes would only hold
+%% memory until the stream is pruned. So is one to a client request stream
+%% already pruned, which must not be opened again from offset 0 (§4.5).
 -spec enqueue_send(non_neg_integer(), iodata(), boolean(), t()) -> t().
-enqueue_send(Sid, IoData, Fin, State) ->
+enqueue_send(Sid, IoData, Fin, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Sid := {Stream, _Flow}} ->
+            case roadrunner_quic_stream:send_ended(Stream) of
+                true -> State;
+                false -> append_send(Sid, IoData, Fin, State)
+            end;
+        #{} when Sid rem 4 =:= 0 ->
+            case opened_before(Sid, State) of
+                true -> State;
+                false -> append_send(Sid, IoData, Fin, State)
+            end;
+        #{} ->
+            append_send(Sid, IoData, Fin, State)
+    end.
+
+-spec append_send(non_neg_integer(), iodata(), boolean(), t()) -> t().
+append_send(Sid, IoData, Fin, State) ->
     {Stream0, Flow, State1} = stream_for_send(Sid, State),
     Stream1 = roadrunner_quic_stream:enqueue(IoData, Stream0),
     Stream2 =
@@ -2672,20 +2725,26 @@ process_reset_stream(Sid, ErrorCode, FinalSize, State) ->
     end.
 
 %% Peer STOP_SENDING (RFC 9000 §3.5): the peer will not read more of our
-%% response on this stream. Abandon our send side — `stop_sending/1` discards
-%% the unsent buffer and marks the stream send-stopped, so a parked send reply
-%% releases with `{error, closed}` (via `release_drained/1` at the end of this
-%% datagram) instead of `ok` — and surface it to the owner as a stream reset so
-%% a response worker stops (reusing the reset routing) rather than buffering more
-%% onto a stopped stream. A frame for a stream we hold no send state for is
-%% ignored, like a late RESET_STREAM.
+%% response on this stream. Abandon our send side with a RESET_STREAM carrying
+%% its error code, which §3.5 requires while the side is still sending —
+%% `stop_sending/1` discards the unsent buffer and marks the stream
+%% send-stopped, so a parked send reply releases with `{error, closed}` (via
+%% `release_drained/1` at the end of this datagram) instead of `ok`. A side
+%% whose FIN is already out is left to finish (§3.5 lets it). Either way it
+%% is surfaced to the owner, as `{stop_sending, _, _}`, so a response
+%% worker stops rather than buffering more onto a stopped stream; unlike a
+%% RESET_STREAM the request side may still be sending. A frame for a stream
+%% we hold no send state for is ignored, like a late RESET_STREAM.
 -spec process_stop_sending(non_neg_integer(), non_neg_integer(), t()) -> t().
 process_stop_sending(Sid, ErrorCode, #state{streams = Streams} = State) ->
     case Streams of
-        #{Sid := {Stream0, Flow}} ->
-            Stream1 = roadrunner_quic_stream:stop_sending(Stream0),
-            State1 = put_stream(Sid, Stream1, Flow, State),
-            emit({stream_reset, Sid, ErrorCode}, State1);
+        #{Sid := {Stream, Flow}} ->
+            State1 =
+                case roadrunner_quic_stream:send_ended(Stream) of
+                    true -> State;
+                    false -> reset_send_side(Sid, ErrorCode, Stream, Flow, State)
+                end,
+            emit({stop_sending, Sid, ErrorCode}, State1);
         #{} ->
             State
     end.
