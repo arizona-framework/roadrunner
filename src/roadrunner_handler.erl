@@ -90,8 +90,20 @@ Over HTTP/2, when the client cancels a request (`RST_STREAM`), the
 handler is told, not stopped. Its next write ends its process there,
 without a crash report; a body read that waits on the client fails with
 `{error, closed}`; a `{loop, ...}` handler gets
-`{roadrunner_disconnect, reset}` (see `c:handle_info/3`). Work the
-handler is in the middle of runs on, and whatever it answers is dropped.
+`{roadrunner_disconnect, reset}` (see `c:handle_info/3`).
+
+Over HTTP/3, when the client cancels a request (`RESET_STREAM`, or
+`STOP_SENDING` when it will not read the answer), the server resets its
+side of the stream (with `H3_REQUEST_CANCELLED` after a `RESET_STREAM`,
+with the client's own code after a `STOP_SENDING`), unless the answer is
+already complete, and tells the handler, without stopping it. Its next
+write returns `{error, closed}` and puts nothing on the wire; a body read
+that waits on the client fails with `{error, closed}`; a `{loop, ...}`
+handler gets `{roadrunner_disconnect, reset}`. A body the client still
+sends after its `STOP_SENDING` is discarded.
+
+On both, work the handler is in the middle of runs on, so a long
+computation should check in between, and whatever it answers is dropped.
 While the connection lasts, the request still counts toward
 `max_concurrent_requests` until the handler returns, so that limit also
 bounds the handlers a client leaves running by opening streams and

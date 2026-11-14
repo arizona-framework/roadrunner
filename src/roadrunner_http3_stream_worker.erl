@@ -435,7 +435,7 @@ send_loop(Conn, StreamId, Fields, Handler, State) ->
     handler_code(fun() -> info_loop(Conn, StreamId, Handler, Push, State) end).
 
 %% The conn's `'DOWN'` and a peer `{roadrunner_stream_reset, _}` (routed
-%% by the conn loop on RESET_STREAM) each deliver one final
+%% by the conn loop on RESET_STREAM or STOP_SENDING) each deliver one final
 %% `{roadrunner_disconnect, _}` to the handler and end the loop. OTP
 %% message shapes are answered via `roadrunner_loop_sys` rather than
 %% surfacing in `handle_info/3`: `sys:get_state/1` & friends work and a

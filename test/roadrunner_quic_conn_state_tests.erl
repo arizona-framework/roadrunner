@@ -2595,6 +2595,87 @@ reset_stream_sends_reset_with_final_size_test() ->
     ?assertEqual({reply, self(), Ref, ok}, hd(Effects)),
     ?assert(lists:member({reset_stream, 0, 7, 5}, sent_app_frames(Effects, ApSecret))).
 
+%% Once the send side is over (FIN out, or reset already), or the stream is
+%% not held at all, a local reset sends nothing: no frame may go on it, and
+%% a RESET_STREAM for a pruned stream would carry a wrong final size.
+reset_stream_of_an_ended_send_side_sends_nothing_test() ->
+    {State, ApSecret} = connected_for_send(),
+    {Finished, _} = ?M:handle_send(self(), make_ref(), 0, ~"hello", true, ?NOW, State),
+    Ref = make_ref(),
+    {_, E1} = ?M:handle_call(self(), Ref, {reset_stream, 0, 7}, ?NOW, Finished),
+    ?assertEqual({reply, self(), Ref, ok}, hd(E1)),
+    ?assertEqual([], [F || {reset_stream, _, _, _} = F <- sent_app_frames(E1, ApSecret)]),
+    {Sending, _} = ?M:handle_send(self(), make_ref(), 0, ~"hello", false, ?NOW, State),
+    {Reset, _} = ?M:handle_call(self(), make_ref(), {reset_stream, 0, 7}, ?NOW, Sending),
+    {_, E2} = ?M:handle_call(self(), make_ref(), {reset_stream, 0, 7}, ?NOW, Reset),
+    ?assertEqual([], [F || {reset_stream, _, _, _} = F <- sent_app_frames(E2, ApSecret)]),
+    {_, E3} = ?M:handle_call(self(), make_ref(), {reset_stream, 4, 7}, ?NOW, State),
+    ?assertEqual([], [F || {reset_stream, _, _, _} = F <- sent_app_frames(E3, ApSecret)]).
+
+%% A request fully received whose response we reset stays held until its
+%% owner releases it: a late write then fails and puts nothing on the wire,
+%% instead of opening the stream again from offset 0 (RFC 9000 §3.1, §4.5).
+reset_stream_kept_until_released_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Request = app_datagram([{stream, 0, 0, ~"req", true}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Request, State),
+    {State2, _} = ?M:handle_call(self(), make_ref(), {reset_stream, 0, 7}, ?NOW, State1),
+    Ref = make_ref(),
+    {State3, E1} = ?M:handle_send(self(), Ref, 0, ~"late", true, ?NOW, State2),
+    ?assertEqual([{error, closed}], replies_for(E1, Ref)),
+    ?assertEqual([], [F || {stream, 0, _, _, _} = F <- sent_app_frames(E1, ServerApSecret)]),
+    ReleaseRef = make_ref(),
+    {State4, E2} = ?M:handle_call(self(), ReleaseRef, {release_stream, 0}, ?NOW, State3),
+    ?assertEqual([{reply, self(), ReleaseRef, ok}], E2),
+    {_, E3} = ?M:handle_call(self(), ReleaseRef, {release_stream, 4}, ?NOW, State3),
+    ?assertEqual([{reply, self(), ReleaseRef, ok}], E3),
+    %% Released and pruned: a write still landing is dropped, not sent on a
+    %% stream opened again.
+    {_, E4} = ?M:handle_send(self(), make_ref(), 0, ~"later", true, ?NOW, State4),
+    ?assertEqual([], [F || {stream, 0, _, _, _} = F <- sent_app_frames(E4, ServerApSecret)]).
+
+%% A response given whole, its FIN queued behind flow control, is complete:
+%% a local reset leaves it to finish (RFC 9114 §4.1.1: the peer keeps a
+%% complete response).
+reset_of_a_complete_response_sends_nothing_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Request = app_datagram([{stream, 0, 0, ~"req", true}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Request, State),
+    {State2, _} = ?M:handle_send_final(0, binary:copy(~"x", 100000), ?NOW, State1),
+    {_, Effects} = ?M:handle_call(self(), make_ref(), {reset_stream, 0, 7}, ?NOW, State2),
+    ?assertEqual(
+        [], [F || {reset_stream, _, _, _} = F <- sent_app_frames(Effects, ServerApSecret)]
+    ).
+
+%% A complete response whose FIN waits on flow control, on a stream the
+%% peer then resets: the rest never goes out, so the response is not
+%% complete after all, and a local reset ends our side with a RESET_STREAM.
+reset_of_a_queued_response_the_peer_reset_ends_it_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    Request = app_datagram([{stream, 0, 0, ~"req", true}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Request, State),
+    {State2, Sent} = ?M:handle_send_final(0, binary:copy(~"x", 100000), ?NOW, State1),
+    %% The peer acknowledges what was sent, so the congestion window lets
+    %% the next frame out, and resets its side.
+    Reset = app_datagram(
+        [ack_frame_through(largest_app_pn(Sent, ServerApSecret)), {reset_stream, 0, 16#10C, 3}],
+        1,
+        ClientApSecret
+    ),
+    {State3, _} = ?M:handle_datagram(?NOW, ?PEER, Reset, State2),
+    {_, Effects} = ?M:handle_call(self(), make_ref(), {reset_stream, 0, 16#10C}, ?NOW, State3),
+    ?assertMatch(
+        [{reset_stream, 0, 16#10C, _}],
+        [F || {reset_stream, _, _, _} = F <- sent_app_frames(Effects, ServerApSecret)]
+    ).
+
+%% A write after the FIN went out is dropped: nothing more may go on that side.
+send_after_fin_is_dropped_test() ->
+    {State, ApSecret} = connected_for_send(),
+    {State1, _} = ?M:handle_send(self(), make_ref(), 0, ~"hello", true, ?NOW, State),
+    {_, Effects} = ?M:handle_send(self(), make_ref(), 0, ~"more", true, ?NOW, State1),
+    ?assertEqual([], [F || {stream, 0, _, _, _} = F <- sent_app_frames(Effects, ApSecret)]).
+
 stop_sending_sends_stop_sending_frame_test() ->
     %% stop_sending emits a STOP_SENDING frame for the stream and replies ok.
     {State, ApSecret} = connected_for_send(),
@@ -2962,8 +3043,8 @@ parked_reply_released_on_peer_reset_test() ->
     ?assertEqual([{error, closed}], replies_for(E2, Ref)).
 
 %% A peer STOP_SENDING while parked clears our send side and releases with
-%% {error, closed} (closing the pre-existing no-handler hang), and surfaces a
-%% stream reset to the owner so a response worker stops.
+%% {error, closed} (closing the pre-existing no-handler hang), and surfaces it
+%% to the owner so a response worker stops.
 parked_reply_released_on_peer_stop_sending_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(),
     Ref = make_ref(),
@@ -2973,7 +3054,24 @@ parked_reply_released_on_peer_stop_sending_test() ->
     Stop = app_datagram([{stop_sending, 0, 7}], 0, ClientApSecret),
     {_State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Stop, State1),
     ?assertEqual([{error, closed}], replies_for(E2, Ref)),
-    ?assert(lists:member({stream_reset, 0, 7}, [Ev || {emit, _Owner, Ev} <- E2])).
+    ?assert(lists:member({stop_sending, 0, 7}, [Ev || {emit, _Owner, Ev} <- E2])).
+
+%% RFC 9000 §3.5: a STOP_SENDING for a side still sending gets a
+%% RESET_STREAM back, with its error code; a side whose FIN is out is left
+%% to finish.
+peer_stop_sending_answered_with_reset_test() ->
+    {State, ClientApSecret, ServerApSecret} = connect_owned(),
+    {Sending, _} = ?M:handle_send(self(), make_ref(), 0, ~"hello", false, ?NOW, State),
+    Stop = app_datagram([{stop_sending, 0, 7}], 0, ClientApSecret),
+    {_, E1} = ?M:handle_datagram(?NOW, ?PEER, Stop, Sending),
+    ?assert(
+        lists:member({reset_stream, 0, 7, 5}, sent_app_frames(E1, ServerApSecret))
+    ),
+    {Finished, _} = ?M:handle_send(self(), make_ref(), 0, ~"hello", true, ?NOW, State),
+    {_, E2} = ?M:handle_datagram(?NOW, ?PEER, Stop, Finished),
+    ?assertEqual(
+        [], [F || {reset_stream, _, _, _} = F <- sent_app_frames(E2, ServerApSecret)]
+    ).
 
 %% A local reset (handle_call {reset_stream, _}) while a send on that stream is
 %% parked releases the parked reply with {error, closed}; it clears send_buf, so
@@ -3152,14 +3250,22 @@ close_when_done_resends_a_lost_response_test() ->
     ).
 
 %% A response flow control holds back holds the close until the peer resets
-%% the stream: STOP_SENDING abandons the bytes, so nothing is owed any more.
+%% the stream: STOP_SENDING abandons the bytes, so nothing is owed any more,
+%% once the peer has the RESET_STREAM it calls for (RFC 9000 §3.5).
 close_when_done_released_by_stop_sending_test() ->
     {State, ClientApSecret, ServerApSecret, Largest} = held_response_closing(),
     Stop = app_datagram(
         [ack_frame_through(Largest), {stop_sending, 0, 7}], 1, ClientApSecret
     ),
-    {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Stop, State),
-    ?assertEqual(draining, ?M:phase(State1)),
+    {State1, E1} = ?M:handle_datagram(?NOW, ?PEER, Stop, State),
+    ?assertMatch([{reset_stream, 0, 7, _}], [
+        F
+     || {reset_stream, _, _, _} = F <- sent_app_frames(E1, ServerApSecret)
+    ]),
+    ?assertEqual(connected, ?M:phase(State1)),
+    Ack = ack_through(largest_app_pn(E1, ServerApSecret), 2, ClientApSecret),
+    {State2, Effects} = ?M:handle_datagram(?NOW, ?PEER, Ack, State1),
+    ?assertEqual(draining, ?M:phase(State2)),
     ?assertMatch(
         [{connection_close, application, 16#0100, _, _}], close_frames(Effects, ServerApSecret)
     ),

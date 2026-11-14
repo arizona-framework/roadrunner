@@ -24,6 +24,7 @@ picks what it does with the body.
     streamed_answer_asks_for_the_body_first/1,
     read_then_streamed_answer_gets_one_100/1,
     expect_continue_rejected_on_the_headers/1,
+    reset_after_the_answer_is_not_answered/1,
     body_over_the_cap_fails_the_read/1,
     credit_waits_for_the_reader/1,
     credit_comes_back_as_the_reader_reads/1,
@@ -31,11 +32,15 @@ picks what it does with the body.
     content_length_overrun_resets/1,
     malformed_content_length_resets/1,
     reset_while_reading/1,
+    stop_sending_fails_the_read_and_keeps_the_conn/1,
     reset_of_a_stopped_stream/1,
     read_of_a_stopped_stream/1,
     read_times_out/1,
     body_withdraw_of_a_gone_stream_is_answered/1,
-    parked_until_a_slot_frees/1
+    parked_until_a_slot_frees/1,
+    stop_sending_withdraws_a_parked_request/1,
+    stop_sending_after_the_answer_changes_nothing/1,
+    write_after_a_short_body_fails/1
 ]).
 
 -define(H, roadrunner_manual_body_handler).
@@ -63,6 +68,7 @@ all() ->
         streamed_answer_asks_for_the_body_first,
         read_then_streamed_answer_gets_one_100,
         expect_continue_rejected_on_the_headers,
+        reset_after_the_answer_is_not_answered,
         body_over_the_cap_fails_the_read,
         credit_waits_for_the_reader,
         credit_comes_back_as_the_reader_reads,
@@ -70,11 +76,15 @@ all() ->
         content_length_overrun_resets,
         malformed_content_length_resets,
         reset_while_reading,
+        stop_sending_fails_the_read_and_keeps_the_conn,
         reset_of_a_stopped_stream,
         read_of_a_stopped_stream,
         read_times_out,
         body_withdraw_of_a_gone_stream_is_answered,
-        parked_until_a_slot_frees
+        parked_until_a_slot_frees,
+        stop_sending_withdraws_a_parked_request,
+        stop_sending_after_the_answer_changes_nothing,
+        write_after_a_short_body_fails
     ].
 
 init_per_suite(Config) ->
@@ -116,6 +126,8 @@ extra(read_times_out) ->
     #{request_timeout => 100};
 extra(parked_until_a_slot_frees) ->
     #{max_concurrent_requests => 1, overload_mode => {queue, #{max_queued => 4, timeout => 5000}}};
+extra(stop_sending_withdraws_a_parked_request) ->
+    extra(parked_until_a_slot_frees);
 extra(_Case) ->
     #{}.
 
@@ -134,6 +146,7 @@ routes(TestPid) ->
             max_content_length => 500000
         },
         {~"/report", ?H, {report, TestPid}},
+        {~"/stream-after-read", ?H, {stream_after_read, TestPid}},
         {~"/stream-echo", ?H, stream_echo},
         {~"/read-then-stream", ?H, read_then_stream}
     ].
@@ -205,6 +218,20 @@ answers_before_the_body(Config) ->
     ?assertMatch({401, _, ~"no"}, roadrunner_quic_test_h3:collect(Conn, StreamId)),
     ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"late", true),
     ?assertMatch({200, _, ~"2"}, post(Conn, ~"/read", ~"ok")).
+
+reset_after_the_answer_is_not_answered(Config) ->
+    %% The handler answered (FIN out) while the client was still sending,
+    %% and the client resets its side, as one told to stop sending does:
+    %% the response is complete, so nothing is reset back.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/reject", []),
+    ?assertMatch({401, _, ~"no"}, roadrunner_quic_test_h3:collect(Conn, StreamId)),
+    ok = roadrunner_quic_test_conn:reset_stream(Conn, StreamId, ?H3_REQUEST_CANCELLED),
+    ?assertMatch({200, _, ~"2"}, post(Conn, ~"/read", ~"ok")),
+    receive
+        {quic_test_stream_reset, Conn, StreamId, Code} -> ct:fail({reset_back, Code})
+    after 0 -> ok
+    end.
 
 expect_continue_asks_on_the_first_read(Config) ->
     Conn = ?config(conn, Config),
@@ -326,6 +353,18 @@ reset_while_reading(Config) ->
     ok = roadrunner_quic_test_conn:reset_stream(Conn, StreamId, ?H3_REQUEST_CANCELLED),
     ?assertEqual({error, closed}, read_result()).
 
+stop_sending_fails_the_read_and_keeps_the_conn(Config) ->
+    %% The client stops reading the answer (STOP_SENDING alone) while the
+    %% handler waits on its body: the read fails, and what the client still
+    %% sends is dropped once the handler ends, not taken for a new request.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/report", [{~"expect", ~"100-continue"}]),
+    ok = interim_100(Conn, StreamId),
+    ok = roadrunner_quic_test_conn:stop_sending(Conn, StreamId, ?H3_REQUEST_CANCELLED),
+    ?assertEqual({error, closed}, read_result()),
+    ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"late body", true),
+    ?assertMatch({200, _, ~"2"}, post(Conn, ~"/read", ~"ok")).
+
 reset_of_a_stopped_stream(Config) ->
     %% A malformed body stops the stream while its handler is still waiting:
     %% the client's reset then ends it, and the handler's read fails.
@@ -380,6 +419,55 @@ parked_until_a_slot_frees(Config) ->
     ok = go(),
     ?assertMatch({200, _, ~"1"}, roadrunner_quic_test_h3:collect(Conn, First)),
     ?assertMatch({200, _, ~"5"}, roadrunner_quic_test_h3:collect(Conn, Second)).
+
+stop_sending_withdraws_a_parked_request(Config) ->
+    %% A request parked for the slot, its body complete, whose client stops
+    %% reading the answer: it leaves the queue, so the slot the first lets
+    %% go of serves the next request. Were it dispatched, the parked
+    %% `/gated` would hold the slot and the last request would wait.
+    Conn = ?config(conn, Config),
+    First = open(Conn, ~"/gated", []),
+    ok = wait_gated(),
+    Parked = open(Conn, ~"/gated", []),
+    ok = roadrunner_quic_test_h3:send_data(Conn, Parked, ~"x", true),
+    ok = roadrunner_quic_test_conn:stop_sending(Conn, Parked, ?H3_REQUEST_CANCELLED),
+    ?assertEqual(?H3_REQUEST_CANCELLED, reset_code(Conn, Parked)),
+    ok = roadrunner_quic_test_h3:send_data(Conn, First, ~"a", true),
+    ok = go(),
+    ?assertMatch({200, _, ~"1"}, roadrunner_quic_test_h3:collect(Conn, First)),
+    ?assertMatch({200, _, ~"2"}, post(Conn, ~"/read", ~"ok")).
+
+stop_sending_after_the_answer_changes_nothing(Config) ->
+    %% The handler answered before the body, so the server asked the client
+    %% to stop sending and discards the rest. A STOP_SENDING from the client
+    %% then, for an answer already complete, is not answered with another
+    %% request to stop.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/reject", []),
+    ?assertMatch({401, _, ~"no"}, roadrunner_quic_test_h3:collect(Conn, StreamId)),
+    receive
+        {quic_test_stop_sending, Conn, StreamId, _} -> ok
+    after 5000 -> ct:fail(no_stop_sending)
+    end,
+    ok = roadrunner_quic_test_conn:stop_sending(Conn, StreamId, ?H3_REQUEST_CANCELLED),
+    ?assertMatch({200, _, ~"2"}, post(Conn, ~"/read", ~"ok")),
+    receive
+        {quic_test_stop_sending, Conn, StreamId, _} = Again -> ct:fail({stopped_again, Again})
+    after 0 -> ok
+    end.
+
+write_after_a_short_body_fails(Config) ->
+    %% A body shorter than its `content-length` fails the read and the
+    %% server resets the stream; the handler, still running, finds its
+    %% writes failing rather than seemingly sent.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/stream-after-read", [{~"content-length", ~"10"}]),
+    ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, ~"four", true),
+    ?assertMatch({error, _}, read_result()),
+    receive
+        {write_result, Write} -> ?assertMatch({error, _}, Write)
+    after 5000 -> ct:fail(no_write_result)
+    end.
 
 %% =============================================================================
 %% Helpers

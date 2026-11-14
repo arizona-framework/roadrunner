@@ -226,9 +226,9 @@ send_pending_test() ->
     {_, _, _, Sent} = ?M:next_frame(100, ?M:finish(?M:enqueue(<<"d">>, ?M:new()))),
     ?assertNot(?M:send_pending(Sent)).
 
-%% A stream is terminal only when the send FIN is on the wire AND the receive
-%% side has reached its final size (FIN delivered or reset) — one side alone is
-%% not enough.
+%% A stream is terminal only when the send side is over (FIN on the wire, or
+%% reset and released by its owner) AND the receive side has reached its final
+%% size (FIN delivered or reset) — one side alone is not enough.
 is_terminal_test() ->
     ?assertNot(?M:is_terminal(?M:new())),
     {_, _, true, SendDone} = ?M:next_frame(100, ?M:finish(?M:enqueue(~"x", ?M:new()))),
@@ -238,7 +238,28 @@ is_terminal_test() ->
     {ok, _, true, BothDone} = ?M:receive_data(0, ~"y", true, SendDone),
     ?assert(?M:is_terminal(BothDone)),
     {ok, ResetDone} = ?M:reset(0, SendDone),
-    ?assert(?M:is_terminal(ResetDone)).
+    ?assert(?M:is_terminal(ResetDone)),
+    ?assertNot(?M:is_terminal(?M:release(?M:stop_sending(?M:new())))),
+    ?assertNot(?M:is_terminal(?M:stop_sending(RecvDone))),
+    ?assert(?M:is_terminal(?M:release(?M:stop_sending(RecvDone)))).
+
+%% The send side is over once its FIN is on the wire or it was reset.
+send_ended_test() ->
+    ?assertNot(?M:send_ended(?M:new())),
+    ?assertNot(?M:send_ended(?M:finish(?M:enqueue(~"x", ?M:new())))),
+    {_, _, true, Sent} = ?M:next_frame(100, ?M:finish(?M:enqueue(~"x", ?M:new()))),
+    ?assert(?M:send_ended(Sent)),
+    ?assert(?M:send_ended(?M:stop_sending(?M:new()))).
+
+%% A response given whole is answered, its FIN queued or sent, unless the
+%% peer reset its side before the queued end went out; a reset side is.
+answered_test() ->
+    ?assertNot(?M:answered(?M:new())),
+    Queued = ?M:finish(?M:enqueue(~"x", ?M:new())),
+    ?assert(?M:answered(Queued)),
+    {ok, PeerReset} = ?M:reset(0, Queued),
+    ?assertNot(?M:answered(PeerReset)),
+    ?assert(?M:answered(?M:stop_sending(PeerReset))).
 
 %% A stream owes a send once the peer started it (delivered bytes, a buffered
 %% gap above the cursor, or a final size alone), until our FIN is on the wire

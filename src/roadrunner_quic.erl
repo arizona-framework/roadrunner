@@ -27,6 +27,7 @@
     send_data/4,
     send_final/3,
     reset_stream/3,
+    release_stream/2,
     stop_sending/3,
     consumed/3,
     close/2,
@@ -89,6 +90,16 @@ send_final(Conn, StreamId, IoData) ->
 -spec reset_stream(pid(), non_neg_integer(), non_neg_integer()) -> ok.
 reset_stream(Conn, StreamId, ErrorCode) ->
     call(Conn, {reset_stream, StreamId, ErrorCode}).
+
+-doc """
+Tell the connection the owner will write no more on a stream whose send side
+was reset, so it can be dropped once the peer's side ends too. Until then
+writes to it are dropped and fail, and after it a write to it is dropped
+too, rather than opening it again.
+""".
+-spec release_stream(pid(), non_neg_integer()) -> ok.
+release_stream(Conn, StreamId) ->
+    call(Conn, {release_stream, StreamId}).
 
 -doc "Ask the peer to stop sending on a stream with a STOP_SENDING carrying the h3 error code.".
 -spec stop_sending(pid(), non_neg_integer(), non_neg_integer()) -> ok.
