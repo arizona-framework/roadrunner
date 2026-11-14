@@ -2254,6 +2254,42 @@ pto_after_samples(HelloOpts, DelayField) ->
     [At] = [A || {arm_timer, pto, A} <- Effects],
     At.
 
+idle_timer_ignores_a_packet_that_fails_to_open_test() ->
+    %% Only a packet received and processed successfully restarts the idle
+    %% timer (RFC 9000 §10.1): one sealed with keys the connection does not
+    %% hold, as anyone on the path could send, leaves the deadline alone.
+    {State, _ClientApSecret} = connected_with_owner(),
+    Forged = app_datagram([ping], 5, crypto:strong_rand_bytes(32)),
+    {State1, _} = ?M:handle_datagram(?NOW + 20000, ?PEER, Forged, State),
+    {State2, _} = ?M:handle_timeout(?NOW + ?IDLE_TIMEOUT, idle, State1),
+    ?assertEqual(closed, ?M:phase(State2)).
+
+idle_timer_ignores_a_replayed_packet_test() ->
+    %% A copy of a packet already processed is discarded (RFC 9000 §12.3), so
+    %% it does not restart the idle timer (§10.1) either: an attacker on the
+    %% path replaying it cannot hold the connection open.
+    {State, ClientApSecret} = connected_with_owner(),
+    Ping = app_datagram([ping], 5, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Ping, State),
+    {State2, _} = ?M:handle_datagram(?NOW + 20000, ?PEER, Ping, State1),
+    {State3, _} = ?M:handle_timeout(?NOW + ?IDLE_TIMEOUT, idle, State2),
+    ?assertEqual(closed, ?M:phase(State3)).
+
+idle_timer_restarts_on_the_first_ack_eliciting_send_test() ->
+    %% Sending an ack-eliciting packet restarts the idle timer when it is the
+    %% first since a packet was received (RFC 9000 §10.1), so the deadline
+    %% counts from it; a later send before anything is received does not.
+    {State, ClientApSecret} = connected_with_owner(),
+    Ping = app_datagram([ping], 5, ClientApSecret),
+    {State0, _} = ?M:handle_datagram(?NOW + 10000, ?PEER, Ping, State),
+    {State1, _} = ?M:handle_send(self(), make_ref(), 0, ~"a", false, ?NOW + 20000, State0),
+    {State2, _} = ?M:handle_send(self(), make_ref(), 0, ~"b", false, ?NOW + 40000, State1),
+    Deadline = ?NOW + 20000 + ?IDLE_TIMEOUT,
+    {State3, _} = ?M:handle_timeout(Deadline - 1, idle, State2),
+    ?assertNotEqual(closed, ?M:phase(State3)),
+    {State4, _} = ?M:handle_timeout(Deadline, idle, State3),
+    ?assertEqual(closed, ?M:phase(State4)).
+
 idle_timer_armed_when_nothing_in_flight_test() ->
     %% With no ack-eliciting bytes in flight (the peer just acknowledged the
     %% server's HANDSHAKE_DONE), the idle deadline (Now + ?IDLE_TIMEOUT) is the
