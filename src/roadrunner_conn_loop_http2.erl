@@ -744,7 +744,9 @@ recv_idle_expired(State) ->
 
 %% Whether the conn is still serving: a worker runs and no stream holds
 %% sends that wait for the client's flow-control window. A worker reading a
-%% body waits on the client too, but its read has its own deadline. A
+%% body waits on the client too, within its read's deadline, which the
+%% handler may have moved to never (`roadrunner_req:set_body_timeout/2`):
+%% the liveness PING is then all that ends a client gone quiet. A
 %% client that stops granting window meets the idle timeout, and the conn
 %% closes with every stream on it, a quiet one still at work included: a
 %% client that holds a window shut that long has stopped reading.
