@@ -25,6 +25,8 @@ picks what the handler does with the body:
 - `echo_pieces`: a `{send, ...}` fun that starts a streamed answer, then
   sends back each piece of the body as it arrives, ending with it
 - `{retimed, Pid}`: give the reads no time at all, then `{report, Pid}`
+- `{retimed_send, Pid}`: the same from a `{send, ...}` fun, which then
+  replies `200` itself
 - `answer_unread`: give the reads no deadline, then answer `400`
   without reading the body
 """.
@@ -57,6 +59,14 @@ behave(echo_pieces, Req) ->
     Fun = fun(Req0) ->
         {ok, Send} = roadrunner_send:stream(200, [{~"content-type", ~"text/plain"}], Req0),
         echo(Send, Req0)
+    end,
+    {{send, [], Fun}, Req};
+behave({retimed_send, Pid}, Req) ->
+    Fun = fun(Req0) ->
+        Result = roadrunner_req:read_body(roadrunner_req:set_body_timeout(0, Req0)),
+        Pid ! {read_result, Result},
+        ok = roadrunner_send:reply(200, [], ~"ok", Req0),
+        Req0
     end,
     {{send, [], Fun}, Req};
 behave({retimed, Pid}, Req) ->
