@@ -28,6 +28,7 @@
     loss_time/1,
     update_rtt/3,
     reset_rtt/2,
+    set_ack_delay/2,
     get_pto/1,
     pto_period/1,
     pto_deadline/1,
@@ -113,7 +114,12 @@
     %% congestion controller to read via cc_signal/1 immediately after.
     cc_signal = ?NO_CC_SIGNAL :: cc_signal(),
     max_ack_delay :: non_neg_integer(),
-    ack_delay_exponent :: non_neg_integer()
+    ack_delay_exponent :: non_neg_integer(),
+    %% An Initial or Handshake space: its packets are acknowledged at once
+    %% (RFC 9000 §13.2.1), so its probe timeout leaves max_ack_delay out (RFC
+    %% 9002 §6.2.1) and its RTT samples ignore the ACK delay, as §5.3 allows
+    %% for Initial and as is safe for Handshake, whose delay is near zero.
+    handshake :: boolean()
 }).
 
 -opaque t() :: #loss{}.
@@ -128,7 +134,8 @@
 -type opts() :: #{
     initial_rtt => non_neg_integer(),
     max_ack_delay => non_neg_integer(),
-    ack_delay_exponent => non_neg_integer()
+    ack_delay_exponent => non_neg_integer(),
+    handshake => boolean()
 }.
 
 %% =============================================================================
@@ -139,7 +146,8 @@
 A fresh loss-detection state. `initial_rtt` seeds the smoothed RTT until
 the first sample (RFC 9002 §6.2.2, default 333ms); `max_ack_delay` and
 `ack_delay_exponent` are the peer's advertised values (defaults 25ms and
-3), the latter used to decode the ACK Delay field.
+3), the latter used to decode the ACK Delay field; `handshake` marks an
+Initial or Handshake space (default `false`).
 """.
 -spec new(opts()) -> t().
 new(Opts) ->
@@ -149,7 +157,8 @@ new(Opts) ->
         smoothed_rtt = InitialRtt,
         rtt_var = InitialRtt div 2,
         max_ack_delay = maps:get(max_ack_delay, Opts, ?DEFAULT_MAX_ACK_DELAY),
-        ack_delay_exponent = maps:get(ack_delay_exponent, Opts, ?DEFAULT_ACK_DELAY_EXPONENT)
+        ack_delay_exponent = maps:get(ack_delay_exponent, Opts, ?DEFAULT_ACK_DELAY_EXPONENT),
+        handshake = maps:get(handshake, Opts, false)
     }.
 
 %% =============================================================================
@@ -326,13 +335,15 @@ update_rtt(LatestRtt, _AckDelay, #loss{has_sample = false} = Loss) ->
 update_rtt(
     LatestRtt,
     AckDelay,
-    #loss{smoothed_rtt = SRtt, rtt_var = RttVar, min_rtt = MinRtt, max_ack_delay = MaxAckDelay} =
-        Loss
+    #loss{smoothed_rtt = SRtt, rtt_var = RttVar, min_rtt = MinRtt} = Loss
 ) ->
     NewMinRtt = min(MinRtt, LatestRtt),
+    Delay = sample_ack_delay(AckDelay, Loss),
+    %% The delay, capped, comes off the sample unless that would take it
+    %% under the minimum RTT (RFC 9002 §5.3, Appendix A.7).
     Adjusted =
-        case LatestRtt > NewMinRtt + AckDelay of
-            true -> LatestRtt - min(AckDelay, MaxAckDelay);
+        case LatestRtt >= NewMinRtt + Delay of
+            true -> LatestRtt - Delay;
             false -> LatestRtt
         end,
     Loss#loss{
@@ -340,6 +351,30 @@ update_rtt(
         min_rtt = NewMinRtt,
         rtt_var = (3 * RttVar + abs(SRtt - Adjusted)) div 4,
         smoothed_rtt = (7 * SRtt + Adjusted) div 8
+    }.
+
+%% The ACK delay an RTT sample takes off: none in a handshake space, whose
+%% ACKs are immediate (RFC 9000 §13.2.1, RFC 9002 §5.3), else at most
+%% max_ack_delay.
+-spec sample_ack_delay(non_neg_integer(), t()) -> non_neg_integer().
+sample_ack_delay(_AckDelay, #loss{handshake = true}) -> 0;
+sample_ack_delay(AckDelay, #loss{max_ack_delay = MaxAckDelay}) -> min(AckDelay, MaxAckDelay).
+
+-doc """
+Take the peer's `max_ack_delay` (ms) and `ack_delay_exponent` once its
+transport parameters are known (RFC 9000 §18.2), each kept as it was when
+absent: the exponent decodes the ACK Delay field of every ACK it sends
+(§19.3), and `max_ack_delay` caps that delay in RTT samples, pads the probe
+timeout (RFC 9002 §5.3, §6.2.1) and lengthens the persistent congestion
+duration (§7.6.1).
+""".
+-spec set_ack_delay(
+    #{max_ack_delay => non_neg_integer(), ack_delay_exponent => non_neg_integer()}, t()
+) -> t().
+set_ack_delay(Params, #loss{max_ack_delay = MaxAckDelay, ack_delay_exponent = Exponent} = Loss) ->
+    Loss#loss{
+        max_ack_delay = maps:get(max_ack_delay, Params, MaxAckDelay),
+        ack_delay_exponent = maps:get(ack_delay_exponent, Params, Exponent)
     }.
 
 -doc """
@@ -366,20 +401,28 @@ reset_rtt(Now, #loss{initial_rtt = InitialRtt} = Loss) ->
 
 -doc """
 The probe timeout: `smoothed_rtt + max(4 * rtt_var, granularity) +
-max_ack_delay`, doubled per consecutive PTO (RFC 9002 §6.2.1).
+max_ack_delay` (no `max_ack_delay` in a handshake space), doubled per
+consecutive PTO (RFC 9002 §6.2.1).
 """.
 -spec get_pto(t()) -> non_neg_integer().
 get_pto(#loss{pto_count = Count} = Loss) ->
     pto_period(Loss) bsl Count.
 
 -doc """
-The probe timeout before backoff (RFC 9002 §6.2.1), also the base of the
-persistent congestion duration (§7.6.1) and of the idle timeout's floor
-(RFC 9000 §10.1).
+The probe timeout before backoff (RFC 9002 §6.2.1), with no `max_ack_delay`
+in a handshake space; also the base of the idle timeout's floor (RFC 9000
+§10.1).
 """.
 -spec pto_period(t()) -> non_neg_integer().
-pto_period(#loss{smoothed_rtt = SRtt, rtt_var = RttVar, max_ack_delay = MaxAckDelay}) ->
-    SRtt + max(4 * RttVar, ?GRANULARITY) + MaxAckDelay.
+pto_period(#loss{handshake = true} = Loss) ->
+    rtt_period(Loss);
+pto_period(#loss{max_ack_delay = MaxAckDelay} = Loss) ->
+    rtt_period(Loss) + MaxAckDelay.
+
+%% The probe timeout's RTT part, before any max_ack_delay.
+-spec rtt_period(t()) -> non_neg_integer().
+rtt_period(#loss{smoothed_rtt = SRtt, rtt_var = RttVar}) ->
+    SRtt + max(4 * RttVar, ?GRANULARITY).
 
 -doc """
 When the probe timeout fires (RFC 9002 §6.2.1): the probe timeout after the
@@ -599,8 +642,11 @@ first_rtt_sample_at(_Now, #loss{first_rtt_sample_at = At}) -> At.
 -spec persistent_congestion([#sent{}], t()) -> boolean().
 persistent_congestion(_Lost, #loss{first_rtt_sample_at = undefined}) ->
     false;
-persistent_congestion(Lost, #loss{first_rtt_sample_at = FirstSampleAt} = Loss) ->
-    Duration = pto_period(Loss) * ?PERSISTENT_CONGESTION_THRESHOLD,
+persistent_congestion(
+    Lost, #loss{first_rtt_sample_at = FirstSampleAt, max_ack_delay = MaxAckDelay} = Loss
+) ->
+    %% With max_ack_delay in every space, unlike the probe timeout (§7.6.1).
+    Duration = (rtt_period(Loss) + MaxAckDelay) * ?PERSISTENT_CONGESTION_THRESHOLD,
     congested_run(Lost, FirstSampleAt, Duration, none).
 
 %% Walk the lost packets newest-first, tracking the current run of

@@ -54,6 +54,19 @@ update_rtt_subsequent_sample_test() ->
     ?assertEqual(50, ?M:min_rtt(Adjust)),
     ?assert(?M:smoothed_rtt(Adjust) > 50).
 
+%% The delay is capped at max_ack_delay before the comparison, and a sample
+%% exactly at min + delay is adjusted (Appendix A.7): 75 - 25 = 50 leaves
+%% the smoothed RTT where it was.
+update_rtt_caps_the_delay_first_test() ->
+    Base = ?M:update_rtt(50, 0, ?M:new(#{})),
+    ?assertEqual(50, ?M:smoothed_rtt(?M:update_rtt(75, 1000, Base))).
+
+%% A handshake space's samples ignore the ACK delay (§5.3): 70 stands.
+handshake_update_rtt_ignores_the_ack_delay_test() ->
+    Base = ?M:update_rtt(50, 0, ?M:new(#{handshake => true})),
+    Plain = ?M:update_rtt(70, 0, ?M:update_rtt(50, 0, ?M:new(#{}))),
+    ?assertEqual(?M:smoothed_rtt(Plain), ?M:smoothed_rtt(?M:update_rtt(70, 10, Base))).
+
 %% =============================================================================
 %% Probe timeout (RFC 9002 §6.2).
 %% =============================================================================
@@ -64,6 +77,17 @@ pto_with_backoff_test() ->
     ?assertEqual(325, ?M:get_pto(Loss)),
     ?assertEqual(650, ?M:get_pto(?M:on_pto_expired(Loss))),
     ?assertEqual(1, ?M:pto_count(?M:on_pto_expired(Loss))).
+
+%% A handshake space's probe timeout leaves max_ack_delay out (§6.2.1):
+%% 100 + max(4*50, 1) = 300.
+handshake_pto_leaves_out_max_ack_delay_test() ->
+    ?assertEqual(300, ?M:get_pto(?M:new(#{initial_rtt => 100, handshake => true}))).
+
+%% The peer's values replace the defaults, each kept when absent.
+set_ack_delay_test() ->
+    Loss = ?M:set_ack_delay(#{max_ack_delay => 100}, ?M:new(#{initial_rtt => 100})),
+    ?assertEqual(400, ?M:get_pto(Loss)),
+    ?assertEqual(400, ?M:get_pto(?M:set_ack_delay(#{}, Loss))).
 
 %% =============================================================================
 %% ACK processing + loss detection (RFC 9002 §5-§6).
@@ -269,6 +293,15 @@ persistent_congestion_established_test() ->
 %% (10 + 12 + 25) * 3 = 141, past the 120ms span (§7.6.1).
 persistent_congestion_needs_the_duration_test() ->
     Loss = sampled_then_sent(#{max_ack_delay => 25}, [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]),
+    {Loss1, _, _} = ?M:on_ack_received({ack, 8, 0, 0, []}, 170, Loss),
+    ?assertMatch(#{persistent_congestion := false}, ?M:cc_signal(Loss1)).
+
+%% The same in a handshake space: its probe timeout leaves max_ack_delay
+%% out, but the persistent congestion duration keeps it (§7.6.1).
+persistent_congestion_keeps_max_ack_delay_in_a_handshake_space_test() ->
+    Loss = sampled_then_sent(
+        #{max_ack_delay => 25, handshake => true}, [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]
+    ),
     {Loss1, _, _} = ?M:on_ack_received({ack, 8, 0, 0, []}, 170, Loss),
     ?assertMatch(#{persistent_congestion := false}, ?M:cc_signal(Loss1)).
 
