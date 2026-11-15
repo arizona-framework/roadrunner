@@ -1159,8 +1159,13 @@ large_body({error, _}, _Buffered, _Idle) -> false.
 %% (`min_heap_size`, up to `Cap`) lets the next request start at that size,
 %% so a handler building a sizeable response collects a few times per
 %% request instead of several. Sampled when the handler returns, before the
-%% response is encoded. Raising the floor resizes the heap at once, so it
-%% does not follow each request down; instead, every `?HEAP_FLOOR_RELEARN`
+%% response is encoded. The heap's size changes only when the process
+%% collects, so for a `{send, ...}` fun, which runs after the sample, the
+%% next request reads what the fun grew the heap to. Raising the floor
+%% resizes nothing at once either: the emulator keeps the new
+%% `min_heap_size`, and the next collection sizes the heap to at least it.
+%% A full sweep never shrinks the heap below the floor, so the floor does
+%% not follow each request down; instead, every `?HEAP_FLOOR_RELEARN`
 %% requests it drops back to `Base` and the next request sets it again.
 %% Dropping it resizes nothing: the heap shrinks only at a collection that
 %% finds it mostly empty, which a connection whose requests still need the
