@@ -8,7 +8,7 @@
 -export([stop/2, bad_trailer/2, late_headers/2, stale_send/2, bad_name/2, big_header/2]).
 -export([unsafe_header/2, unsafe_fail/2, busy/2, squeezed/2, late_compression/2]).
 -export([stale_compression/2, held/1, was_compressed/2, flood/2, big_trailer/2]).
--export([hold/2, watch/2, stop_after/2, reset_at/2, watch_late/2]).
+-export([hold/2, watch/2, stop_after/2, reset_at/2, watch_late/2, keys/2]).
 
 name() -> ~"test.Echo".
 
@@ -47,7 +47,8 @@ rpcs() ->
         ~"Watch" => rpc(watch, server_stream),
         ~"StopAfter" => rpc(stop_after, server_stream),
         ~"ResetAt" => rpc(reset_at, unary),
-        ~"WatchLate" => rpc(watch_late, server_stream)
+        ~"WatchLate" => rpc(watch_late, server_stream),
+        ~"Keys" => rpc(keys, unary)
     }.
 
 rpc(Function, Kind) ->
@@ -255,6 +256,12 @@ watch_late(Request, Stream) ->
                     watch_late(Request, Stream)
             end
     end.
+
+%% The keys the call keeps in its process dictionary, sorted, after
+%% `cancelled/2` told it a reset arrived when the request is `cancelled`.
+keys(Request, Stream) ->
+    _ = Request =:= ~"cancelled" andalso roadrunner_grpc:cancelled({h2_stream_reset, 1}, Stream),
+    {reply, term_to_binary(lists:sort([Key || {{roadrunner_grpc, Key}, _} <- get()])), Stream}.
 
 until(Time) ->
     receive

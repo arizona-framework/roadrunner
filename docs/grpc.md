@@ -500,6 +500,11 @@ unless its process dies of an exit signal it does not trap (such as
 returns. Calls to the health service and to server reflection emit the
 same events, under their own service names
 (`grpc.health.v1.Health`, `grpc.reflection.v1.ServerReflection`).
+A call checks the handler once, as it starts. With the default
+`roadrunner_event_noop` it emits no events and keeps no counts, so
+event work costs a call almost nothing until you set a handler. A call
+that started under a handler still ends with its stop or exception
+event if that handler crashes and is replaced while the call runs.
 The events run in the call's own process, inside the request's events,
 so the request's `request_id` ties them together. Time is not measured
 for you: read `erlang:monotonic_time/0` in the start event and keep it

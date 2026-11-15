@@ -241,7 +241,11 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
     headers = [] :: roadrunner_http:headers(),
     trailers = [] :: roadrunner_http:headers(),
     %% The response's body writer once its headers went out.
-    send = undefined :: roadrunner_handler:send_fun() | undefined
+    send = undefined :: roadrunner_handler:send_fun() | undefined,
+    %% Whether the call reports events: a handler other than the no-op one
+    %% was set as it started. One that does not keeps no count, span or
+    %% ending (`call/4`).
+    events = false :: boolean()
 }).
 
 -opaque stream() :: #stream{}.
@@ -554,7 +558,9 @@ subtype(_Rest) -> invalid.
 
 %% The call, on the request's process, between its `grpc_call_start` event
 %% and the one that ends it. A call that ends in an exit or a raise reports
-%% how it ended and goes on ending as it would.
+%% how it ended and goes on ending as it would. The handler is read once, as
+%% the call starts: with the no-op one, the default, the call reports
+%% nothing and keeps nothing for it.
 -spec call(roadrunner_req:request(), binary(), module(), #route{}) -> roadrunner_req:request().
 call(Req, ContentType, Codec, #route{name = Name, rpcs = Rpcs} = Route) ->
     #{~"method" := Method} = roadrunner_req:bindings(Req),
@@ -563,15 +569,20 @@ call(Req, ContentType, Codec, #route{name = Name, rpcs = Rpcs} = Route) ->
             #{Method := Found} -> Found;
             #{} -> undefined
         end,
-    Span = roadrunner_event:grpc_call_start(Req, Name, Method, rpc_kind(Rpc)),
     RecvEncoding = request_encoding(roadrunner_req:header(~"grpc-encoding", Req)),
-    _ = put(?CALL_KEY, {Span, RecvEncoding, 0, 0, 0, 0}),
-    try
-        run_call(Req, ContentType, Codec, Route, Method, Rpc, RecvEncoding)
-    catch
-        Class:Reason:Stacktrace ->
-            ok = call_raised(Class, Reason, Stacktrace),
-            erlang:raise(Class, Reason, Stacktrace)
+    case roadrunner_event:enabled() of
+        true ->
+            Span = roadrunner_event:grpc_call_start(Req, Name, Method, rpc_kind(Rpc)),
+            _ = put(?CALL_KEY, {Span, RecvEncoding, 0, 0, 0, 0}),
+            try
+                run_call(Req, ContentType, Codec, Route, Method, Rpc, RecvEncoding, true)
+            catch
+                Class:Reason:Stacktrace ->
+                    ok = call_raised(Class, Reason, Stacktrace),
+                    erlang:raise(Class, Reason, Stacktrace)
+            end;
+        false ->
+            run_call(Req, ContentType, Codec, Route, Method, Rpc, RecvEncoding, false)
     end.
 
 -spec rpc_kind({atom(), roadrunner_grpc_service:kind(), term(), term()} | undefined) ->
@@ -588,9 +599,10 @@ rpc_kind(undefined) -> undefined.
     #route{},
     binary(),
     {atom(), roadrunner_grpc_service:kind(), term(), term()} | undefined,
-    encoding() | binary()
+    encoding() | binary(),
+    boolean()
 ) -> roadrunner_req:request().
-run_call(Req, ContentType, Codec, #route{service = Service} = Route, Method, Rpc, Encoding) ->
+run_call(Req, ContentType, Codec, #route{service = Service} = Route, Method, Rpc, Encoding, Events) ->
     Stream0 = #stream{
         req = Req,
         codec = Codec,
@@ -598,7 +610,8 @@ run_call(Req, ContentType, Codec, #route{service = Service} = Route, Method, Rpc
         input = undefined,
         output = undefined,
         max_message_size = Route#route.max_message_size,
-        deadline = infinity
+        deadline = infinity,
+        events = Events
     },
     try
         {Function, Kind, In, Out} = rpc(Method, Rpc),
@@ -917,15 +930,19 @@ sent_encoding() ->
         undefined -> identity
     end.
 
--spec count_received(non_neg_integer()) -> ok.
-count_received(Bytes) ->
+-spec count_received(stream(), non_neg_integer()) -> ok.
+count_received(#stream{events = false}, _Bytes) ->
+    ok;
+count_received(#stream{events = true}, Bytes) ->
     {Span, Encoding, Received, ReceivedBytes, Sent, SentBytes} = get(?CALL_KEY),
     _ = put(?CALL_KEY, {Span, Encoding, Received + 1, ReceivedBytes + Bytes, Sent, SentBytes}),
     ok.
 
 %% A framed message's bytes, read off its prefix.
--spec count_sent(iodata()) -> ok.
-count_sent([<<_Flag, Bytes:32>>, _Message]) ->
+-spec count_sent(stream(), iodata()) -> ok.
+count_sent(#stream{events = false}, _Frame) ->
+    ok;
+count_sent(#stream{events = true}, [<<_Flag, Bytes:32>>, _Message]) ->
     {Span, Encoding, Received, ReceivedBytes, Sent, SentBytes} = get(?CALL_KEY),
     _ = put(?CALL_KEY, {Span, Encoding, Received, ReceivedBytes, Sent + 1, SentBytes + Bytes}),
     ok.
@@ -960,14 +977,20 @@ events(Stream) ->
 ```
 """.
 -spec cancelled(term(), stream()) -> boolean().
-cancelled({h2_stream_reset, _StreamId}, _Stream) -> gone_now();
-cancelled({roadrunner_stream_reset, _StreamId}, _Stream) -> gone_now();
-cancelled({'DOWN', Ref, process, _Pid, _Reason}, #stream{connection = Ref}) -> gone_now();
-cancelled(_Message, _Stream) -> false.
+cancelled({h2_stream_reset, _StreamId}, Stream) ->
+    gone_now(Stream);
+cancelled({roadrunner_stream_reset, _StreamId}, Stream) ->
+    gone_now(Stream);
+cancelled({'DOWN', Ref, process, _Pid, _Reason}, #stream{connection = Ref} = Stream) ->
+    gone_now(Stream);
+cancelled(_Message, _Stream) ->
+    false.
 
 %% The call is over: its events say so whatever the method returns next.
--spec gone_now() -> true.
-gone_now() ->
+-spec gone_now(stream()) -> true.
+gone_now(#stream{events = false}) ->
+    true;
+gone_now(#stream{events = true}) ->
     _ = put(?GONE_KEY, erlang:monotonic_time(millisecond)),
     true.
 
@@ -988,11 +1011,11 @@ finish(Status, Message, #stream{send = Send, req = Req} = Stream) ->
 %% A call that ends before any response: the status in the response
 %% headers, a single HEADERS frame that ends the stream. It goes one way,
 %% so a stream already reset or lost does not fail it: what the call's
-%% events report is found out first.
+%% events report is found out first, by a call that reports them.
 -spec trailers_only(status(), binary(), stream()) -> {ending(), roadrunner_req:request()}.
-trailers_only(Status, Message, #stream{req = Req} = Stream) ->
+trailers_only(Status, Message, #stream{req = Req, events = Events} = Stream) ->
     Ending =
-        case stream_gone(Stream) of
+        case Events andalso stream_gone(Stream) of
             true -> gone();
             false -> status_ending(Status, Message)
         end,
@@ -1051,13 +1074,13 @@ recv(#stream{buffer = Buffer, max_message_size = Max} = Stream) ->
     case roadrunner_grpc_frame:decode(Buffer, Max) of
         {ok, false, Bytes, Rest} ->
             Message = decode(Bytes, Stream),
-            ok = count_received(byte_size(Bytes)),
+            ok = count_received(Stream, byte_size(Bytes)),
             {ok, Message, Stream#stream{buffer = Rest, compressed = false}};
         {ok, true, _Bytes, _Rest} when Stream#stream.recv_encoding =:= identity ->
             abort(internal, ~"compressed message without a grpc-encoding to read it", Stream);
         {ok, true, Compressed, Rest} ->
             Message = decode(decompressed(Compressed, Stream), Stream),
-            ok = count_received(byte_size(Compressed)),
+            ok = count_received(Stream, byte_size(Compressed)),
             {ok, Message, Stream#stream{buffer = Rest, compressed = true}};
         {error, message_too_large} ->
             abort(resource_exhausted, ~"request message too large", Stream);
@@ -1152,7 +1175,7 @@ send(Message, #stream{codec = Codec, output = Out} = Stream0, Opts) ->
                 )
         end,
     ok = written(Send(Frame, nofin)),
-    ok = count_sent(Frame),
+    ok = count_sent(Stream, Frame),
     Stream.
 
 %% The response's headers go out once: a stream copy from before the first
