@@ -134,12 +134,14 @@
     %% (`grow_for_head/1`), which becomes the new `Idle`. `undefined` once
     %% grown to `Max`, or when the listener has nothing to grow.
     grow_buffer = undefined :: {pos_integer(), pos_integer()} | undefined,
-    %% `{Floor, Base, Cap}`: the `min_heap_size` this process keeps between
-    %% requests (`Floor`), raised from `Base` towards `Cap` to the heap its
-    %% requests need (`raise_heap_floor/1`) and dropped back to `Base` before
-    %% it hibernates or runs a WebSocket session (`reset_heap_floor/1`).
+    %% `{Floor, Least, Base, Cap}`: the `min_heap_size` this process keeps
+    %% between requests (`Floor`), at least `Least` once it has served one
+    %% and raised towards `Cap` to the heap its requests need
+    %% (`raise_heap_floor/1`), and dropped back to `Base` before it
+    %% hibernates or runs a WebSocket session (`reset_heap_floor/1`).
     %% `undefined` when the listener's `handler_spawn.heap_floor` is `false`.
-    heap_floor = undefined :: {pos_integer(), pos_integer(), pos_integer()} | undefined,
+    heap_floor = undefined ::
+        {pos_integer(), pos_integer(), pos_integer(), pos_integer()} | undefined,
     %% How `recv_request_bytes/2` waits for bytes: the socket's read mode
     %% (`read_mode/2`), paired with `proto_opts.hibernate_after` when that
     %% is set. `once` arms the socket before each request and reads the
@@ -470,6 +472,9 @@ proxy_protocol_stage(Socket, #{proxy_protocol := true} = ProtoOpts, OsPeer) ->
 %% Every this many requests a connection drops its heap floor and learns it
 %% again (`raise_heap_floor/1`).
 -define(HEAP_FLOOR_RELEARN, 16).
+%% The least heap floor, in words, of a connection that has served a
+%% request (`raise_heap_floor/1`): a step of the emulator's heap-size ladder.
+-define(HEAP_FLOOR_LEAST, 2586).
 %% What a socket reads request heads with once one did not fit its
 %% `idle_recv_buffer` (`grow_for_head/1`).
 -define(HEAD_RECV_BUFFER, 16384).
@@ -1166,21 +1171,38 @@ large_body({error, _}, _Buffered, _Idle) -> false.
 %% `min_heap_size`, and the next collection sizes the heap to at least it.
 %% A full sweep never shrinks the heap below the floor, so the floor does
 %% not follow each request down; instead, every `?HEAP_FLOOR_RELEARN`
-%% requests it drops back to `Base` and the next request sets it again.
+%% requests it drops back to `Least` and the next request sets it again.
 %% Dropping it resizes nothing: the heap shrinks only at a collection that
 %% finds it mostly empty, which a connection whose requests still need the
 %% heap never makes, while one now serving smaller requests gives the
 %% memory back.
+%%
+%% The floor never drops under `Least` (`?HEAP_FLOOR_LEAST`, or `Cap` when
+%% that is lower) once the connection has served a request. The floor a
+%% request teaches is the smallest heap that fits it, so a request that
+%% allocates little still fills that heap and collects about once each
+%% time. Such a heap is small, so a collection there costs mostly its
+%% fixed price rather than the copying of what is live, and a larger heap
+%% saves most of those collections for a few kilobytes. A connection that
+%% has not served a request yet keeps `Base`.
 -spec heap_floor(roadrunner_conn:proto_opts()) ->
-    {pos_integer(), pos_integer(), pos_integer()} | undefined.
+    {pos_integer(), pos_integer(), pos_integer(), pos_integer()} | undefined.
 heap_floor(#{heap_floor := Cap}) ->
     %% The base is the size this process was spawned with: the listener's
     %% `handler_spawn` `min_heap_size`, as the emulator rounded it up, or
     %% the emulator's default.
     {min_heap_size, Base} = erlang:process_info(self(), min_heap_size),
-    case Cap > Base of
-        true -> {Base, Base, Cap};
-        false -> undefined
+    %% With a `max_heap_size` the floor is off, the least one included: a
+    %% raised `min_heap_size` makes every collection hold larger heaps, so
+    %% it could take the connection over the limit when its own data would
+    %% not. The limit is the one this process was spawned with, the
+    %% listener's or the emulator's default then; a later change of the
+    %% default (`erlang:system_flag/2`) does not reach it.
+    case erlang:process_info(self(), max_heap_size) of
+        {max_heap_size, #{size := 0}} when Cap > Base ->
+            {Base, min(max(?HEAP_FLOOR_LEAST, Base), Cap), Base, Cap};
+        {max_heap_size, _} ->
+            undefined
     end;
 heap_floor(#{}) ->
     undefined.
@@ -1191,16 +1213,23 @@ raise_heap_floor(#loop_state{heap_floor = undefined} = S) ->
 raise_heap_floor(#loop_state{requests_served = Served} = S) when
     Served rem ?HEAP_FLOOR_RELEARN =:= 0
 ->
-    reset_heap_floor(S);
-raise_heap_floor(#loop_state{heap_floor = {Cap, _Base, Cap}} = S) ->
+    #loop_state{heap_floor = {Floor, Least, Base, Cap}} = S,
+    case Floor of
+        Least ->
+            S;
+        _ ->
+            _ = erlang:process_flag(min_heap_size, Least),
+            S#loop_state{heap_floor = {Least, Least, Base, Cap}}
+    end;
+raise_heap_floor(#loop_state{heap_floor = {Cap, _Least, _Base, Cap}} = S) ->
     %% At the cap already: nothing to raise, so skip reading the heap.
     S;
-raise_heap_floor(#loop_state{heap_floor = {Floor, Base, Cap}} = S) ->
+raise_heap_floor(#loop_state{heap_floor = {Floor, Least, Base, Cap}} = S) ->
     {heap_size, Heap} = erlang:process_info(self(), heap_size),
-    case min(Heap, Cap) of
+    case min(max(Heap, Least), Cap) of
         Needed when Needed > Floor ->
             _ = erlang:process_flag(min_heap_size, Needed),
-            S#loop_state{heap_floor = {Needed, Base, Cap}};
+            S#loop_state{heap_floor = {Needed, Least, Base, Cap}};
         _ ->
             S
     end.
@@ -1208,9 +1237,9 @@ raise_heap_floor(#loop_state{heap_floor = {Floor, Base, Cap}} = S) ->
 %% Back to `Base` before the process hibernates (it would otherwise wake at
 %% the floor) or runs a WebSocket session, which sizes its own heap.
 -spec reset_heap_floor(#loop_state{}) -> #loop_state{}.
-reset_heap_floor(#loop_state{heap_floor = {Floor, Base, Cap}} = S) when Floor > Base ->
+reset_heap_floor(#loop_state{heap_floor = {Floor, Least, Base, Cap}} = S) when Floor > Base ->
     _ = erlang:process_flag(min_heap_size, Base),
-    S#loop_state{heap_floor = {Base, Base, Cap}};
+    S#loop_state{heap_floor = {Base, Least, Base, Cap}};
 reset_heap_floor(S) ->
     S.
 

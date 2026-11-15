@@ -2,8 +2,9 @@
 -moduledoc """
 The HTTP/1.1 connection's heap floor (`handler_spawn.heap_floor`): after a
 request it keeps the heap that request needed as its `min_heap_size`, up
-to the cap, and drops back to the base before it hibernates or runs a
-WebSocket session. The handler is `roadrunner_heap_floor_handler`.
+to the cap and never under a least floor once it has served a request,
+and drops back to the base before it hibernates or runs a WebSocket
+session. The handler is `roadrunner_heap_floor_handler`.
 """.
 
 -behaviour(ct_suite).
@@ -14,10 +15,15 @@ WebSocket session. The handler is `roadrunner_heap_floor_handler`.
 -export([suite/0, all/0, init_per_testcase/2, end_per_testcase/2]).
 -export([
     floor_rises_after_a_large_request/1,
+    floor_rises_to_the_least_after_a_small_request/1,
     floor_stops_at_the_cap/1,
     floor_off/1,
     floor_starts_at_the_spawn_min_heap_size/1,
     floor_off_when_the_cap_is_under_the_spawn_min_heap_size/1,
+    floor_off_under_a_max_heap_size/1,
+    floor_off_under_a_max_heap_size_map/1,
+    floor_off_under_the_default_max_heap_size/1,
+    floor_kept_when_the_default_max_heap_size_changes_later/1,
     floor_relearns_every_16_requests/1,
     floor_resets_before_hibernating/1,
     floor_resets_for_a_websocket_session/1
@@ -31,10 +37,15 @@ suite() ->
 all() ->
     [
         floor_rises_after_a_large_request,
+        floor_rises_to_the_least_after_a_small_request,
         floor_stops_at_the_cap,
         floor_off,
         floor_starts_at_the_spawn_min_heap_size,
         floor_off_when_the_cap_is_under_the_spawn_min_heap_size,
+        floor_off_under_a_max_heap_size,
+        floor_off_under_a_max_heap_size_map,
+        floor_off_under_the_default_max_heap_size,
+        floor_kept_when_the_default_max_heap_size_changes_later,
         floor_relearns_every_16_requests,
         floor_resets_before_hibernating,
         floor_resets_for_a_websocket_session
@@ -65,6 +76,10 @@ listener_opts(floor_starts_at_the_spawn_min_heap_size) ->
     #{handler_spawn => #{opts => [{min_heap_size, 2000}]}};
 listener_opts(floor_off_when_the_cap_is_under_the_spawn_min_heap_size) ->
     #{handler_spawn => #{opts => [{min_heap_size, 2000}], heap_floor => #{max => 1000}}};
+listener_opts(floor_off_under_a_max_heap_size) ->
+    #{handler_spawn => #{opts => [{fullsweep_after, 0}, {max_heap_size, 40000}]}};
+listener_opts(floor_off_under_a_max_heap_size_map) ->
+    #{handler_spawn => #{opts => [{fullsweep_after, 0}, {max_heap_size, #{size => 40000}}]}};
 listener_opts(floor_resets_before_hibernating) ->
     #{hibernate_after => 200};
 listener_opts(_Case) ->
@@ -81,6 +96,14 @@ floor_rises_after_a_large_request(Config) ->
     Floor = report(Sock),
     ?assert(Floor > base()),
     ?assert(Floor =< 46422).
+
+%% A request that needs less than the least floor still raises the floor
+%% to it, and relearning keeps it there.
+floor_rises_to_the_least_after_a_small_request(Config) ->
+    Sock = connect(Config),
+    ?assertEqual(base(), report(Sock)),
+    Floors = [report(Sock) || _ <- lists:seq(2, 20)],
+    ?assertEqual(lists:duplicate(19, least()), Floors).
 
 %% The emulator rounds a `min_heap_size` up to a step of its heap-size
 %% ladder, so the cap reads back as that step.
@@ -107,17 +130,55 @@ floor_off_when_the_cap_is_under_the_spawn_min_heap_size(Config) ->
     ok = alloc(Sock),
     ?assertEqual(rounded(2000), report(Sock)).
 
-%% Every 16th request drops the floor, so the 17th starts at the base: a
-%% connection whose requests got smaller can give the heap back. Each
-%% report reads the floor before its own request is counted.
+%% With a `max_heap_size` the floor is off, the least one included: the
+%% connection stays at its base.
+floor_off_under_a_max_heap_size(Config) ->
+    stays_at_the_base(connect(Config)).
+
+floor_off_under_a_max_heap_size_map(Config) ->
+    stays_at_the_base(connect(Config)).
+
+%% The emulator's default `max_heap_size` when the connection starts
+%% turns its floor off too, for as long as it lives.
+floor_off_under_the_default_max_heap_size(Config) ->
+    Default = erlang:system_flag(max_heap_size, 40000),
+    Sock =
+        try
+            Started = connect(Config),
+            ?assertEqual(base(), report(Started)),
+            Started
+        after
+            erlang:system_flag(max_heap_size, Default)
+        end,
+    stays_at_the_base(Sock).
+
+%% A default set after the connection started does not reach it: the
+%% connection was spawned without a limit and keeps its floor.
+floor_kept_when_the_default_max_heap_size_changes_later(Config) ->
+    Sock = connect(Config),
+    ?assertEqual(base(), report(Sock)),
+    Default = erlang:system_flag(max_heap_size, 40000),
+    try
+        ?assertEqual(least(), report(Sock))
+    after
+        erlang:system_flag(max_heap_size, Default)
+    end.
+
+stays_at_the_base(Sock) ->
+    Floors = [report(Sock) || _ <- lists:seq(1, 20)],
+    ?assertEqual(lists:duplicate(20, base()), Floors).
+
+%% Every 16th request drops the floor, so the 17th starts at the least
+%% floor: a connection whose requests got smaller can give the heap back.
+%% Each report reads the floor before its own request is counted.
 floor_relearns_every_16_requests(Config) ->
     Sock = connect(Config),
     ok = alloc(Sock),
     Floors = [report(Sock) || _ <- lists:seq(2, 16)],
-    ?assert(lists:all(fun(Floor) -> Floor > base() end, Floors)),
-    ?assertEqual(base(), report(Sock)),
+    ?assert(lists:all(fun(Floor) -> Floor > least() end, Floors)),
+    ?assertEqual(least(), report(Sock)),
     ok = alloc(Sock),
-    ?assert(report(Sock) > base()).
+    ?assert(report(Sock) > least()).
 
 %% The floor drops back before the connection hibernates, so it sleeps and
 %% wakes small, and the next requests raise it again.
@@ -155,6 +216,10 @@ floor_resets_for_a_websocket_session(Config) ->
 
 base() ->
     element(2, erlang:system_info(min_heap_size)).
+
+%% The least floor of a connection that has served a request.
+least() ->
+    rounded(2586).
 
 %% `Words` as the emulator stores a `min_heap_size`: rounded up to a step of
 %% its heap-size ladder.
