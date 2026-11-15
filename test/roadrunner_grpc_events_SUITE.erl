@@ -52,7 +52,11 @@ call emitted.
     h3_crash/1,
     h3_deadline_cancels/1,
     h3_client_cancels/1,
-    h3_connection_gone/1
+    h3_connection_gone/1,
+    keys_of_a_reported_call/1,
+    no_handler_same_answers/1,
+    no_handler_keeps_nothing/1,
+    no_handler_cancelled_before_trailers_only/1
 ]).
 
 -define(SVC, ~"/test.Echo/").
@@ -66,10 +70,15 @@ suite() ->
     [{timetrap, {seconds, 30}}].
 
 all() ->
-    [{group, http2}, {group, http3}].
+    [{group, no_handler}, {group, http2}, {group, http3}].
 
 groups() ->
     [
+        {no_handler, [], [
+            no_handler_same_answers,
+            no_handler_keeps_nothing,
+            no_handler_cancelled_before_trailers_only
+        ]},
         {http2, [], [
             unary,
             server_stream,
@@ -98,7 +107,8 @@ groups() ->
             client_resets_well_before_the_deadline,
             cancelled_long_before_a_late_return,
             stopped_after_a_response,
-            encoding_of_a_call_refused_early
+            encoding_of_a_call_refused_early,
+            keys_of_a_reported_call
         ]},
         {http3, [], [
             h3_unary,
@@ -115,6 +125,11 @@ groups() ->
 
 init_per_testcase(Case, Config) ->
     {ok, _} = roadrunner_test_event_handler:start(),
+    ok =
+        case atom_to_list(Case) of
+            "no_handler_" ++ _ -> roadrunner_event:put_handler(roadrunner_event_noop);
+            _ -> ok
+        end,
     Id = {?MODULE, Case},
     ok = telemetry:attach_many(Id, ?EVENTS, fun ?MODULE:forward/4, self()),
     Protocols =
@@ -434,6 +449,63 @@ encoding_of_a_call_refused_early(Config) ->
     ),
     {_, {stop, _, Br}} = ended(),
     ?assertMatch(#{status := unimplemented, recv_encoding := ~"br"}, Br).
+
+%% A call that reports events keeps its counts, and when `cancelled/2` told
+%% the method the call is over, in its process dictionary.
+keys_of_a_reported_call(Config) ->
+    {_, [Kept], _, _} = call(Config, ~"Keys", [~"x"]),
+    ?assertEqual([call, connection], binary_to_term(Kept)),
+    {_, {stop, _, _}} = ended(),
+    {_, [Told], _, _} = call(Config, ~"Keys", [~"cancelled"]),
+    ?assertEqual([call, connection, gone], binary_to_term(Told)),
+    {_, {stop, _, _}} = ended().
+
+%% --- No handler ---
+
+%% With the no-op handler, calls answer as they do with one.
+no_handler_same_answers(Config) ->
+    {_, [~"hi"], Trailers, _} = call(Config, ~"Unary", [~"hi"]),
+    ?assertEqual(~"0", proplists:get_value(~"grpc-status", Trailers)),
+    {_, [~"1", ~"2", ~"3"], _, _} = call(Config, ~"Count", [~"3"]),
+    {_, [~"abc"], _, _} = call(Config, ~"Sum", [~"a", ~"b", ~"c"]),
+    {Headers, [], trailers_only, _} = call(Config, ~"Fail", [~"x"]),
+    ?assertEqual(~"5", proplists:get_value(~"grpc-status", Headers)),
+    {Crashed, [], trailers_only, _} = call(Config, ~"Crash", [~"x"]),
+    ?assertEqual(~"13", proplists:get_value(~"grpc-status", Crashed)),
+    {Unknown, [], trailers_only, _} = call(Config, ~"Nope", [~"x"]),
+    ?assertEqual(~"12", proplists:get_value(~"grpc-status", Unknown)),
+    ?assertEqual([], drain()).
+
+%% With the no-op handler, a call keeps no counts, nor that `cancelled/2`
+%% told the method the call is over.
+no_handler_keeps_nothing(Config) ->
+    {_, [Kept], _, _} = call(Config, ~"Keys", [~"x"]),
+    ?assertEqual([connection], binary_to_term(Kept)),
+    {_, [Told], _, _} = call(Config, ~"Keys", [~"cancelled"]),
+    ?assertEqual([connection], binary_to_term(Told)).
+
+%% With the no-op handler, a call whose client reset it ends with its
+%% status all the same, and reports nothing.
+no_handler_cancelled_before_trailers_only(Config) ->
+    C = hold_call(Config),
+    Pid =
+        receive
+            {held, Held} -> Held
+        after 5000 -> ct:fail(not_held)
+        end,
+    true = unregister(roadrunner_grpc_held),
+    1 = erlang:trace(Pid, true, ['receive']),
+    MRef = monitor(process, Pid),
+    _ = roadrunner_grpc_test_client:reset(C, 1),
+    ok = let_go(Pid, fun
+        ({h2_stream_reset, _}) -> true;
+        (_) -> false
+    end),
+    receive
+        {'DOWN', MRef, process, Pid, Reason} -> ?assertEqual(normal, Reason)
+    after 5000 -> ct:fail(call_still_running)
+    end,
+    ?assertEqual([], drain()).
 
 %% --- HTTP/3 ---
 

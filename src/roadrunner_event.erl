@@ -16,6 +16,7 @@
 
 -export([
     put_handler/1,
+    enabled/0,
     request_start/1,
     request_stop/3,
     request_exception/4,
@@ -53,6 +54,15 @@ put_handler(Handler) when is_atom(Handler) ->
         true -> persistent_term:put(?HANDLER_KEY, Handler);
         false -> error({invalid_event_handler, Handler})
     end.
+
+-doc """
+Whether events go to a handler other than the no-op default, for an
+emitter that keeps state across events (a gRPC call's counts) and can
+skip it.
+""".
+-spec enabled() -> boolean().
+enabled() ->
+    handler() =/= roadrunner_event_noop.
 
 -spec handler() -> module().
 handler() ->
