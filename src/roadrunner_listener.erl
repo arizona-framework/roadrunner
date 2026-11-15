@@ -431,8 +431,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   raises the floor by half, up to `max`, and every 16th stream starts at
   half the floor and lowers it to that if it did not collect. A streamed
   or file response teaches the floor only what happened before its body
-  started. With a `max_heap_size` in `opts` (or the emulator's default),
-  the floor is at most half of it.
+  started. With a `max_heap_size` set, in `opts` or as the emulator's
+  default, the floor is off, since a raised `min_heap_size` can make a
+  collection reach the limit.
   A WebSocket session learns its floor from its `handle_info/2` calls,
   where a server push is built, relearns every 16 of them while raised
   and drops it before it hibernates; `ws.heap_floor` tunes it for
