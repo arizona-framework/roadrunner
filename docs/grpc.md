@@ -2,8 +2,9 @@
 
 Roadrunner serves gRPC services on its HTTP/2 and HTTP/3 listeners. This
 guide shows how to write a service, put it on a listener, and use what a
-call can do: streams, metadata, status codes, deadlines, compression and
-the health service. The last part shows how to use Protocol Buffers.
+call can do: streams, metadata, status codes, deadlines, compression, the
+health service and server reflection. The last part shows how to use
+Protocol Buffers.
 
 ## What you get
 
@@ -17,6 +18,7 @@ the health service. The last part shows how to use Protocol Buffers.
 - `gzip` and `deflate` message compression, both ways
 - a limit on the size of each request message
 - gRPC's health service, `grpc.health.v1.Health`
+- gRPC's server reflection, for tools such as `grpcurl`
 - pluggable codecs: raw bytes by default, Protocol Buffers through gpb, or
   your own
 
@@ -118,6 +120,7 @@ every service in it:
 - `send_compression`: how responses are compressed, `identity` (the
   default), `gzip` or `deflate`
 - `health`: `true` adds the health service, by default `false`
+- `reflection`: `true` adds server reflection, by default `false`
 
 A bad option raises, from `routes/1` itself or as the listener starts
 (then wrapped as `{init_route_failed, Path, roadrunner_grpc, Reason}`),
@@ -491,6 +494,54 @@ supervises: if it restarts, they start over (the server `serving`, the
 rest unset), and each `Watch` ends with `UNAVAILABLE` so its client
 watches again.
 
+## Server reflection
+
+Server reflection lets tools such as `grpcurl` and `grpcui` ask your
+server which services it has and how their messages look, so you can call
+them without a copy of the `.proto` files. Add it with
+`reflection => true`:
+
+```erlang
+routes => roadrunner_grpc:routes(#{services => [greeter], reflection => true})
+```
+
+It answers on `grpc.reflection.v1.ServerReflection` and on the older
+`grpc.reflection.v1alpha.ServerReflection`, which some tools still call
+first. Like the health service, it speaks its own Protocol Buffers
+messages, whatever codecs your services use.
+
+To describe a service, it needs the service's `.proto` files: each one a
+serialized `google.protobuf.FileDescriptorProto`, the file that declares
+the service and the files it imports. A service module gives them with
+the optional `files/0` callback, which returns the list of binaries, and
+a descriptor map with a `files` key holding the same list.
+The Protocol Buffers adapter fills them in for you when gpb generated the
+module with its `descriptor` option (see below).
+
+With the files, reflection answers:
+
+- which file declares a name: a message, enum, enum value, service,
+  method, field, oneof or extension, by its full name such as
+  `helloworld.Greeter.SayHello`
+- a file by its name
+- which file declares an extension of a message, and the numbers of a
+  message's extensions
+
+Each answer holds the file and the files it imports, all the way down. A
+file already sent on the same stream is not sent again as an import.
+When two services give a file of the same name, the first one is kept.
+Anything reflection does not know is answered `NOT_FOUND`.
+
+Reflection lists the services that give their descriptor files, plus the
+health service and reflection itself, which give gRPC's own. A service
+that gives no files (one that speaks the raw codec, say) is left out of
+the list, so every service a tool such as `grpcurl` or `grpcui` is told of
+can be described: those tools describe each listed service as they start,
+and stop at the first one they cannot.
+
+A bad `files` value raises as the listener starts, like any other bad
+option.
+
 ## Protocol Buffers with gpb
 
 Most gRPC services speak Protocol Buffers. roadrunner's adapter,
@@ -526,6 +577,10 @@ gpb defaults). With `rebar3_gpb_plugin`, for example:
 ```
 
 With the `maps` option, messages are maps; without it they are records.
+Add gpb's `descriptor` option for server reflection: the adapter then
+gives each service the module's `.proto` files, named and laid out the way
+protoc writes them (an imported file goes by the name its import uses, and
+a map field's entry is nested in its message as `<FieldName>Entry`).
 
 ### The service
 

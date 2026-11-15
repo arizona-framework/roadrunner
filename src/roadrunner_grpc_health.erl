@@ -28,7 +28,7 @@ with `UNAVAILABLE` so its client watches again.
 -behaviour(roadrunner_grpc_service).
 
 -export([set_status/2]).
--export([name/0, rpcs/0, check/2, list/2, watch/2]).
+-export([name/0, rpcs/0, files/0, check/2, list/2, watch/2]).
 
 %% HealthCheckResponse.ServingStatus values.
 -define(SERVING, 1).
@@ -61,6 +61,12 @@ rpcs() ->
             function => watch, kind => server_stream, input => request, output => response
         }
     }.
+
+%% grpc/health/v1/health.proto, for server reflection.
+-doc false.
+-spec files() -> [binary()].
+files() ->
+    [roadrunner_grpc_descriptor:health()].
 
 -doc false.
 -spec check(binary(), roadrunner_grpc:stream()) ->

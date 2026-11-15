@@ -3,13 +3,16 @@
 
 -behaviour(roadrunner_grpc_service).
 
--export([name/0, rpcs/0]).
+-export([name/0, rpcs/0, files/0]).
 -export([unary/2, count/2, sum/1, chat/1, fail/2, crash/2, crash_after/2, meta/2, deadline/2, bad/2]).
 -export([stop/2, bad_trailer/2, late_headers/2, stale_send/2, bad_name/2, big_header/2]).
 -export([unsafe_header/2, unsafe_fail/2, busy/2, squeezed/2, late_compression/2]).
 -export([stale_compression/2, held/1, was_compressed/2]).
 
 name() -> ~"test.Echo".
+
+%% `base.proto`, which declares `test.Echo`, and its import.
+files() -> roadrunner_grpc_reflection_test_files:files().
 
 rpcs() ->
     #{
