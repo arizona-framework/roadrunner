@@ -426,9 +426,13 @@ Optional middleware and timing knobs (durations in milliseconds):
   smaller gives the larger heap back. A connection between requests
   holds about the same heap either way, since it collects nothing while
   it waits. HTTP/2 and HTTP/3 run each request in a stream worker of
-  its own, so there the connection keeps the floor: each worker raises
-  it to the heap its request needed and the next worker starts at that
-  size, and every 16th stream starts at the base and learns it again.
+  its own, so there the connection keeps the floor and starts each
+  worker at it: a worker that collected while it built its response
+  raises the floor by half, up to `max`, and every 16th stream starts at
+  half the floor and lowers it to that if it did not collect. A streamed
+  or file response teaches the floor only what happened before its body
+  started. With a `max_heap_size` in `opts` (or the emulator's default),
+  the floor is at most half of it.
   A WebSocket session learns its floor from its `handle_info/2` calls,
   where a server push is built, relearns every 16 of them while raised
   and drops it before it hibernates; `ws.heap_floor` tunes it for
