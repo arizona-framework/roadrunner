@@ -15,6 +15,7 @@ test client (`roadrunner_quic_test_h3`), with `roadrunner_heap_floor_handler`.
 -export([suite/0, all/0, init_per_testcase/2, end_per_testcase/2]).
 -export([
     floor_rises_after_a_large_request/1,
+    floor_rises_after_a_large_send_fun/1,
     floor_stops_at_the_cap/1,
     floor_off/1,
     floor_starts_at_the_spawn_min_heap_size/1,
@@ -33,6 +34,7 @@ suite() ->
 all() ->
     [
         floor_rises_after_a_large_request,
+        floor_rises_after_a_large_send_fun,
         floor_stops_at_the_cap,
         floor_off,
         floor_starts_at_the_spawn_min_heap_size,
@@ -50,6 +52,7 @@ init_per_testcase(Case, Config) ->
             port => 0,
             routes => [
                 {~"/alloc", ?H, {alloc, self()}},
+                {~"/send_alloc", ?H, {send_alloc, self()}},
                 {~"/gated", ?H, {gated_alloc, self()}},
                 {~"/report", ?H, report}
             ]
@@ -89,6 +92,26 @@ floor_rises_after_a_large_request(Config) ->
     ?assertEqual(base(), Base),
     C2 = alloc(C1, 3),
     {Floor, _} = report(C2, 5),
+    ?assert(Floor > base()),
+    ?assert(Floor =< 46422).
+
+%% A `{send, ...}` fun does the request's work after the handler returns:
+%% the floor is the heap the fun needed. The worker raises it once the fun
+%% has answered, so the next request waits for the worker to end.
+floor_rises_after_a_large_send_fun(Config) ->
+    C = open(Config),
+    {_, C1} = response(send_get(C, 3, ~"/send_alloc"), 3),
+    Worker =
+        receive
+            {conn, Pid} -> Pid
+        after 5000 -> ct:fail(no_alloc)
+        end,
+    MRef = monitor(process, Worker),
+    receive
+        {'DOWN', MRef, process, Worker, _} -> ok
+    after 5000 -> ct:fail(worker_alive)
+    end,
+    {Floor, _} = report(C1, 5),
     ?assert(Floor > base()),
     ?assert(Floor =< 46422).
 

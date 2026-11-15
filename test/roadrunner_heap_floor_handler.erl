@@ -4,6 +4,7 @@ Test fixture for `roadrunner_heap_floor_SUITE` and
 `roadrunner_stream_heap_floor_SUITE`. The route state picks what it does:
 `{alloc, Report}` builds a large live term before it answers (so the
 heap of the process running it grows) and tells `Report` that pid;
+`{send_alloc, Report}` does the same in a `{send, ...}` fun;
 `{gated_alloc, Report}` tells `Report` its pid, waits for `go`, then
 builds a smaller one; `report` answers with the running process's
 `min_heap_size`; `{ws, Report}` (or `{ws, Report, Opts}`, with upgrade
@@ -27,6 +28,17 @@ handle({alloc, Report}, Req) ->
     %% About 40,000 words kept live until the handler returns.
     Live = lists:seq(1, 20000),
     {roadrunner_resp:text(200, integer_to_binary(length(Live))), Req};
+handle({send_alloc, Report}, Req) ->
+    {
+        {send, [], fun(R) ->
+            Report ! {conn, self()},
+            %% About 40,000 words kept live until the fun has answered.
+            Live = lists:seq(1, 20000),
+            ok = roadrunner_send:reply(200, [], integer_to_binary(length(Live)), R),
+            R
+        end},
+        Req
+    };
 handle({gated_alloc, Report}, Req) ->
     Report ! {gated, self()},
     receive

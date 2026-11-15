@@ -872,15 +872,11 @@ read_more(#stream{eof = true, buffer = <<>>} = Stream) ->
 read_more(#stream{eof = true} = Stream) ->
     abort(internal, ~"request message cut short", Stream);
 read_more(#stream{req = Req, buffer = Buffer} = Stream) ->
-    case roadrunner_req:read_body(Req, #{length => missing(Buffer)}) of
+    case read_body(Buffer, Req) of
         {more, Bytes, Req1} ->
-            recv(Stream#stream{
-                req = Req1, buffer = <<Buffer/binary, (iolist_to_binary(Bytes))/binary>>
-            });
+            recv(Stream#stream{req = Req1, buffer = append(Buffer, Bytes)});
         {ok, Bytes, Req1} ->
-            recv(Stream#stream{
-                req = Req1, buffer = <<Buffer/binary, (iolist_to_binary(Bytes))/binary>>, eof = true
-            });
+            recv(Stream#stream{req = Req1, buffer = append(Buffer, Bytes), eof = true});
         {error, request_timeout} ->
             abort(deadline_exceeded, ~"deadline exceeded", Stream);
         {error, content_length_too_large} ->
@@ -888,6 +884,21 @@ read_more(#stream{req = Req, buffer = Buffer} = Stream) ->
         {error, Reason} ->
             exit({shutdown, {grpc_recv, Reason}})
     end.
+
+%% Between messages, read what has arrived, which for a small call is the
+%% whole message and the end of the requests at once; partway through one,
+%% read what it still lacks, so a large message is gathered in one read
+%% instead of growing the buffer DATA by DATA.
+-spec read_body(binary(), roadrunner_req:request()) ->
+    {ok | more, iodata(), roadrunner_req:request()} | {error, term()}.
+read_body(<<>>, Req) ->
+    roadrunner_req:read_body_chunked(Req);
+read_body(Buffer, Req) ->
+    roadrunner_req:read_body(Req, #{length => missing(Buffer)}).
+
+-spec append(binary(), iodata()) -> binary().
+append(<<>>, Bytes) -> iolist_to_binary(Bytes);
+append(Buffer, Bytes) -> <<Buffer/binary, (iolist_to_binary(Bytes))/binary>>.
 
 -spec missing(binary()) -> pos_integer().
 missing(<<_Flag, Len:32, Message/binary>>) -> Len - byte_size(Message);
