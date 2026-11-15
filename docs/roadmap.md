@@ -196,12 +196,13 @@ Unlocks `baseline-h3` and `static-h3`.
 
 **What:** `roadrunner_grpc` serves the four call kinds over HTTP/2 and
 HTTP/3 with pluggable codecs, and cancels a call at its `grpc-timeout`.
-Still to come: the Protocol Buffers adapter
-(`grpc_protobuf/`, built and tested only in the `test` profile today) as a
-package of its own; telemetry for calls and benchmarks.
+Still to come: the Hex release of the Protocol Buffers adapter,
+[`roadrunner_grpc_protobuf`](https://github.com/arizona-framework/roadrunner_grpc_protobuf),
+after the roadrunner release that ships gRPC; telemetry for calls and
+benchmarks.
 
-**HttpArena impact:** `unary-grpc`, `stream-grpc`, and their TLS
-variants, once the Protocol Buffers adapter is on Hex.
+**HttpArena impact:** `unary-grpc` and `unary-grpc-tls`, the gRPC
+profiles the leaderboard scores.
 
 **Scope:** medium, in several PRs.
 

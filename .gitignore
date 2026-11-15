@@ -21,4 +21,3 @@ rebar3.crashdump
 test/autobahn/reports/
 test/redbot/reports/
 /doc
-grpc_protobuf/test/gen/
