@@ -144,45 +144,47 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch, HeapFloor0) ->
 %% base.
 
 %% The connection's cell, or `undefined` when the listener's
-%% `handler_spawn.heap_floor` is `false` or its `max` no higher than the base.
+%% `handler_spawn.heap_floor` is `false`, its `max` no higher than the
+%% base, or the workers have a `max_heap_size` (see max_heap_size_set/1).
 -doc false.
 -spec conn_heap_floor(roadrunner_conn:proto_opts()) -> conn_heap_floor().
 conn_heap_floor(#{heap_floor := Cap, handler_spawn_opts := SpawnOpts}) ->
     Base =
-        case lists:keyfind(min_heap_size, 1, SpawnOpts) of
+        case last_spawn_opt(min_heap_size, SpawnOpts) of
             {min_heap_size, Words} -> Words;
             false -> element(2, erlang:system_info(min_heap_size))
         end,
-    case min(Cap, max_heap_floor(SpawnOpts)) of
-        Max when Max > Base ->
+    case Cap > Base andalso not max_heap_size_set(SpawnOpts) of
+        true ->
             Cell = atomics:new(1, []),
             ok = atomics:put(Cell, 1, Base),
-            {Cell, Base, Max};
-        _ ->
+            {Cell, Base, Cap};
+        false ->
             undefined
     end;
 conn_heap_floor(#{}) ->
     undefined.
 
-%% A process cannot start with a `min_heap_size` over its `max_heap_size`
-%% (the spawn fails with `badarg`), and the emulator rounds the
-%% `min_heap_size` up a step of its heap-size ladder first. So with a
-%% `max_heap_size`, the listener's or the emulator's default, the floor
-%% stays at most at half of it: rounded up, that is still under it, and a
-%% worker keeps room to grow before the limit kills it. A size of 0 is no
-%% limit.
--spec max_heap_floor([proc_lib:start_spawn_option()]) -> pos_integer() | infinity.
-max_heap_floor(SpawnOpts) ->
-    Max =
-        case lists:keyfind(max_heap_size, 1, SpawnOpts) of
+%% Whether workers spawned with `SpawnOpts` have a `max_heap_size`, the
+%% listener's or the emulator's default (a size of 0 is no limit). The
+%% floor is then off: a raised `min_heap_size` makes every collection
+%% hold larger heaps, and no floor under the limit was found that keeps a
+%% collection from reaching it, so a worker the limit would let live
+%% could be killed because of the floor.
+-spec max_heap_size_set([proc_lib:start_spawn_option()]) -> boolean().
+max_heap_size_set(SpawnOpts) ->
+    Size =
+        case last_spawn_opt(max_heap_size, SpawnOpts) of
             {max_heap_size, Words} when is_integer(Words) -> Words;
             {max_heap_size, #{size := Words}} -> Words;
             false -> maps:get(size, erlang:system_info(max_heap_size))
         end,
-    case Max of
-        0 -> infinity;
-        _ -> Max div 2
-    end.
+    Size > 0.
+
+%% A spawn option as the spawn applies it: the last one given wins.
+-spec last_spawn_opt(atom(), [proc_lib:start_spawn_option()]) -> tuple() | false.
+last_spawn_opt(Key, SpawnOpts) ->
+    lists:keyfind(Key, 1, lists:reverse(SpawnOpts)).
 
 %% The floor the next worker starts at: the cell's, or half of it for a
 %% relearning stream (every 16th, see above).
@@ -233,15 +235,15 @@ start_heap_floor(undefined) ->
 %% (`process_flag/2`) would only take effect at the worker's first
 %% collection. Later options win, so the floor goes after the listener's.
 %% The emulator's default `max_heap_size` can change while the connection
-%% lives (`erlang:system_flag/2`) and applies at each spawn, so the floor
-%% is held under half of it here too (see max_heap_floor/1).
+%% lives (`erlang:system_flag/2`) and applies at each spawn, so a worker
+%% spawned while one is set gets no floor (see max_heap_size_set/1).
 -doc false.
 -spec spawn_opts([proc_lib:start_spawn_option()], heap_floor()) ->
     [proc_lib:start_spawn_option() | monitor].
 spawn_opts(SpawnOpts, {_Cell, Floor, Base, _Cap, _Relearn}) when Floor > Base ->
-    case min(Floor, max_heap_floor(SpawnOpts)) of
-        Spawn when Spawn > Base -> [monitor | SpawnOpts ++ [{min_heap_size, Spawn}]];
-        _ -> [monitor | SpawnOpts]
+    case max_heap_size_set(SpawnOpts) of
+        false -> [monitor | SpawnOpts ++ [{min_heap_size, Floor}]];
+        true -> [monitor | SpawnOpts]
     end;
 spawn_opts(SpawnOpts, _HeapFloor) ->
     [monitor | SpawnOpts].

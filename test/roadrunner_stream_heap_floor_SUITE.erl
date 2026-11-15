@@ -22,8 +22,8 @@ request.
     floor_rises_after_short_lived_garbage/1,
     floor_rises_after_a_short_streamed_send_fun/1,
     floor_stops_at_the_cap/1,
-    floor_stays_under_half_the_max_heap_size/1,
-    floor_cap_follows_the_max_heap_size/1,
+    floor_off_under_a_max_heap_size/1,
+    floor_off_follows_the_max_heap_size/1,
     spawn_follows_a_changed_default_max_heap_size/1,
     worker_at_the_cap_drops_its_min_heap_size/1,
     long_streams_leave_the_floor/1,
@@ -50,8 +50,8 @@ all() ->
         floor_rises_after_short_lived_garbage,
         floor_rises_after_a_short_streamed_send_fun,
         floor_stops_at_the_cap,
-        floor_stays_under_half_the_max_heap_size,
-        floor_cap_follows_the_max_heap_size,
+        floor_off_under_a_max_heap_size,
+        floor_off_follows_the_max_heap_size,
         spawn_follows_a_changed_default_max_heap_size,
         worker_at_the_cap_drops_its_min_heap_size,
         long_streams_leave_the_floor,
@@ -99,7 +99,7 @@ protocol_opts(_Case) ->
 
 listener_opts(floor_stops_at_the_cap) ->
     #{handler_spawn => #{heap_floor => #{max => 1000}}};
-listener_opts(floor_stays_under_half_the_max_heap_size) ->
+listener_opts(floor_off_under_a_max_heap_size) ->
     %% `kill => false`: the 40,000-word request outgrows the limit.
     #{
         handler_spawn => #{
@@ -176,62 +176,60 @@ floor_stops_at_the_cap(Config) ->
     {Floor, _} = report(C2, 5),
     ?assertEqual(rounded(1000), Floor).
 
-%% A process cannot start with a `min_heap_size` over its `max_heap_size`:
-%% the floor stays under half of it, so the workers it sizes still start.
-floor_stays_under_half_the_max_heap_size(Config) ->
+%% With a `max_heap_size` the floor is off: after a large request the
+%% next worker still starts at the base.
+floor_off_under_a_max_heap_size(Config) ->
     C = open(Config),
     C1 = alloc(C, 1),
-    {Floor, C2} = report(C1, 3),
-    ?assertEqual(rounded(10000), Floor),
+    {Heap, C2} = report(C1, 3),
+    ?assertEqual(base(), Heap),
     {Next, _} = report(C2, 5),
-    ?assertEqual(Floor, Next).
+    ?assertEqual(base(), Next).
 
-floor_cap_follows_the_max_heap_size(_Config) ->
-    Cap = fun(SpawnOpts) ->
-        {_Cell, _Base, Max} = roadrunner_stream_worker:conn_heap_floor(#{
-            heap_floor => 46422, handler_spawn_opts => SpawnOpts
-        }),
-        Max
-    end,
-    ?assertEqual(10000, Cap([{max_heap_size, 20000}])),
-    ?assertEqual(10000, Cap([{max_heap_size, #{size => 20000}}])),
-    ?assertEqual(46422, Cap([{max_heap_size, #{size => 0}}])),
-    ?assertEqual(46422, Cap([])),
-    ?assertEqual(
-        undefined,
+%% The listener's `max_heap_size`, in either form, or the emulator's
+%% default turns the floor off; a size of 0 is no limit.
+floor_off_follows_the_max_heap_size(_Config) ->
+    Floor = fun(SpawnOpts) ->
         roadrunner_stream_worker:conn_heap_floor(#{
-            heap_floor => 46422, handler_spawn_opts => [{max_heap_size, 400}]
+            heap_floor => 46422, handler_spawn_opts => SpawnOpts
         })
+    end,
+    ?assertEqual(undefined, Floor([{max_heap_size, 20000}])),
+    ?assertEqual(undefined, Floor([{max_heap_size, #{size => 20000}}])),
+    ?assertMatch({_, _, 46422}, Floor([{max_heap_size, #{size => 0}}])),
+    %% The spawn applies the last of repeated options, and so does the check.
+    ?assertEqual(undefined, Floor([{max_heap_size, 0}, {max_heap_size, 50000}])),
+    ?assertMatch({_, _, 46422}, Floor([{max_heap_size, 50000}, {max_heap_size, 0}])),
+    ?assertMatch({_, _, 46422}, Floor([])),
+    Default = erlang:system_flag(max_heap_size, 30000),
+    try
+        ?assertEqual(undefined, Floor([])),
+        ?assertMatch({_, _, 46422}, Floor([{max_heap_size, 0}]))
+    after
+        erlang:system_flag(max_heap_size, Default)
+    end.
+
+%% The emulator's default `max_heap_size` set while a connection lives
+%% applies at the next spawn: a worker spawned while it is set gets no
+%% floor, and one spawned after it is cleared gets the floor again.
+spawn_follows_a_changed_default_max_heap_size(_Config) ->
+    HeapFloor = {atomics:new(1, []), 40000, base(), 46422, false},
+    ?assertEqual(
+        [monitor, {min_heap_size, 40000}], roadrunner_stream_worker:spawn_opts([], HeapFloor)
     ),
     Default = erlang:system_flag(max_heap_size, 30000),
     try
-        ?assertEqual(15000, Cap([]))
-    after
-        erlang:system_flag(max_heap_size, Default)
-    end.
-
-%% The emulator's default `max_heap_size` lowered while a connection lives
-%% applies at the next spawn: the floor the spawn asks for stays under half
-%% of it, or is left out when that is not above the base, so the spawn
-%% cannot fail.
-spawn_follows_a_changed_default_max_heap_size(_Config) ->
-    Base = base(),
-    HeapFloor = {atomics:new(1, []), 40000, Base, 46422, false},
-    Default = erlang:system_flag(max_heap_size, 30000),
-    try
-        ?assertEqual(
-            [monitor, {min_heap_size, 15000}],
-            roadrunner_stream_worker:spawn_opts([], HeapFloor)
-        ),
+        ?assertEqual([monitor], roadrunner_stream_worker:spawn_opts([], HeapFloor)),
         {Pid, Ref} = spawn_opt(fun() -> ok end, roadrunner_stream_worker:spawn_opts([], HeapFloor)),
         receive
             {'DOWN', Ref, process, Pid, normal} -> ok
-        end,
-        _ = erlang:system_flag(max_heap_size, 400),
-        ?assertEqual([monitor], roadrunner_stream_worker:spawn_opts([], HeapFloor))
+        end
     after
         erlang:system_flag(max_heap_size, Default)
-    end.
+    end,
+    ?assertEqual(
+        [monitor, {min_heap_size, 40000}], roadrunner_stream_worker:spawn_opts([], HeapFloor)
+    ).
 
 %% A worker started at the cap lowers its `min_heap_size` to the base, so
 %% one that lives on does not hold the cap's heap after it collects.

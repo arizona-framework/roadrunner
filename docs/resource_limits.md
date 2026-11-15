@@ -479,9 +479,12 @@ ones. A streamed or file response teaches the floor only what happened
 before its body started, since a long stream collects however large the
 floor, and every worker drops its `min_heap_size` back to the base once
 it has started, so a stream that lives on holds only what it keeps live.
-With a `max_heap_size` in `handler_spawn`'s `opts` (or the emulator's
-default, read again at each spawn), the floor is at most half of it, as
-a process cannot start with a `min_heap_size` above it.
+With a `max_heap_size` set, in `handler_spawn`'s `opts` or as the
+emulator's default (read as a connection starts, and again at each
+spawn while it has none), the floor is off: a
+raised `min_heap_size` makes every collection hold larger heaps, so it
+could take a worker over the limit when the worker's own data would
+not.
 
 Compared with learning from the heap left at the end of a request, over
 h2c with 16 connections and a fresh server per run, a JSON response used
