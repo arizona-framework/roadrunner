@@ -3,7 +3,8 @@
 Behaviour for an event handler: the module roadrunner hands its
 request, connection, and WebSocket events to.
 
-Roadrunner has no telemetry dependency. Every event goes to one
+Roadrunner has no telemetry dependency. Every event, gRPC calls'
+(`roadrunner_grpc`) among them, goes to one
 `handle_event/2` callback on the configured handler, which decides
 what to do with it: forward it to the `telemetry` library, record
 Prometheus metrics, open OpenTelemetry spans, or drop it. The default
@@ -33,16 +34,18 @@ in a start event and keep it in the span to compute a duration later.
 
 ## Spans
 
-Three events open a span: `request_start`, `listener_accept`, and
-`ws_upgrade`. Whatever `handle_event/2` returns for them is opaque to
-roadrunner and is handed back as the first element of the events that
-follow:
+Four events open a span: `request_start`, `listener_accept`,
+`ws_upgrade`, and `grpc_call_start`. Whatever `handle_event/2` returns
+for them is opaque to roadrunner and is handed back as the first
+element of the events that follow:
 
 - `request_start` -> `request_stop` or `request_exception`, in the
   same process
 - `listener_accept` -> `listener_conn_close`, in the same process
 - `ws_upgrade` -> `ws_frame_in`, `ws_frame_out`, and
   `ws_frame_rejected`, in the WebSocket session process
+- `grpc_call_start` -> `grpc_call_stop` or `grpc_call_exception`, in
+  the process running the call, inside the request's own span
 
 The return value of every other event is ignored.
 
@@ -146,6 +149,35 @@ tell listeners apart, match on the listener name the events carry.
   with `1009` because an inbound frame or message passed a size cap.
   `Reason` is `max_frame_size | max_message_size`, `Size` the
   offending byte count.
+- `grpc_call_start`, `{Req, Service, Method, Kind}`: a gRPC call to
+  `Service` (its full name, `package.Service`) and `Method` starts,
+  ahead of its checks and its method. `Kind` is `unary`,
+  `server_stream`, `client_stream` or `bidi_stream`, or `undefined` for
+  a method the service does not have (answered `UNIMPLEMENTED`). Returns
+  the call span. A request refused before a call starts (`405`, `415`,
+  `505`, the router's `404`) has only the request's events.
+- `grpc_call_stop`, `{Span, Status, Message, Reason, Messages,
+  Encodings}`: the call ended. `Status` is a `t:roadrunner_grpc:status/0`
+  and `Message` its `grpc-message` (`<<>>` for none). `Reason` says
+  how the call ended, see `t:grpc_stop_reason/0`. `Messages` is `{Received,
+  ReceivedBytes, Sent, SentBytes}`: the request messages read and the
+  response messages sent, and their bytes as they crossed the wire
+  (compressed when compressed, without gRPC's 5-byte prefix).
+  `Encodings` is `{RecvEncoding, SendEncoding}`: the client's
+  `grpc-encoding` (`identity` without one, its value as a binary for
+  one roadrunner does not read), and the one the response messages went
+  out with (`identity` when no response started).
+- `grpc_call_exception`, `{Span, Class, Reason, Stacktrace, Messages,
+  Encodings}`: the method raised (or returned something it may not),
+  and the call is about to end with `INTERNAL`; also for any other
+  raise that ends the call, such as trailers too large for the client,
+  which reset the stream. Fires in place of `grpc_call_stop`.
+  `Messages` and `Encodings` are as for `grpc_call_stop`.
+
+Every call that starts ends with exactly one `grpc_call_stop` or
+`grpc_call_exception`, however it ends, unless its process is ended by
+an exit signal it does not trap (`exit(Pid, kill)`, a `max_heap_size`
+kill, a linked process crashing) or its method never returns.
 
 ## Stability
 
@@ -190,6 +222,7 @@ handle_event(_Event, _Args) ->
 """.
 
 -export_type([event/0, span/0, peer/0, response_kind/0, close_reason/0]).
+-export_type([grpc_stop_reason/0, grpc_messages/0, grpc_encodings/0]).
 
 -doc "The name of an event handed to `handle_event/2`.".
 -type event() ::
@@ -208,11 +241,15 @@ handle_event(_Event, _Args) ->
     | ws_upgrade
     | ws_frame_in
     | ws_frame_out
-    | ws_frame_rejected.
+    | ws_frame_rejected
+    | grpc_call_start
+    | grpc_call_stop
+    | grpc_call_exception.
 
 -doc """
-What a handler returns from `request_start`, `listener_accept`, or
-`ws_upgrade`; handed back unchanged on the events that follow.
+What a handler returns from `request_start`, `listener_accept`,
+`ws_upgrade`, or `grpc_call_start`; handed back unchanged on the
+events that follow.
 """.
 -type span() :: term().
 
@@ -262,8 +299,60 @@ Why a connection ended, as carried by `listener_conn_close`.
     | {transport, term()}.
 
 -doc """
+How a gRPC call ended, as carried by `grpc_call_stop`, with the
+`Status` each comes with:
+
+- `normal`: the call ended `OK`
+- `error`: it ended with another status, the method's
+  (`{error, Status, Message, Stream}`) or one roadrunner answered for it
+  (an unknown method, a request message too large or malformed, a read
+  still waiting at the deadline, and so on)
+- `cancelled`: the client cancelled the call (reset its stream) or its
+  connection went away before it could read the call's status: a write
+  or read failed with it, or it was seen before a Trailers-Only status,
+  which goes out without waiting (including when `cancelled/2` told the
+  method); `Status` is `cancelled`
+- `deadline`: as `cancelled`, but from 50 ms before the call's
+  `grpc-timeout` ran out on: roadrunner cancelled it a second after the
+  deadline, or the client did at its own deadline; `Status` is
+  `deadline_exceeded`. Roadrunner counts the deadline from when the call
+  starts: with `auto` buffering after the request's body was read, with
+  `manual` after the router and middlewares ran. The client's own
+  deadline comes that much earlier, so a client reset at it is
+  `deadline` only when the call started within about 50 ms of the
+  request's arrival; a body that took longer to arrive makes it
+  `cancelled`. The time compared is when the call learned the stream
+  was gone: when `roadrunner_grpc:cancelled/2` told the method, or else
+  when a write or read failed or the status was about to go out, which
+  can be well after the reset came in (a method that keeps working
+  without reading or writing)
+- `stopped`: no gRPC status went out: the method stopped the call on
+  purpose (`exit({shutdown, _})`), or its response headers were too
+  large for the client and the request was answered `500`; `Status` is
+  what a gRPC client reads then: `unknown` before a response started
+  (an HTTP `500`), `internal` after (a stream ended without trailers)
+""".
+-type grpc_stop_reason() :: normal | error | cancelled | deadline | stopped.
+
+-doc """
+A gRPC call's messages: `{Received, ReceivedBytes, Sent, SentBytes}`,
+the request messages read and the response messages sent, and their
+bytes as they crossed the wire.
+""".
+-type grpc_messages() ::
+    {non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}.
+
+-doc """
+A gRPC call's encodings: `{RecvEncoding, SendEncoding}`, the client's
+`grpc-encoding` (its value, for one roadrunner does not read) and the
+response messages'.
+""".
+-type grpc_encodings() ::
+    {roadrunner_grpc:encoding() | binary(), roadrunner_grpc:encoding()}.
+
+-doc """
 Handle one event. The return value is the span for `request_start`,
-`listener_accept`, and `ws_upgrade`, and is ignored for every other
+`listener_accept`, `ws_upgrade`, and `grpc_call_start`, and is ignored for every other
 event. See the module documentation for each event's arguments.
 """.
 -callback handle_event
@@ -291,4 +380,30 @@ event. See the module documentation for each event's arguments.
     (
         ws_frame_rejected,
         {span(), max_frame_size | max_message_size, non_neg_integer()}
+    ) -> term();
+    (
+        grpc_call_start,
+        {roadrunner_req:request(), binary(), binary(), roadrunner_grpc_service:kind() | undefined}
+    ) -> span();
+    (
+        grpc_call_stop,
+        {
+            span(),
+            roadrunner_grpc:status(),
+            binary(),
+            grpc_stop_reason(),
+            grpc_messages(),
+            grpc_encodings()
+        }
+    ) -> term();
+    (
+        grpc_call_exception,
+        {
+            span(),
+            error | exit | throw,
+            term(),
+            erlang:stacktrace(),
+            grpc_messages(),
+            grpc_encodings()
+        }
     ) -> term().

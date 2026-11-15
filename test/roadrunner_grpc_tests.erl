@@ -147,9 +147,10 @@ reflection_files_test() ->
     _ = ?M:init_route(#{service => Own, reflection => [roadrunner_grpc_unexported_service]}),
     ok.
 
-%% A codec module that does not exist, and a service whose rpcs/0 is not a
-%% map, are refused.
+%% A codec module that does not exist, a service whose rpcs/0 is not a map,
+%% and a module with no name/0, are refused.
 init_route_missing_codec_and_bad_rpcs_test() ->
+    ?assertError({invalid_grpc_opt, service, lists}, ?M:init_route(#{service => lists})),
     ?assertError(
         {invalid_grpc_opt, codecs, [nope]}, ?M:init_route(#{service => ?SVC, codecs => [nope]})
     ),

@@ -31,7 +31,10 @@
     ws_upgrade/4,
     ws_frame_in/3,
     ws_frame_out/3,
-    ws_frame_rejected/3
+    ws_frame_rejected/3,
+    grpc_call_start/4,
+    grpc_call_stop/6,
+    grpc_call_exception/6
 ]).
 
 -define(HANDLER_KEY, {?MODULE, handler}).
@@ -212,4 +215,37 @@ ws_frame_out(Span, Opcode, PayloadSize) ->
 ) -> ok.
 ws_frame_rejected(Span, Reason, Size) ->
     _ = dispatch(ws_frame_rejected, {Span, Reason, Size}),
+    ok.
+
+-doc "Emit `grpc_call_start` and return the handler's gRPC call span.".
+-spec grpc_call_start(
+    roadrunner_req:request(), binary(), binary(), roadrunner_grpc_service:kind() | undefined
+) -> roadrunner_event_handler:span().
+grpc_call_start(Req, Service, Method, Kind) ->
+    dispatch(grpc_call_start, {Req, Service, Method, Kind}).
+
+-doc "Emit `grpc_call_stop` for the span `grpc_call_start/4` returned.".
+-spec grpc_call_stop(
+    roadrunner_event_handler:span(),
+    roadrunner_grpc:status(),
+    binary(),
+    roadrunner_event_handler:grpc_stop_reason(),
+    roadrunner_event_handler:grpc_messages(),
+    roadrunner_event_handler:grpc_encodings()
+) -> ok.
+grpc_call_stop(Span, Status, Message, Reason, Messages, Encodings) ->
+    _ = dispatch(grpc_call_stop, {Span, Status, Message, Reason, Messages, Encodings}),
+    ok.
+
+-doc "Emit `grpc_call_exception` for the span `grpc_call_start/4` returned.".
+-spec grpc_call_exception(
+    roadrunner_event_handler:span(),
+    error | exit | throw,
+    term(),
+    erlang:stacktrace(),
+    roadrunner_event_handler:grpc_messages(),
+    roadrunner_event_handler:grpc_encodings()
+) -> ok.
+grpc_call_exception(Span, Class, Reason, Stacktrace, Messages, Encodings) ->
+    _ = dispatch(grpc_call_exception, {Span, Class, Reason, Stacktrace, Messages, Encodings}),
     ok.
