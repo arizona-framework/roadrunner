@@ -116,7 +116,68 @@ handle_event(ws_frame_rejected, {Metadata, Reason, Size}) ->
         [roadrunner, ws, frame_rejected],
         #{system_time => erlang:system_time(), size => Size},
         Metadata#{reason => Reason}
-    ).
+    );
+handle_event(grpc_call_start, {Req, Service, Method, Kind}) ->
+    StartMono = erlang:monotonic_time(),
+    #{request_id := RequestId, peer := Peer, listener_name := ListenerName} = Req,
+    Metadata = #{
+        request_id => RequestId,
+        peer => Peer,
+        listener_name => ListenerName,
+        service => Service,
+        method => Method,
+        call_kind => Kind
+    },
+    ok = telemetry:execute(
+        [roadrunner, grpc, start], #{system_time => erlang:system_time()}, Metadata
+    ),
+    {StartMono, Metadata};
+handle_event(
+    grpc_call_stop, {{StartMono, Metadata}, Status, Message, Reason, Messages, Encodings}
+) ->
+    {RecvEncoding, SendEncoding} = Encodings,
+    telemetry:execute(
+        [roadrunner, grpc, stop],
+        grpc_measurements(StartMono, Messages),
+        Metadata#{
+            status => Status,
+            message => Message,
+            reason => Reason,
+            recv_encoding => RecvEncoding,
+            send_encoding => SendEncoding
+        }
+    );
+handle_event(
+    grpc_call_exception, {{StartMono, Metadata}, Class, Reason, Stacktrace, Messages, Encodings}
+) ->
+    {RecvEncoding, SendEncoding} = Encodings,
+    telemetry:execute(
+        [roadrunner, grpc, exception],
+        grpc_measurements(StartMono, Messages),
+        Metadata#{
+            kind => Class,
+            reason => Reason,
+            stacktrace => Stacktrace,
+            recv_encoding => RecvEncoding,
+            send_encoding => SendEncoding
+        }
+    );
+%% A call that started under another handler, before a test put this one
+%% in place, and ends after: its span is that handler's.
+handle_event(Event, Args) when
+    (Event =:= grpc_call_stop orelse Event =:= grpc_call_exception),
+    not is_tuple(element(1, Args)) orelse tuple_size(element(1, Args)) =/= 2
+->
+    ok.
+
+grpc_measurements(StartMono, {Received, ReceivedBytes, Sent, SentBytes}) ->
+    #{
+        duration => erlang:monotonic_time() - StartMono,
+        messages_received => Received,
+        bytes_received => ReceivedBytes,
+        messages_sent => Sent,
+        bytes_sent => SentBytes
+    }.
 
 now_event(Event, Metadata) ->
     telemetry:execute(Event, #{system_time => erlang:system_time()}, Metadata).

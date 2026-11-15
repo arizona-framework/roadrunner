@@ -104,6 +104,12 @@ is, to keep a secret out of a compressed stream. `recv_compressed/1` says
 whether the message `recv/1` returned last came compressed, a unary or
 server-streaming method's request among them.
 
+## Events
+
+A call emits `grpc_call_start` as it starts, then exactly one
+`grpc_call_stop` or `grpc_call_exception` as it ends, to the node's
+`roadrunner_event_handler`, which has their arguments.
+
 ## Metadata
 
 `metadata/1` is the request's custom metadata, without the HTTP/2 and gRPC
@@ -129,8 +135,27 @@ are each an entry, and one that is not base64 ends the call with
 -define(MAX_MESSAGE_SIZE, 4194304).
 %% Where the call's process keeps the response's body writer once it started.
 -define(SEND_KEY, {?MODULE, send}).
-%% Where it keeps the timer that cancels the call at its deadline.
+%% Where it keeps the timer that cancels the call at its deadline, with
+%% when a reset counts as the deadline's (`gone/0`).
 -define(TIMER_KEY, {?MODULE, deadline_timer}).
+%% A stream gone this close to the call's deadline, or later, is the
+%% deadline's (`gone/0`). The deadline counts from when the call starts,
+%% rounded up to a millisecond: after the request's way here, and after its
+%% body was read with `auto` buffering, or the router and middlewares ran
+%% with `manual`. A client that cancels as its own deadline passes
+%% (grpc-go, grpc-java) has its reset here that much before roadrunner's
+%% deadline, less the reset's own way. The slack covers that gap for a
+%% call that starts as its request arrives (`manual` buffering, a body that
+%% has not had to wait); a call whose body took longer to arrive than the
+%% slack is reported `cancelled` instead.
+-define(DEADLINE_SLACK, 50).
+%% When `cancelled/2` told the method the call is over, which takes the
+%% message that said so from the mailbox (`stream_gone/1`, `gone/0`).
+-define(GONE_KEY, {?MODULE, gone}).
+%% And the call's event span, the client's `grpc-encoding`, and the request
+%% and response messages so far, counted and summed in bytes, until the call
+%% ends (`call_ended/1`).
+-define(CALL_KEY, {?MODULE, call}).
 %% And its monitor of the connection (`cancelled/2`).
 -define(CONN_KEY, {?MODULE, connection}).
 %% How long after its deadline a call still running is cancelled. The
@@ -178,6 +203,8 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
     | unauthenticated.
 
 -record(route, {
+    %% The service's full name, `package.Service`.
+    name :: binary(),
     service :: module(),
     rpcs :: #{binary() => {atom(), roadrunner_grpc_service:kind(), term(), term()}},
     codecs :: #{binary() => module()},
@@ -218,6 +245,9 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
 }).
 
 -opaque stream() :: #stream{}.
+
+%% How a call ended with a status, or with none: for its events.
+-type ending() :: {status(), binary(), roadrunner_event_handler:grpc_stop_reason()}.
 
 -doc "How a message is compressed: `identity` (not), `gzip` or `deflate`.".
 -type encoding() :: identity | gzip | deflate.
@@ -314,8 +344,9 @@ the listener from starting.
 -spec init_route(map()) -> #route{}.
 init_route(#{service := Service} = Opts) ->
     ok = check_known_opts(Opts),
-    {Module, Rpcs} = service(Service),
+    {Name, Module, Rpcs} = service(Service),
     #route{
+        name = Name,
         service = Module,
         rpcs = rpcs(Module, Rpcs),
         codecs = codecs(maps:get(codecs, Opts, [roadrunner_grpc_codec_raw])),
@@ -333,17 +364,18 @@ check_known_opts(Opts) ->
         [Key | _] -> error({unknown_grpc_opt, Key})
     end.
 
-%% The module that holds the methods, and the methods: a service module's
-%% own, or a descriptor's.
--spec service(term()) -> {module(), term()}.
+%% The service's name, the module that holds the methods, and the methods: a
+%% service module's own, or a descriptor's.
+-spec service(term()) -> {binary(), module(), term()}.
 service(Service) when is_atom(Service) ->
     ok = loaded(Service, Service),
-    {Service, Service:rpcs()};
+    {module_name(Service), Service, Service:rpcs()};
 service(#{module := Module, rpcs := Rpcs} = Service) ->
     case descriptor(Service) of
         true ->
             ok = loaded(Module, Service),
-            {Module, Rpcs};
+            #{name := Name} = Service,
+            {Name, Module, Rpcs};
         false ->
             error({invalid_grpc_opt, service, Service})
     end;
@@ -386,6 +418,13 @@ service_files(Module) ->
     case erlang:function_exported(Module, files, 0) of
         true -> Module:files();
         false -> []
+    end.
+
+-spec module_name(module()) -> binary().
+module_name(Service) ->
+    case erlang:function_exported(Service, name, 0) andalso Service:name() of
+        Name when is_binary(Name) -> Name;
+        _ -> error({invalid_grpc_opt, service, Service})
     end.
 
 -spec loaded(module(), term()) -> ok.
@@ -513,11 +552,45 @@ subtype(<<";", _/binary>>) -> ~"proto";
 subtype(<<"+", Sub/binary>>) -> roadrunner_bin:trim_ows(hd(binary:split(Sub, ~";")));
 subtype(_Rest) -> invalid.
 
-%% The call, on the request's process: its checks ahead of the method,
-%% then the method, then the status that ends it.
+%% The call, on the request's process, between its `grpc_call_start` event
+%% and the one that ends it. A call that ends in an exit or a raise reports
+%% how it ended and goes on ending as it would.
 -spec call(roadrunner_req:request(), binary(), module(), #route{}) -> roadrunner_req:request().
-call(Req, ContentType, Codec, #route{service = Service, rpcs = Rpcs} = Route) ->
+call(Req, ContentType, Codec, #route{name = Name, rpcs = Rpcs} = Route) ->
     #{~"method" := Method} = roadrunner_req:bindings(Req),
+    Rpc =
+        case Rpcs of
+            #{Method := Found} -> Found;
+            #{} -> undefined
+        end,
+    Span = roadrunner_event:grpc_call_start(Req, Name, Method, rpc_kind(Rpc)),
+    RecvEncoding = request_encoding(roadrunner_req:header(~"grpc-encoding", Req)),
+    _ = put(?CALL_KEY, {Span, RecvEncoding, 0, 0, 0, 0}),
+    try
+        run_call(Req, ContentType, Codec, Route, Method, Rpc, RecvEncoding)
+    catch
+        Class:Reason:Stacktrace ->
+            ok = call_raised(Class, Reason, Stacktrace),
+            erlang:raise(Class, Reason, Stacktrace)
+    end.
+
+-spec rpc_kind({atom(), roadrunner_grpc_service:kind(), term(), term()} | undefined) ->
+    roadrunner_grpc_service:kind() | undefined.
+rpc_kind({_Function, Kind, _In, _Out}) -> Kind;
+rpc_kind(undefined) -> undefined.
+
+%% The call's checks ahead of the method, then the method, then the status
+%% that ends it.
+-spec run_call(
+    roadrunner_req:request(),
+    binary(),
+    module(),
+    #route{},
+    binary(),
+    {atom(), roadrunner_grpc_service:kind(), term(), term()} | undefined,
+    encoding() | binary()
+) -> roadrunner_req:request().
+run_call(Req, ContentType, Codec, #route{service = Service} = Route, Method, Rpc, Encoding) ->
     Stream0 = #stream{
         req = Req,
         codec = Codec,
@@ -528,8 +601,8 @@ call(Req, ContentType, Codec, #route{service = Service, rpcs = Rpcs} = Route) ->
         deadline = infinity
     },
     try
-        {Function, Kind, In, Out} = rpc(Method, Rpcs),
-        RecvEncoding = recv_encoding(roadrunner_req:header(~"grpc-encoding", Req)),
+        {Function, Kind, In, Out} = rpc(Method, Rpc),
+        RecvEncoding = recv_encoding(Encoding),
         Accepted = accepted(roadrunner_req:header(~"grpc-accept-encoding", Req)),
         Timeout = timeout(roadrunner_req:header(~"grpc-timeout", Req)),
         Stream = Stream0#stream{
@@ -551,31 +624,36 @@ call(Req, ContentType, Codec, #route{service = Service, rpcs = Rpcs} = Route) ->
             finish({error, Status, Message, add_headers(Headers, Stream0)})
     end.
 
--spec rpc(binary(), map()) -> {atom(), roadrunner_grpc_service:kind(), term(), term()}.
-rpc(Method, Rpcs) ->
-    case Rpcs of
-        #{Method := Rpc} -> Rpc;
-        #{} -> throw({?MODULE, unimplemented, <<"unknown method ", Method/binary>>, []})
+-spec rpc(binary(), {atom(), roadrunner_grpc_service:kind(), term(), term()} | undefined) ->
+    {atom(), roadrunner_grpc_service:kind(), term(), term()}.
+rpc(Method, undefined) ->
+    throw({?MODULE, unimplemented, <<"unknown method ", Method/binary>>, []});
+rpc(_Method, Rpc) ->
+    Rpc.
+
+%% The client's `grpc-encoding`, as the call's events report it: one
+%% roadrunner reads, or the header's value.
+-spec request_encoding(binary() | undefined) -> encoding() | binary().
+request_encoding(undefined) ->
+    identity;
+request_encoding(Value) ->
+    case encoding(Value) of
+        unknown -> Value;
+        Known -> Known
     end.
 
-%% The client's `grpc-encoding`: one roadrunner reads, or the call ends
-%% `UNIMPLEMENTED` naming the ones it does (gRPC's compression.md).
--spec recv_encoding(binary() | undefined) -> encoding().
-recv_encoding(undefined) ->
-    identity;
+%% A `grpc-encoding` roadrunner reads, or the call ends `UNIMPLEMENTED`
+%% naming the ones it does (gRPC's compression.md).
+-spec recv_encoding(encoding() | binary()) -> encoding().
+recv_encoding(Encoding) when is_atom(Encoding) ->
+    Encoding;
 recv_encoding(Encoding) ->
-    case encoding(Encoding) of
-        unknown ->
-            Supported = roadrunner_grpc_compress:encodings(),
-            throw(
-                {?MODULE, unimplemented,
-                    <<"unsupported grpc-encoding ", Encoding/binary, "; supported: ",
-                        Supported/binary>>,
-                    []}
-            );
-        Known ->
-            Known
-    end.
+    Supported = roadrunner_grpc_compress:encodings(),
+    throw(
+        {?MODULE, unimplemented,
+            <<"unsupported grpc-encoding ", Encoding/binary, "; supported: ", Supported/binary>>,
+            []}
+    ).
 
 -spec encoding(binary()) -> encoding() | unknown.
 encoding(~"identity") -> identity;
@@ -619,8 +697,8 @@ timeout(Value) ->
 %% When the call's timeout runs out. A call still running a little after
 %% (`?CANCEL_GRACE`, which leaves a read waiting at the deadline the time to
 %% end the call with `DEADLINE_EXCEEDED`) is cancelled: the stream is reset
-%% and the method stops at its next write or read. The timer is cancelled when the call ends before
-%% (`ended/1`).
+%% and the method stops at its next write or read. The timer is cancelled
+%% when the call ends before (`ended/1`).
 -spec deadline_after(non_neg_integer() | infinity, roadrunner_req:request()) ->
     integer() | infinity.
 deadline_after(infinity, _Req) ->
@@ -629,8 +707,9 @@ deadline_after(Ms, Req) ->
     %% A call runs over HTTP/2 or HTTP/3 (`handle/1` answers HTTP/1.1 with
     %% 505), both of which can cancel a stream.
     {ok, Timer} = roadrunner_send_writer:cancel_after(Ms + ?CANCEL_GRACE, Req),
-    _ = put(?TIMER_KEY, Timer),
-    erlang:monotonic_time(millisecond) + Ms.
+    Deadline = erlang:monotonic_time(millisecond) + Ms,
+    _ = put(?TIMER_KEY, {Timer, Deadline - ?DEADLINE_SLACK}),
+    Deadline.
 
 -spec add_headers(roadrunner_http:headers(), stream()) -> stream().
 add_headers(Headers, #stream{headers = Own} = Stream) ->
@@ -668,6 +747,9 @@ run(Kind, Service, Function, Stream) ->
                 },
                 #{domain => [roadrunner, grpc]}
             ),
+            %% Reported as it is caught, ahead of the INTERNAL status, as a
+            %% request's crash is ahead of its 500.
+            ok = call_ended({exception, Class, Reason, Stacktrace}),
             {error, internal, ~"internal error", Stream}
     end.
 
@@ -714,13 +796,15 @@ finish({ok, Stream}) ->
 finish({error, Status, Message, Stream}) ->
     ended(finish(Status, Message, Stream)).
 
--spec ended(roadrunner_req:request()) -> roadrunner_req:request().
-ended(Req) ->
+%% The call ended as its status went out, or as the stream went away first.
+-spec ended({ending(), roadrunner_req:request()}) -> roadrunner_req:request().
+ended({Ending, Req}) ->
+    ok = call_ended(Ending),
     _ = erase(?SEND_KEY),
     _ =
         case erase(?TIMER_KEY) of
             undefined -> ok;
-            Timer -> erlang:cancel_timer(Timer, [{async, true}, {info, false}])
+            {Timer, _Deadline} -> erlang:cancel_timer(Timer, [{async, true}, {info, false}])
         end,
     _ =
         case erase(?CONN_KEY) of
@@ -728,6 +812,123 @@ ended(Req) ->
             Ref -> demonitor(Ref, [flush])
         end,
     Req.
+
+%% The call ending with `Status`, which the client gets.
+-spec status_ending(status(), binary()) -> ending().
+status_ending(ok, Message) -> {ok, Message, normal};
+status_ending(Status, Message) -> {Status, Message, error}.
+
+%% Whether the client cancelled the call, or its connection went away,
+%% before a status that goes out one way (Trailers-Only), which no one
+%% would then read: `cancelled/2` said so to the method, or the message
+%% that says so waits in the mailbox.
+-spec stream_gone(stream()) -> boolean().
+stream_gone(#stream{connection = Ref}) ->
+    get(?GONE_KEY) =/= undefined orelse
+        receive
+            {h2_stream_reset, _StreamId} -> true;
+            {roadrunner_stream_reset, _StreamId} -> true;
+            {'DOWN', Ref, process, _Pid, _Reason} -> true
+        after 0 -> false
+        end.
+
+%% A call stopped with no gRPC status: before a response, the client reads
+%% the HTTP status (a 500) as `UNKNOWN`; after one, a stream that ends
+%% without trailers as `INTERNAL`.
+-spec stopped_ending() -> ending().
+stopped_ending() ->
+    case get(?SEND_KEY) of
+        undefined -> {unknown, <<>>, stopped};
+        {_Send, _Encoding} -> {internal, <<>>, stopped}
+    end.
+
+%% How a call that exits or raises ended. An exit of the call's own, the
+%% client cancelling, its connection gone, a write or read that failed with
+%% it, is no crash; nor is a stop on purpose (`{shutdown, _}`), the method's
+%% or the call's when its response headers are too large for the client.
+-spec call_raised(error | exit | throw, term(), erlang:stacktrace()) -> ok.
+call_raised(exit, {shutdown, {grpc_send, TooLarge}}, _Stacktrace) when
+    TooLarge =:= header_list_too_large; TooLarge =:= field_section_too_large
+->
+    call_ended(stopped_ending());
+call_raised(exit, {shutdown, {Op, _Reason}}, _Stacktrace) when
+    Op =:= grpc_send; Op =:= grpc_recv
+->
+    call_ended(gone());
+call_raised(exit, {shutdown, _Reason}, _Stacktrace) ->
+    call_ended(stopped_ending());
+call_raised(exit, Gone, _Stacktrace) when
+    Gone =:= stream_reset;
+    Gone =:= conn_down;
+    is_tuple(Gone), element(1, Gone) =:= quic_conn_down
+->
+    call_ended(gone());
+call_raised(Class, Reason, Stacktrace) ->
+    call_ended({exception, Class, Reason, Stacktrace}).
+
+%% A call whose stream went away before its status: from `?DEADLINE_SLACK`
+%% ahead of its deadline on, the deadline's (whether roadrunner or the
+%% client reset it then); before, the client cancelled it or its connection
+%% went away. When it went away is when `cancelled/2` told the method, or
+%% else when the call finds out (a write or read that fails, a reset in the
+%% mailbox), which may be later than the reset came in.
+-spec gone() -> ending().
+gone() ->
+    At =
+        case erase(?GONE_KEY) of
+            undefined -> erlang:monotonic_time(millisecond);
+            Told -> Told
+        end,
+    case get(?TIMER_KEY) of
+        {_Timer, Reached} when At >= Reached -> {deadline_exceeded, <<>>, deadline};
+        _ -> {cancelled, <<>>, cancelled}
+    end.
+
+%% Emit the event that ends the call, once: the first to end it takes its
+%% span, so a crash already reported is not reported again as the call
+%% then ends.
+-spec call_ended(ending() | {exception, error | exit | throw, term(), erlang:stacktrace()}) ->
+    ok.
+call_ended(Ending) ->
+    case erase(?CALL_KEY) of
+        {Span, RecvEncoding, Received, ReceivedBytes, Sent, SentBytes} ->
+            Messages = {Received, ReceivedBytes, Sent, SentBytes},
+            Encodings = {RecvEncoding, sent_encoding()},
+            case Ending of
+                {exception, Class, Reason, Stacktrace} ->
+                    roadrunner_event:grpc_call_exception(
+                        Span, Class, Reason, Stacktrace, Messages, Encodings
+                    );
+                {Status, Message, Reason} ->
+                    roadrunner_event:grpc_call_stop(
+                        Span, Status, Message, Reason, Messages, Encodings
+                    )
+            end;
+        undefined ->
+            ok
+    end.
+
+%% The response messages' encoding: the one their headers announced, or
+%% `identity` when no response started.
+-spec sent_encoding() -> encoding().
+sent_encoding() ->
+    case get(?SEND_KEY) of
+        {_Send, Encoding} -> Encoding;
+        undefined -> identity
+    end.
+
+-spec count_received(non_neg_integer()) -> ok.
+count_received(Bytes) ->
+    {Span, Encoding, Received, ReceivedBytes, Sent, SentBytes} = get(?CALL_KEY),
+    _ = put(?CALL_KEY, {Span, Encoding, Received + 1, ReceivedBytes + Bytes, Sent, SentBytes}),
+    ok.
+
+%% A framed message's bytes, read off its prefix.
+-spec count_sent(iodata()) -> ok.
+count_sent([<<_Flag, Bytes:32>>, _Message]) ->
+    {Span, Encoding, Received, ReceivedBytes, Sent, SentBytes} = get(?CALL_KEY),
+    _ = put(?CALL_KEY, {Span, Encoding, Received, ReceivedBytes, Sent + 1, SentBytes + Bytes}),
+    ok.
 
 %% Monitor the client's connection for the call (`cancelled/2`). A call
 %% runs over HTTP/2 or HTTP/3 (`handle/1` answers HTTP/1.1 with 505), both of
@@ -759,12 +960,18 @@ events(Stream) ->
 ```
 """.
 -spec cancelled(term(), stream()) -> boolean().
-cancelled({h2_stream_reset, _StreamId}, _Stream) -> true;
-cancelled({roadrunner_stream_reset, _StreamId}, _Stream) -> true;
-cancelled({'DOWN', Ref, process, _Pid, _Reason}, #stream{connection = Ref}) -> true;
+cancelled({h2_stream_reset, _StreamId}, _Stream) -> gone_now();
+cancelled({roadrunner_stream_reset, _StreamId}, _Stream) -> gone_now();
+cancelled({'DOWN', Ref, process, _Pid, _Reason}, #stream{connection = Ref}) -> gone_now();
 cancelled(_Message, _Stream) -> false.
 
--spec finish(status(), binary(), stream()) -> roadrunner_req:request().
+%% The call is over: its events say so whatever the method returns next.
+-spec gone_now() -> true.
+gone_now() ->
+    _ = put(?GONE_KEY, erlang:monotonic_time(millisecond)),
+    true.
+
+-spec finish(status(), binary(), stream()) -> {ending(), roadrunner_req:request()}.
 finish(Status, Message, #stream{send = undefined} = Stream) ->
     %% The method may have started the response on a stream it then lost,
     %% crashing or aborting: the writer is kept where the call can find it.
@@ -773,16 +980,25 @@ finish(Status, Message, #stream{send = undefined} = Stream) ->
         {Send, _Encoding} -> finish(Status, Message, Stream#stream{send = Send})
     end;
 finish(Status, Message, #stream{send = Send, req = Req} = Stream) ->
+    %% A stream the client reset or lost fails this write, which waits on
+    %% the connection.
     ok = written(Send(<<>>, {fin, status_headers(Status, Message, Stream)})),
-    Req.
+    {status_ending(Status, Message), Req}.
 
 %% A call that ends before any response: the status in the response
-%% headers, a single HEADERS frame that ends the stream.
--spec trailers_only(status(), binary(), stream()) -> roadrunner_req:request().
+%% headers, a single HEADERS frame that ends the stream. It goes one way,
+%% so a stream already reset or lost does not fail it: what the call's
+%% events report is found out first.
+-spec trailers_only(status(), binary(), stream()) -> {ending(), roadrunner_req:request()}.
 trailers_only(Status, Message, #stream{req = Req} = Stream) ->
+    Ending =
+        case stream_gone(Stream) of
+            true -> gone();
+            false -> status_ending(Status, Message)
+        end,
     Headers = response_headers(Stream) ++ status_headers(Status, Message, Stream),
     ok = written(roadrunner_send:reply(200, Headers, <<>>, Req)),
-    Req.
+    {Ending, Req}.
 
 %% A write that could not go out (the client is gone, say) stops the call.
 -spec written(ok | {error, term()}) -> ok.
@@ -834,12 +1050,15 @@ running out while it waits with `DEADLINE_EXCEEDED`.
 recv(#stream{buffer = Buffer, max_message_size = Max} = Stream) ->
     case roadrunner_grpc_frame:decode(Buffer, Max) of
         {ok, false, Bytes, Rest} ->
-            {ok, decode(Bytes, Stream), Stream#stream{buffer = Rest, compressed = false}};
+            Message = decode(Bytes, Stream),
+            ok = count_received(byte_size(Bytes)),
+            {ok, Message, Stream#stream{buffer = Rest, compressed = false}};
         {ok, true, _Bytes, _Rest} when Stream#stream.recv_encoding =:= identity ->
             abort(internal, ~"compressed message without a grpc-encoding to read it", Stream);
         {ok, true, Compressed, Rest} ->
-            Bytes = decompressed(Compressed, Stream),
-            {ok, decode(Bytes, Stream), Stream#stream{buffer = Rest, compressed = true}};
+            Message = decode(decompressed(Compressed, Stream), Stream),
+            ok = count_received(byte_size(Compressed)),
+            {ok, Message, Stream#stream{buffer = Rest, compressed = true}};
         {error, message_too_large} ->
             abort(resource_exhausted, ~"request message too large", Stream);
         {error, bad_compressed_flag} ->
@@ -933,6 +1152,7 @@ send(Message, #stream{codec = Codec, output = Out} = Stream0, Opts) ->
                 )
         end,
     ok = written(Send(Frame, nofin)),
+    ok = count_sent(Frame),
     Stream.
 
 %% The response's headers go out once: a stream copy from before the first

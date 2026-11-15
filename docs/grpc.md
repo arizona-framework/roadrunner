@@ -2,8 +2,8 @@
 
 Roadrunner serves gRPC services on its HTTP/2 and HTTP/3 listeners. This
 guide shows how to write a service, put it on a listener, and use what a
-call can do: streams, metadata, status codes, deadlines, compression, the
-health service and server reflection. The last part shows how to use
+call can do: streams, metadata, status codes, deadlines, compression,
+telemetry, the health service and server reflection. The last part shows how to use
 Protocol Buffers.
 
 ## What you get
@@ -17,6 +17,7 @@ Protocol Buffers.
   cancelled
 - `gzip` and `deflate` message compression, both ways
 - a limit on the size of each request message
+- an event when each call starts and ends, for metrics and tracing
 - gRPC's health service, `grpc.health.v1.Health`
 - gRPC's server reflection, for tools such as `grpcurl`
 - pluggable codecs: raw bytes by default, Protocol Buffers through gpb
@@ -455,6 +456,66 @@ roadrunner_grpc:routes(#{
 ```
 
 See [Resource limits](resource_limits.md) for the defaults.
+
+## Telemetry
+
+Each call emits events to roadrunner's event handler (see
+`roadrunner_event_handler`), as requests do:
+
+- `grpc_call_start` as the call starts, with the request, the service's
+  full name, the method's name and the call kind (`undefined` for a
+  method the service does not have); what the handler returns is the
+  call's span
+- `grpc_call_stop` as the call ends, with the span, the status and its
+  message, how the call ended, the messages read and sent with their
+  bytes, and the encodings both ways
+- `grpc_call_exception` in place of the stop when the method crashed
+  (the client gets `INTERNAL`) or the call raised as it ended (trailers
+  too large for the client, say, which reset the stream), with the span,
+  the class, reason and stacktrace, and the same messages and encodings
+
+How a call ended is one of:
+
+- `normal`: it ended `OK`
+- `error`: it ended with another status, yours or one roadrunner
+  answered for you
+- `cancelled`: the client cancelled it or went away before it could
+  read the status; the status is `cancelled`
+- `deadline`: the same, from 50 ms before its deadline on; the status is
+  `deadline_exceeded`. The time that counts is when the call learned the
+  client was gone: when `roadrunner_grpc:cancelled/2` said so, or else at
+  its next read or write or as its status went out, which can be long
+  after the client cancelled if the method keeps working without either.
+  The deadline counts from when the call starts (with `auto` buffering,
+  after the body was read), so a client that cancels at its own deadline
+  is reported `cancelled` when its body took more than about 50 ms to
+  arrive
+- `stopped`: it ended with no gRPC status (an `exit({shutdown, _})`, or
+  response headers too large for the client); the status is the one a
+  client reads then, `unknown` before any response and `internal` after
+
+Every call that starts ends with exactly one stop or exception event,
+unless its process dies of an exit signal it does not trap (such as
+`exit(Pid, kill)` or a linked process crashing) or its method never
+returns. Calls to the health service and to server reflection emit the
+same events, under their own service names
+(`grpc.health.v1.Health`, `grpc.reflection.v1.ServerReflection`).
+The events run in the call's own process, inside the request's events,
+so the request's `request_id` ties them together. Time is not measured
+for you: read `erlang:monotonic_time/0` in the start event and keep it
+in the span. A handler that sends these to the `telemetry` library, a
+Prometheus exporter or OpenTelemetry can label them by service, method,
+kind and status.
+
+```erlang
+handle_event(grpc_call_start, {_Req, Service, Method, _Kind}) ->
+    {erlang:monotonic_time(), Service, Method};
+handle_event(grpc_call_stop, {{Start, Service, Method}, Status, _Message, _How, _, _}) ->
+    Duration = erlang:monotonic_time() - Start,
+    my_metrics:observe(Service, Method, Status, Duration);
+handle_event(_Event, _Args) ->
+    ok.
+```
 
 ## The health service
 

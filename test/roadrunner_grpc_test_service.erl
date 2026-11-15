@@ -7,7 +7,8 @@
 -export([unary/2, count/2, sum/1, chat/1, fail/2, crash/2, crash_after/2, meta/2, deadline/2, bad/2]).
 -export([stop/2, bad_trailer/2, late_headers/2, stale_send/2, bad_name/2, big_header/2]).
 -export([unsafe_header/2, unsafe_fail/2, busy/2, squeezed/2, late_compression/2]).
--export([stale_compression/2, held/1, was_compressed/2]).
+-export([stale_compression/2, held/1, was_compressed/2, flood/2, big_trailer/2]).
+-export([hold/2, watch/2, stop_after/2, reset_at/2, watch_late/2]).
 
 name() -> ~"test.Echo".
 
@@ -39,7 +40,14 @@ rpcs() ->
         ~"LateCompression" => rpc(late_compression, server_stream),
         ~"StaleCompression" => rpc(stale_compression, server_stream),
         ~"Held" => rpc(held, client_stream),
-        ~"WasCompressed" => rpc(was_compressed, unary)
+        ~"WasCompressed" => rpc(was_compressed, unary),
+        ~"Flood" => rpc(flood, server_stream),
+        ~"BigTrailer" => rpc(big_trailer, unary),
+        ~"Hold" => rpc(hold, unary),
+        ~"Watch" => rpc(watch, server_stream),
+        ~"StopAfter" => rpc(stop_after, server_stream),
+        ~"ResetAt" => rpc(reset_at, unary),
+        ~"WatchLate" => rpc(watch_late, server_stream)
     }.
 
 rpc(Function, Kind) ->
@@ -152,6 +160,10 @@ bad_name(~"good", Stream) ->
 big_header(_Request, Stream) ->
     {reply, ~"", roadrunner_grpc:set_headers([{~"x-big", binary:copy(~"a", 500)}], Stream)}.
 
+%% A trailer too big for a client that limits its header lists.
+big_trailer(_Request, Stream) ->
+    {reply, ~"", roadrunner_grpc:set_trailers([{~"x-big", binary:copy(~"a", 500)}], Stream)}.
+
 %% A header value with a CR LF, ahead of a response...
 unsafe_header(_Request, Stream) ->
     Stream1 = roadrunner_grpc:set_headers([{~"x-a", <<"a\r\nb">>}], Stream),
@@ -195,4 +207,56 @@ held(Stream) ->
     roadrunner_grpc_held ! {held, self()},
     receive
         go -> sum(Stream)
+    end.
+
+%% Sends until a write fails: the client cancelled, went away, or the
+%% call's deadline cancelled it.
+flood(Request, Stream) ->
+    flood(Request, roadrunner_grpc:send(Request, Stream)).
+
+%% Works without reading or writing until the process registered as
+%% `roadrunner_grpc_held` lets it go, then fails.
+hold(_Request, Stream) ->
+    roadrunner_grpc_held ! {held, self()},
+    receive
+        go -> {error, not_found, ~"gone", Stream}
+    end.
+
+%% Waits on messages of its own until `cancelled/2` says the call is over.
+watch(_Request, Stream) ->
+    receive
+        Message ->
+            case roadrunner_grpc:cancelled(Message, Stream) of
+                true -> {ok, Stream};
+                false -> watch(~"", Stream)
+            end
+    end.
+
+%% Stops on purpose after a response started.
+stop_after(Request, Stream) ->
+    _ = roadrunner_grpc:send(Request, Stream),
+    exit({shutdown, stopped}).
+
+%% `Hold`, asking for the reset the request's number of milliseconds
+%% before the call's deadline.
+reset_at(Before, Stream) ->
+    ok = until(roadrunner_grpc:deadline(Stream) - binary_to_integer(Before)),
+    hold(Before, Stream).
+
+%% `Watch`, then working on until the call's deadline before it returns.
+watch_late(Request, Stream) ->
+    receive
+        Message ->
+            case roadrunner_grpc:cancelled(Message, Stream) of
+                true ->
+                    ok = until(roadrunner_grpc:deadline(Stream)),
+                    {ok, Stream};
+                false ->
+                    watch_late(Request, Stream)
+            end
+    end.
+
+until(Time) ->
+    receive
+    after max(0, Time - erlang:monotonic_time(millisecond)) -> ok
     end.
