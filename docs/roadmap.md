@@ -181,8 +181,10 @@ adds preface sniffing or h1-parse-then-switch logic to the conn
 loop — a real expansion of the connection state machine that
 isn't on the critical path.
 
-**HttpArena impact:** none (its `baseline-h2c` / `json-h2c` profiles
-use prior-knowledge).
+**HttpArena impact:** HttpArena serves HTTP/1.1 and prior-knowledge
+h2c gRPC on the same port (8080). Its gRPC client never sends
+`Upgrade`, so the shared-port preface sniff is what lets the main entry
+run `unary-grpc`.
 
 **Scope:** medium. Decide on shared-port sniff vs h1-parse-Upgrade;
 implement the chosen path; tests for both successful upgrade and
