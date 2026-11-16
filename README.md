@@ -419,7 +419,9 @@ By default a method gets and returns raw bytes. For Protocol Buffers, use
 or write your own codec.
 
 Give gRPC a listener of its own with `body_buffering => manual`, so streams
-really stream. A call over HTTP/1.1 is answered `505`. See the
+really stream. A call over HTTP/1.1 is answered `505`. To call a gRPC
+server from Erlang, `roadrunner_grpc_client` is a small client for tests,
+tooling and simple calls. See the
 [gRPC guide](https://github.com/arizona-framework/roadrunner/blob/main/docs/grpc.md)
 for the details.
 
@@ -569,6 +571,7 @@ to `roadrunner_grpc:routes/1`. See the
 | `roadrunner_grpc_codec_raw` | Default gRPC codec, messages as raw bytes |
 | `roadrunner_grpc_health` | gRPC health service and its statuses |
 | `roadrunner_grpc_reflection` | gRPC server reflection |
+| `roadrunner_grpc_client` | gRPC client for tests, tooling and simple calls |
 
 ## Conformance
 
