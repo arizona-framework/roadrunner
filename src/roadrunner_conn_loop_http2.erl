@@ -112,11 +112,10 @@
 %% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`.
 -define(MAX_FRAME_SIZE, 16_384).
 
-%% Default cumulative cap on an assembled HEADERS+CONTINUATION block. Each
-%% frame is already bounded to MAX_FRAME_SIZE, but the number of CONTINUATION
-%% frames is not, so without this a peer can flood CONTINUATION frames and
-%% grow the block without bound (the HTTP/2 CONTINUATION Flood). Overridable
-%% per listener via the `max_header_block` http2 opt. h1 and h3 have their own
+%% Default cap on a request's assembled HEADERS+CONTINUATION block. A
+%% request over it is answered 431 on its own stream, its block still
+%% decoded (HPACK state is per connection, RFC 9113 §4.3). Overridable per
+%% listener via the `max_header_block` http2 opt. h1 and h3 have their own
 %% header-block caps (each separately configurable; h1 defaults to 10240, h3
 %% to 16384).
 -define(MAX_HEADER_BLOCK, 16_384).
@@ -126,6 +125,19 @@
 %% overhead alone pushes it up), so giving it headroom over `max_header_block`
 %% means the decoded gate only fires on genuinely huge header sets. When the
 %% encoded cap is overridden, the default tracks it (`2 * max_header_block`).
+%%
+%% The larger of the two is the most the conn assembles of one block (the
+%% `header_block_ceiling`). Each frame is bounded to MAX_FRAME_SIZE, but the
+%% number of CONTINUATION frames is not, so without a ceiling a peer could
+%% grow a block without bound (the HTTP/2 CONTINUATION Flood); past it the
+%% connection ends with GOAWAY(ENHANCE_YOUR_CALM). A client that keeps to
+%% the advertised list size and sends its headers plain or Huffman-coded
+%% as encoders usually do stays under it: a field then encodes in about
+%% its name and value plus a few length bytes, under the 32 bytes the list
+%% size counts for it. Huffman coding can make a string longer than it is
+%% (RFC 7541 §5.2: a backslash takes 19 bits), so a block of such strings can
+%% pass the ceiling while its list size does not; the setting is advisory
+%% (RFC 9113 §6.5.2).
 -define(DEFAULT_MAX_HEADER_LIST_SIZE, (2 * ?MAX_HEADER_BLOCK)).
 
 %% RFC 7541 §4.2 default HPACK dynamic-table size: what we tell the peer
@@ -340,9 +352,14 @@
     %% client is resetting far beyond the limit and gets
     %% GOAWAY(ENHANCE_YOUR_CALM) (`refuse_over_limit/5`).
     reset_refusals = 0 :: non_neg_integer(),
-    %% Cumulative HEADERS+CONTINUATION block cap (CONTINUATION-flood guard).
-    %% Read from proto_opts at `enter/6`.
+    %% A request's HEADERS+CONTINUATION block cap: a larger block is
+    %% decoded, then answered 431 in `finalize_headers/2`. Read from
+    %% proto_opts at `enter/6`.
     max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
+    %% The most bytes of one block the conn assembles (CONTINUATION-flood
+    %% guard), the larger of `max_header_block` and `max_header_list_size`;
+    %% past it, GOAWAY(ENHANCE_YOUR_CALM) in `on_continuation/4`.
+    header_block_ceiling = ?DEFAULT_MAX_HEADER_LIST_SIZE :: pos_integer(),
     %% Request-body cap (`max_content_length` listener opt); an over-cap
     %% body answers 413 + RST_STREAM(NO_ERROR). Read from proto_opts at
     %% `enter/6`.
@@ -498,6 +515,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         stream_recv_window_threshold = StreamThreshold,
         max_concurrent_streams = MaxStreams,
         max_header_block = MaxHeaderBlock,
+        header_block_ceiling = max(MaxHeaderBlock, MaxHeaderListSize),
         max_header_list_size = MaxHeaderListSize,
         max_content_length = MaxContentLength,
         body_buffering = maps:get(body_buffering, ProtoOpts, auto),
@@ -1295,7 +1313,7 @@ new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow, BodyCap) ->
     }.
 
 on_continuation(
-    StreamId, Flags, Fragment, #loop{streams = Streams, max_header_block = MaxHeaderBlock} = State
+    StreamId, Flags, Fragment, #loop{streams = Streams, header_block_ceiling = Ceiling} = State
 ) ->
     case Streams of
         #{
@@ -1311,16 +1329,17 @@ on_continuation(
             NewLen = Len + FragLen,
             EndHeaders = (Flags band 16#04) =/= 0,
             %% CONTINUATION-flood guard, both variants. The assembled
-            %% block crossed the cap (memory exhaustion), or a non-final
+            %% block crossed the ceiling (memory exhaustion), or a non-final
             %% empty CONTINUATION made no forward progress (an endless
             %% stream of those pins the conn in header assembly without
             %% ever growing the byte total). Each frame is bounded by
             %% MAX_FRAME_SIZE but neither the cumulative size nor the
             %% frame count is otherwise limited. The per-connection HPACK
             %% context can't be resynced if we skip the block, so this is
-            %% a connection error rather than a per-stream reject.
+            %% a connection error rather than a per-stream reject (a block
+            %% only over `max_header_block` is, in `finalize_headers/2`).
             %% ENHANCE_YOUR_CALM is the RFC 9113 §6.5.2 resource-limit code.
-            case NewLen > MaxHeaderBlock orelse (FragLen =:= 0 andalso not EndHeaders) of
+            case NewLen > Ceiling orelse (FragLen =:= 0 andalso not EndHeaders) of
                 true ->
                     goaway_exit(State, enhance_your_calm);
                 false ->
@@ -1380,11 +1399,18 @@ finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) -
 %% the stream entry. If END_STREAM was set on the HEADERS frame,
 %% dispatch the worker now (no body); otherwise wait for DATA.
 finalize_headers(
-    StreamId, #loop{streams = Streams, hpack_dec = Dec, max_header_list_size = MaxHLS} = State
+    StreamId,
+    #loop{
+        streams = Streams,
+        hpack_dec = Dec,
+        max_header_block = MaxHeaderBlock,
+        max_header_list_size = MaxHLS
+    } = State
 ) ->
     #{
         StreamId := #{
             header_fragment := Fragment,
+            header_len := Len,
             end_stream_seen := EndStreamSeen
         } = Stream
     } = Streams,
@@ -1398,13 +1424,15 @@ finalize_headers(
                 hpack_dec = Dec1,
                 streams = Streams#{StreamId := Stream1}
             },
-            case roadrunner_http:header_list_size(Headers) > MaxHLS of
+            case Len > MaxHeaderBlock orelse roadrunner_http:header_list_size(Headers) > MaxHLS of
                 true ->
-                    %% RFC 9113 §6.5.2: the decoded list exceeds the
-                    %% MAX_HEADER_LIST_SIZE we advertised. Answer 431, then
-                    %% RST_STREAM(NO_ERROR) (decode succeeded, so the
-                    %% connection is intact), and drop the stream — no worker
-                    %% is dispatched until END_STREAM.
+                    %% The block is over `max_header_block`, or the decoded
+                    %% list over the MAX_HEADER_LIST_SIZE we advertised (RFC
+                    %% 9113 §6.5.2). Either refuses this request alone
+                    %% (§10.5.1): answer 431, then RST_STREAM(NO_ERROR)
+                    %% (decode succeeded, so the connection is intact), and
+                    %% drop the stream; no worker is dispatched until
+                    %% END_STREAM.
                     Resp = ~"Request Header Fields Too Large",
                     State2 = encode_and_send_response_atomic(
                         State1,

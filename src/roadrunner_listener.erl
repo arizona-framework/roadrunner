@@ -659,8 +659,9 @@ ops-tuning rationale.
     %%   SETTINGS; HEADERS that would exceed it get
     %%   RST_STREAM(REFUSED_STREAM). Default `100`.
     %% - `max_header_block` — cumulative HEADERS+CONTINUATION block cap
-    %%   (`pos_integer`); over-cap closes the conn with
-    %%   GOAWAY(ENHANCE_YOUR_CALM). Default `16384`.
+    %%   (`pos_integer`); an over-cap request gets `431`, and a block over
+    %%   the larger of this and `max_header_list_size` closes the conn
+    %%   with GOAWAY(ENHANCE_YOUR_CALM). Default `16384`.
     %%
     %% Empty list, unknown protocol atoms, duplicate entries, bad
     %% tuple shape, unknown sub-option keys, or out-of-range sub-
@@ -778,10 +779,14 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   client that keeps opening streams while such handlers alone fill the
   limit gets `GOAWAY(ENHANCE_YOUR_CALM)` (the HTTP/2 rapid reset
   attack). Default `100`.
-- `max_header_block` — cumulative cap on an assembled
-  HEADERS+CONTINUATION block (the CONTINUATION-flood guard);
-  over-cap closes the connection with `GOAWAY(ENHANCE_YOUR_CALM)`.
-  Default `16384`. This is the h2 counterpart to the `{http1, ...}`
+- `max_header_block` — cumulative cap on a request's assembled
+  HEADERS+CONTINUATION block; an over-cap request gets `431` +
+  `RST_STREAM(NO_ERROR)` and the connection serves on. A block over the
+  larger of this and `max_header_list_size` is not read to its end (the
+  CONTINUATION-flood guard): the connection is closed with
+  `GOAWAY(ENHANCE_YOUR_CALM)`. A client that keeps to the advertised
+  `max_header_list_size` and encodes its headers as usual stays under
+  it. Default `16384`. This is the h2 counterpart to the `{http1, ...}`
   `max_header_block` opt, but the two are independent and default
   differently (h1 `10240`, h2 `16384`).
 - `max_header_list_size` — cap on the *decoded* (uncompressed)

@@ -124,6 +124,7 @@ are advertised to the peer in the initial `SETTINGS` frame.
 | `SETTINGS_MAX_CONCURRENT_STREAMS` | 100 | yes |
 | HPACK decoder table | 4 KB | no (fixed) |
 | Header block (HEADERS + CONTINUATION) | 16 KB | yes |
+| Decoded header list (`SETTINGS_MAX_HEADER_LIST_SIZE`) | 32 KB | yes |
 | Connection receive window (`conn_window`) | 2^31-1 (the largest allowed) | yes |
 | Stream receive window (`stream_window`) | 16 MB | yes |
 | Unread socket reads per connection (`active`) | 16 | yes |
@@ -150,11 +151,23 @@ those handlers ends, and a client that still has streams of its own open
 is only refused, so a client that resets its requests now and then is
 not closed for it.
 
-The cumulative header block has no
-`SETTINGS` counterpart yet, so it is enforced silently: a peer that
-overruns it gets `GOAWAY(ENHANCE_YOUR_CALM)`. The concurrency and
-header-block caps are tuned under `{http2, #{...}}` in the `protocols`
-list, with the keys `max_concurrent_streams` and `max_header_block`.
+A request whose header block (HEADERS plus its CONTINUATION frames) is
+over `max_header_block`, or whose decoded headers are over the
+advertised `SETTINGS_MAX_HEADER_LIST_SIZE` (name + value + 32 per field,
+RFC 9113 §6.5.2), is answered `431 Request Header Fields Too Large` and
+its stream reset with `NO_ERROR`; the connection and its other streams
+go on. The block is still decoded first, as every block updates the
+connection's HPACK state (RFC 9113 §4.3). The list size defaults to twice
+`max_header_block`, and the larger of the two is the most of one block
+the server reads: a block that grows past it is the CONTINUATION flood,
+and the connection is closed with `GOAWAY(ENHANCE_YOUR_CALM)`. A client
+that keeps to the advertised list size and encodes its headers as usual
+stays under it; Huffman coding can make some strings longer than they
+are, so a block of those can pass it, which the advisory list size
+(RFC 9113 §6.5.2) allows. The
+concurrency and header caps are tuned under `{http2, #{...}}` in the
+`protocols` list, with the keys `max_concurrent_streams`,
+`max_header_block` and `max_header_list_size`.
 
 `active` sets how many socket reads a connection takes before it asks
 the socket for more (`once` asks after every read). On TLS each ask is a
@@ -185,12 +198,17 @@ real limit. HTTP/3 does the same with `SETTINGS_MAX_FIELD_SECTION_SIZE`
 | Limit | Default | Configurable |
 |---|---|---|
 | Field section block (encoded HEADERS) | 16 KB | yes |
+| Decoded field section (`SETTINGS_MAX_FIELD_SECTION_SIZE`) | 32 KB | yes |
 | `initial_max_streams_bidi` | 100 | yes |
 | QPACK dynamic table (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`) | 4 KB | yes |
 | QPACK blocked streams (`SETTINGS_QPACK_BLOCKED_STREAMS`) | 16 | yes |
 
 The encoded request field section is capped before it reaches the
-handler; an overrun answers `431 Request Header Fields Too Large`. The
+handler; an overrun answers `431 Request Header Fields Too Large`, as
+does a decoded one over the advertised `SETTINGS_MAX_FIELD_SECTION_SIZE`
+(twice `max_header_block` unless set with `max_field_section_size`).
+Either refuses that request alone: a field section is decoded on its own
+stream, so the connection's other requests go on. The
 concurrent client-initiated bidirectional (request) stream count is
 advertised to the peer in the QUIC transport parameters, the h3
 counterpart to HTTP/2's `max_concurrent_streams`. Both are tuned under
