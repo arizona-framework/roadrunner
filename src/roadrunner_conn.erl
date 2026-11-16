@@ -160,7 +160,7 @@ deadline in milliseconds. The shed form answers it `503` with the
 
 -type proto_opts() :: #{
     dispatch := dispatch(),
-    middlewares := roadrunner_middleware:middleware_list(),
+    middlewares := roadrunner_middleware:middlewares(),
     max_content_length := non_neg_integer(),
     %% WebSocket inbound size caps. `ws_max_frame_size` bounds a single
     %% frame's declared payload (enforced before buffering);

@@ -183,7 +183,7 @@ server_header(Req, Next, Server) ->
 
 -export([compose/2, build_pipeline/2, compile_pipeline/3, compile_pipeline/4, resolve/1]).
 -export_type([
-    middleware/0, middleware_fun/0, middleware_list/0, next/0, config/0, state/0, resolved/0
+    middleware/0, middleware_fun/0, middlewares/0, next/0, config/0, state/0, resolved/0
 ]).
 
 -doc """
@@ -240,7 +240,7 @@ bare `Callable` defaults it to `#{}`.
     | {middleware_fun(), config()}.
 
 -doc "An ordered list of `t:middleware/0` entries.".
--type middleware_list() :: [middleware()].
+-type middlewares() :: [middleware()].
 
 -doc """
 Optional compile-time setup. When a module exports it, it runs **once**
@@ -291,7 +291,7 @@ single time and reuse the result across every route (via
 Raises `{invalid_middleware, Entry, Reason}` for an entry that is not a
 middleware (see "Middleware shape" above).
 """.
--spec resolve(middleware_list()) -> [resolved()].
+-spec resolve(middlewares()) -> [resolved()].
 resolve(Mws) ->
     [resolve_entry(Mw) || Mw <- Mws].
 
@@ -346,7 +346,7 @@ list runs **outermost** — it gets the first crack at the request and the
 last crack at the response. The handler is the innermost call; an empty
 list returns the handler fun unchanged.
 """.
--spec compose(middleware_list(), next()) -> next().
+-spec compose(middlewares(), next()) -> next().
 compose(Mws, Handler) ->
     compose_resolved(resolve(Mws), Handler).
 
@@ -379,7 +379,7 @@ compose_resolved([{Callable, State} | Rest], Handler) ->
 %% `compose/2` to save one closure allocation + one indirection on the
 %% no-mws fast path most production handlers hit.
 -doc false.
--spec build_pipeline(middleware_list(), module()) -> next().
+-spec build_pipeline(middlewares(), module()) -> next().
 build_pipeline([], Handler) ->
     fun Handler:handle/1;
 build_pipeline(Mws, Handler) ->
@@ -392,7 +392,7 @@ build_pipeline(Mws, Handler) ->
 %% single-handler dispatch (one pipeline, so no listener/route split). Routes
 %% use `compile_pipeline/4`.
 -doc false.
--spec compile_pipeline(middleware_list(), module(), no_state | {state, term()}) -> next().
+-spec compile_pipeline(middlewares(), module(), no_state | {state, term()}) -> next().
 compile_pipeline(Mws, Handler, no_state) ->
     build_pipeline(Mws, Handler);
 compile_pipeline(Mws, Handler, {state, State}) ->
@@ -405,7 +405,7 @@ compile_pipeline(Mws, Handler, {state, State}) ->
 %% handler), staying outermost. Used by `roadrunner_router:compile/2` so a
 %% listener-wide middleware's `init/1` runs once, not once per route.
 -doc false.
--spec compile_pipeline([resolved()], middleware_list(), module(), no_state | {state, term()}) ->
+-spec compile_pipeline([resolved()], middlewares(), module(), no_state | {state, term()}) ->
     next().
 compile_pipeline(ResolvedListener, RouteMws, Handler, no_state) ->
     build_resolved_pipeline(ResolvedListener, RouteMws, Handler);
@@ -417,7 +417,7 @@ compile_pipeline(ResolvedListener, RouteMws, Handler, {state, State}) ->
 %% middlewares (resolved here) around the handler. An empty listener + route
 %% list collapses to `fun Handler:handle/1` (no closures) via the
 %% `compose_resolved/2` empty-list clause.
--spec build_resolved_pipeline([resolved()], middleware_list(), module()) -> next().
+-spec build_resolved_pipeline([resolved()], middlewares(), module()) -> next().
 build_resolved_pipeline(ResolvedListener, RouteMws, Handler) ->
     Inner = compose_resolved(resolve(RouteMws), fun Handler:handle/1),
     compose_resolved(ResolvedListener, Inner).
