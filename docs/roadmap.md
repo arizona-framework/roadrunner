@@ -181,6 +181,22 @@ profiles the leaderboard scores.
 
 **Scope:** medium, in several PRs.
 
+### gRPC interceptors — medium
+
+**What:** an `interceptors` option for `roadrunner_grpc:routes/1` that
+wraps each call with what a middleware does not know as the call
+starts: the service, the method and the call kind, around the method
+itself, and around each message read and sent for streams (grpc-go's
+stream interceptors).
+
+**Why deferred:** `middlewares` already covers checks ahead of a call
+(auth, rate limits, values for the method) and `reject/3` answers them
+with a gRPC status; a middleware reads the method from the path. A
+complete interceptor wraps the stream's reads and writes too, which is
+its own design.
+
+**Scope:** medium.
+
 ## Other
 
 ### CI bench-vs-baseline comparison

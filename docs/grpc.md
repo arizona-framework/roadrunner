@@ -123,6 +123,8 @@ every service in it:
 - `max_message_size`: the largest request message, in bytes
 - `max_content_length`: the most all of a call's requests may add up to,
   in bytes, set on each route in place of the listener's
+- `middlewares`: middlewares for every route, see
+  [Middlewares](#middlewares)
 - `send_compression`: how responses are compressed, `identity` (the
   default), `gzip` or `deflate`
 - `health`: `true` adds the health service, by default `false`
@@ -433,6 +435,60 @@ One more is answered at the HTTP level once the call runs: response
 headers too big for the client's `SETTINGS_MAX_HEADER_LIST_SIZE` cannot
 be sent, so the call gets a `500` and stops.
 
+## Middlewares
+
+`middlewares` puts route middlewares (see `roadrunner_middleware`) on
+every route `routes/1` returns, the health and reflection ones included,
+as gRPC servers apply their interceptors to every service they serve. A
+middleware runs before the call starts, with the request: it can check
+the request's metadata (as headers) or the client's certificate, put
+values on the request for the method (`roadrunner_req:put_private/3`,
+read back through `roadrunner_grpc:request/1`), and refuse the call.
+
+To refuse a call, return `roadrunner_grpc:reject(Status, Message, Req)`
+in place of `Next(Req)`. It answers with the gRPC status and message in
+the response headers (Trailers-Only), which is what gRPC clients read.
+An HTTP error such as a `401` would reach them as `UNKNOWN` or
+`UNAVAILABLE`, without your message.
+
+```erlang
+-module(api_key).
+-behaviour(roadrunner_middleware).
+-export([call/3]).
+
+call(Req, Next, Keys) ->
+    case roadrunner_req:header(~"x-api-key", Req) of
+        Key when is_binary(Key) andalso is_map_key(Key, Keys) ->
+            Next(roadrunner_req:put_private(api_client, map_get(Key, Keys), Req));
+        _ ->
+            roadrunner_grpc:reject(unauthenticated, ~"missing or unknown x-api-key", Req)
+    end.
+```
+
+```erlang
+roadrunner_grpc:routes(#{
+    services => [greeter],
+    health => true,
+    middlewares => [{api_key, #{~"k1" => ~"client-1"}}]
+})
+```
+
+A middleware that should let some calls through, such as health checks
+from a load balancer, matches on the path, `/package.Service/Method`:
+
+```erlang
+call(Req, Next, Keys) ->
+    case roadrunner_req:path(Req) of
+        <<"/grpc.health.v1.Health/", _/binary>> -> Next(Req);
+        _ -> check_key(Req, Next, Keys)
+    end.
+```
+
+A call a middleware rejects never starts: its method does not run and it
+emits no gRPC call events, only the request's own (see
+[Telemetry](#telemetry)). The listener's `middlewares` run too, before
+the routes' ones, for gRPC requests as for any other.
+
 ## Deadlines and cancellation
 
 A client sets a deadline with the `grpc-timeout` header. If a `recv/1`, or
@@ -592,6 +648,11 @@ How a call ended is one of:
 - `stopped`: it ended with no gRPC status (an `exit({shutdown, _})`, or
   response headers too large for the client); the status is the one a
   client reads then, `unknown` before any response and `internal` after
+
+A request answered before its call starts emits no gRPC call events:
+an HTTP refusal (`405`, `415`, `505`, the router's `404`) or a
+middleware's `roadrunner_grpc:reject/3`. Its request events
+(`request_start`, `request_stop`) report it.
 
 Every call that starts ends with exactly one stop or exception event,
 unless its process dies of an exit signal it does not trap (such as

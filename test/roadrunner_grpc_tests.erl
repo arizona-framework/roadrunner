@@ -213,3 +213,69 @@ init_route_bad_rpc_test() ->
         {invalid_grpc_opt, service, {roadrunner_grpc_unexported_service, ~"Gone", _}},
         ?M:init_route(#{service => roadrunner_grpc_unexported_service})
     ).
+
+%% `middlewares` go on every route, the health and reflection ones among
+%% them; one that is not a list is refused.
+routes_middlewares_test() ->
+    Mws = [roadrunner_compress],
+    Routes = ?M:routes(#{
+        services => [?SVC],
+        health => true,
+        reflection => true,
+        middlewares => Mws,
+        max_content_length => 7
+    }),
+    ?assertMatch(
+        [
+            #{middlewares := Mws, state := #{service := roadrunner_grpc_health}},
+            #{middlewares := Mws},
+            #{middlewares := Mws},
+            #{middlewares := Mws, max_content_length := 7, state := #{service := ?SVC}}
+        ],
+        Routes
+    ),
+    [#{state := State} | _] = lists:reverse(Routes),
+    ?assertNot(is_map_key(middlewares, State)),
+    ?assertError(
+        {invalid_grpc_opt, middlewares, x}, ?M:routes(#{services => [?SVC], middlewares => x})
+    ).
+
+%% A middleware's rejection answers with the status in the headers alone,
+%% under the request's gRPC `content-type`, or gRPC's own.
+reject_test() ->
+    Req = #{headers => [{~"content-type", ~"Application/GRPC+Test; x=1"}]},
+    ?assertEqual(
+        {
+            {200,
+                [
+                    {~"content-type", ~"application/grpc+test"},
+                    {~"grpc-status", ~"16"},
+                    {~"grpc-message", ~"no key"}
+                ],
+                <<>>},
+            Req
+        },
+        ?M:reject(unauthenticated, ~"no key", Req)
+    ),
+    ContentType = fun(Headers) ->
+        {{200, [{~"content-type", Type} | _], <<>>}, _} =
+            ?M:reject(permission_denied, <<>>, #{headers => Headers}),
+        Type
+    end,
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpcx"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc+"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc+ ;a=b"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc+a b"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc+a,b"}])),
+    ?assertEqual(
+        ~"application/grpc+x.y-z_1", ContentType([{~"content-type", ~"application/grpc+X.y-Z_1"}])
+    ),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"text/plain"}])),
+    ?assertEqual(~"application/grpc", ContentType([])),
+    ?assertMatch(
+        {{200, [_, {~"grpc-status", ~"7"}], <<>>}, _},
+        ?M:reject(permission_denied, <<>>, #{headers => []})
+    ),
+    ?assertError(function_clause, ?M:reject(ok, <<>>, #{headers => []})),
+    ?assertError(function_clause, ?M:reject(nope, <<>>, #{headers => []})).

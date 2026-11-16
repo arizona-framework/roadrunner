@@ -2,7 +2,8 @@
 -moduledoc """
 What a gRPC method and the middlewares in front of it reach beyond the
 stream: the call's HTTP request, over HTTP/2 with TLS and a client
-certificate.
+certificate, and middlewares that `roadrunner_grpc:routes/1` puts on
+every route, which answer a call with a gRPC status.
 """.
 
 -behaviour(ct_suite).
@@ -11,7 +12,12 @@ certificate.
 -include_lib("stdlib/include/assert.hrl").
 
 -export([suite/0, all/0, init_per_testcase/2, end_per_testcase/2]).
--export([request_tells_what_the_metadata_leaves_out/1]).
+-export([
+    request_tells_what_the_metadata_leaves_out/1,
+    middleware_rejects_with_a_status/1,
+    middleware_lets_a_call_through/1,
+    middleware_guards_the_health_service/1
+]).
 
 -define(SVC, ~"/test.Echo/").
 
@@ -19,7 +25,12 @@ suite() ->
     [{timetrap, {seconds, 30}}].
 
 all() ->
-    [request_tells_what_the_metadata_leaves_out].
+    [
+        request_tells_what_the_metadata_leaves_out,
+        middleware_rejects_with_a_status,
+        middleware_lets_a_call_through,
+        middleware_guards_the_health_service
+    ].
 
 init_per_testcase(request_tells_what_the_metadata_leaves_out, Config) ->
     start(Config, tls, #{
@@ -29,7 +40,23 @@ init_per_testcase(request_tells_what_the_metadata_leaves_out, Config) ->
             end
         ],
         routes => roadrunner_grpc:routes(#{services => [roadrunner_grpc_test_service]})
+    });
+init_per_testcase(_Case, Config) ->
+    start(Config, tcp, #{
+        routes => roadrunner_grpc:routes(#{
+            services => [roadrunner_grpc_test_service],
+            health => true,
+            middlewares => [{fun api_key/3, ~"secret"}]
+        })
     }).
+
+%% A middleware that lets a call with the right `x-api-key` through and
+%% rejects the others `UNAUTHENTICATED`.
+api_key(Req, Next, Key) ->
+    case roadrunner_req:header(~"x-api-key", Req) of
+        Key -> Next(Req);
+        _ -> roadrunner_grpc:reject(unauthenticated, ~"bad api key: café", Req)
+    end.
 
 end_per_testcase(_Case, _Config) ->
     ok = roadrunner_listener:stop(?MODULE).
@@ -58,9 +85,46 @@ request_tells_what_the_metadata_leaves_out(Config) ->
     ?assertEqual(~"5S", Timeout),
     ?assertEqual([{~"x-a", ~"b"}], Metadata).
 
+%% The call is answered Trailers-Only, with the status and its message,
+%% and the method never runs.
+middleware_rejects_with_a_status(Config) ->
+    {Headers, [], trailers_only, _} = call(Config, ~"Unary", [], [~"x"]),
+    ?assertEqual(~"200", header(~":status", Headers)),
+    ?assertEqual(~"application/grpc", header(~"content-type", Headers)),
+    ?assertEqual(~"16", header(~"grpc-status", Headers)),
+    ?assertEqual(
+        ~"bad api key: café",
+        roadrunner_grpc_status:decode_message(header(~"grpc-message", Headers))
+    ).
+
+middleware_lets_a_call_through(Config) ->
+    {_, [~"x"], Trailers, _} = call(Config, ~"Unary", [{~"x-api-key", ~"secret"}], [~"x"]),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)).
+
+%% The health service's route carries the middlewares too.
+middleware_guards_the_health_service(Config) ->
+    {Headers, [], trailers_only, _} = roadrunner_grpc_test_client:call(
+        open(Config), 1, ~"/grpc.health.v1.Health/Check", [], [<<>>]
+    ),
+    ?assertEqual(~"16", header(~"grpc-status", Headers)),
+    {_, [_], Trailers, _} = roadrunner_grpc_test_client:call(
+        open(Config), 1, ~"/grpc.health.v1.Health/Check", [{~"x-api-key", ~"secret"}], [<<>>]
+    ),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)).
+
 %% --- helpers ---
 
+open(Config) ->
+    roadrunner_grpc_test_client:open(?config(port, Config)).
+
+call(Config, Method, Extra, Messages) ->
+    roadrunner_grpc_test_client:call(
+        open(Config), 1, <<?SVC/binary, Method/binary>>, Extra, Messages
+    ).
+
 start(Config, Transport, Opts) ->
+    %% The health service's store runs under the application.
+    {ok, _} = application:ensure_all_started(roadrunner),
     Defaults = #{port => 0, protocols => [http2], body_buffering => manual},
     {ok, _} = roadrunner_listener:start_link(
         ?MODULE, maps:merge(maps:merge(Defaults, transport(Transport)), Opts)
