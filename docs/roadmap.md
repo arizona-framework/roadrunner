@@ -164,32 +164,6 @@ with and without packet loss). Remaining:
 
 Remaining HttpArena profiles need roadrunner-side features.
 
-### h2c Upgrade-mode on a shared port — medium (roadrunner-side)
-
-**What:** RFC 7540 §3.2 `Upgrade: h2c` negotiation: an HTTP/1.1
-request with `Upgrade: h2c, HTTP2-Settings: <base64>` headers,
-answered with `101 Switching Protocols`, after which the
-connection upstreams h2 frames. The same listener accepts h1 and
-h2c on the same port, unlocking `protocols => [http1, http2]` on
-plain TCP (today that combo is rejected at `init/1` with
-`{listener_opt_conflict, protocols, _, no_h2c_upgrade}`).
-
-**Why deferred:** The prior-knowledge variant (`protocols => [http2]`
-on a dedicated plaintext listener) ships and covers the common case
-(benchmarks, internal clients with prior knowledge). Upgrade-mode
-adds preface sniffing or h1-parse-then-switch logic to the conn
-loop — a real expansion of the connection state machine that
-isn't on the critical path.
-
-**HttpArena impact:** HttpArena serves HTTP/1.1 and prior-knowledge
-h2c gRPC on the same port (8080). Its gRPC client never sends
-`Upgrade`, so the shared-port preface sniff is what lets the main entry
-run `unary-grpc`.
-
-**Scope:** medium. Decide on shared-port sniff vs h1-parse-Upgrade;
-implement the chosen path; tests for both successful upgrade and
-`Upgrade: h2c` rejection on TLS sockets (the spec forbids it).
-
 ### HTTP/3 — see above
 
 Unlocks `baseline-h3` and `static-h3`.
@@ -337,6 +311,21 @@ to a path.
 **Why deferred:** no event handler asking for it today.
 `(listener_name, method, path)` is already enough to identify a
 route in dashboards; named lookup is a niceness, not a need.
+
+### Per-route `body_buffering` — large
+
+**What:** Let a route pick `auto` or `manual` body buffering, in place of
+the listener's. A gRPC service wants `manual` so streams really stream,
+while the other routes on a listener that serves both HTTP/1.1 and HTTP/2
+on one port usually want `auto`.
+
+**Why deferred:** on HTTP/2 and HTTP/3 the connection decides from the
+listener's mode when to start a stream's worker (at the end of the headers
+or of the body), and the worker is what resolves the route, so the choice
+has to move to after routing. Today a gRPC listener of its own is the
+workaround.
+
+**Scope:** large.
 
 ### Nested route groups with shared prefix + middlewares — medium
 

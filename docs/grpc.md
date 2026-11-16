@@ -91,8 +91,11 @@ missing, the routes fail to compile and the listener does not start.
 ```
 
 On plain TCP, `protocols => [http2]` serves cleartext HTTP/2 with prior
-knowledge, which is what gRPC clients use for an insecure channel. With
-TLS, add HTTP/3 too:
+knowledge, which is what gRPC clients use for an insecure channel. To
+serve HTTP/1.1 on the same port too, use `protocols => [http1, http2]`: a
+connection that opens with the HTTP/2 preface is HTTP/2, any other is
+HTTP/1.1 (see [Body buffering](#body-buffering-use-manual) for what that
+means for the other routes). With TLS, add HTTP/3 too:
 
 ```erlang
 {ok, _} = roadrunner:start_listener(grpc, #{
@@ -145,8 +148,10 @@ finished sending, and a call over `max_content_length` is answered
 `413 Payload Too Large` instead of a gRPC status.
 
 `body_buffering` is a listener option, and with `manual` every other
-handler on the listener must read its own body. That is why a listener of
-its own is the best place for gRPC.
+handler on the listener must read its own body, over HTTP/1.1 as well as
+HTTP/2 when the listener serves both. That is why a listener of its own is
+the best place for gRPC. Setting `body_buffering` per route is on the
+roadmap.
 
 ### A service built at runtime
 

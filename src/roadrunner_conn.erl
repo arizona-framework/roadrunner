@@ -252,8 +252,9 @@ deadline in milliseconds. The shed form answers it `503` with the
     tls_upgrade => [ssl:tls_server_option()],
     %% Enabled protocols as a flat atom list in user-supplied (ALPN
     %% preference) order. On plain TCP with `[http2]`,
-    %% `roadrunner_conn_loop:awaiting_shoot/3` routes straight to the
-    %% h2 conn loop. HTTP/2 sub-opts are flattened onto proto_opts
+    %% `roadrunner_conn_loop:serve/5` routes straight to the h2 conn
+    %% loop; with both `http1` and `http2` it picks the loop from each
+    %% connection's first bytes. HTTP/2 sub-opts are flattened onto proto_opts
     %% top-level as `http2_conn_window`, `http2_stream_window`,
     %% `http2_window_refill_threshold` — see those keys below. The
     %% user-facing nested shape (`{http2, #{conn_window => N, ...}}`)

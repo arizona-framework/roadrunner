@@ -352,8 +352,9 @@ HTTP/1.1 and HTTP/2 share the TCP port. HTTP/3 serves over UDP
 on the same port number. When the listener also serves HTTP/1.1 or HTTP/2 on a
 fixed port (not `port => 0`), their responses advertise HTTP/3 in `Alt-Svc` so
 browsers upgrade. For HTTP/2 over plain TCP (prior knowledge), use
-`protocols => [http2]` without `tls`. Without `tls`, a listener serves either
-HTTP/1.1 or HTTP/2, not both.
+`protocols => [http2]` without `tls`, or `protocols => [http1, http2]` to serve
+both on one port: a connection that opens with the HTTP/2 preface is HTTP/2,
+any other is HTTP/1.1. `Upgrade: h2c` is not offered, as RFC 9113 deprecates it.
 
 For the fastest new connections, use an ECDSA P-256 certificate. Each new TLS
 or QUIC connection signs with the certificate's key, and an ECDSA P-256

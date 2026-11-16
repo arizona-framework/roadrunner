@@ -100,8 +100,9 @@ Notable differences:
   `max_connections` leaves it waiting in the backlog; its default is 16384,
   not 1024
 - HTTP/3 needs `tls` and runs over UDP on the same port number
-- Without `tls`, a listener serves either HTTP/1.1 or HTTP/2 (prior
-  knowledge), not both
+- Without `tls`, `protocols => [http1, http2]` serves HTTP/1.1 and
+  HTTP/2 (prior knowledge) on the same port, told apart by HTTP/2's
+  connection preface; `Upgrade: h2c` is not offered
 - A listener with `tls` starts `ssl` itself; add `ssl` to your application's
   `applications` list so releases include it
 - To stop gracefully, `roadrunner_listener:drain/2` stops accepting, lets open

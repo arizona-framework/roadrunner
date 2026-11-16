@@ -72,7 +72,7 @@
 %% Internal entries, invoked via `proc_lib:spawn_opt/4` and via
 %% `erlang:hibernate/3`. Must stay exported so the runtime can
 %% re-enter them after wake-from-hibernate.
--export([init_loop/2, recv_request_bytes_hib/3]).
+-export([init_loop/2, recv_request_bytes_hib/3, sniff_recv_hib/3]).
 
 %% Loop-state record carried through every phase. Allocated once on
 %% the transition out of `awaiting_shoot` and pattern-matched (not
@@ -386,8 +386,136 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
                 request_slot = request_slot(ProtoOpts)
             },
-            start_reading(S)
+            case shares_port_with_h2c(Scheme, ProtoOpts) of
+                true ->
+                    Deadline = erlang:monotonic_time(millisecond) + RequestTimeout,
+                    sniff_preface(S, Deadline);
+                false ->
+                    start_reading(S)
+            end
     end.
+
+%% True for a plain-TCP listener that serves both HTTP/1.1 and HTTP/2 on
+%% the port: each connection then picks its protocol from its first bytes
+%% (`sniff_preface/2`). A TLS connection that did not negotiate `h2` is
+%% HTTP/1.1 (RFC 9113 §3.2), and a plain-TCP `[http1]` listener reads its
+%% first request with no detour.
+-spec shares_port_with_h2c(http | https, roadrunner_conn:proto_opts()) -> boolean().
+shares_port_with_h2c(http, #{protocols := Protocols}) -> lists:member(http2, Protocols);
+shares_port_with_h2c(_Scheme, _ProtoOpts) -> false.
+
+%% --- protocol detection on a shared plain-TCP port ---
+%%
+%% A client with prior knowledge of HTTP/2 opens with the 24-byte
+%% connection preface `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` (RFC 9113
+%% §3.3, §3.4); no HTTP/1.1 request can start that way (the `PRI` method
+%% is reserved for it, RFC 7540 §11.6). The first bytes therefore decide the
+%% protocol: the whole preface hands the connection, those bytes included,
+%% to the HTTP/2 loop; bytes that leave the preface go to the HTTP/1.1
+%% loop as the start of its first request. Only a proper prefix of the
+%% preface waits for more, so an HTTP/1.1 request is told apart at its
+%% first byte, its second for `POST`, `PUT` and `PATCH` (its fifth for a
+%% `PRI` request), and its first
+%% read is the one `recv_idle/2` would have made: no extra read and no
+%% extra wait. The wait for the first bytes keeps the bounds of the wait
+%% for a first request: `request_timeout` (with its 408), drains and
+%% `hibernate_after` act as they do in `recv_active/3`. A client still
+%% short of the whole preface is not held to `min_bytes_per_second`,
+%% just as a prior-knowledge HTTP/2 client is not: it can hold the
+%% connection for `request_timeout` at most. An HTTP/1.1 request leaves
+%% the preface within its first bytes and is measured from its first byte
+%% on.
+%%
+%% `Upgrade: h2c` (RFC 7540 §3.2) is not offered: RFC 9113 §3.1 deprecates
+%% it, and an HTTP/1.1 request carrying it is served as HTTP/1.1, which a
+%% server may do with any upgrade it does not take (RFC 9110 §7.8).
+-spec sniff_preface(#loop_state{}, integer()) -> no_return().
+sniff_preface(#loop_state{buffered = Buf} = S, Deadline) ->
+    case roadrunner_conn_loop_http2:preface(Buf) of
+        http1 ->
+            ok = arm_reading(S),
+            handle_request_bytes(S, Deadline);
+        http2 ->
+            #loop_state{
+                socket = Socket,
+                proto_opts = ProtoOpts,
+                listener_name = ListenerName,
+                peer = Peer,
+                conn_span = ConnSpan
+            } = S,
+            roadrunner_conn_loop_http2:enter(
+                Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buf
+            );
+        more ->
+            sniff_recv(S, Deadline)
+    end.
+
+%% One read toward `sniff_preface/2`, armed `{active, once}` and parked
+%% in `receive` like `recv_idle/2`, so a drain is seen at once. The socket
+%% is passive again when the bytes arrive, as both loops expect it.
+-spec sniff_recv(#loop_state{}, integer()) -> no_return().
+sniff_recv(
+    #loop_state{
+        socket = Socket,
+        buffered = Buf,
+        recv_phase_start = PhaseStart,
+        recv_phase_bytes = PhaseBytes,
+        recv_mode = Mode
+    } = S,
+    Deadline
+) ->
+    arm_active_once(S),
+    {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
+    HibernateAfter = hibernate_after(Mode),
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {DataTag, _Sock, Bytes} ->
+            %% The slowloris window opens at the first byte, so an HTTP/1.1
+            %% request is measured from there once it is told apart.
+            PhaseStart1 =
+                case PhaseBytes of
+                    0 -> erlang:monotonic_time(millisecond);
+                    _ -> PhaseStart
+                end,
+            sniff_preface(
+                S#loop_state{
+                    buffered = roadrunner_bin:append(Buf, Bytes),
+                    recv_phase_bytes = PhaseBytes + byte_size(Bytes),
+                    recv_phase_start = PhaseStart1
+                },
+                Deadline
+            );
+        {ClosedTag, _Sock} ->
+            exit_normal(S, peer_closed);
+        {ErrorTag, _Sock, Reason} ->
+            exit_normal(S, {transport, Reason});
+        {roadrunner_drain, _DrainDeadline} ->
+            exit_normal(S, drained);
+        _Stray ->
+            sniff_recv(S, Deadline)
+    after min(HibernateAfter, Remaining) ->
+        case Remaining =< HibernateAfter of
+            true ->
+                timeout_response(S),
+                exit_normal(S, request_timeout);
+            false ->
+                S1 = reset_heap_floor(S),
+                TRef = erlang:start_timer(Deadline, self(), ?MODULE, [{abs, true}]),
+                erlang:hibernate(?MODULE, sniff_recv_hib, [S1, Deadline, TRef])
+        end
+    end.
+
+%% Hibernate continuation of `sniff_recv/2`, as `recv_request_bytes_hib/3`
+%% is of `recv_active/3`.
+-doc false.
+-spec sniff_recv_hib(#loop_state{}, integer(), reference()) -> no_return().
+sniff_recv_hib(S, Deadline, TRef) ->
+    ok = cancel_deadline_timer(TRef),
+    sniff_recv(S, Deadline).
+
+-spec hibernate_after(recv_mode()) -> pos_integer() | infinity.
+hibernate_after({_Mode, HibernateAfter}) -> HibernateAfter;
+hibernate_after(_Mode) -> infinity.
 
 %% `{http1, #{active => ...}}`, or by transport when unset: `{active, 16}`
 %% on TLS, where every arm is a call into the TLS connection process, and
@@ -410,12 +538,16 @@ active_count(Mode) -> Mode.
 %% `{active, N}` is armed once, here, and again only on the socket's
 %% passive message; `once` arms before each request instead.
 -spec start_reading(#loop_state{}) -> no_return().
-start_reading(#loop_state{recv_mode = Mode} = S) ->
+start_reading(S) ->
+    ok = arm_reading(S),
+    read_request_phase(S).
+
+-spec arm_reading(#loop_state{}) -> ok.
+arm_reading(#loop_state{recv_mode = Mode} = S) ->
     case active_count(Mode) of
         once -> ok;
-        N -> ok = arm_active_n(S, N)
-    end,
-    read_request_phase(S).
+        N -> arm_active_n(S, N)
+    end.
 
 %% HTTP/1 requests count against `max_concurrent_requests` only when the
 %% listener sheds over it: in `refuse` and `queue` modes the ceiling bounds
@@ -899,6 +1031,11 @@ recv_active(
 -doc false.
 -spec recv_request_bytes_hib(#loop_state{}, integer(), reference()) -> no_return().
 recv_request_bytes_hib(S, Deadline, TRef) ->
+    ok = cancel_deadline_timer(TRef),
+    recv_request_bytes(S, Deadline).
+
+-spec cancel_deadline_timer(reference()) -> ok.
+cancel_deadline_timer(TRef) ->
     case erlang:cancel_timer(TRef) of
         false ->
             %% Already fired: its message is queued or on its way, and
@@ -908,8 +1045,7 @@ recv_request_bytes_hib(S, Deadline, TRef) ->
             end;
         _Left ->
             ok
-    end,
-    recv_request_bytes(S, Deadline).
+    end.
 
 %% Slowloris on first request → 408. Idle keep-alive timeout →
 %% silent close (peer wasn't waiting on bytes).
