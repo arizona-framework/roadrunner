@@ -14,16 +14,23 @@ only h3-legal headers (no `connection` / `keep-alive`, which RFC 9114
 -spec handle(roadrunner_req:request()) ->
     {roadrunner_handler:response(), roadrunner_req:request()}.
 handle(#{target := ~"/cancel-unfinished"} = Req) ->
-    %% Starts the answer, then has its stream cancelled, twice (the second
-    %% finds it cancelled already), and waits to be told.
+    %% Starts the answer, then has its stream cancelled and waits to be
+    %% told. Once told, it cancels the stream again as its timer would,
+    %% before telling the test (registered as `h3_cancel_test`): sent from
+    %% the worker, that second cancel reaches the loop before anything the
+    %% test does next, and finds the stream cancelled already.
     {
         {send, [], fun(R) ->
             {ok, Send} = roadrunner_send:stream(200, [], R),
             ok = Send(~"part", nofin),
             {ok, _} = roadrunner_send_writer:cancel_after(0, R),
-            {ok, _} = roadrunner_send_writer:cancel_after(0, R),
             receive
-                {roadrunner_stream_reset, _} -> R
+                {roadrunner_stream_reset, StreamId} ->
+                    _ =
+                        (roadrunner_http3_stream_worker:loop() !
+                            {roadrunner_cancel_stream, StreamId}),
+                    _ = (h3_cancel_test ! {cancel_unfinished, cancelled_again}),
+                    R
             end
         end},
         Req
