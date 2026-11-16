@@ -163,9 +163,50 @@ resolve_unloadable_module_crashes_test() ->
     %% A middleware module that can't be loaded is a config error: it fails
     %% when the pipeline is resolved (listener start), not on a request.
     ?assertError(
-        {middleware_module_not_loaded, roadrunner_no_such_middleware, _},
+        {invalid_middleware, roadrunner_no_such_middleware, {not_loaded, nofile}},
         roadrunner_middleware:resolve([roadrunner_no_such_middleware])
+    ),
+    ?assertError(
+        {invalid_middleware, {roadrunner_no_such_middleware, #{}}, {not_loaded, nofile}},
+        roadrunner_middleware:resolve([{roadrunner_no_such_middleware, #{}}])
     ).
+
+resolve_module_without_call_crashes_test() ->
+    %% A loaded module that is not a middleware (here a handler) would crash
+    %% every request with `undef`; it is refused when the pipeline resolves.
+    ?assertError(
+        {invalid_middleware, roadrunner_hello_handler, no_call_3},
+        roadrunner_middleware:resolve([roadrunner_hello_handler])
+    ),
+    ?assertError(
+        {invalid_middleware, {roadrunner_hello_handler, #{a := 1}}, no_call_3},
+        roadrunner_middleware:resolve([{roadrunner_hello_handler, #{a => 1}}])
+    ).
+
+resolve_fun_of_wrong_arity_crashes_test() ->
+    Fun = fun(Req, Next) -> Next(Req) end,
+    ?assertError(
+        {invalid_middleware, Fun, bad_arity},
+        roadrunner_middleware:resolve([Fun])
+    ),
+    ?assertError(
+        {invalid_middleware, {Fun, #{}}, bad_arity},
+        roadrunner_middleware:resolve([{Fun, #{}}])
+    ).
+
+resolve_other_terms_crash_test() ->
+    [
+        ?assertError(
+            {invalid_middleware, Entry, not_a_middleware},
+            roadrunner_middleware:resolve([Entry])
+        )
+     || Entry <- [
+            42,
+            ~"roadrunner_test_middlewares",
+            {roadrunner_test_middlewares, call, 3},
+            {~"roadrunner_test_middlewares", #{}}
+        ]
+    ].
 
 %% =============================================================================
 %% End-to-end through roadrunner_conn — exercises the map-shape route's

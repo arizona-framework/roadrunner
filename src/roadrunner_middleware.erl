@@ -101,6 +101,20 @@ Config (module) and `State` (fun) default to `#{}` for the bare forms.
 The same callable can appear more than once with different config, e.g.
 `[{rate_limit, #{rps => 10}}, {rate_limit, #{rps => 100}}]`.
 
+Entries are checked when the pipeline is compiled (listener start and
+every `reload_routes/2`), so a wrong one stops the listener from starting
+instead of failing every request. A bad entry raises
+`{invalid_middleware, Entry, Reason}`, where `Entry` is the entry as
+written and `Reason` is one of:
+
+- `{not_loaded, Why}`: the module cannot be loaded; `Why` is the
+  `code:ensure_loaded/1` error, such as `nofile`
+- `no_call_3`: the module loads but does not export `call/3`, so it is
+  not a middleware (a handler module passed by mistake, say)
+- `bad_arity`: the fun does not take three arguments
+- `not_a_middleware`: the entry is neither a module, a fun, nor a
+  `{Callable, Config}` pair of one
+
 Middleware `State` is **not** the request's `state` field. Route state
 (`{Path, Handler, State}`) is injected onto the request map and read
 with `roadrunner_req:state/1`; middleware `State` is handed to `call/3`
@@ -273,6 +287,9 @@ Resolve a middleware list to its runtime `t:resolved/0` pairs, running each
 module's `init/1` **once**. Use this to resolve listener-wide middlewares a
 single time and reuse the result across every route (via
 `compile_pipeline/4`) instead of re-running their init per route.
+
+Raises `{invalid_middleware, Entry, Reason}` for an entry that is not a
+middleware (see "Middleware shape" above).
 """.
 -spec resolve(middleware_list()) -> [resolved()].
 resolve(Mws) ->
@@ -282,33 +299,40 @@ resolve(Mws) ->
 %% that exports the optional `init/1` callback runs it here, so the per-request
 %% closure reuses the returned state; a module without `init/1` (and any fun)
 %% threads its config through verbatim. A bare entry defaults its config to
-%% `#{}`.
--spec resolve_entry(middleware()) -> resolved().
-resolve_entry({Mod, Config}) when is_atom(Mod) ->
-    resolve_module(Mod, Config);
-resolve_entry({Fun, Config}) when is_function(Fun, 3) ->
+%% `#{}`. The entry comes from user config, so anything that is not a
+%% middleware raises `{invalid_middleware, Entry, Reason}` here, at compile
+%% time (listener start), rather than crashing every request.
+-spec resolve_entry(term()) -> resolved().
+resolve_entry({Callable, Config} = Entry) ->
+    resolve_callable(Callable, Config, Entry);
+resolve_entry(Callable) ->
+    resolve_callable(Callable, #{}, Callable).
+
+-spec resolve_callable(term(), config(), term()) -> resolved().
+resolve_callable(Mod, Config, Entry) when is_atom(Mod) ->
+    resolve_module(Mod, Config, Entry);
+resolve_callable(Fun, Config, _Entry) when is_function(Fun, 3) ->
     {Fun, Config};
-resolve_entry(Mod) when is_atom(Mod) ->
-    resolve_module(Mod, #{});
-resolve_entry(Fun) when is_function(Fun, 3) ->
-    {Fun, #{}}.
+resolve_callable(Fun, _Config, Entry) when is_function(Fun) ->
+    error({invalid_middleware, Entry, bad_arity});
+resolve_callable(_Other, _Config, Entry) ->
+    error({invalid_middleware, Entry, not_a_middleware}).
 
--spec resolve_module(module(), config()) -> resolved().
-resolve_module(Mod, Config) ->
-    case has_init(Mod) of
-        true -> {Mod, Mod:init(Config)};
-        false -> {Mod, Config}
-    end.
-
-%% Whether `Mod` exports the optional `init/1`. The module is loaded first so
+%% A module entry must load and export `call/3`. The module is loaded first so
 %% `function_exported/3` can see it (it reports `false` for an unloaded module
-%% even when the export exists). A middleware module that can't be loaded is a
-%% config error worth failing at compile time (listener start), not per request.
--spec has_init(module()) -> boolean().
-has_init(Mod) ->
-    case code:ensure_loaded(Mod) of
-        {module, Mod} -> erlang:function_exported(Mod, init, 1);
-        {error, Reason} -> error({middleware_module_not_loaded, Mod, Reason})
+%% even when the export exists).
+-spec resolve_module(module(), config(), term()) -> resolved().
+resolve_module(Mod, Config, Entry) ->
+    maybe
+        {module, Mod} ?= code:ensure_loaded(Mod),
+        true ?= erlang:function_exported(Mod, call, 3),
+        case erlang:function_exported(Mod, init, 1) of
+            true -> {Mod, Mod:init(Config)};
+            false -> {Mod, Config}
+        end
+    else
+        {error, Why} -> error({invalid_middleware, Entry, {not_loaded, Why}});
+        false -> error({invalid_middleware, Entry, no_call_3})
     end.
 
 -doc """

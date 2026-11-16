@@ -162,7 +162,9 @@ Whichever form is used, a handler that exports the optional
 `roadrunner_handler` callback `init_route/1` has it run once per route
 when the listener starts (and on `reload_routes/2`), turning the route's
 state into the one the handler sees. A raise in it stops the listener
-from starting, with `{init_route_failed, Path, Handler, Reason}`.
+from starting, with `{init_route_failed, Path, Handler, Reason}`. So does
+an entry in a `middlewares` list that is not a middleware, with
+`{invalid_middleware, Entry, Reason}` (see `roadrunner_middleware`).
 
 Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares` — listener-wide pipeline applied to every request.
