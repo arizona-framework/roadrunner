@@ -352,8 +352,9 @@ say_hello(Name, Stream0) ->
   `INTERNAL` before the method runs
 - names you set are made of `0-9`, `a-z`, `_`, `-` and `.`, and cannot
   be a name gRPC or HTTP/2 sets itself (`grpc-status`, `grpc-message`,
-  `grpc-encoding`, `grpc-accept-encoding`, `grpc-timeout`,
-  `grpc-message-type`, `content-type`, `content-length`, `te`)
+  `grpc-status-details-bin`, `grpc-encoding`, `grpc-accept-encoding`,
+  `grpc-timeout`, `grpc-message-type`, `content-type`, `content-length`,
+  `te`)
 - values you set, other than `-bin` ones, are printable ASCII with no
   space at either end
 - a name or value that breaks these rules raises
@@ -388,7 +389,9 @@ whoami(_Request, Stream) ->
 A call answers HTTP `200` and ends with a gRPC status in its trailers:
 
 - `OK` when the method returns normally
-- the status of an `{error, Status, Message, Stream}` return
+- the status of an `{error, Status, Message, Stream}` return, or of an
+  `{error, Status, Message, Details, Stream}` one (see
+  [Error details](#error-details))
 - `INTERNAL` when the method crashes; the crash is logged with the stack,
   under the logger domain `[roadrunner, grpc]`, and the client gets only
   `internal error`
@@ -413,6 +416,42 @@ A streaming method can send some responses and then return an error: the
 client gets the responses, then the error status. A call that fails
 before any response is answered with the status in the response headers
 alone (gRPC's Trailers-Only form).
+
+### Error details
+
+gRPC's richer error model attaches details to a status: messages such as
+`google.rpc.BadRequest` (which fields were wrong) or
+`google.rpc.RetryInfo` (when to try again). Return
+`{error, Status, Message, Details, Stream}`, `Details` a list of
+`{TypeUrl, Value}`, each a `google.protobuf.Any`: `TypeUrl` names the
+detail's message type and `Value` is that message encoded, with your
+codec. roadrunner sends them in the `grpc-status-details-bin` trailer as
+a `google.rpc.Status` whose code and message are the call's own, as gRPC
+clients check (grpc-go turns a mismatch into `INTERNAL`), and its client
+libraries hand them to your code (`status.FromError(err).Details()` in
+Go, `StatusProto.fromThrowable` in Java).
+
+```erlang
+create_user(#{name := <<>>}, Stream) ->
+    %% bad_request/2 encodes a google.rpc.BadRequest with your codec.
+    Details = [{~"type.googleapis.com/google.rpc.BadRequest", bad_request(~"name", ~"is empty")}],
+    {error, invalid_argument, ~"invalid user", Details, Stream};
+```
+
+`grpc-status-details-bin` is roadrunner's to set, so `set_trailers/2`
+refuses it, and the details always agree with the status.
+
+### Retry pushback
+
+A client whose retry policy allows it retries a call that failed with a
+retryable status (`UNAVAILABLE`, say). The `grpc-retry-pushback-ms`
+trailer tells it how long to wait first, in milliseconds, or not to retry
+at all with a negative or malformed value. Set it with `set_trailers/2`:
+
+```erlang
+{error, unavailable, ~"overloaded",
+    roadrunner_grpc:set_trailers([{~"grpc-retry-pushback-ms", ~"500"}], Stream)}
+```
 
 roadrunner answers some calls for you:
 
@@ -472,6 +511,19 @@ roadrunner_grpc:routes(#{
     health => true,
     middlewares => [{api_key, #{~"k1" => ~"client-1"}}]
 })
+```
+
+`roadrunner_grpc:reject/4` takes a map of what goes with the status:
+`details`, as a method returns them (see [Error details](#error-details)),
+and `trailers`, metadata sent with the status, such as a retry pushback:
+
+```erlang
+roadrunner_grpc:reject(
+    resource_exhausted,
+    ~"rate limited",
+    #{trailers => [{~"grpc-retry-pushback-ms", ~"1000"}]},
+    Req
+)
 ```
 
 A middleware that should let some calls through, such as health checks

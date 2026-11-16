@@ -10,7 +10,7 @@
 -export([stale_compression/2, held/1, was_compressed/2, flood/2, big_trailer/2]).
 -export([hold/2, watch/2, stop_after/2, reset_at/2, watch_late/2, keys/2]).
 -export([active_sum/1, active_chat/1, mixed_sum/1, notify/2]).
--export([request/2]).
+-export([request/2, rich_fail/2, rich_fail_after/2]).
 
 name() -> ~"test.Echo".
 
@@ -55,7 +55,9 @@ rpcs() ->
         ~"ActiveChat" => rpc(active_chat, bidi_stream),
         ~"MixedSum" => rpc(mixed_sum, client_stream),
         ~"Notify" => rpc(notify, server_stream),
-        ~"Request" => rpc(request, unary)
+        ~"Request" => rpc(request, unary),
+        ~"RichFail" => rpc(rich_fail, unary),
+        ~"RichFailAfter" => rpc(rich_fail_after, server_stream)
     }.
 
 rpc(Function, Kind) ->
@@ -366,3 +368,15 @@ request(_Request, Stream) ->
             timeout => roadrunner_req:header(~"grpc-timeout", Req),
             metadata => roadrunner_grpc:metadata(Stream)
         }), Stream}.
+
+%% An error with rich details, before any response.
+rich_fail(_Request, Stream) ->
+    {error, invalid_argument, ~"bad name: café",
+        [{~"type.googleapis.com/google.rpc.BadRequest", [<<10, 2>>, ~"ok"]}, {~"t/empty", <<>>}],
+        Stream}.
+
+%% The same after a response, with a retry pushback trailer.
+rich_fail_after(_Request, Stream0) ->
+    Stream1 = roadrunner_grpc:send(~"first", Stream0),
+    Stream = roadrunner_grpc:set_trailers([{~"grpc-retry-pushback-ms", ~"250"}], Stream1),
+    {error, unavailable, ~"try later", [{~"t/retry", <<8, 1>>}], Stream}.

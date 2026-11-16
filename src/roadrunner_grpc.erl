@@ -67,7 +67,9 @@ and a client stream that fits the listener's `max_content_length`.
 
 A call answers `:status 200` and ends with the gRPC status in its
 trailers: `OK` when the method returns normally, the status of an
-`{error, Status, Message, Stream}`, `INTERNAL` when the method crashes.
+`{error, Status, Message, Stream}` (or `{error, Status, Message, Details,
+Stream}`, with gRPC's rich error details, `t:details/0`), `INTERNAL`
+when the method crashes.
 A call that fails before any response is answered Trailers-Only, the
 status in the response headers. The rest is answered as HTTP: `505` over
 HTTP/1.1, `405` for a method other than `POST`, `415` for a
@@ -126,7 +128,8 @@ emits neither: its request events report it.
 headers; `set_headers/2` and `set_trailers/2` add the response's, with
 names of `0-9`, `a-z`, `_`, `-` and `.` other than the ones gRPC sets
 (`grpc-status`, say) and values of printable ASCII with no space at either
-end; others raise, so the call ends `INTERNAL`.
+end; others raise, so the call ends `INTERNAL`. A `grpc-retry-pushback-ms`
+trailer tells a client that retries the call how long to wait first.
 A metadata name ending in `-bin` carries bytes: its value is base64 on the
 wire and plain bytes here, both ways; a request's comma-separated values
 are each an entry, and one that is not base64 ends the call with
@@ -139,12 +142,12 @@ to read what the metadata leaves out: the client's certificate, the
 
 -export([routes/1, init_route/1, handle/1]).
 -export([recv/1, send/2, send/3, metadata/1, set_headers/2, set_trailers/2, deadline/1, peer/1]).
--export([request/1, reject/3]).
+-export([request/1, reject/3, reject/4]).
 -export([set_send_compression/2, cancelled/2, recv_compressed/1]).
 -export([recv_async/1, info/2]).
 -export([reflection_index/1]).
 
--export_type([opts/0, status/0, stream/0, encoding/0, info/0]).
+-export_type([opts/0, status/0, stream/0, encoding/0, info/0, details/0, reject_opts/0]).
 
 -define(MAX_MESSAGE_SIZE, 4194304).
 %% Where the call's process keeps the response's body writer once it started.
@@ -273,6 +276,23 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
 
 %% How a call ended with a status, or with none: for its events.
 -type ending() :: {status(), binary(), roadrunner_event_handler:grpc_stop_reason()}.
+
+-doc """
+gRPC's rich error details (google.rpc.Status's `details`): each a
+`google.protobuf.Any`, as `{TypeUrl, Value}`, `TypeUrl` naming the
+detail's message type (`~"type.googleapis.com/google.rpc.BadRequest"`,
+say) and `Value` that message's own encoded bytes. They go to the client
+in `grpc-status-details-bin`, as a google.rpc.Status whose code and
+message are the call's status and message.
+""".
+-type details() :: [{TypeUrl :: binary(), Value :: iodata()}].
+
+-doc """
+What `reject/4` adds to a rejection: `details`, gRPC's rich error details
+(`t:details/0`), and `trailers`, metadata sent with the status as
+`set_trailers/2` takes it (`grpc-retry-pushback-ms`, say).
+""".
+-type reject_opts() :: #{details => details(), trailers => roadrunner_http:headers()}.
 
 -doc "How a message is compressed: `identity` (not), `gzip` or `deflate`.".
 -type encoding() :: identity | gzip | deflate.
@@ -827,6 +847,12 @@ result(Kind, {ok, #stream{} = Stream}) when Kind =:= server_stream; Kind =:= bid
 result(_Kind, {error, Status, Message, #stream{} = Stream}) when is_binary(Message) ->
     _ = roadrunner_grpc_status:code(Status),
     {error, Status, Message, Stream};
+result(_Kind, {error, Status, Message, Details, #stream{trailers = Trailers} = Stream}) when
+    is_binary(Message), is_list(Details)
+->
+    {error, Status, Message, Stream#stream{
+        trailers = details_fields(Status, Message, Details) ++ Trailers
+    }};
 result(_Kind, Other) ->
     error({bad_return, Other}).
 
@@ -1099,6 +1125,18 @@ encoding_header(Encoding, Headers) -> [{~"grpc-encoding", atom_to_binary(Encodin
 -spec status_headers(status(), binary(), stream()) -> roadrunner_http:headers().
 status_headers(Status, Message, #stream{trailers = Trailers}) ->
     status_fields(Status, Message, Trailers).
+
+%% The `grpc-status-details-bin` of a status with details: a
+%% google.rpc.Status of the same code and message, which a client checks
+%% against `grpc-status` (grpc-go answers a mismatch `INTERNAL`). None
+%% without details.
+-spec details_fields(status(), binary(), details()) -> roadrunner_http:headers().
+details_fields(_Status, _Message, []) ->
+    [];
+details_fields(Status, Message, Details) ->
+    Code = roadrunner_grpc_status:code(Status),
+    Bytes = iolist_to_binary(roadrunner_grpc_status_proto:status(Code, Message, Details)),
+    [{~"grpc-status-details-bin", base64:encode(Bytes, #{padding => false})}].
 
 %% The status, its message when it has one, then `Trailers`.
 -spec status_fields(status(), binary(), roadrunner_http:headers()) -> roadrunner_http:headers().
@@ -1534,7 +1572,8 @@ own_name(Name) ->
                 ~"grpc-encoding",
                 ~"grpc-accept-encoding",
                 ~"grpc-timeout",
-                ~"grpc-message-type"
+                ~"grpc-message-type",
+                ~"grpc-status-details-bin"
             ])
     of
         true -> Name;
@@ -1642,9 +1681,37 @@ The method never runs, so the call emits no `grpc_call_start` or
 `grpc_call_stop`: the request's own events report it.
 """.
 -spec reject(status(), binary(), roadrunner_req:request()) -> roadrunner_handler:result().
-reject(Status, Message, Req) when Status =/= ok, is_binary(Message) ->
+reject(Status, Message, Req) ->
+    reject(Status, Message, #{}, Req).
+
+-doc """
+`reject/3`, with gRPC's rich error `details` (`t:details/0`) and
+`trailers`, metadata sent with the status (`t:reject_opts/0`). Trailers
+follow `set_trailers/2`'s rules, and raise as it does.
+
+```erlang
+roadrunner_grpc:reject(
+    unavailable,
+    ~"too many calls",
+    #{trailers => [{~"grpc-retry-pushback-ms", ~"500"}]},
+    Req
+)
+```
+""".
+-spec reject(status(), binary(), reject_opts(), roadrunner_req:request()) ->
+    roadrunner_handler:result().
+reject(Status, Message, Opts, Req) when Status =/= ok, is_binary(Message), is_map(Opts) ->
+    Trailers = reject_details(Status, Message, Opts) ++ reject_trailers(Opts),
     ContentType = reject_content_type(roadrunner_req:header(~"content-type", Req)),
-    {{200, [{~"content-type", ContentType} | status_fields(Status, Message, [])], <<>>}, Req}.
+    {{200, [{~"content-type", ContentType} | status_fields(Status, Message, Trailers)], <<>>}, Req}.
+
+-spec reject_details(status(), binary(), reject_opts()) -> roadrunner_http:headers().
+reject_details(Status, Message, #{details := Details}) -> details_fields(Status, Message, Details);
+reject_details(_Status, _Message, #{}) -> [].
+
+-spec reject_trailers(reject_opts()) -> roadrunner_http:headers().
+reject_trailers(#{trailers := Trailers}) -> wire(Trailers);
+reject_trailers(#{}) -> [].
 
 %% The response's `content-type`, the request's as a call would answer it
 %% (`codec/2`), or gRPC's own for a request that names none of gRPC's.

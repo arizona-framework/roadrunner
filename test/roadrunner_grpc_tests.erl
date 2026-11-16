@@ -280,3 +280,45 @@ reject_test() ->
     ),
     ?assertError(function_clause, ?M:reject(ok, <<>>, #{headers => []})),
     ?assertError(function_clause, ?M:reject(nope, <<>>, #{headers => []})).
+
+%% `reject/4` adds the status's details, a google.rpc.Status of the same
+%% code and message, and trailers as `set_trailers/2` takes them.
+reject_with_details_and_trailers_test() ->
+    Details = [{~"t/a", ~"v"}],
+    {{200, Headers, <<>>}, _} = ?M:reject(
+        resource_exhausted,
+        ~"slow down",
+        #{details => Details, trailers => [{~"grpc-retry-pushback-ms", ~"500"}, {~"x-bin", <<0>>}]},
+        #{headers => []}
+    ),
+    Encoded = base64:encode(
+        iolist_to_binary(roadrunner_grpc_status_proto:status(8, ~"slow down", Details)),
+        #{padding => false}
+    ),
+    ?assertEqual(
+        [
+            {~"content-type", ~"application/grpc"},
+            {~"grpc-status", ~"8"},
+            {~"grpc-message", ~"slow down"},
+            {~"grpc-status-details-bin", Encoded},
+            {~"grpc-retry-pushback-ms", ~"500"},
+            {~"x-bin", ~"AA"}
+        ],
+        Headers
+    ),
+    ?assertEqual(
+        ?M:reject(internal, ~"m", #{headers => []}),
+        ?M:reject(internal, ~"m", #{}, #{headers => []})
+    ),
+    %% No details, no details header.
+    ?assertEqual(
+        ?M:reject(internal, ~"m", #{headers => []}),
+        ?M:reject(internal, ~"m", #{details => []}, #{headers => []})
+    ),
+    %% The details header is the call's own to set.
+    ?assertError(
+        {invalid_metadata, ~"grpc-status-details-bin"},
+        ?M:reject(
+            internal, ~"m", #{trailers => [{~"grpc-status-details-bin", <<>>}]}, #{headers => []}
+        )
+    ).
