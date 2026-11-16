@@ -632,8 +632,26 @@ compile_rejects_invalid_max_content_length_test_() ->
                 [#{path => ~"/x", handler => h, max_content_length => Bad}], []
             )
         )
-     || Bad <- [-1, 1.5, ~"10", infinity]
+     || Bad <- [-1, 1.5, ~"10", unlimited]
     ].
+
+%% `infinity` sets no cap on a body the handler reads as it arrives; one
+%% the listener reads whole first keeps the listener's cap.
+infinity_max_content_length_needs_manual_buffering_test() ->
+    Routes = [#{path => ~"/x", handler => h, max_content_length => infinity}],
+    ?assertMatch(
+        {ok, h, _, _, _, #{max_content_length := infinity}},
+        roadrunner_router:resolve(~"POST", ~"/x", roadrunner_router:compile(Routes, [], manual))
+    ),
+    ?assertMatch(
+        {ok, h, _, _, _, undefined},
+        roadrunner_router:resolve(~"POST", ~"/x", roadrunner_router:compile(Routes, [], auto))
+    ),
+    ?assertMatch(
+        {ok, h, _, _, _, undefined},
+        roadrunner_router:resolve(~"POST", ~"/x", roadrunner_router:compile(Routes, []))
+    ),
+    ?assertEqual(ok, roadrunner_router:validate(Routes)).
 
 compile_rejects_invalid_rate_limit_test_() ->
     %% A map of positive integers with `rate` set, and no other keys.

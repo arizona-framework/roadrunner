@@ -113,7 +113,11 @@ means for the other routes). With TLS, add HTTP/3 too:
 ```
 
 `routes/1` returns a plain list of routes, so you can add other routes
-next to them.
+next to them. Its routes answer `POST` only (`methods => [~"POST"]`): a
+route above them that answers every method on the same paths, such as
+`/:a/:b`, would take every call, so the listener refuses that table as it
+starts (`unreachable_route`). Put the gRPC routes first, or give the
+other route its own `methods`.
 
 ### Options
 
@@ -125,7 +129,10 @@ every service in it:
   `[roadrunner_grpc_codec_raw]`
 - `max_message_size`: the largest request message, in bytes
 - `max_content_length`: the most all of a call's requests may add up to,
-  in bytes, set on each route in place of the listener's
+  in bytes, by default `infinity` (see
+  [Message size limits](#message-size-limits))
+- `middlewares`: middlewares for every route, see
+  [Middlewares](#middlewares)
 - `send_compression`: how responses are compressed, `identity` (the
   default), `gzip` or `deflate`
 - `health`: `true` adds the health service, by default `false`
@@ -147,9 +154,9 @@ setting to use for gRPC.
 
 With `auto` (the listener's default), the whole request body is read
 before the method runs. That works for unary and server-streaming calls,
-and for a client stream that fits in `max_content_length`. But a bidi
-method then sees all the requests at once, only after the client has
-finished sending, and a call over `max_content_length` is answered
+and for a client stream that fits in the listener's `max_content_length`.
+But a bidi method then sees all the requests at once, only after the
+client has finished sending, and a call over the cap is answered
 `413 Payload Too Large` instead of a gRPC status.
 
 `body_buffering` is a listener option, and with `manual` every other
@@ -157,6 +164,14 @@ handler on the listener must read its own body, over HTTP/1.1 as well as
 HTTP/2 when the listener serves both. That is why a listener of its own is
 the best place for gRPC. Setting `body_buffering` per route is on the
 roadmap.
+
+### Beside an Arizona app
+
+An [Arizona](https://github.com/arizona-framework/arizona) app can serve
+gRPC on the same listener and port as its pages, through a `grpc` entry in
+its routes that uses `roadrunner_grpc:routes/1`. The
+[arizona_roadrunner](https://github.com/arizona-framework/arizona_roadrunner#grpc)
+README shows how.
 
 ### A service built at runtime
 
@@ -352,8 +367,9 @@ say_hello(Name, Stream0) ->
   `INTERNAL` before the method runs
 - names you set are made of `0-9`, `a-z`, `_`, `-` and `.`, and cannot
   be a name gRPC or HTTP/2 sets itself (`grpc-status`, `grpc-message`,
-  `grpc-encoding`, `grpc-accept-encoding`, `grpc-timeout`,
-  `grpc-message-type`, `content-type`, `content-length`, `te`)
+  `grpc-status-details-bin`, `grpc-encoding`, `grpc-accept-encoding`,
+  `grpc-timeout`, `grpc-message-type`, `content-type`, `content-length`,
+  `te`)
 - values you set, other than `-bin` ones, are printable ASCII with no
   space at either end
 - a name or value that breaks these rules raises
@@ -366,12 +382,31 @@ say_hello(Name, Stream0) ->
 `roadrunner_grpc:peer/1` returns the client's address as
 `{IP, Port}`.
 
+`roadrunner_grpc:request/1` returns the call's HTTP request, for what
+the metadata leaves out. Read it with the `roadrunner_req` functions:
+the client's certificate with `roadrunner_req:peercert/1`, its TLS
+session with `roadrunner_req:tls_info/1`, what a middleware put on the
+request with `roadrunner_req:private/2`, the `request_id`, and any header,
+`grpc-*` ones included, with `roadrunner_req:header/2`. It is for
+reading: the call reads the request body itself, so read the requests
+with `recv/1` or `recv_async/1`, not through the request.
+
+```erlang
+whoami(_Request, Stream) ->
+    case roadrunner_req:peercert(roadrunner_grpc:request(Stream)) of
+        {ok, Der} -> {reply, subject(Der), Stream};
+        {error, _} -> {error, unauthenticated, ~"no client certificate", Stream}
+    end.
+```
+
 ## Errors and status codes
 
 A call answers HTTP `200` and ends with a gRPC status in its trailers:
 
 - `OK` when the method returns normally
-- the status of an `{error, Status, Message, Stream}` return
+- the status of an `{error, Status, Message, Stream}` return, or of an
+  `{error, Status, Message, Details, Stream}` one (see
+  [Error details](#error-details))
 - `INTERNAL` when the method crashes; the crash is logged with the stack,
   under the logger domain `[roadrunner, grpc]`, and the client gets only
   `internal error`
@@ -397,6 +432,42 @@ client gets the responses, then the error status. A call that fails
 before any response is answered with the status in the response headers
 alone (gRPC's Trailers-Only form).
 
+### Error details
+
+gRPC's richer error model attaches details to a status: messages such as
+`google.rpc.BadRequest` (which fields were wrong) or
+`google.rpc.RetryInfo` (when to try again). Return
+`{error, Status, Message, Details, Stream}`, `Details` a list of
+`{TypeUrl, Value}`, each a `google.protobuf.Any`: `TypeUrl` names the
+detail's message type and `Value` is that message encoded, with your
+codec. roadrunner sends them in the `grpc-status-details-bin` trailer as
+a `google.rpc.Status` whose code and message are the call's own, as gRPC
+clients check (grpc-go turns a mismatch into `INTERNAL`), and its client
+libraries hand them to your code (`status.FromError(err).Details()` in
+Go, `StatusProto.fromThrowable` in Java).
+
+```erlang
+create_user(#{name := <<>>}, Stream) ->
+    %% bad_request/2 encodes a google.rpc.BadRequest with your codec.
+    Details = [{~"type.googleapis.com/google.rpc.BadRequest", bad_request(~"name", ~"is empty")}],
+    {error, invalid_argument, ~"invalid user", Details, Stream};
+```
+
+`grpc-status-details-bin` is roadrunner's to set, so `set_trailers/2`
+refuses it, and the details always agree with the status.
+
+### Retry pushback
+
+A client whose retry policy allows it retries a call that failed with a
+retryable status (`UNAVAILABLE`, say). The `grpc-retry-pushback-ms`
+trailer tells it how long to wait first, in milliseconds, or not to retry
+at all with a negative or malformed value. Set it with `set_trailers/2`:
+
+```erlang
+{error, unavailable, ~"overloaded",
+    roadrunner_grpc:set_trailers([{~"grpc-retry-pushback-ms", ~"500"}], Stream)}
+```
+
 roadrunner answers some calls for you:
 
 - an unknown method of a known service: `UNIMPLEMENTED`
@@ -410,7 +481,7 @@ roadrunner answers some calls for you:
 Some requests are refused at the HTTP level, before any call starts:
 
 - over HTTP/1.1: `505`
-- a method other than `POST`: `405`
+- a method other than `POST`: the router's `405`, with `allow: POST`
 - a `content-type` none of the codecs speak: `415`
 - an unknown service: the router's `404`, which gRPC clients read as
   `UNIMPLEMENTED`
@@ -418,6 +489,73 @@ Some requests are refused at the HTTP level, before any call starts:
 One more is answered at the HTTP level once the call runs: response
 headers too big for the client's `SETTINGS_MAX_HEADER_LIST_SIZE` cannot
 be sent, so the call gets a `500` and stops.
+
+## Middlewares
+
+`middlewares` puts route middlewares (see `roadrunner_middleware`) on
+every route `routes/1` returns, the health and reflection ones included,
+as gRPC servers apply their interceptors to every service they serve. A
+middleware runs before the call starts, with the request: it can check
+the request's metadata (as headers) or the client's certificate, put
+values on the request for the method (`roadrunner_req:put_private/3`,
+read back through `roadrunner_grpc:request/1`), and refuse the call.
+
+To refuse a call, return `roadrunner_grpc:reject(Status, Message, Req)`
+in place of `Next(Req)`. It answers with the gRPC status and message in
+the response headers (Trailers-Only), which is what gRPC clients read.
+An HTTP error such as a `401` would reach them as `UNKNOWN` or
+`UNAVAILABLE`, without your message.
+
+```erlang
+-module(api_key).
+-behaviour(roadrunner_middleware).
+-export([call/3]).
+
+call(Req, Next, Keys) ->
+    case roadrunner_req:header(~"x-api-key", Req) of
+        Key when is_binary(Key) andalso is_map_key(Key, Keys) ->
+            Next(roadrunner_req:put_private(api_client, map_get(Key, Keys), Req));
+        _ ->
+            roadrunner_grpc:reject(unauthenticated, ~"missing or unknown x-api-key", Req)
+    end.
+```
+
+```erlang
+roadrunner_grpc:routes(#{
+    services => [greeter],
+    health => true,
+    middlewares => [{api_key, #{~"k1" => ~"client-1"}}]
+})
+```
+
+`roadrunner_grpc:reject/4` takes a map of what goes with the status:
+`details`, as a method returns them (see [Error details](#error-details)),
+and `trailers`, metadata sent with the status, such as a retry pushback:
+
+```erlang
+roadrunner_grpc:reject(
+    resource_exhausted,
+    ~"rate limited",
+    #{trailers => [{~"grpc-retry-pushback-ms", ~"1000"}]},
+    Req
+)
+```
+
+A middleware that should let some calls through, such as health checks
+from a load balancer, matches on the path, `/package.Service/Method`:
+
+```erlang
+call(Req, Next, Keys) ->
+    case roadrunner_req:path(Req) of
+        <<"/grpc.health.v1.Health/", _/binary>> -> Next(Req);
+        _ -> check_key(Req, Next, Keys)
+    end.
+```
+
+A call a middleware rejects never starts: its method does not run and it
+emits no gRPC call events, only the request's own (see
+[Telemetry](#telemetry)). The listener's `middlewares` run too, before
+the routes' ones, for gRPC requests as for any other.
 
 ## Deadlines and cancellation
 
@@ -523,21 +661,30 @@ Two limits bound what a client can send:
   after it is decompressed, so a small compressed message cannot expand
   into a huge one; a larger message ends the call with
   `RESOURCE_EXHAUSTED`
-- `max_content_length` bounds all of a call's requests together; with
-  `manual` buffering, a call over it ends with `RESOURCE_EXHAUSTED`, and
-  with `auto` the request is answered `413`
+- `max_content_length` bounds all of a call's requests together, by
+  default `infinity`: no bound
 
-A client stream or bidi stream that lives long can send a lot over its
-life, so set `max_content_length` on the routes to what such a call may
-total:
+gRPC has no limit on a whole call: a client stream or bidi stream may go
+on for as long as it lives, and gRPC servers such as grpc-go and
+grpc-java set none. With `manual` buffering a call never holds more than
+the message it is reading, which `max_message_size` bounds, and the
+client sends only as fast as the method reads (HTTP/2 and HTTP/3 flow
+control), so the default stays `infinity`. Set `max_content_length` on
+the routes to end a call that sends more than that in all with
+`RESOURCE_EXHAUSTED`:
 
 ```erlang
 roadrunner_grpc:routes(#{
-    services => [chat_service],
+    services => [upload_service],
     max_message_size => 1_048_576,
     max_content_length => 1_073_741_824
 })
 ```
+
+With `auto` buffering the listener reads a call's whole body before the
+method runs, so a route left at `infinity` keeps the listener's
+`max_content_length` (10 MB by default), and a body over it is answered
+`413`.
 
 See [Resource limits](resource_limits.md) for the defaults.
 
@@ -578,6 +725,11 @@ How a call ended is one of:
 - `stopped`: it ended with no gRPC status (an `exit({shutdown, _})`, or
   response headers too large for the client); the status is the one a
   client reads then, `unknown` before any response and `internal` after
+
+A request answered before its call starts emits no gRPC call events:
+an HTTP refusal (`405`, `415`, `505`, the router's `404`) or a
+middleware's `roadrunner_grpc:reject/3`. Its request events
+(`request_start`, `request_stop`) report it.
 
 Every call that starts ends with exactly one stop or exception event,
 unless its process dies of an exit signal it does not trap (such as

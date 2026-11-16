@@ -231,7 +231,7 @@ deadline in milliseconds. The shed form answers it `503` with the
     rate_limit := undefined | rate_limit(),
     rate_limited_counter := atomics:atomics_ref(),
     min_bytes_per_second := non_neg_integer(),
-    body_buffering := auto | manual,
+    body_buffering := roadrunner_listener:body_buffering(),
     listener_name => atom(),
     %% When `false`, conns skip registering in the listener's drain
     %% registry (`drain_table`). The registry is the mechanism
@@ -828,6 +828,9 @@ disarmed() ->
 %% The manual-mode body reader of the request in flight, as its last read
 %% left it (`remember_reader/1`).
 -define(READER_PDKEY, {?MODULE, body_reader}).
+%% How much of an unread body a drain reads before it drops it and reads on
+%% (`drain_reader/1`).
+-define(DRAIN_STEP, 65536).
 
 %% Drain-detection cap when in passive recv. Each recv call is bounded
 %% to at most this many ms so the conn re-checks its mailbox for
@@ -1083,7 +1086,7 @@ resolve_handler({router, ListenerName}, Req) ->
 %% The body cap of a resolved request: its route's `max_content_length` when
 %% the route sets one, else the listener's `Default`.
 -doc false.
--spec body_cap(resolved(), non_neg_integer()) -> non_neg_integer().
+-spec body_cap(resolved(), non_neg_integer()) -> roadrunner_router:body_limit().
 body_cap({ok, _Handler, _Bindings, _Pipeline, _State, #{max_content_length := Max}}, _Default) ->
     Max;
 body_cap(_Resolved, Default) ->
@@ -1098,7 +1101,7 @@ body_cap(_Resolved, Default) ->
 %% an `Expect: 100-continue` request needs its answer now.
 -doc false.
 -spec route_body_cap(dispatch(), roadrunner_http:headers(), non_neg_integer()) ->
-    non_neg_integer().
+    roadrunner_router:body_limit().
 route_body_cap({router, ListenerName}, Headers, Default) ->
     case {lists:keyfind(~":method", 1, Headers), lists:keyfind(~":path", 1, Headers)} of
         {{_, Method}, {_, Target}} ->
@@ -1236,7 +1239,7 @@ expects_continue(Req) ->
     none | chunked | {content_length, non_neg_integer()},
     binary(),
     fun((roadrunner_req:deadline()) -> {ok, binary()} | {error, term()}),
-    non_neg_integer(),
+    roadrunner_router:body_limit(),
     {pos_integer(), pos_integer(), pos_integer()},
     integer()
 ) -> roadrunner_req:body_reader().
@@ -1253,7 +1256,8 @@ make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits, Deadline) ->
         request_deadline => Deadline,
         id => make_ref(),
         max => Max,
-        trailer_limits => TrailerLimits
+        trailer_limits => TrailerLimits,
+        chunk_left => 0
     }.
 
 %% The body reader of an HTTP/2 request in manual body mode: its DATA is
@@ -1643,8 +1647,8 @@ read_chunked(Buf, RecvFun, MaxCL, Body, TrailerLimits) ->
             E
     end.
 
-%% Read and discard whatever the handler left in a manual-mode
-%% `body_reader`, returning any post-body leftover bytes that belong to a
+%% Read and discard, in steps of `?DRAIN_STEP` bytes, whatever the handler
+%% left in a manual-mode `body_reader`, returning any post-body leftover bytes that belong to a
 %% pipelined next request. `roadrunner_conn_loop`'s finishing phase
 %% threads `Leftover` forward into the next `reading_request` parse so
 %% pipelined clients get their N+1 request seen; a WebSocket session's
@@ -1652,7 +1656,11 @@ read_chunked(Buf, RecvFun, MaxCL, Body, TrailerLimits) ->
 -doc false.
 -spec drain_reader(roadrunner_req:body_reader()) -> {ok, binary()} | {error, term()}.
 drain_reader(BS) ->
-    case consume_reader(BS, all) of
+    %% A step at a time, each dropped before the next: the body may be as
+    %% large as its cap allows, or have none (`max_content_length =>
+    %% infinity`), and only its end is wanted.
+    case consume_reader(BS, {length, ?DRAIN_STEP}) of
+        {more, _Bytes, BS1} -> drain_reader(BS1);
         {ok, _Bytes, #{buffered := Leftover}} -> {ok, Leftover};
         {error, _} = E -> E
     end.
@@ -1926,14 +1934,24 @@ chunked_collect(
         deadline := Deadline,
         max := Max,
         bytes_read := Read,
-        trailer_limits := TrailerLimits
+        trailer_limits := TrailerLimits,
+        chunk_left := Left0
     } = BS,
     Want
 ) ->
-    case roadrunner_http1:parse_chunk(Buf, TrailerLimits, Max - Read) of
+    case roadrunner_http1:parse_chunk_part(Buf, TrailerLimits, budget(Max, Read), Left0) of
         {ok, Data, Rest} ->
             NewRead = Read + byte_size(Data),
-            BS2 = BS#{buffered := Rest, bytes_read := NewRead, pending := Data},
+            BS2 = BS#{buffered := Rest, bytes_read := NewRead, pending := Data, chunk_left := 0},
+            chunked_collect(BS2, Want);
+        {part, <<>>, Left} ->
+            case Recv(Deadline) of
+                {ok, More} -> chunked_collect(BS#{buffered := More, chunk_left := Left}, Want);
+                {error, _} = E -> E
+            end;
+        {part, Data, Left} ->
+            NewRead = Read + byte_size(Data),
+            BS2 = BS#{buffered := <<>>, bytes_read := NewRead, pending := Data, chunk_left := Left},
             chunked_collect(BS2, Want);
         {ok, last, _Trailers, Rest} ->
             chunked_collect(BS#{buffered := Rest, done := true}, Want);
@@ -1947,6 +1965,12 @@ chunked_collect(
         {error, _} = E ->
             E
     end.
+
+%% What a chunked body may still bring under its reader's `max`: no cap
+%% for a route that sets `max_content_length => infinity`.
+-spec budget(roadrunner_router:body_limit(), non_neg_integer()) -> roadrunner_router:body_limit().
+budget(infinity, _Read) -> infinity;
+budget(Max, Read) -> Max - Read.
 
 %% Pull exactly one decoded chunk out of a chunked body_reader. Pending
 %% bytes (left over from a length-bounded read) are returned first; if
@@ -1967,13 +1991,22 @@ next_chunk(
         deadline := Deadline,
         max := Max,
         bytes_read := Read,
-        trailer_limits := TrailerLimits
+        trailer_limits := TrailerLimits,
+        chunk_left := Left0
     } = BS
 ) ->
-    case roadrunner_http1:parse_chunk(Buf, TrailerLimits, Max - Read) of
+    case roadrunner_http1:parse_chunk_part(Buf, TrailerLimits, budget(Max, Read), Left0) of
         {ok, Data, Rest} ->
             NewRead = Read + byte_size(Data),
-            {more, Data, BS#{buffered := Rest, bytes_read := NewRead}};
+            {more, Data, BS#{buffered := Rest, bytes_read := NewRead, chunk_left := 0}};
+        {part, <<>>, Left} ->
+            case Recv(Deadline) of
+                {ok, More} -> next_chunk(BS#{buffered := More, chunk_left := Left});
+                {error, _} = E -> E
+            end;
+        {part, Data, Left} ->
+            NewRead = Read + byte_size(Data),
+            {more, Data, BS#{buffered := <<>>, bytes_read := NewRead, chunk_left := Left}};
         {ok, last, _Trailers, Rest} ->
             {ok, <<>>, BS#{buffered := Rest, done := true}};
         {more, _} ->

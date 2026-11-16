@@ -237,7 +237,7 @@
     %% `auto` buffers a request's body and dispatches at the stream's FIN;
     %% `manual` dispatches at the end of the headers and hands the worker
     %% the body as it reads (`dispatch_reading/4`). Read from proto_opts.
-    body_buffering = auto :: auto | manual,
+    body_buffering = auto :: roadrunner_listener:body_buffering(),
     %% Cap on the encoded request field section (HEADERS block). Read from
     %% proto_opts at conn start; defaults to `?MAX_HEADER_BLOCK`.
     max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
@@ -1516,7 +1516,8 @@ new_request_stream(BodyCap) ->
         %% is granted as the worker reads (`deliver/3`).
         unreleased => 0,
         %% The listener's `max_content_length` until a body outgrows it and
-        %% its route raises it (`raise_body_cap/4`).
+        %% its route raises it (`raise_body_cap/4`), to `infinity` for a
+        %% route that sets no cap.
         body_cap => BodyCap,
         %% RFC 9114 §4.1 request frame sequence: HEADERS, then DATA, then
         %% optional trailing HEADERS, then nothing.

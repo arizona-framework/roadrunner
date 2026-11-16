@@ -181,6 +181,22 @@ profiles the leaderboard scores.
 
 **Scope:** medium, in several PRs.
 
+### gRPC interceptors — medium
+
+**What:** an `interceptors` option for `roadrunner_grpc:routes/1` that
+wraps each call with what a middleware does not know as the call
+starts: the service, the method and the call kind, around the method
+itself, and around each message read and sent for streams (grpc-go's
+stream interceptors).
+
+**Why deferred:** `middlewares` already covers checks ahead of a call
+(auth, rate limits, values for the method) and `reject/3` answers them
+with a gRPC status; a middleware reads the method from the path. A
+complete interceptor wraps the stream's reads and writes too, which is
+its own design.
+
+**Scope:** medium.
+
 ## Other
 
 ### Production gRPC client — large
@@ -346,6 +362,9 @@ listener's mode when to start a stream's worker (at the end of the headers
 or of the body), and the worker is what resolves the route, so the choice
 has to move to after routing. Today a gRPC listener of its own is the
 workaround.
+A route's `max_content_length => infinity`, which holds only for bodies
+read as they arrive, would then follow the route's mode in place of the
+listener's (`roadrunner_router:compile/3`).
 
 **Scope:** large.
 

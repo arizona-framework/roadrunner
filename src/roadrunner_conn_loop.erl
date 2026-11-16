@@ -126,7 +126,7 @@
     keep_alive_timeout = 0 :: non_neg_integer(),
     %% `auto` reads the full body synchronously; `manual` builds a
     %% body_reader the handler pulls from. Drives `read_body_phase/3`.
-    body_buffering = auto :: auto | manual,
+    body_buffering = auto :: roadrunner_listener:body_buffering(),
     %% `{Idle, Max}` while the socket still reads with its small
     %% `idle_recv_buffer`: the first body with more than `Idle` bytes still
     %% to come grows it to `Max` for good (`grow_buffer/2`), and a request
@@ -1392,7 +1392,7 @@ reset_heap_floor(S) ->
     | chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding},
-    non_neg_integer()
+    roadrunner_router:body_limit()
 ) -> continue | too_large | none.
 expect_answer(#loop_state{buffered = ~""}, Req, Framing, MaxCL) ->
     case roadrunner_conn:expects_continue(Req) of
@@ -1421,7 +1421,7 @@ expect_answer(_S, _Req, _Framing, _MaxCL) ->
 %% The manual read's slow-client rate window starts with the 100, when the
 %% client can start sending, so `continue` carries what its recv is made of.
 -spec read_body(
-    auto | manual,
+    roadrunner_listener:body_buffering(),
     continue | none,
     #loop_state{},
     roadrunner_req:request(),
@@ -1429,7 +1429,7 @@ expect_answer(_S, _Req, _Framing, _MaxCL) ->
     | chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding},
-    non_neg_integer(),
+    roadrunner_router:body_limit(),
     roadrunner_conn:resolved(),
     integer()
 ) -> no_return().

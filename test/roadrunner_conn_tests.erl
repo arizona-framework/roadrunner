@@ -1780,7 +1780,8 @@ consume_state_no_framing_returns_empty_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     ?assertMatch({ok, <<>>, #{buffered := ~"hi"}}, roadrunner_conn:consume_body_reader(State, all)).
 
@@ -1793,7 +1794,8 @@ consume_state_already_drained_returns_empty_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     ?assertMatch({ok, <<>>, _}, roadrunner_conn:consume_body_reader(State, all)).
 
@@ -1806,7 +1808,8 @@ consume_state_length_returns_more_then_ok_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     {more, First, State1} = roadrunner_conn:consume_body_reader(State0, {length, 4}),
     ?assertEqual(~"abcd", First),
@@ -1822,7 +1825,8 @@ consume_state_length_recv_error_propagates_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> {error, closed} end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     ?assertEqual({error, closed}, roadrunner_conn:consume_body_reader(State, all)).
 
@@ -1852,7 +1856,8 @@ consume_state_length_multi_recv_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> Recv() end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     {more, Bytes, State1} = roadrunner_conn:consume_body_reader(State0, {length, 8}),
     ?assertEqual(~"abcdefgh", iolist_to_binary(Bytes)),
@@ -1880,7 +1885,8 @@ consume_state_length_multi_recv_error_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> Recv() end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     ?assertEqual(
         {error, closed},
@@ -1896,7 +1902,8 @@ consume_state_request_too_large_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> error(unused) end,
         max => 10,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     ?assertEqual(
         {error, content_length_too_large},
@@ -1914,7 +1921,8 @@ consume_state_request_too_large_in_pieces_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> error(unused) end,
         max => 10,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     ?assertEqual(
         {error, content_length_too_large},
@@ -2089,7 +2097,8 @@ consume_state_next_chunk_for_content_length_drains_fully_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     ?assertMatch({ok, ~"hello", _}, roadrunner_conn:consume_body_reader(State, next_chunk)).
 
@@ -2120,7 +2129,8 @@ chunked_state(Buf, Recv) ->
         id => make_ref(),
         recv => fun(_Deadline) -> Recv() end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     }.
 
 consume_state_recvs_more_when_buffer_short_test() ->
@@ -2138,7 +2148,8 @@ consume_state_recvs_more_when_buffer_short_test() ->
             {ok, ~"llo"}
         end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     {ok, Bytes, _} = roadrunner_conn:consume_body_reader(State, all),
     ?assertEqual(~"hello", iolist_to_binary(Bytes)),

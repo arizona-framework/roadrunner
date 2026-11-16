@@ -41,15 +41,19 @@ from starting:
 - `reflection`: `true` adds gRPC's server reflection
   (`roadrunner_grpc_reflection`) to the routes; by default `false`
 - `max_content_length`: the most a call's requests may add up to, in bytes,
-  for `routes/1` to set on each route in place of the listener's (10 MiB
-  by default); past it the call ends with `RESOURCE_EXHAUSTED` with
-  `manual` buffering, and with `auto` the request is answered `413`, as
-  the body is read before the call starts. A client or
-  bidi stream that lives long can carry more than that over its life, so
-  set it to what such a call may total
+  for `routes/1` to set on each route, past which the call ends with
+  `RESOURCE_EXHAUSTED`; by default `infinity`: gRPC has no such total, a
+  client or bidi stream may go on for as long as it lives, and
+  `max_message_size` bounds what one message holds. With `auto`
+  buffering, where the body is read whole before the call starts, a call
+  is held to the listener's `max_content_length` instead of `infinity`,
+  and one over the cap is answered `413`
+- `middlewares`: route middlewares (`roadrunner_middleware`) for every
+  route `routes/1` returns, the health and reflection ones among them;
+  one answers a call with a gRPC status with `reject/3`
 
-The health and reflection routes keep the defaults: the shared options
-apply to the services' routes.
+The health and reflection routes keep the defaults: the other shared
+options apply to the services' routes.
 
 ## Body buffering
 
@@ -57,16 +61,20 @@ With `body_buffering => manual` a call reads its requests as they come, so
 client streams and bidi streams flow both ways; a dedicated gRPC listener
 is the place for it. With `auto`, the default, the whole request body is
 read before the method runs, which suits unary and server-streaming calls
-and a client stream that fits `max_content_length`.
+and a client stream that fits the listener's `max_content_length`.
 
 ## What the client gets
 
 A call answers `:status 200` and ends with the gRPC status in its
 trailers: `OK` when the method returns normally, the status of an
-`{error, Status, Message, Stream}`, `INTERNAL` when the method crashes.
+`{error, Status, Message, Stream}` (or `{error, Status, Message, Details,
+Stream}`, with gRPC's rich error details, `t:details/0`), `INTERNAL`
+when the method crashes.
 A call that fails before any response is answered Trailers-Only, the
 status in the response headers. The rest is answered as HTTP: `505` over
-HTTP/1.1, `405` for a method other than `POST`, `415` for a
+HTTP/1.1, the router's `405` for a method other than `POST` (`routes/1`
+sets `methods`; `handle/1` answers it the same way as a handler of its
+own), `415` for a
 `content-type` none of the codecs speak, the router's `404` for an
 unknown service, and `500` for response headers over the client's
 SETTINGS_MAX_HEADER_LIST_SIZE. An unknown method of a known service is `UNIMPLEMENTED`,
@@ -112,7 +120,9 @@ unary or server-streaming method's request among them.
 
 A call emits `grpc_call_start` as it starts, then exactly one
 `grpc_call_stop` or `grpc_call_exception` as it ends, to the node's
-`roadrunner_event_handler`, which has their arguments.
+`roadrunner_event_handler`, which has their arguments. A request answered
+before the call starts (an HTTP refusal, a middleware's `reject/3`)
+emits neither: its request events report it.
 
 ## Metadata
 
@@ -120,22 +130,26 @@ A call emits `grpc_call_start` as it starts, then exactly one
 headers; `set_headers/2` and `set_trailers/2` add the response's, with
 names of `0-9`, `a-z`, `_`, `-` and `.` other than the ones gRPC sets
 (`grpc-status`, say) and values of printable ASCII with no space at either
-end; others raise, so the call ends `INTERNAL`.
+end; others raise, so the call ends `INTERNAL`. A `grpc-retry-pushback-ms`
+trailer tells a client that retries the call how long to wait first.
 A metadata name ending in `-bin` carries bytes: its value is base64 on the
 wire and plain bytes here, both ways; a request's comma-separated values
 are each an entry, and one that is not base64 ends the call with
-`INTERNAL` before the method runs.
+`INTERNAL` before the method runs. `request/1` is the call's HTTP request,
+to read what the metadata leaves out: the client's certificate, the
+`request_id`, what a middleware put on the request.
 """.
 
 -behaviour(roadrunner_handler).
 
 -export([routes/1, init_route/1, handle/1]).
 -export([recv/1, send/2, send/3, metadata/1, set_headers/2, set_trailers/2, deadline/1, peer/1]).
+-export([request/1, reject/3, reject/4]).
 -export([set_send_compression/2, cancelled/2, recv_compressed/1]).
 -export([recv_async/1, info/2]).
 -export([reflection_index/1]).
 
--export_type([opts/0, status/0, stream/0, encoding/0, info/0]).
+-export_type([opts/0, status/0, stream/0, encoding/0, info/0, details/0, reject_opts/0]).
 
 -define(MAX_MESSAGE_SIZE, 4194304).
 %% Where the call's process keeps the response's body writer once it started.
@@ -178,7 +192,8 @@ every service (see the moduledoc).
     services := [module() | roadrunner_grpc_service:descriptor()],
     codecs => [module()],
     max_message_size => pos_integer(),
-    max_content_length => non_neg_integer(),
+    max_content_length => roadrunner_router:body_limit(),
+    middlewares => roadrunner_middleware:middleware_list(),
     send_compression => encoding(),
     health => boolean(),
     reflection => boolean()
@@ -264,6 +279,23 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
 %% How a call ended with a status, or with none: for its events.
 -type ending() :: {status(), binary(), roadrunner_event_handler:grpc_stop_reason()}.
 
+-doc """
+gRPC's rich error details (google.rpc.Status's `details`): each a
+`google.protobuf.Any`, as `{TypeUrl, Value}`, `TypeUrl` naming the
+detail's message type (`~"type.googleapis.com/google.rpc.BadRequest"`,
+say) and `Value` that message's own encoded bytes. They go to the client
+in `grpc-status-details-bin`, as a google.rpc.Status whose code and
+message are the call's status and message.
+""".
+-type details() :: [{TypeUrl :: binary(), Value :: iodata()}].
+
+-doc """
+What `reject/4` adds to a rejection: `details`, gRPC's rich error details
+(`t:details/0`), and `trailers`, metadata sent with the status as
+`set_trailers/2` takes it (`grpc-retry-pushback-ms`, say).
+""".
+-type reject_opts() :: #{details => details(), trailers => roadrunner_http:headers()}.
+
 -doc "How a message is compressed: `identity` (not), `gzip` or `deflate`.".
 -type encoding() :: identity | gzip | deflate.
 
@@ -283,20 +315,22 @@ that is not the call's.
 
 -doc """
 The routes for `Opts`'s `services`, one per service, at
-`/package.Service/:method`: `max_content_length` set on each route, the
-other options its state.
+`/package.Service/:method`, answering `POST` only: `max_content_length` set on each route,
+`middlewares` on each route, the health and reflection ones among them,
+the other options its state.
 """.
 -spec routes(opts()) -> roadrunner_router:routes().
 routes(#{services := Services} = Opts) when is_list(Services) ->
-    Shared = maps:without([services, max_content_length, health, reflection], Opts),
-    Limits = maps:with([max_content_length], Opts),
-    Health = health_route(Opts),
+    Shared = maps:without([services, max_content_length, middlewares, health, reflection], Opts),
+    Keys = route_keys(Opts),
+    Health = health_route(Opts, Keys),
     Health ++
-        reflection_routes(Opts, Services, Health) ++
+        reflection_routes(Opts, Services, Health, Keys) ++
         [
-            Limits#{
+            Keys#{
                 path => <<"/", (service_name(Service, Services))/binary, "/:method">>,
                 handler => ?MODULE,
+                methods => [~"POST"],
                 state => Shared#{service => Service}
             }
          || Service <- Services
@@ -304,45 +338,60 @@ routes(#{services := Services} = Opts) when is_list(Services) ->
 routes(Opts) ->
     error({invalid_grpc_opts, Opts}).
 
+%% The route keys of the services' routes: `max_content_length`, by
+%% default `infinity`, and `middlewares`, which the router checks as the
+%% routes compile. The health and reflection routes take the
+%% `middlewares`.
+-spec route_keys(map()) -> map().
+route_keys(#{middlewares := Middlewares}) when not is_list(Middlewares) ->
+    error({invalid_grpc_opt, middlewares, Middlewares});
+route_keys(Opts) ->
+    maps:merge(
+        #{max_content_length => infinity}, maps:with([max_content_length, middlewares], Opts)
+    ).
+
 %% The health service's route, with `health => true`: it speaks its own
 %% protobuf messages, so it takes the raw codec whatever the services use.
--spec health_route(map()) -> roadrunner_router:routes().
-health_route(#{health := true}) ->
+-spec health_route(map(), map()) -> roadrunner_router:routes().
+health_route(#{health := true}, Keys) ->
     [
-        #{
+        (maps:with([middlewares], Keys))#{
             path => <<"/", (roadrunner_grpc_health:name())/binary, "/:method">>,
             handler => ?MODULE,
+            methods => [~"POST"],
             state => #{service => roadrunner_grpc_health}
         }
     ];
-health_route(#{health := false}) ->
+health_route(#{health := false}, _Keys) ->
     [];
-health_route(#{health := Other}) ->
+health_route(#{health := Other}, _Keys) ->
     error({invalid_grpc_opt, health, Other});
-health_route(#{}) ->
+health_route(#{}, _Keys) ->
     [].
 
 %% Reflection's routes, with `reflection => true`: its own two versions,
 %% answering from every service the routes serve, the health service and
 %% reflection itself among them. Like the health service, it takes the raw
 %% codec.
--spec reflection_routes(map(), [term()], roadrunner_router:routes()) -> roadrunner_router:routes().
-reflection_routes(#{reflection := true}, Services, Health) ->
-    Own = roadrunner_grpc_reflection:services(),
-    Described = Services ++ [Service || #{state := #{service := Service}} <- Health] ++ Own,
+-spec reflection_routes(map(), [term()], roadrunner_router:routes(), map()) ->
+    roadrunner_router:routes().
+reflection_routes(#{reflection := true}, Services, Health, Keys) ->
+    Reflection = roadrunner_grpc_reflection:services(),
+    Described = Services ++ [Service || #{state := #{service := Service}} <- Health] ++ Reflection,
     [
-        #{
+        (maps:with([middlewares], Keys))#{
             path => <<"/", Name/binary, "/:method">>,
             handler => ?MODULE,
+            methods => [~"POST"],
             state => #{service => Service, reflection => Described}
         }
-     || #{name := Name} = Service <- Own
+     || #{name := Name} = Service <- Reflection
     ];
-reflection_routes(#{reflection := false}, _Services, _Health) ->
+reflection_routes(#{reflection := false}, _Services, _Health, _Keys) ->
     [];
-reflection_routes(#{reflection := Other}, _Services, _Health) ->
+reflection_routes(#{reflection := Other}, _Services, _Health, _Keys) ->
     error({invalid_grpc_opt, reflection, Other});
-reflection_routes(#{}, _Services, _Health) ->
+reflection_routes(#{}, _Services, _Health, _Keys) ->
     [].
 
 -spec service_name(term(), [term()]) -> binary().
@@ -803,6 +852,12 @@ result(Kind, {ok, #stream{} = Stream}) when Kind =:= server_stream; Kind =:= bid
 result(_Kind, {error, Status, Message, #stream{} = Stream}) when is_binary(Message) ->
     _ = roadrunner_grpc_status:code(Status),
     {error, Status, Message, Stream};
+result(_Kind, {error, Status, Message, Details, #stream{trailers = Trailers} = Stream}) when
+    is_binary(Message), is_list(Details)
+->
+    {error, Status, Message, Stream#stream{
+        trailers = details_fields(Status, Message, Details) ++ Trailers
+    }};
 result(_Kind, Other) ->
     error({bad_return, Other}).
 
@@ -1074,6 +1129,23 @@ encoding_header(Encoding, Headers) -> [{~"grpc-encoding", atom_to_binary(Encodin
 
 -spec status_headers(status(), binary(), stream()) -> roadrunner_http:headers().
 status_headers(Status, Message, #stream{trailers = Trailers}) ->
+    status_fields(Status, Message, Trailers).
+
+%% The `grpc-status-details-bin` of a status with details: a
+%% google.rpc.Status of the same code and message, which a client checks
+%% against `grpc-status` (grpc-go answers a mismatch `INTERNAL`). None
+%% without details.
+-spec details_fields(status(), binary(), details()) -> roadrunner_http:headers().
+details_fields(_Status, _Message, []) ->
+    [];
+details_fields(Status, Message, Details) ->
+    Code = roadrunner_grpc_status:code(Status),
+    Bytes = iolist_to_binary(roadrunner_grpc_status_proto:status(Code, Message, Details)),
+    [{~"grpc-status-details-bin", base64:encode(Bytes, #{padding => false})}].
+
+%% The status, its message when it has one, then `Trailers`.
+-spec status_fields(status(), binary(), roadrunner_http:headers()) -> roadrunner_http:headers().
+status_fields(Status, Message, Trailers) ->
     Code = integer_to_binary(roadrunner_grpc_status:code(Status)),
     case Message of
         <<>> ->
@@ -1505,7 +1577,8 @@ own_name(Name) ->
                 ~"grpc-encoding",
                 ~"grpc-accept-encoding",
                 ~"grpc-timeout",
-                ~"grpc-message-type"
+                ~"grpc-message-type",
+                ~"grpc-status-details-bin"
             ])
     of
         true -> Name;
@@ -1569,3 +1642,114 @@ reflection_index(#stream{req = Req}) ->
 -spec peer(stream()) -> {inet:ip_address(), inet:port_number()} | undefined.
 peer(#stream{req = Req}) ->
     roadrunner_req:peer(Req).
+
+-doc """
+The call's HTTP request, for what the stream does not tell itself: the
+client's certificate (`roadrunner_req:peercert/1`) and TLS session
+(`roadrunner_req:tls_info/1`), what a middleware put on the request
+(`roadrunner_req:private/2`), the `request_id`, and the headers
+`metadata/1` leaves out (`roadrunner_req:header/2`). It is for reading:
+the call reads the body through the stream, so read it with `recv/1` or
+`recv_async/1`, never through the request.
+
+```erlang
+whoami(_Request, Stream) ->
+    case roadrunner_req:peercert(roadrunner_grpc:request(Stream)) of
+        {ok, Der} -> {reply, subject(Der), Stream};
+        {error, _} -> {error, unauthenticated, ~"no client certificate", Stream}
+    end.
+```
+""".
+-spec request(stream()) -> roadrunner_req:request().
+request(#stream{req = Req}) ->
+    Req.
+
+-doc """
+Answer a call from a middleware, before its method runs: the response a
+middleware returns in place of `Next(Req)` to end the call with a gRPC
+`Status` other than `ok` and its `Message`, the status in the response
+headers alone (gRPC's Trailers-Only), as a gRPC client expects. An HTTP
+error status (a `401`, say) would reach the client as `UNKNOWN` or
+`UNAVAILABLE` instead.
+
+```erlang
+call(Req, Next, Keys) ->
+    case roadrunner_req:header(~"x-api-key", Req) of
+        Key when is_binary(Key) andalso is_map_key(Key, Keys) ->
+            Next(Req);
+        _ ->
+            roadrunner_grpc:reject(unauthenticated, ~"missing or unknown x-api-key", Req)
+    end.
+```
+
+The method never runs, so the call emits no `grpc_call_start` or
+`grpc_call_stop`: the request's own events report it.
+""".
+-spec reject(status(), binary(), roadrunner_req:request()) -> roadrunner_handler:result().
+reject(Status, Message, Req) ->
+    reject(Status, Message, #{}, Req).
+
+-doc """
+`reject/3`, with gRPC's rich error `details` (`t:details/0`) and
+`trailers`, metadata sent with the status (`t:reject_opts/0`). Trailers
+follow `set_trailers/2`'s rules, and raise as it does.
+
+```erlang
+roadrunner_grpc:reject(
+    unavailable,
+    ~"too many calls",
+    #{trailers => [{~"grpc-retry-pushback-ms", ~"500"}]},
+    Req
+)
+```
+""".
+-spec reject(status(), binary(), reject_opts(), roadrunner_req:request()) ->
+    roadrunner_handler:result().
+reject(Status, Message, Opts, Req) when Status =/= ok, is_binary(Message), is_map(Opts) ->
+    Trailers = reject_details(Status, Message, Opts) ++ reject_trailers(Opts),
+    ContentType = reject_content_type(roadrunner_req:header(~"content-type", Req)),
+    {{200, [{~"content-type", ContentType} | status_fields(Status, Message, Trailers)], <<>>}, Req}.
+
+-spec reject_details(status(), binary(), reject_opts()) -> roadrunner_http:headers().
+reject_details(Status, Message, #{details := Details}) -> details_fields(Status, Message, Details);
+reject_details(_Status, _Message, #{}) -> [].
+
+-spec reject_trailers(reject_opts()) -> roadrunner_http:headers().
+reject_trailers(#{trailers := Trailers}) -> wire(Trailers);
+reject_trailers(#{}) -> [].
+
+%% The response's `content-type`, the request's as a call would answer it
+%% (`codec/2`), or gRPC's own for a request that names none of gRPC's.
+-spec reject_content_type(binary() | undefined) -> binary().
+reject_content_type(ContentType) when is_binary(ContentType) ->
+    case roadrunner_bin:ascii_lowercase(ContentType) of
+        <<"application/grpc", Rest/binary>> ->
+            case subtype(Rest) of
+                invalid ->
+                    ~"application/grpc";
+                Subtype ->
+                    case Subtype =/= <<>> andalso token(Subtype) of
+                        true -> response_content_type(Subtype, Rest);
+                        false -> ~"application/grpc"
+                    end
+            end;
+        _Other ->
+            ~"application/grpc"
+    end;
+reject_content_type(undefined) ->
+    ~"application/grpc".
+
+%% Whether a lowercase subtype is an RFC 9110 token (§5.6.2 tchar), and
+%% so safe to echo in the response's `content-type`.
+-spec token(binary()) -> boolean().
+token(<<C, Rest/binary>>) when
+    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse
+        C =:= $! orelse C =:= $# orelse C =:= $$ orelse C =:= $% orelse C =:= $& orelse
+        C =:= $' orelse C =:= $* orelse C =:= $+ orelse C =:= $- orelse C =:= $. orelse
+        C =:= $^ orelse C =:= $_ orelse C =:= $` orelse C =:= $| orelse C =:= $~
+->
+    token(Rest);
+token(<<>>) ->
+    true;
+token(_Subtype) ->
+    false.

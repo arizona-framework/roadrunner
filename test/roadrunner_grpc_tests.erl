@@ -13,6 +13,8 @@ routes_test() ->
             #{
                 path => ~"/test.Echo/:method",
                 handler => ?M,
+                methods => [~"POST"],
+                max_content_length => infinity,
                 state => #{service => ?SVC, max_message_size => 9}
             }
         ],
@@ -75,6 +77,7 @@ routes_health_test() ->
             #{
                 path => ~"/grpc.health.v1.Health/:method",
                 handler => ?M,
+                methods => [~"POST"],
                 state => #{service => roadrunner_grpc_health}
             }
         ],
@@ -213,3 +216,117 @@ init_route_bad_rpc_test() ->
         {invalid_grpc_opt, service, {roadrunner_grpc_unexported_service, ~"Gone", _}},
         ?M:init_route(#{service => roadrunner_grpc_unexported_service})
     ).
+
+%% `middlewares` go on every route, the health and reflection ones among
+%% them; one that is not a list is refused.
+routes_middlewares_test() ->
+    Mws = [roadrunner_compress],
+    Routes = ?M:routes(#{
+        services => [?SVC],
+        health => true,
+        reflection => true,
+        middlewares => Mws,
+        max_content_length => 7
+    }),
+    ?assertMatch(
+        [
+            #{middlewares := Mws, state := #{service := roadrunner_grpc_health}},
+            #{middlewares := Mws},
+            #{middlewares := Mws},
+            #{middlewares := Mws, max_content_length := 7, state := #{service := ?SVC}}
+        ],
+        Routes
+    ),
+    [#{state := State} | _] = lists:reverse(Routes),
+    ?assertNot(is_map_key(middlewares, State)),
+    ?assertError(
+        {invalid_grpc_opt, middlewares, x}, ?M:routes(#{services => [?SVC], middlewares => x})
+    ).
+
+%% A middleware's rejection answers with the status in the headers alone,
+%% under the request's gRPC `content-type`, or gRPC's own.
+reject_test() ->
+    Req = #{headers => [{~"content-type", ~"Application/GRPC+Test; x=1"}]},
+    ?assertEqual(
+        {
+            {200,
+                [
+                    {~"content-type", ~"application/grpc+test"},
+                    {~"grpc-status", ~"16"},
+                    {~"grpc-message", ~"no key"}
+                ],
+                <<>>},
+            Req
+        },
+        ?M:reject(unauthenticated, ~"no key", Req)
+    ),
+    ContentType = fun(Headers) ->
+        {{200, [{~"content-type", Type} | _], <<>>}, _} =
+            ?M:reject(permission_denied, <<>>, #{headers => Headers}),
+        Type
+    end,
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpcx"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc+"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc+ ;a=b"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc+a b"}])),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"application/grpc+a,b"}])),
+    ?assertEqual(
+        ~"application/grpc+x.y-z_1", ContentType([{~"content-type", ~"application/grpc+X.y-Z_1"}])
+    ),
+    ?assertEqual(~"application/grpc", ContentType([{~"content-type", ~"text/plain"}])),
+    ?assertEqual(~"application/grpc", ContentType([])),
+    ?assertMatch(
+        {{200, [_, {~"grpc-status", ~"7"}], <<>>}, _},
+        ?M:reject(permission_denied, <<>>, #{headers => []})
+    ),
+    ?assertError(function_clause, ?M:reject(ok, <<>>, #{headers => []})),
+    ?assertError(function_clause, ?M:reject(nope, <<>>, #{headers => []})).
+
+%% `reject/4` adds the status's details, a google.rpc.Status of the same
+%% code and message, and trailers as `set_trailers/2` takes them.
+reject_with_details_and_trailers_test() ->
+    Details = [{~"t/a", ~"v"}],
+    {{200, Headers, <<>>}, _} = ?M:reject(
+        resource_exhausted,
+        ~"slow down",
+        #{details => Details, trailers => [{~"grpc-retry-pushback-ms", ~"500"}, {~"x-bin", <<0>>}]},
+        #{headers => []}
+    ),
+    Encoded = base64:encode(
+        iolist_to_binary(roadrunner_grpc_status_proto:status(8, ~"slow down", Details)),
+        #{padding => false}
+    ),
+    ?assertEqual(
+        [
+            {~"content-type", ~"application/grpc"},
+            {~"grpc-status", ~"8"},
+            {~"grpc-message", ~"slow down"},
+            {~"grpc-status-details-bin", Encoded},
+            {~"grpc-retry-pushback-ms", ~"500"},
+            {~"x-bin", ~"AA"}
+        ],
+        Headers
+    ),
+    ?assertEqual(
+        ?M:reject(internal, ~"m", #{headers => []}),
+        ?M:reject(internal, ~"m", #{}, #{headers => []})
+    ),
+    %% No details, no details header.
+    ?assertEqual(
+        ?M:reject(internal, ~"m", #{headers => []}),
+        ?M:reject(internal, ~"m", #{details => []}, #{headers => []})
+    ),
+    %% The details header is the call's own to set.
+    ?assertError(
+        {invalid_metadata, ~"grpc-status-details-bin"},
+        ?M:reject(
+            internal, ~"m", #{trailers => [{~"grpc-status-details-bin", <<>>}]}, #{headers => []}
+        )
+    ).
+
+%% Used as a handler of its own, outside `routes/1`, `handle/1` still
+%% answers a method other than POST with 405 itself.
+handle_other_method_test() ->
+    Req = #{version => {2, 0}, method => ~"GET"},
+    ?assertEqual({{405, [{~"allow", ~"POST"}], <<>>}, Req}, ?M:handle(Req)).

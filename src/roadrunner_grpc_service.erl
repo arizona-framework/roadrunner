@@ -31,8 +31,10 @@ of the call, and returns what the call answers:
   `{ok, Stream}`
 
 Any of them may instead return `{error, Status, Message, Stream}`, a
-`t:roadrunner_grpc:status/0` and a UTF-8 message for the client. A method
-that crashes ends the call with `INTERNAL`.
+`t:roadrunner_grpc:status/0` and a UTF-8 message for the client, or
+`{error, Status, Message, Details, Stream}` with gRPC's rich error details
+(`t:roadrunner_grpc:details/0`). A method that crashes ends the call with
+`INTERNAL`.
 
 `input` and `output` are given to the call's `roadrunner_grpc_codec` as
 the message types; the raw codec ignores them.

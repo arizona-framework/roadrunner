@@ -1858,3 +1858,24 @@ request_line_connect_not_implemented_test() ->
 request_line_cut_inside_short_query_asks_for_more_test() ->
     %% The buffer ends a few bytes into the query: no space or CRLF yet.
     ?assertEqual({more, undefined}, roadrunner_http1:parse_request(~"GET /a?b")).
+
+%% `parse_chunk_part/4` hands a chunk over 64 KB back as it arrives; a
+%% smaller one, the last chunk, a partial size line and errors come as from
+%% `parse_chunk/3`.
+parse_chunk_part_test() ->
+    L = {8192, 10240, 100},
+    ?assertEqual(
+        {part, ~"ab", 65535}, roadrunner_http1:parse_chunk_part(~"10001\r\nab", L, infinity, 0)
+    ),
+    ?assertEqual({part, ~"cd", 1}, roadrunner_http1:parse_chunk_part(~"cd", L, infinity, 3)),
+    ?assertEqual({ok, ~"e", ~"x"}, roadrunner_http1:parse_chunk_part(~"e\r\nx", L, infinity, 1)),
+    ?assertEqual({more, undefined}, roadrunner_http1:parse_chunk_part(~"3\r\nab", L, infinity, 0)),
+    ?assertEqual({ok, ~"abc", <<>>}, roadrunner_http1:parse_chunk_part(~"3\r\nabc\r\n", L, 3, 0)),
+    ?assertEqual({more, undefined}, roadrunner_http1:parse_chunk_part(~"1", L, infinity, 0)),
+    ?assertEqual({ok, last, [], ~"n"}, roadrunner_http1:parse_chunk_part(~"0\r\n\r\nn", L, 0, 0)),
+    ?assertEqual(
+        {error, content_length_too_large}, roadrunner_http1:parse_chunk_part(~"4\r\n", L, 3, 0)
+    ),
+    ?assertEqual(
+        {error, bad_chunk_size}, roadrunner_http1:parse_chunk_part(~"x\r\n", L, infinity, 0)
+    ).

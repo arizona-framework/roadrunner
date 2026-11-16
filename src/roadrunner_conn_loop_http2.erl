@@ -241,8 +241,9 @@
     %% END_STREAM (RFC 9113 §8.1.2.6).
     body_len := non_neg_integer(),
     %% The body cap: the listener's `max_content_length` until a body
-    %% outgrows it and its route raises it (`stream_body_cap/4`).
-    body_cap := non_neg_integer(),
+    %% outgrows it and its route raises it (`stream_body_cap/4`), to
+    %% `infinity` for a route that sets no cap.
+    body_cap := roadrunner_router:body_limit(),
     send_window := integer(),
     recv_window := non_neg_integer(),
     worker_pid := undefined | pid(),
@@ -368,7 +369,7 @@
     %% `manual` starts the worker at the end of the headers and hands it the
     %% body as it reads (`dispatch_reading/3`), within `request_timeout`
     %% from then. Read from proto_opts at `enter/6`.
-    body_buffering = auto :: auto | manual,
+    body_buffering = auto :: roadrunner_listener:body_buffering(),
     request_timeout = 0 :: non_neg_integer(),
     %% Decoded header-list cap (RFC 9113 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE):
     %% advertised in our SETTINGS and enforced after HPACK decode in
@@ -1791,8 +1792,8 @@ refill_conn_window(State) ->
 %% the stream's own `Cap` while the body fits in it, else its route's,
 %% looked up only once a body outgrows the cap it has (the listener's, at
 %% first) and kept on the stream from then on.
--spec stream_body_cap(non_neg_integer(), non_neg_integer(), map(), #loop{}) ->
-    non_neg_integer().
+-spec stream_body_cap(non_neg_integer(), roadrunner_router:body_limit(), map(), #loop{}) ->
+    roadrunner_router:body_limit().
 stream_body_cap(NewLen, Cap, _Stream, _State) when NewLen =< Cap ->
     Cap;
 stream_body_cap(
