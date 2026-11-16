@@ -1,9 +1,10 @@
 -module(roadrunner_reset_flood_SUITE).
 -moduledoc """
 A client that resets its requests while their handlers still run (the
-HTTP/2 rapid reset attack, CVE-2023-44487) gets no more handlers running
-at once on a connection than the connection's stream limit. The handler
-(`roadrunner_h2_slot_handler`) announces itself and runs until released, ignoring the reset, so each one stands for work a
+HTTP/2 rapid reset attack, CVE-2023-44487, and its HTTP/3 form) gets no
+more handlers running at once on a connection than the connection's stream
+limit. The handler (`roadrunner_h2_slot_handler`) announces itself and
+runs until released, ignoring the reset, so each one stands for work a
 client abandons.
 """.
 
@@ -12,7 +13,7 @@ client abandons.
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
--export([suite/0, all/0]).
+-export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
 -export([init_per_testcase/2, end_per_testcase/2]).
 -export([
     h2_reset_handlers_hold_the_stream_limit/1,
@@ -20,11 +21,20 @@ client abandons.
     h2_reset_flood_gets_goaway/1,
     h2_client_with_open_streams_is_only_refused/1,
     h2_reset_at_a_normal_rate_is_served/1,
-    h2_reset_of_an_answered_stream_frees_it/1
+    h2_reset_of_an_answered_stream_frees_it/1,
+    h3_reset_handlers_hold_the_stream_credit/1,
+    h3_credit_frees_when_a_reset_handler_ends/1,
+    h3_reset_at_a_normal_rate_is_served/1,
+    h3_request_after_stop_sending_is_not_served/1,
+    h3_request_in_the_stop_sending_packet_is_not_served/1
 ]).
 
 -define(MAX_STREAMS, 4).
 -define(COLLECTOR, roadrunner_h2_slot_collector).
+%% RFC 9114 §8.1 H3_REQUEST_CANCELLED.
+-define(H3_REQUEST_CANCELLED, 16#010C).
+%% RFC 9000 §20.1 STREAM_LIMIT_ERROR.
+-define(STREAM_LIMIT_ERROR, 16#04).
 
 suite() ->
     [{timetrap, {seconds, 30}}].
@@ -36,12 +46,25 @@ all() ->
         h2_reset_flood_gets_goaway,
         h2_client_with_open_streams_is_only_refused,
         h2_reset_at_a_normal_rate_is_served,
-        h2_reset_of_an_answered_stream_frees_it
+        h2_reset_of_an_answered_stream_frees_it,
+        h3_reset_handlers_hold_the_stream_credit,
+        h3_credit_frees_when_a_reset_handler_ends,
+        h3_reset_at_a_normal_rate_is_served,
+        h3_request_after_stop_sending_is_not_served,
+        h3_request_in_the_stop_sending_packet_is_not_served
     ].
 
-init_per_testcase(_Case, Config) ->
+init_per_suite(Config) ->
+    {ok, _} = application:ensure_all_started(crypto),
+    {ok, _} = application:ensure_all_started(ssl),
+    Config.
+
+end_per_suite(_Config) ->
+    ok.
+
+init_per_testcase(Case, Config) ->
     true = register(?COLLECTOR, self()),
-    {ok, _} = roadrunner_listener:start_link(?MODULE, listener_opts()),
+    {ok, _} = roadrunner_listener:start_link(?MODULE, listener_opts(protocol(Case))),
     [{port, roadrunner_listener:port(?MODULE)} | Config].
 
 end_per_testcase(_Case, _Config) ->
@@ -49,7 +72,13 @@ end_per_testcase(_Case, _Config) ->
     true = unregister(?COLLECTOR),
     ok.
 
-listener_opts() ->
+protocol(Case) ->
+    case atom_to_binary(Case) of
+        <<"h2_", _/binary>> -> http2;
+        <<"h3_", _/binary>> -> http3
+    end.
+
+listener_opts(http2) ->
     #{
         port => 0,
         protocols => [{http2, #{max_concurrent_streams => ?MAX_STREAMS}}],
@@ -57,6 +86,13 @@ listener_opts() ->
             {~"/", roadrunner_h2_slot_handler},
             {~"/answered", roadrunner_answer_then_hold_handler}
         ]
+    };
+listener_opts(http3) ->
+    #{
+        port => 0,
+        protocols => [{http3, #{max_streams_bidi => ?MAX_STREAMS}}],
+        tls => roadrunner_test_certs:server_opts(),
+        routes => roadrunner_h2_slot_handler
     }.
 
 %% =============================================================================
@@ -183,6 +219,106 @@ h2_reset_of_an_answered_stream_frees_it(Config) ->
     {200, ~"ok", C2} = response(C1, Id),
     lists:foreach(fun(H) -> ok = stop(H) end, Handlers),
     {_, _} = ping_sync(C2).
+
+%% =============================================================================
+%% HTTP/3
+%% =============================================================================
+
+h3_reset_handlers_hold_the_stream_credit(Config) ->
+    %% Four requests cancelled while their handlers run keep the stream
+    %% credit they took: the server grants no more (RFC 9000 §4.6), and a
+    %% client opening a fifth anyway breaks the limit (STREAM_LIMIT_ERROR).
+    Conn = h3_connect(Config),
+    Handlers = h3_fill_with_cancelled(Conn),
+    ?assertEqual([], max_streams_grants(Conn)),
+    {ok, _} = roadrunner_quic_test_h3:open_request(Conn, h3_headers()),
+    receive
+        {quic_test_closed, Conn, Code} -> ?assertEqual(?STREAM_LIMIT_ERROR, Code)
+    after 5000 -> ct:fail(no_stream_limit_error)
+    end,
+    release(Handlers).
+
+h3_credit_frees_when_a_reset_handler_ends(Config) ->
+    %% A cancelled handler that ends gives its stream credit back.
+    Conn = h3_connect(Config),
+    [First | Rest] = h3_fill_with_cancelled(Conn),
+    First ! release,
+    receive
+        {quic_test_max_streams, Conn, bidi, Max} -> ?assertEqual(?MAX_STREAMS + 1, Max)
+    after 5000 -> ct:fail(no_max_streams)
+    end,
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, h3_headers()),
+    [Next] = handlers_started(1),
+    Next ! release,
+    ?assertMatch({200, _, ~"ok"}, roadrunner_quic_test_h3:collect(Conn, StreamId)),
+    release(Rest),
+    roadrunner_quic_test_h3:close(Conn).
+
+h3_reset_at_a_normal_rate_is_served(Config) ->
+    %% One cancelled request at a time, each handler ending before the
+    %% next: credit keeps coming back, so every request is served.
+    Conn = h3_connect(Config),
+    lists:foreach(
+        fun(_) ->
+            {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, h3_headers()),
+            [Handler] = handlers_started(1),
+            ok = roadrunner_quic_test_h3:cancel(Conn, StreamId),
+            ?assertEqual(?H3_REQUEST_CANCELLED, server_reset(Conn, StreamId)),
+            ok = stop(Handler)
+        end,
+        lists:seq(1, 4 * ?MAX_STREAMS)
+    ),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, h3_headers()),
+    [Handler] = handlers_started(1),
+    Handler ! release,
+    ?assertMatch({200, _, ~"ok"}, roadrunner_quic_test_h3:collect(Conn, StreamId)),
+    roadrunner_quic_test_h3:close(Conn).
+
+h3_request_after_stop_sending_is_not_served(Config) ->
+    %% A client opens a stream with no bytes, stops our side of it, then
+    %% sends a request on it: the server gave the stream up, so the request
+    %% is not read and starts no handler (it would run on a stream whose
+    %% credit already came back). The next request is served as usual.
+    Conn = h3_connect(Config),
+    Bogus = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(Conn, Bogus, <<>>, false),
+    ok = roadrunner_quic_test_conn:stop_sending(Conn, Bogus, ?H3_REQUEST_CANCELLED),
+    ?assertEqual(?H3_REQUEST_CANCELLED, server_reset(Conn, Bogus)),
+    Frame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(h3_headers())),
+    ok = roadrunner_quic_test_conn:send(Conn, Bogus, iolist_to_binary(Frame), true),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, h3_headers()),
+    [Handler] = handlers_started(1),
+    Handler ! release,
+    ?assertMatch({200, _, ~"ok"}, roadrunner_quic_test_h3:collect(Conn, StreamId)),
+    receive
+        {handler_started, Pid} -> ct:fail({bogus_request_served, Pid})
+    after 0 -> ok
+    end,
+    roadrunner_quic_test_h3:close(Conn).
+
+h3_request_in_the_stop_sending_packet_is_not_served(Config) ->
+    %% The same, all in one packet: the request reaches the server's
+    %% connection loop before it gives the stream up, and is still not read.
+    Conn = h3_connect(Config),
+    Bogus = roadrunner_quic_test_conn:open_bidi(Conn),
+    Frame = iolist_to_binary(
+        roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(h3_headers()))
+    ),
+    ok = roadrunner_quic_test_conn:send_frames(Conn, [
+        {stream, Bogus, 0, <<>>, false},
+        {stop_sending, Bogus, ?H3_REQUEST_CANCELLED},
+        {stream, Bogus, 0, Frame, true}
+    ]),
+    ?assertEqual(?H3_REQUEST_CANCELLED, server_reset(Conn, Bogus)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, h3_headers()),
+    [Handler] = handlers_started(1),
+    Handler ! release,
+    ?assertMatch({200, _, ~"ok"}, roadrunner_quic_test_h3:collect(Conn, StreamId)),
+    receive
+        {handler_started, Pid} -> ct:fail({bogus_request_served, Pid})
+    after 0 -> ok
+    end,
+    roadrunner_quic_test_h3:close(Conn).
 
 %% =============================================================================
 %% Helpers
@@ -320,4 +456,53 @@ next_frame(#{sock := Sock, buf := Buf, dec := Dec} = C) ->
         _More ->
             {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
             next_frame(C#{buf := <<Buf/binary, Data/binary>>})
+    end.
+
+%% --- HTTP/3 client ---
+
+h3_connect(Config) ->
+    {ok, Conn} = roadrunner_quic_test_h3:connect(
+        {127, 0, 0, 1}, ?config(port, Config), #{max_streams_events => true}
+    ),
+    Conn.
+
+%% Open the connection's whole stream credit and cancel every request
+%% while its handler runs, once the server has reset its side of each.
+h3_fill_with_cancelled(Conn) ->
+    StreamIds = [
+        begin
+            {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, h3_headers()),
+            StreamId
+        end
+     || _ <- lists:seq(1, ?MAX_STREAMS)
+    ],
+    Handlers = handlers_started(?MAX_STREAMS),
+    lists:foreach(
+        fun(StreamId) ->
+            ok = roadrunner_quic_test_h3:cancel(Conn, StreamId),
+            ?assertEqual(?H3_REQUEST_CANCELLED, server_reset(Conn, StreamId))
+        end,
+        StreamIds
+    ),
+    Handlers.
+
+h3_headers() ->
+    [
+        {~":method", ~"GET"},
+        {~":scheme", ~"https"},
+        {~":authority", ~"localhost"},
+        {~":path", ~"/"}
+    ].
+
+server_reset(Conn, StreamId) ->
+    receive
+        {quic_test_stream_reset, Conn, StreamId, Code} -> Code
+    after 5000 -> ct:fail(no_server_reset)
+    end.
+
+%% The MAX_STREAMS (bidi) grants received so far.
+max_streams_grants(Conn) ->
+    receive
+        {quic_test_max_streams, Conn, bidi, Max} -> [Max | max_streams_grants(Conn)]
+    after 0 -> []
     end.

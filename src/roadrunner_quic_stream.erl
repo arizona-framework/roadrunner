@@ -37,6 +37,7 @@
     next_frame/2,
     stop_sending/1,
     release/1,
+    released/1,
     send_pending/1,
     send_abandoned/1,
     send_owed/1,
@@ -264,6 +265,11 @@ again from offset 0.
 -spec release(t()) -> t().
 release(#stream{} = Stream) ->
     Stream#stream{released = true}.
+
+-doc "Whether the owner released the stream (`release/1`).".
+-spec released(t()) -> boolean().
+released(#stream{released = Released}) ->
+    Released.
 
 -doc """
 Whether both directions are finished, so the stream can be pruned: the send

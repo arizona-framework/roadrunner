@@ -197,6 +197,16 @@ counterpart to HTTP/2's `max_concurrent_streams`. Both are tuned under
 `{http3, #{...}}` in the `protocols` list, with the keys
 `max_header_block` and `max_streams_bidi`.
 
+The stream count holds at once, not over the connection's life: each
+request stream that closes gives its credit back with a `MAX_STREAMS`
+frame (RFC 9000 §4.6), so a connection serves any number of requests,
+never more than `max_streams_bidi` at a time. A request the client
+cancels (`RESET_STREAM` or `STOP_SENDING`) is not closed until its
+handler ends, as on HTTP/2, so cancelling requests in a loop (the HTTP/3
+form of the rapid reset attack) runs no more handlers at once than the
+limit. A client that opens a stream past its credit breaks the QUIC
+limit and the connection is closed with `STREAM_LIMIT_ERROR`.
+
 Response headers are held to the client's own limit: a client that sends
 `SETTINGS_MAX_FIELD_SECTION_SIZE` (Chrome, quiche and ngtcp2 all do) gets
 no header section over it (RFC 9114 §4.2.2), counted the same way (name
@@ -269,8 +279,8 @@ can exhaust the VM-global process table — failing spawns everywhere, not
 just this listener — on top of unbounded handler memory.
 `max_concurrent_requests` caps that product directly: a listener-wide
 ceiling on live handler processes for the multiplexed protocols. Like
-`max_concurrent_streams`, it counts a handler still running after its
-client reset the stream. Over the
+the per-connection stream limits, it counts a handler still running
+after its client reset the stream. Over the
 ceiling, a new HTTP/2 or HTTP/3 stream is refused with `REFUSED_STREAM` /
 `H3_REQUEST_REJECTED` (both retry-safe per RFC 9113 §8.7) before any
 handler runs, and the refusal emits `request_throttled` and

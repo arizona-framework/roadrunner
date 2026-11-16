@@ -3575,18 +3575,108 @@ parked_reply_not_double_released_test() ->
     {_State3, E3} = ?M:handle_datagram(?NOW, ?PEER, Ack, State2),
     ?assertEqual([], replies_for(E3, Ref)).
 
-%% As the peer opens bidi streams toward the advertised limit (test TP = 3), the
-%% server raises the limit and sends MAX_STREAMS so the peer can keep opening
-%% request streams (RFC 9000 §4.6). The first open is still within credit (no
-%% grant); the second crosses the refill threshold and grants a fresh window.
-max_streams_granted_as_bidi_credit_consumed_test() ->
+%% Opening request streams grants no bidi credit (RFC 9000 §4.6): the limit
+%% (test TP = 3) bounds how many are open at once, so a fourth while three
+%% are open is a STREAM_LIMIT_ERROR.
+max_streams_not_granted_on_open_test() ->
     {State0, ClientApSecret, ServerApSecret} = connect_owned(),
-    Open0 = app_datagram([{stream, 0, 0, ~"a", true}], 0, ClientApSecret),
-    {State1, E0} = ?M:handle_datagram(?NOW, ?PEER, Open0, State0),
-    ?assertEqual([], max_streams_frames(E0, ServerApSecret)),
-    Open4 = app_datagram([{stream, 4, 0, ~"b", true}], 1, ClientApSecret),
-    {_State2, E4} = ?M:handle_datagram(?NOW, ?PEER, Open4, State1),
-    ?assertEqual([{max_streams, bidi, 5}], max_streams_frames(E4, ServerApSecret)).
+    {State1, E1} = open_requests([0, 4, 8], 0, State0, ClientApSecret),
+    ?assertEqual([], max_streams_frames(E1, ServerApSecret)),
+    Open12 = app_datagram([{stream, 12, 0, ~"d", true}], 3, ClientApSecret),
+    {State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Open12, State1),
+    ?assertEqual(draining, ?M:phase(State2)),
+    ?assertEqual([{emit, self(), {closed, {local, stream_limit_error}}}], emits(E2)).
+
+%% A request stream gives its credit back once both its sides are done: with
+%% every stream taken, the first answered raises the limit by one, in the
+%% same send pass that puts its FIN out, since the client has no credit
+%% left to wait with.
+max_streams_granted_as_streams_close_test() ->
+    {State0, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = open_requests([0, 4, 8], 0, State0, ClientApSecret),
+    {_State2, E2} = ?M:handle_send(self(), make_ref(), 0, ~"ok", true, ?NOW, State1),
+    ?assertEqual([{max_streams, bidi, 4}], max_streams_frames(E2, ServerApSecret)).
+
+%% No MAX_STREAMS goes out once the connection is closing (RFC 9000 §10.2),
+%% even when a released stream gives its credit back then.
+max_streams_not_granted_while_closing_test() ->
+    {State0, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = open_requests([0, 4, 8], 0, State0, ClientApSecret),
+    Reset = app_datagram([{reset_stream, 0, 16#010C, 1}], 3, ClientApSecret),
+    {State2, _} = ?M:handle_datagram(?NOW, ?PEER, Reset, State1),
+    {State3, _} = ?M:handle_call(self(), make_ref(), {reset_stream, 0, 16#010C}, ?NOW, State2),
+    {State4, _} = ?M:handle_call(self(), make_ref(), {close, 0}, ?NOW, State3),
+    {_State5, E5} = ?M:handle_call(self(), make_ref(), {release_stream, 0}, ?NOW, State4),
+    ?assertEqual([], max_streams_frames(E5, ServerApSecret)).
+
+%% Bytes on a request stream the owner released are dropped, and only its end
+%% is told, so they are never read as a new request.
+released_stream_delivers_only_its_end_test() ->
+    {State0, ClientApSecret, _ServerApSecret} = connect_owned(),
+    Open = app_datagram([{stream, 0, 0, <<>>, false}], 0, ClientApSecret),
+    {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Open, State0),
+    {State2, _} = ?M:handle_call(self(), make_ref(), {reset_stream, 0, 16#010C}, ?NOW, State1),
+    {State3, _} = ?M:handle_call(self(), make_ref(), {release_stream, 0}, ?NOW, State2),
+    More = app_datagram([{stream, 0, 0, ~"req", false}], 1, ClientApSecret),
+    {State4, E4} = ?M:handle_datagram(?NOW, ?PEER, More, State3),
+    ?assertEqual([], [D || {emit, _, {stream_data, _, _, _}} = D <- E4]),
+    End = app_datagram([{stream, 0, 3, ~"uest", true}], 2, ClientApSecret),
+    {_State5, E5} = ?M:handle_datagram(?NOW, ?PEER, End, State4),
+    ?assertEqual(
+        [{emit, self(), {stream_data, 0, <<>>, true}}],
+        [D || {emit, _, {stream_data, _, _, _}} = D <- E5]
+    ).
+
+%% With credit to spare, a closed stream's credit is given back only once
+%% the credit left is at most half of what the raise would leave: answering
+%% the one request open of three allowed raises nothing (two left of three),
+%% and opening the next, which leaves one of two, does.
+max_streams_granted_in_batches_test() ->
+    {State0, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = open_requests([0], 0, State0, ClientApSecret),
+    {State2, E2} = ?M:handle_send(self(), make_ref(), 0, ~"ok", true, ?NOW, State1),
+    ?assertEqual([], max_streams_frames(E2, ServerApSecret)),
+    {_State3, E3} = open_requests([4], 1, State2, ClientApSecret),
+    ?assertEqual([{max_streams, bidi, 4}], max_streams_frames(E3, ServerApSecret)).
+
+%% A request the client reset holds its credit while the owner still works
+%% on it (its send side reset but not released, as while its handler runs):
+%% the credit comes back, with a MAX_STREAMS, when the owner releases it.
+max_streams_held_until_reset_stream_released_test() ->
+    {State0, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = open_requests([0, 4, 8], 0, State0, ClientApSecret),
+    Reset = app_datagram([{reset_stream, 0, 16#010C, 1}], 3, ClientApSecret),
+    {State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Reset, State1),
+    {State3, E3} = ?M:handle_call(self(), make_ref(), {reset_stream, 0, 16#010C}, ?NOW, State2),
+    ?assertEqual([], max_streams_frames(E2 ++ E3, ServerApSecret)),
+    {_State4, E4} = ?M:handle_call(self(), make_ref(), {release_stream, 0}, ?NOW, State3),
+    ?assertEqual([{max_streams, bidi, 4}], max_streams_frames(E4, ServerApSecret)).
+
+%% Only a request stream gives bidi credit back: a client unidirectional
+%% stream the owner abandons and releases, so it closes, raises nothing, even
+%% with every request stream taken.
+max_streams_not_granted_for_a_uni_stream_test() ->
+    {State0, ClientApSecret, ServerApSecret} = connect_owned(),
+    {State1, _} = open_requests([0, 4, 8], 0, State0, ClientApSecret),
+    Uni = app_datagram([{stream, 2, 0, ~"u", true}], 3, ClientApSecret),
+    {State2, E2} = ?M:handle_datagram(?NOW, ?PEER, Uni, State1),
+    {State3, E3} = ?M:handle_call(self(), make_ref(), {reset_stream, 2, 0}, ?NOW, State2),
+    {_State4, E4} = ?M:handle_call(self(), make_ref(), {release_stream, 2}, ?NOW, State3),
+    ?assertEqual([], max_streams_frames(E2 ++ E3 ++ E4, ServerApSecret)).
+
+%% Open the request streams `Sids`, each with a whole request (FIN), one
+%% packet each, numbered from `PN`.
+open_requests(Sids, PN, State, ClientApSecret) ->
+    {State1, Effects, _} = lists:foldl(
+        fun(Sid, {S, Acc, N}) ->
+            Datagram = app_datagram([{stream, Sid, 0, ~"r", true}], N, ClientApSecret),
+            {S1, E} = ?M:handle_datagram(?NOW, ?PEER, Datagram, S),
+            {S1, Acc ++ E, N + 1}
+        end,
+        {State, [], PN},
+        Sids
+    ),
+    {State1, Effects}.
 
 max_streams_frames(Effects, ServerApSecret) ->
     [F || {max_streams, _, _} = F <- sent_app_frames(Effects, ServerApSecret)].

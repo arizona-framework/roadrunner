@@ -817,7 +817,10 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
   `16384`).
 - `max_streams_bidi` — cap on concurrent client-initiated bidirectional
   (request) streams, advertised to the peer in the QUIC transport
-  parameters. Default `100`. The h3 counterpart to the `{http2, ...}`
+  parameters. Credit for more comes back (`MAX_STREAMS`) as request
+  streams close, and a request the client cancels does not close until
+  its handler ends. Default `100`, the least RFC 9114 §6.1 says a
+  server should allow. The h3 counterpart to the `{http2, ...}`
   `max_concurrent_streams` opt.
 - `max_field_section_size` — cap on the *decoded* (uncompressed)
   field-section size (RFC 7541 §4.1: sum of name + value + 32 per field),
