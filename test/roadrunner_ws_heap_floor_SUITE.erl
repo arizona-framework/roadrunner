@@ -22,6 +22,8 @@ by messages to the session's `handle_info/2`.
     floor_off_when_the_cap_is_under_the_upgrade_min_heap_size/1,
     floor_relearns_every_16_events/1,
     small_events_leave_the_floor/1,
+    session_starts_from_its_own_data/1,
+    session_starts_from_its_own_data_without_the_connection_floor/1,
     small_events_raise_it_with_no_minimum/1,
     ws_cap_overrides_the_listener/1,
     ws_cap_off/1,
@@ -45,6 +47,8 @@ all() ->
         floor_off_when_the_cap_is_under_the_upgrade_min_heap_size,
         floor_relearns_every_16_events,
         small_events_leave_the_floor,
+        session_starts_from_its_own_data,
+        session_starts_from_its_own_data_without_the_connection_floor,
         small_events_raise_it_with_no_minimum,
         ws_cap_overrides_the_listener,
         ws_cap_off,
@@ -59,7 +63,10 @@ init_per_testcase(Case, Config) ->
         ?MODULE,
         maps:merge(listener_opts(Case), #{
             port => 0,
-            routes => [{~"/ws", ?H, route_state(Case)}]
+            routes => [
+                {~"/ws", ?H, route_state(Case)},
+                {~"/alloc", ?H, {alloc, self()}}
+            ]
         })
     ),
     [{port, roadrunner_listener:port(?MODULE)} | Config].
@@ -79,6 +86,8 @@ listener_opts(ws_cap_overrides_the_listener) ->
     #{ws => #{heap_floor => #{max => 1000}}};
 listener_opts(ws_cap_off) ->
     #{ws => #{heap_floor => false}};
+listener_opts(session_starts_from_its_own_data_without_the_connection_floor) ->
+    #{handler_spawn => #{heap_floor => false}, ws => #{heap_floor => #{max => 46422}}};
 listener_opts(floor_resets_when_the_session_idles) ->
     #{ws => #{hibernate_after => 200}};
 listener_opts(_Case) ->
@@ -203,6 +212,26 @@ floor_resets_when_the_session_idles(Config) ->
     _ = erlang:trace(Session, false, [running]),
     ?assertEqual({min_heap_size, base()}, process_info(Session, min_heap_size)).
 
+%% A keep-alive request that grew the connection's heap leaves it grown
+%% (nothing collects between requests); the session that then runs in the
+%% connection starts from its own live data, so a small event leaves its
+%% floor at the base.
+session_starts_from_its_own_data(Config) ->
+    starts_from_its_own_data(Config).
+
+%% The same with the connection's own floor off and the session's on: the
+%% request still leaves the heap grown.
+session_starts_from_its_own_data_without_the_connection_floor(Config) ->
+    starts_from_its_own_data(Config).
+
+starts_from_its_own_data(Config) ->
+    Sock = connect(Config),
+    ok = gen_tcp:send(Sock, ~"GET /alloc HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ok = read_alloc_response(Sock, <<>>),
+    Session = upgrade_on(Sock),
+    ok = small_alloc(Session),
+    ?assertEqual(base(), report(Session)).
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -223,11 +252,29 @@ rounded(Words) ->
     after 5000 -> ct:fail(no_probe)
     end.
 
-%% Upgrade and return the session's pid, once its `init/1` has run.
+%% Upgrade a new connection and return the session's pid.
 upgrade(Config) ->
+    upgrade_on(connect(Config)).
+
+connect(Config) ->
     {ok, Sock} = gen_tcp:connect(
         {127, 0, 0, 1}, ?config(port, Config), [binary, {active, false}], 5000
     ),
+    Sock.
+
+%% The `/alloc` response, `20000` as its body.
+read_alloc_response(Sock, Acc) ->
+    case binary:split(Acc, ~"\r\n\r\n") of
+        [_Head, ~"20000"] ->
+            ok;
+        _ ->
+            {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+            read_alloc_response(Sock, <<Acc/binary, Data/binary>>)
+    end.
+
+%% Upgrade on `Sock` and return the session's pid, once its `init/1` has
+%% run.
+upgrade_on(Sock) ->
     ok = gen_tcp:send(Sock, [
         ~"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
         ~"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"

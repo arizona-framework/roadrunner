@@ -505,7 +505,10 @@ instead of five times, and a push took 48 µs instead of 78 to 82 µs,
 round trip included. Inbound frames run no floor code, so an echo or
 chat session answering small messages costs exactly what it did. An
 idle session holds the heap its last event left with or without the
-floor.
+floor. A session that runs in an HTTP/1.1 connection inherits the heap
+the requests before it left, so with its floor on it collects once as
+it starts when that heap is over its base, and learns its floor from
+its own data rather than from those requests.
 
 Only a `handle_info/2` that needed at least the `min` of `ws.heap_floor`
 (2586 words, about 20 KB, by default) raises the floor, so small
