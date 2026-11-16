@@ -1771,6 +1771,9 @@ retry_get(Conn, Path, Tries) ->
 %% answer is unfinished is reset with H3_REQUEST_CANCELLED (RFC 9114
 %% §4.1.1), and the connection goes on serving.
 server_cancel_resets_an_unfinished_answer(Config) ->
+    %% A second cancel for the stream, cancelled already, is left alone;
+    %% the request after it proves the loop got past it.
+    true = register(h3_cancel_test, self()),
     Conn = connect(?config(port, Config)),
     {ok, StreamId} = roadrunner_quic_test_h3:open_request(
         Conn, headers(~"GET", ~"/cancel-unfinished")
@@ -1779,13 +1782,20 @@ server_cancel_resets_an_unfinished_answer(Config) ->
         {error, {stream_reset, ?H3_REQUEST_CANCELLED}},
         roadrunner_quic_test_h3:collect(Conn, StreamId)
     ),
+    receive
+        {cancel_unfinished, cancelled_again} -> ok
+    end,
     ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
     close(Conn).
 
-%% A complete answer is left as it went out.
+%% A complete answer is left as it went out, and its worker is still told.
 server_cancel_leaves_a_complete_answer(Config) ->
+    true = register(h3_cancel_test, self()),
     Conn = connect(?config(port, Config)),
     ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/cancel-answered"))),
+    receive
+        {cancel_answered, Armed, told} -> ?assertMatch({ok, _}, Armed)
+    end,
     close(Conn).
 
 stream_cancel(Config) ->
