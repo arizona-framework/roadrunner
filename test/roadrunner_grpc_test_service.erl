@@ -9,6 +9,7 @@
 -export([unsafe_header/2, unsafe_fail/2, busy/2, squeezed/2, late_compression/2]).
 -export([stale_compression/2, held/1, was_compressed/2, flood/2, big_trailer/2]).
 -export([hold/2, watch/2, stop_after/2, reset_at/2, watch_late/2, keys/2]).
+-export([active_sum/1, active_chat/1, mixed_sum/1, notify/2]).
 
 name() -> ~"test.Echo".
 
@@ -48,7 +49,11 @@ rpcs() ->
         ~"StopAfter" => rpc(stop_after, server_stream),
         ~"ResetAt" => rpc(reset_at, unary),
         ~"WatchLate" => rpc(watch_late, server_stream),
-        ~"Keys" => rpc(keys, unary)
+        ~"Keys" => rpc(keys, unary),
+        ~"ActiveSum" => rpc(active_sum, client_stream),
+        ~"ActiveChat" => rpc(active_chat, bidi_stream),
+        ~"MixedSum" => rpc(mixed_sum, client_stream),
+        ~"Notify" => rpc(notify, server_stream)
     }.
 
 rpc(Function, Kind) ->
@@ -262,6 +267,86 @@ watch_late(Request, Stream) ->
 keys(Request, Stream) ->
     _ = Request =:= ~"cancelled" andalso roadrunner_grpc:cancelled({h2_stream_reset, 1}, Stream),
     {reply, term_to_binary(lists:sort([Key || {{roadrunner_grpc, Key}, _} <- get()])), Stream}.
+
+%% `Sum`, reading with `recv_async/1` and `info/2`. Asking twice before a
+%% read is taken in asks once.
+active_sum(Stream) ->
+    active_sum(roadrunner_grpc:recv_async(roadrunner_grpc:recv_async(Stream)), <<>>).
+
+active_sum(Stream, Acc) ->
+    receive
+        Message ->
+            case roadrunner_grpc:info(Message, Stream) of
+                {message, M, Stream1} ->
+                    active_sum(roadrunner_grpc:recv_async(Stream1), <<Acc/binary, M/binary>>);
+                {more, Stream1} ->
+                    active_sum(Stream1, Acc);
+                {eof, Stream1} ->
+                    {reply, Acc, Stream1};
+                ignore ->
+                    active_sum(Stream, Acc)
+            end
+    end.
+
+%% `Chat`, also sending what it is told to broadcast between the client's
+%% messages: it tells the process registered as `roadrunner_grpc_held`
+%% where it runs, then echoes each request and sends each
+%% `{broadcast, Text}` it gets, until the requests end, the call is
+%% cancelled, or the listener drains.
+active_chat(Stream) ->
+    roadrunner_grpc_held ! {held, self()},
+    chatting(roadrunner_grpc:recv_async(Stream)).
+
+chatting(Stream) ->
+    receive
+        {broadcast, Text} ->
+            chatting(roadrunner_grpc:send(Text, Stream));
+        Message ->
+            case roadrunner_grpc:info(Message, Stream) of
+                {message, M, Stream1} ->
+                    chatting(roadrunner_grpc:recv_async(roadrunner_grpc:send(M, Stream1)));
+                {more, Stream1} ->
+                    chatting(Stream1);
+                {eof, Stream1} ->
+                    {ok, Stream1};
+                cancelled ->
+                    {ok, Stream};
+                drain ->
+                    {error, unavailable, ~"server shutting down", Stream};
+                ignore ->
+                    chatting(Stream)
+            end
+    end.
+
+%% Sends each `{notify, Text}` it gets, telling the process registered as
+%% `roadrunner_grpc_held` where it runs first, until the call is cancelled
+%% or the listener drains.
+notify(_Request, Stream) ->
+    roadrunner_grpc_held ! {held, self()},
+    notifying(Stream).
+
+notifying(Stream) ->
+    receive
+        {notify, Text} ->
+            notifying(roadrunner_grpc:send(Text, Stream));
+        Message ->
+            case roadrunner_grpc:info(Message, Stream) of
+                cancelled -> {ok, Stream};
+                drain -> {error, unavailable, ~"server shutting down", Stream};
+                ignore -> notifying(Stream)
+            end
+    end.
+
+%% `Sum`, each `recv/1` after a `recv_async/1`: it waits for the read the
+%% latter asked for.
+mixed_sum(Stream) ->
+    mixed_sum(Stream, <<>>).
+
+mixed_sum(Stream, Acc) ->
+    case roadrunner_grpc:recv(roadrunner_grpc:recv_async(Stream)) of
+        {ok, M, Stream1} -> mixed_sum(Stream1, <<Acc/binary, M/binary>>);
+        {eof, Stream1} -> {reply, Acc, Stream1}
+    end.
 
 until(Time) ->
     receive

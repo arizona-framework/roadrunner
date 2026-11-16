@@ -44,6 +44,9 @@ call emitted.
     cancelled_long_before_a_late_return/1,
     stopped_after_a_response/1,
     encoding_of_a_call_refused_early/1,
+    active_reads/1,
+    active_read_cancelled/1,
+    active_read_drained/1,
     h3_cancelled_before_trailers_only/1,
     h3_unary/1,
     h3_streams/1,
@@ -108,7 +111,10 @@ groups() ->
             cancelled_long_before_a_late_return,
             stopped_after_a_response,
             encoding_of_a_call_refused_early,
-            keys_of_a_reported_call
+            keys_of_a_reported_call,
+            active_reads,
+            active_read_cancelled,
+            active_read_drained
         ]},
         {http3, [], [
             h3_unary,
@@ -153,7 +159,11 @@ tls(_Protocols) -> #{}.
 
 end_per_testcase(_Case, Config) ->
     ok = telemetry:detach(?config(handler_id, Config)),
-    ok = roadrunner_listener:stop(?MODULE).
+    %% A listener that drained has stopped.
+    case whereis(?MODULE) of
+        undefined -> ok;
+        _Listener -> ok = roadrunner_listener:stop(?MODULE)
+    end.
 
 %% Runs in the process emitting the event: the call's own.
 forward(Event, Measurements, Metadata, Test) ->
@@ -285,6 +295,36 @@ client_cancels_a_write(Config) ->
     {stop, M, Md} = ending(Pid),
     ?assertMatch(#{status := cancelled, message := <<>>, reason := cancelled}, Md),
     ?assert(maps:get(messages_sent, M) > 0).
+
+%% Messages read with `recv_async/1` and `info/2` count as `recv/1`'s do.
+active_reads(Config) ->
+    {_, [~"abc"], _, _} = call(Config, ~"ActiveSum", [~"a", ~"bc"]),
+    {_, {stop, M, #{status := ok}}} = ended(),
+    ?assertMatch(
+        #{messages_received := 2, bytes_received := 3, messages_sent := 1, bytes_sent := 3}, M
+    ).
+
+%% A client that resets the call while a read waits ends it `cancelled`.
+active_read_cancelled(Config) ->
+    C0 = active_chat(Config),
+    {Pid, _Start} = started(),
+    C1 = roadrunner_grpc_test_client:send(C0, 1, frame(~"a")),
+    C2 = to_data(C1),
+    _ = roadrunner_grpc_test_client:reset(C2, 1),
+    {stop, M, Md} = ending(Pid),
+    ?assertMatch(#{status := cancelled, reason := cancelled}, Md),
+    ?assertMatch(#{messages_received := 1, messages_sent := 1}, M).
+
+%% A call its method ends on a drain is reported with the status it ended
+%% with.
+active_read_drained(Config) ->
+    _ = active_chat(Config),
+    {Pid, _Start} = started(),
+    _ = spawn(fun() -> roadrunner_listener:drain(?MODULE, 10_000) end),
+    {stop, _, Md} = ending(Pid),
+    ?assertMatch(
+        #{status := unavailable, message := ~"server shutting down", reason := error}, Md
+    ).
 
 %% The client resets the call while the method reads.
 client_cancels_a_read(Config) ->
@@ -657,6 +697,22 @@ flood(Config, Extra) ->
     C0 = roadrunner_grpc_test_client:open(?config(port, Config), [{4, 1024}]),
     C1 = roadrunner_grpc_test_client:start(C0, 1, <<?SVC/binary, "Flood">>, Extra),
     roadrunner_grpc_test_client:finish(roadrunner_grpc_test_client:send(C1, 1, frame(~"x")), 1).
+
+%% Past the first DATA frame of the call on stream 1.
+to_data(C) ->
+    case roadrunner_grpc_test_client:next_frame(C) of
+        {{data, 1, _, _, _}, C1} -> C1;
+        {_Other, C1} -> to_data(C1)
+    end.
+
+%% An `ActiveChat` call, its method waiting on the client and on its own
+%% messages.
+active_chat(Config) ->
+    true = register(roadrunner_grpc_held, self()),
+    C = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "ActiveChat">>, []),
+    receive
+        {held, _Pid} -> C
+    end.
 
 %% A `Hold` call, its method waiting for this process to let it go.
 hold_call(Config) ->

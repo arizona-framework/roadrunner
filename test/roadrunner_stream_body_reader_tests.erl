@@ -173,7 +173,119 @@ set_body_timeout_over_the_receive_limit_test() ->
     ?assertError(function_clause, roadrunner_req:set_body_timeout(16#100000000, Req)),
     ?assertError(function_clause, roadrunner_req:set_body_timeout(16#100000000, #{body => ~""})).
 
+%% --- reading in two steps ---
+
+%% A demand goes to the connection, and its answer, taken in from the
+%% mailbox, comes back as a `next_chunk` read would: `more` until the body
+%% ends. Messages that are not the answer, another stream's included, are
+%% ignored.
+demand_and_answer_test_() ->
+    {spawn, fun() ->
+        Conn = spawn_link(fun() -> serve([{~"ab", false}, {~"", false}, {~"cd", true}]) end),
+        Req = #{
+            body_reader => roadrunner_conn:stream_body_reader(Conn, 7, deadline(5000), 64, false)
+        },
+        ?assertEqual(demanded, roadrunner_req:demand_body(Req)),
+        {more, ~"ab", Req1} = roadrunner_req:body_message(answer(), Req),
+        ?assertEqual(ignore, roadrunner_req:body_message({roadrunner_body, 8, ~"x", true}, Req1)),
+        ?assertEqual(ignore, roadrunner_req:body_message(other, Req1)),
+        demanded = roadrunner_req:demand_body(Req1),
+        {more, ~"", Req2} = roadrunner_req:body_message(answer(), Req1),
+        demanded = roadrunner_req:demand_body(Req2),
+        {ok, ~"cd", Req3} = roadrunner_req:body_message(answer(), Req2),
+        %% The body has ended: the next read returns at once.
+        ?assertEqual(ready, roadrunner_req:demand_body(Req3))
+    end}.
+
+%% A reader whose next read returns at once is `ready`: one holding bytes a
+%% length-bounded read left, one whose read failed, one whose body arrived
+%% whole, and a request with no reader.
+ready_readers_test_() ->
+    {spawn, fun() ->
+        Conn = spawn_link(fun() -> serve([{~"abcd", false}]) end),
+        Req = #{
+            body_reader => roadrunner_conn:stream_body_reader(Conn, 7, deadline(5000), 64, false)
+        },
+        {more, _, Leftover} = roadrunner_req:read_body(Req, #{length => 1}),
+        ?assertEqual(ready, roadrunner_req:demand_body(Leftover)),
+        Silent = spawn_link(fun() -> serve_late(~"") end),
+        Failing = #{
+            body_reader => roadrunner_conn:stream_body_reader(Silent, 7, deadline(0), 64, false)
+        },
+        {error, request_timeout} = roadrunner_req:read_body(Failing),
+        ?assertEqual(ready, roadrunner_req:demand_body(Failing)),
+        ?assertEqual(ready, roadrunner_req:demand_body(req([{~"a", true}], 64))),
+        ?assertEqual(ready, roadrunner_req:demand_body(#{body => ~"a"}))
+    end}.
+
+%% An answer over the reader's cap, or a refusal, fails the read, and every
+%% later one.
+failed_answers_test_() ->
+    {spawn, fun() ->
+        Conn = spawn_link(fun() -> serve([{~"abcd", false}]) end),
+        Req = #{
+            body_reader => roadrunner_conn:stream_body_reader(Conn, 7, deadline(5000), 3, false)
+        },
+        demanded = roadrunner_req:demand_body(Req),
+        ?assertEqual({error, content_length_too_large}, roadrunner_req:body_message(answer(), Req)),
+        ?assertEqual({error, content_length_too_large}, roadrunner_req:read_body(Req)),
+        ?assertEqual(
+            {error, closed},
+            roadrunner_req:body_message({roadrunner_body_error, 7, closed}, Req)
+        )
+    end}.
+
+%% `await_body/1` waits for the answer to the demand already sent, until
+%% the reader's deadline, or until the connection goes away.
+await_body_test_() ->
+    {spawn, fun() ->
+        Conn = spawn_link(fun() -> serve([{~"ab", true}]) end),
+        Req = #{
+            body_reader => roadrunner_conn:stream_body_reader(Conn, 7, deadline(5000), 64, false)
+        },
+        demanded = roadrunner_req:demand_body(Req),
+        ?assertMatch({ok, ~"ab", _}, roadrunner_req:await_body(Req)),
+        Silent = spawn_link(fun() -> serve_late(~"late") end),
+        Late = #{
+            body_reader => roadrunner_conn:stream_body_reader(Silent, 7, deadline(0), 64, false)
+        },
+        demanded = roadrunner_req:demand_body(Late),
+        ?assertEqual({error, request_timeout}, roadrunner_req:await_body(Late)),
+        Gone = spawn(fun() -> ok end),
+        Lost = #{
+            body_reader => roadrunner_conn:stream_body_reader(Gone, 7, deadline(5000), 64, false)
+        },
+        ?assertEqual({error, closed}, roadrunner_req:await_body(Lost))
+    end}.
+
+%% `withdraw_body/1` takes the demand back: what was handed over before is
+%% dropped, and the body ends with `request_timeout`.
+withdraw_body_test_() ->
+    {spawn, fun() ->
+        Conn = spawn_link(fun() -> serve_late(~"late") end),
+        Req = #{
+            body_reader => roadrunner_conn:stream_body_reader(Conn, 7, deadline(5000), 64, false)
+        },
+        demanded = roadrunner_req:demand_body(Req),
+        ?assertEqual({error, request_timeout}, roadrunner_req:withdraw_body(Req)),
+        ?assertEqual(
+            none,
+            receive
+                {roadrunner_body, 7, _, _} = Late -> Late
+            after 0 -> none
+            end
+        ),
+        ?assertEqual({error, request_timeout}, roadrunner_req:read_body(Req))
+    end}.
+
 %% --- helpers ---
+
+%% The connection's answer to a demand, from the mailbox.
+answer() ->
+    receive
+        {roadrunner_body, 7, _, _} = Body -> Body;
+        {roadrunner_body_error, 7, _} = Error -> Error
+    end.
 
 %% A request whose reader's recv hands out `Script`, one entry a call:
 %% `{Data, Fin}` or `{error, Reason}`.

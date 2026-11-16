@@ -82,14 +82,18 @@ when the body was read, a little after the client's.
 
 ## The method's process
 
-`recv/1` waits for the next request, so a method cannot wait for other
-messages at the same time; and the stream belongs to the call's process,
-which is the one to `send/2`. A client that cancels the call (or goes
-away) stops the method on its next write, quietly: there is no one left to
-answer. A method that waits on messages of its own learns of it with
-`cancelled/2`. A request that ends the call (too large, malformed, past its
-deadline) is thrown out of `recv/1` to end the call with its status, so a
-method should not catch everything around `recv/1`.
+`recv/1` waits for the next request. A method that waits on messages of
+its own at the same time (a bidi chat that also pushes what others say)
+asks for it with `recv_async/1` instead and hands what it receives to
+`info/2`, which makes the request message of it, and also tells the call
+cancelled or the listener draining. The stream belongs to the call's
+process, which is the one to `send/2`. A client that cancels the call (or
+goes away) stops the method on its next write, quietly: there is no one
+left to answer. A method that waits on messages of its own learns of it
+from `info/2` (or `cancelled/2`). A request that ends the call (too large,
+malformed, past its deadline) is thrown out of `recv/1` and `info/2` to
+end the call with its status, so a method should not catch everything
+around them.
 
 ## Compression
 
@@ -101,8 +105,8 @@ the route's `send_compression`, or what `set_send_compression/2` picks for
 the call, when the client's `grpc-accept-encoding` lists it, and sent as
 they are otherwise; `send/3` with `#{compress => false}` sends one as it
 is, to keep a secret out of a compressed stream. `recv_compressed/1` says
-whether the message `recv/1` returned last came compressed, a unary or
-server-streaming method's request among them.
+whether the message `recv/1` or `info/2` returned last came compressed, a
+unary or server-streaming method's request among them.
 
 ## Events
 
@@ -128,9 +132,10 @@ are each an entry, and one that is not base64 ends the call with
 -export([routes/1, init_route/1, handle/1]).
 -export([recv/1, send/2, send/3, metadata/1, set_headers/2, set_trailers/2, deadline/1, peer/1]).
 -export([set_send_compression/2, cancelled/2, recv_compressed/1]).
+-export([recv_async/1, info/2]).
 -export([reflection_index/1]).
 
--export_type([opts/0, status/0, stream/0, encoding/0]).
+-export_type([opts/0, status/0, stream/0, encoding/0, info/0]).
 
 -define(MAX_MESSAGE_SIZE, 4194304).
 %% Where the call's process keeps the response's body writer once it started.
@@ -232,6 +237,12 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
     eof = false :: boolean(),
     %% Whether the message `recv/1` returned last came compressed.
     compressed = false :: boolean(),
+    %% The read `recv_async/1` asked for and `info/2` has yet to take in:
+    %% the next DATA the connection was asked for, with the timer of the
+    %% call's deadline (`undefined` without one), or bytes to read at once,
+    %% which a message sent to the call's own process stands for.
+    pending = undefined ::
+        undefined | {demand, reference() | undefined} | {ready, reference()},
     %% How the client compresses its messages (its `grpc-encoding`).
     recv_encoding = identity :: encoding(),
     %% How the response's messages are compressed, and the encodings the
@@ -255,6 +266,20 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
 
 -doc "How a message is compressed: `identity` (not), `gzip` or `deflate`.".
 -type encoding() :: identity | gzip | deflate.
+
+-doc """
+What `info/2` makes of a message the method's process received: the
+next request message, a part of one (with the rest asked for), the end of
+the requests, the call cancelled, the listener draining, or a message
+that is not the call's.
+""".
+-type info() ::
+    {message, term(), stream()}
+    | {more, stream()}
+    | {eof, stream()}
+    | cancelled
+    | drain
+    | ignore.
 
 -doc """
 The routes for `Opts`'s `services`, one per service, at
@@ -975,6 +1000,8 @@ events(Stream) ->
             end
     end.
 ```
+
+It says nothing of a listener draining, which `info/2` tells as well.
 """.
 -spec cancelled(term(), stream()) -> boolean().
 cancelled({h2_stream_reset, _StreamId}, Stream) ->
@@ -1067,10 +1094,31 @@ abort(Status, Message, Stream) ->
 The next request message, or `eof` once the client's requests have ended.
 A message too large, malformed or cut short ends the call (with
 `RESOURCE_EXHAUSTED` or `INTERNAL`), and the call's `grpc-timeout`
-running out while it waits with `DEADLINE_EXCEEDED`.
+running out while it waits with `DEADLINE_EXCEEDED`. After `recv_async/1`
+it waits for the request that asked for; the message that would have
+brought it to `info/2` is then one `info/2` ignores.
 """.
 -spec recv(stream()) -> {ok, term(), stream()} | {eof, stream()}.
-recv(#stream{buffer = Buffer, max_message_size = Max} = Stream) ->
+recv(#stream{pending = undefined} = Stream) ->
+    buffered(Stream);
+recv(#stream{pending = {ready, _Ref}} = Stream) ->
+    buffered(Stream#stream{pending = undefined});
+recv(#stream{pending = {demand, Timer}, req = Req} = Stream) ->
+    ok = cancel_read_timer(Timer),
+    buffered(read(roadrunner_req:await_body(Req), Stream#stream{pending = undefined})).
+
+%% The next message the buffer holds, reading more until it does.
+-spec buffered(stream()) -> {ok, term(), stream()} | {eof, stream()}.
+buffered(Stream) ->
+    case next(Stream) of
+        more -> buffered(read_more(Stream));
+        Result -> Result
+    end.
+
+%% The next message the buffer holds, the end of the requests, or `more`
+%% while it holds only a part of one and the body goes on.
+-spec next(stream()) -> {ok, term(), stream()} | {eof, stream()} | more.
+next(#stream{buffer = Buffer, max_message_size = Max} = Stream) ->
     case roadrunner_grpc_frame:decode(Buffer, Max) of
         {ok, false, Bytes, Rest} ->
             Message = decode(Bytes, Stream),
@@ -1086,8 +1134,12 @@ recv(#stream{buffer = Buffer, max_message_size = Max} = Stream) ->
             abort(resource_exhausted, ~"request message too large", Stream);
         {error, bad_compressed_flag} ->
             abort(internal, ~"malformed request message", Stream);
+        more when Stream#stream.eof, Buffer =:= <<>> ->
+            {eof, Stream};
+        more when Stream#stream.eof ->
+            abort(internal, ~"request message cut short", Stream);
         more ->
-            read_more(Stream)
+            more
     end.
 
 -spec decompressed(binary(), stream()) -> binary().
@@ -1108,24 +1160,24 @@ decode(Bytes, #stream{codec = Codec, input = In} = Stream) ->
 
 %% Read what the next message still lacks: the rest of its 5-byte prefix,
 %% or of the message the prefix announced.
--spec read_more(stream()) -> {ok, term(), stream()} | {eof, stream()}.
-read_more(#stream{eof = true, buffer = <<>>} = Stream) ->
-    {eof, Stream};
-read_more(#stream{eof = true} = Stream) ->
-    abort(internal, ~"request message cut short", Stream);
+-spec read_more(stream()) -> stream().
 read_more(#stream{req = Req, buffer = Buffer} = Stream) ->
-    case read_body(Buffer, Req) of
-        {more, Bytes, Req1} ->
-            recv(Stream#stream{req = Req1, buffer = append(Buffer, Bytes)});
-        {ok, Bytes, Req1} ->
-            recv(Stream#stream{req = Req1, buffer = append(Buffer, Bytes), eof = true});
-        {error, request_timeout} ->
-            abort(deadline_exceeded, ~"deadline exceeded", Stream);
-        {error, content_length_too_large} ->
-            abort(resource_exhausted, ~"request body over the route's max_content_length", Stream);
-        {error, Reason} ->
-            exit({shutdown, {grpc_recv, Reason}})
-    end.
+    read(read_body(Buffer, Req), Stream).
+
+%% A read's bytes added to the buffer, or the call ended as the read
+%% failed.
+-spec read({ok | more, iodata(), roadrunner_req:request()} | {error, term()}, stream()) ->
+    stream().
+read({more, Bytes, Req}, #stream{buffer = Buffer} = Stream) ->
+    Stream#stream{req = Req, buffer = append(Buffer, Bytes)};
+read({ok, Bytes, Req}, #stream{buffer = Buffer} = Stream) ->
+    Stream#stream{req = Req, buffer = append(Buffer, Bytes), eof = true};
+read({error, request_timeout}, Stream) ->
+    abort(deadline_exceeded, ~"deadline exceeded", Stream);
+read({error, content_length_too_large}, Stream) ->
+    abort(resource_exhausted, ~"request body over the route's max_content_length", Stream);
+read({error, Reason}, _Stream) ->
+    exit({shutdown, {grpc_recv, Reason}}).
 
 %% Between messages, read what has arrived, which for a small call is the
 %% whole message and the end of the requests at once; partway through one,
@@ -1145,6 +1197,155 @@ append(Buffer, Bytes) -> <<Buffer/binary, (iolist_to_binary(Bytes))/binary>>.
 -spec missing(binary()) -> pos_integer().
 missing(<<_Flag, Len:32, Message/binary>>) -> Len - byte_size(Message);
 missing(Partial) -> 5 - byte_size(Partial).
+
+-doc """
+Ask for the next request message without waiting for it, so the method
+can wait on its own messages at the same time: the read lands in the
+method's mailbox as a message that `info/2` makes into the request
+message. One read is asked for at a time; asking again before `info/2`
+took the last one in changes nothing. A message already read, or the end
+of the requests, comes as a message too.
+
+```erlang
+chat(Stream) ->
+    ok = room:join(self()),
+    loop(roadrunner_grpc:recv_async(Stream)).
+
+loop(Stream) ->
+    receive
+        {said, Text} ->
+            loop(roadrunner_grpc:send(Text, Stream));
+        Other ->
+            case roadrunner_grpc:info(Other, Stream) of
+                {message, Text, Stream1} ->
+                    ok = room:say(Text),
+                    loop(roadrunner_grpc:recv_async(Stream1));
+                {more, Stream1} ->
+                    loop(Stream1);
+                {eof, Stream1} ->
+                    {ok, Stream1};
+                cancelled ->
+                    {ok, Stream};
+                drain ->
+                    {error, unavailable, ~"server shutting down", Stream};
+                ignore ->
+                    loop(Stream)
+            end
+    end.
+```
+""".
+-spec recv_async(stream()) -> stream().
+recv_async(#stream{pending = undefined} = Stream) ->
+    ask(Stream);
+recv_async(Stream) ->
+    Stream.
+
+%% Ask the connection for more of the body, unless what the next message
+%% needs can be read at once: a whole message in the buffer, a malformed
+%% one, the end of the requests, or bytes the request's reader holds.
+-spec ask(stream()) -> stream().
+ask(#stream{eof = true} = Stream) ->
+    ready(Stream);
+ask(#stream{buffer = Buffer, max_message_size = Max, req = Req} = Stream) ->
+    case roadrunner_grpc_frame:decode(Buffer, Max) of
+        more ->
+            case roadrunner_req:demand_body(Req) of
+                demanded -> Stream#stream{pending = {demand, read_timer(Stream)}};
+                ready -> ready(Stream)
+            end;
+        _Whole ->
+            ready(Stream)
+    end.
+
+%% A read with nothing to wait for still comes as a message, so the method
+%% takes every request message the same way.
+-spec ready(stream()) -> stream().
+ready(Stream) ->
+    Ref = make_ref(),
+    _ = self() ! {?MODULE, Ref},
+    Stream#stream{pending = {ready, Ref}}.
+
+%% The read asked for ends the call at its deadline (`info/2`), as `recv/1`
+%% waiting then does.
+-spec read_timer(stream()) -> reference() | undefined.
+read_timer(#stream{deadline = infinity}) ->
+    undefined;
+read_timer(#stream{deadline = Deadline}) ->
+    erlang:start_timer(Deadline, self(), ?MODULE, [{abs, true}]).
+
+%% A timer that already fired leaves its message, which `info/2` ignores.
+-spec cancel_read_timer(reference() | undefined) -> ok.
+cancel_read_timer(undefined) ->
+    ok;
+cancel_read_timer(Timer) ->
+    erlang:cancel_timer(Timer, [{async, true}, {info, false}]).
+
+-doc """
+What `Message`, one the method's process received, means for the call:
+
+- `{message, Request, Stream}`: the next request message, which
+  `recv_async/1` asked for
+- `{more, Stream}`: a part of one, the rest asked for already
+- `{eof, Stream}`: the client's requests have ended
+- `cancelled`: the client cancelled the call or its connection went away,
+  as `cancelled/2` tells; return, as there is no one left to answer
+- `drain`: the listener is draining (`roadrunner_listener:drain/2`); a
+  call that would go on for long should end, with
+  `{error, unavailable, ~"server shutting down", Stream}` for its client
+  to call again elsewhere
+- `ignore`: the message is not the call's
+
+A request message too large, malformed or cut short ends the call (with
+`RESOURCE_EXHAUSTED` or `INTERNAL`), as from `recv/1`, and the call's
+`grpc-timeout` running out while a read waits with `DEADLINE_EXCEEDED`.
+Go on with the stream it returns, and pass it every message the method
+does not handle itself.
+""".
+-spec info(term(), stream()) -> info().
+info({?MODULE, Ref}, #stream{pending = {ready, Ref}} = Stream0) ->
+    Stream = Stream0#stream{pending = undefined},
+    case next(Stream) of
+        more -> arrived(read(roadrunner_req:read_body_chunked(Stream#stream.req), Stream));
+        Result -> classified(Result)
+    end;
+info({timeout, Timer, ?MODULE}, #stream{pending = {demand, Timer}, req = Req} = Stream) ->
+    {error, request_timeout} = roadrunner_req:withdraw_body(Req),
+    abort(deadline_exceeded, ~"deadline exceeded", Stream);
+info({roadrunner_drain, _Deadline}, _Stream) ->
+    drain;
+info(Message, #stream{pending = {demand, Timer}, req = Req} = Stream) ->
+    case roadrunner_req:body_message(Message, Req) of
+        ignore ->
+            other(Message, Stream);
+        {error, closed} ->
+            true = gone_now(Stream),
+            cancelled;
+        Result ->
+            ok = cancel_read_timer(Timer),
+            arrived(read(Result, Stream#stream{pending = undefined}))
+    end;
+info(Message, Stream) ->
+    other(Message, Stream).
+
+%% A message that is not a read's: the call cancelled, or not the call's.
+-spec other(term(), stream()) -> cancelled | ignore.
+other(Message, Stream) ->
+    case cancelled(Message, Stream) of
+        true -> cancelled;
+        false -> ignore
+    end.
+
+%% A read taken in: the message it completed, or more asked for.
+-spec arrived(stream()) -> info().
+arrived(Stream) ->
+    case next(Stream) of
+        more -> {more, ask(Stream)};
+        Result -> classified(Result)
+    end.
+
+-spec classified({ok, term(), stream()} | {eof, stream()}) -> info().
+classified({ok, Message, Stream}) -> {message, Message, Stream};
+classified({eof, Stream}) -> {eof, Stream}.
 
 -doc """
 Send a response message, the response's headers going first with the
@@ -1268,9 +1469,9 @@ set_send_compression(Encoding, #stream{accepted = Accepted} = Stream) when
     end.
 
 -doc """
-Whether the message `recv/1` returned last came compressed, for a method
-that checks how its client sends (gRPC's interop tests ask a server to);
-`false` before the first.
+Whether the message `recv/1` or `info/2` returned last came compressed, for a
+method that checks how its client sends (gRPC's interop tests ask a server
+to); `false` before the first.
 """.
 -spec recv_compressed(stream()) -> boolean().
 recv_compressed(#stream{compressed = Compressed}) ->

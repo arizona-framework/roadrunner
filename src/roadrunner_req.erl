@@ -198,7 +198,10 @@ closure takes it, so `set_body_timeout/2` can move it.
     %% Present while a 100 Continue is owed to a client holding its body
     %% back: the connection process and stream a streaming response asks
     %% for it before it starts.
-    continue => {pid(), pos_integer()}
+    continue => {pid(), pos_integer()},
+    %% The connection process and stream a read asks for DATA, on a body
+    %% still arriving (`roadrunner_conn:demand_body/1`).
+    source => {pid(), non_neg_integer()}
 }.
 
 -type h1_body_reader() :: #{
@@ -250,6 +253,10 @@ time, or `infinity` for never.
     read_body/1,
     read_body/2,
     read_body_chunked/1,
+    demand_body/1,
+    body_message/2,
+    await_body/1,
+    withdraw_body/1,
     set_body_timeout/2,
     read_form/1,
     bindings/1,
@@ -512,14 +519,7 @@ read_body(#{body_reader := BS} = Req, Opts) ->
             #{length := L} -> {length, L};
             _ -> all
         end,
-    case roadrunner_conn:consume_body_reader(BS, Mode) of
-        {ok, Bytes, BS2} ->
-            {ok, Bytes, Req#{body_reader := BS2, body => Bytes}};
-        {more, Bytes, BS2} ->
-            {more, Bytes, Req#{body_reader := BS2}};
-        {error, _} = E ->
-            E
-    end;
+    with_reader(roadrunner_conn:consume_body_reader(BS, Mode), Req);
 read_body(Req, _Opts) ->
     %% Auto mode (or a manually-constructed req): the body is already
     %% sitting in the `body` field — return it.
@@ -547,16 +547,56 @@ chunks get drained for keep-alive.
     | {more, iodata(), request()}
     | {error, term()}.
 read_body_chunked(#{body_reader := BS} = Req) ->
-    case roadrunner_conn:consume_body_reader(BS, next_chunk) of
-        {ok, Bytes, BS2} ->
-            {ok, Bytes, Req#{body_reader := BS2, body => Bytes}};
-        {more, Bytes, BS2} ->
-            {more, Bytes, Req#{body_reader := BS2}};
-        {error, _} = E ->
-            E
-    end;
+    with_reader(roadrunner_conn:consume_body_reader(BS, next_chunk), Req);
 read_body_chunked(Req) ->
     {ok, body(Req), Req}.
+
+%% `read_body_chunked/1` in two steps, for a process that waits on
+%% messages of its own as the body arrives (`roadrunner_grpc:recv_async/1`):
+%% `demand_body/1` asks for the next DATA without waiting, `demanded`, or
+%% says the next `read_body_chunked/1` returns at once, `ready`; the answer
+%% to a demand lands in the mailbox, and `body_message/2` takes it in
+%% (`ignore` for any other message). `await_body/1` waits for it instead,
+%% and `withdraw_body/1` takes the demand back, which ends the body with
+%% `request_timeout`. A request without a reader (`auto` mode) is `ready`.
+-doc false.
+-spec demand_body(request()) -> demanded | ready.
+demand_body(#{body_reader := BS}) ->
+    roadrunner_conn:demand_body(BS);
+demand_body(_Req) ->
+    ready.
+
+-doc false.
+-spec body_message(term(), request()) ->
+    {ok, iodata(), request()} | {more, iodata(), request()} | {error, term()} | ignore.
+body_message(Message, #{body_reader := BS} = Req) ->
+    case roadrunner_conn:body_message(Message, BS) of
+        ignore -> ignore;
+        Result -> with_reader(Result, Req)
+    end.
+
+-doc false.
+-spec await_body(request()) ->
+    {ok, iodata(), request()} | {more, iodata(), request()} | {error, term()}.
+await_body(#{body_reader := BS} = Req) ->
+    with_reader(roadrunner_conn:await_body(BS), Req).
+
+-doc false.
+-spec withdraw_body(request()) -> {error, request_timeout}.
+withdraw_body(#{body_reader := BS}) ->
+    roadrunner_conn:withdraw_body(BS).
+
+%% A read's result, its reader put back in the request.
+-spec with_reader(
+    {ok, iodata(), body_reader()} | {more, iodata(), body_reader()} | {error, term()}, request()
+) ->
+    {ok, iodata(), request()} | {more, iodata(), request()} | {error, term()}.
+with_reader({ok, Bytes, BS}, Req) ->
+    {ok, Bytes, Req#{body_reader := BS, body => Bytes}};
+with_reader({more, Bytes, BS}, Req) ->
+    {more, Bytes, Req#{body_reader := BS}};
+with_reader({error, _} = E, _Req) ->
+    E.
 
 -doc """
 Set how long the rest of the body may take to read, from now: the

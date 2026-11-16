@@ -14,7 +14,9 @@ Protocol Buffers.
 - request and response metadata, with `-bin` values as plain bytes
 - every gRPC status code, sent as a status and a message
 - deadlines from `grpc-timeout`, and a way to learn that the client
-  cancelled
+  cancelled or that the server is shutting down
+- a method can wait for the next request and its own messages at once,
+  for a chat that also pushes what others say
 - `gzip` and `deflate` message compression, both ways
 - a limit on the size of each request message
 - an event when each call starts and ends, for metrics and tracing
@@ -235,13 +237,82 @@ chat(Stream0) ->
 ### The stream and the method's process
 
 - the stream belongs to the call's process: send from that process only
-- `recv/1` waits for the next request, so a method cannot wait for other
-  messages at the same time
+- `recv/1` waits for the next request and nothing else; to wait for your
+  own messages too, see the next section
 - a request that ends the call (too large, malformed, past its deadline)
-  is thrown out of `recv/1` so the core can answer with the right status,
-  so do not wrap `recv/1` in a catch-all `try` or `catch`
+  is thrown out of `recv/1` and `info/2` so the core can answer with the
+  right status, so do not wrap them in a catch-all `try` or `catch`
 - if the client cancels or goes away, the method stops at its next write,
   quietly, as there is no one left to answer
+
+### Waiting for requests and your own messages
+
+A method that also gets messages of its own, such as a chat where the
+client sends what it says and the server pushes what everyone else says,
+cannot sit in `recv/1`. Ask for the next request with
+`roadrunner_grpc:recv_async/1` instead: it returns at once, and the
+request arrives in the method's mailbox. Hand every message you do not
+handle yourself to `roadrunner_grpc:info/2`, which tells you what it is:
+
+- `{message, Request, Stream}`: the next request; ask for the one after
+  with `recv_async/1` when you are ready for it
+- `{more, Stream}`: part of a request arrived and the rest is asked for
+  already; just keep waiting
+- `{eof, Stream}`: the client has sent all its requests
+- `cancelled`: the client cancelled the call or went away; return
+- `drain`: the server is shutting down (see below)
+- `ignore`: the message is not the call's
+
+```erlang
+%% rpcs: ~"Chat" => #{function => chat, kind => bidi_stream, ...}
+chat(Stream) ->
+    ok = room:join(self()),
+    loop(roadrunner_grpc:recv_async(Stream)).
+
+loop(Stream) ->
+    receive
+        {said, Text} ->
+            %% Someone else in the room.
+            loop(roadrunner_grpc:send(Text, Stream));
+        Other ->
+            case roadrunner_grpc:info(Other, Stream) of
+                {message, Text, Stream1} ->
+                    ok = room:say(Text),
+                    loop(roadrunner_grpc:recv_async(Stream1));
+                {more, Stream1} ->
+                    loop(Stream1);
+                {eof, Stream1} ->
+                    {ok, Stream1};
+                cancelled ->
+                    {ok, Stream};
+                drain ->
+                    {error, unavailable, ~"server shutting down", Stream};
+                ignore ->
+                    loop(Stream)
+            end
+    end.
+```
+
+Always go on with the stream `info/2` returns. One request is asked for
+at a time: calling `recv_async/1` again before `info/2` handed you the
+last one does nothing. The size limit, compression, the deadline and the
+call's events work as with `recv/1`. You can still call `recv/1` after
+`recv_async/1`: it waits for the request already asked for.
+
+Both work with either body buffering mode. With `auto` the requests are
+all read already, so each one arrives in the mailbox at once.
+
+### When the server shuts down
+
+When the listener drains (`roadrunner_listener:drain/2`), new calls are
+refused and the calls running are left to finish until the drain's
+timeout. A long streaming call should end early instead, so its client
+can call again on another server: `info/2` returns `drain` for the
+message the call's process gets. End the call with
+`{error, unavailable, ~"server shutting down", Stream}`; gRPC clients
+treat `UNAVAILABLE` as safe to retry. A method that never waits on its
+own messages does not see the drain, and runs until it is done or the
+drain's timeout stops it.
 
 ## Metadata, headers and trailers
 
@@ -342,8 +413,9 @@ be sent, so the call gets a `500` and stops.
 
 ## Deadlines and cancellation
 
-A client sets a deadline with the `grpc-timeout` header. If a `recv/1` is
-still waiting when it passes, the call ends with `DEADLINE_EXCEEDED`. A
+A client sets a deadline with the `grpc-timeout` header. If a `recv/1`, or
+a request asked for with `recv_async/1`, is still waiting when it passes,
+the call ends with `DEADLINE_EXCEEDED`. A
 call still running shortly after the deadline is cancelled: its stream is
 reset, and the method stops at its next read or write. Without a
 `grpc-timeout`, a call may run for as long as the client stays connected.
@@ -373,9 +445,9 @@ read, a little after the client started its clock.
 A method that only sends and receives through the stream needs nothing
 more: a cancelled call stops it at its next write. A method that waits in
 its own `receive`, such as a server stream that pushes events, gets a
-message when the client cancels or its connection goes away. Check each
-message you do not expect with `roadrunner_grpc:cancelled/2`, and return
-when it says `true`:
+message when the client cancels or its connection goes away. Hand each
+message you do not expect to `roadrunner_grpc:info/2`, and return when it
+says `cancelled`; it also tells you when the server shuts down:
 
 ```erlang
 watch(_Request, Stream) ->
@@ -387,12 +459,16 @@ events(Stream) ->
         {event, Data} ->
             events(roadrunner_grpc:send(Data, Stream));
         Other ->
-            case roadrunner_grpc:cancelled(Other, Stream) of
-                true -> {ok, Stream};
-                false -> events(Stream)
+            case roadrunner_grpc:info(Other, Stream) of
+                cancelled -> {ok, Stream};
+                drain -> {error, unavailable, ~"server shutting down", Stream};
+                ignore -> events(Stream)
             end
     end.
 ```
+
+`roadrunner_grpc:cancelled/2` answers only the first question, `true`
+when the call is over, for a method that has no use for the drain.
 
 ## Compression
 
@@ -478,14 +554,15 @@ How a call ended is one of:
 
 - `normal`: it ended `OK`
 - `error`: it ended with another status, yours or one roadrunner
-  answered for you
+  answered for you (a call you end `UNAVAILABLE` on a drain among them)
 - `cancelled`: the client cancelled it or went away before it could
   read the status; the status is `cancelled`
 - `deadline`: the same, from 50 ms before its deadline on; the status is
   `deadline_exceeded`. The time that counts is when the call learned the
-  client was gone: when `roadrunner_grpc:cancelled/2` said so, or else at
-  its next read or write or as its status went out, which can be long
-  after the client cancelled if the method keeps working without either.
+  client was gone: when `roadrunner_grpc:info/2` or
+  `roadrunner_grpc:cancelled/2` said so, or else at its next read or
+  write or as its status went out, which can be long after the client
+  cancelled if the method keeps working without either.
   The deadline counts from when the call starts (with `auto` buffering,
   after the body was read), so a client that cancels at its own deadline
   is reported `cancelled` when its body took more than about 50 ms to

@@ -67,7 +67,20 @@ fixture, under both body buffering modes.
     route_compression_applies/1,
     body_past_the_window_waits_for_the_reader/1,
     recv_tells_a_compressed_message/1,
-    descriptor_service_calls/1
+    descriptor_service_calls/1,
+    active_reads/1,
+    active_reads_compressed/1,
+    active_message_too_large/1,
+    active_message_cut_short/1,
+    recv_after_recv_async/1,
+    active_chat_interleaves_broadcasts/1,
+    active_deadline_ends_the_wait/1,
+    recv_after_recv_async_deadline/1,
+    active_client_reset_is_cancelled/1,
+    active_drain_is_unavailable/1,
+    active_body_over_the_cap/1,
+    server_stream_learns_of_a_drain/1,
+    http3_active_reads/1
 ]).
 
 -define(RUNTIME, ~"/test.Runtime/").
@@ -78,7 +91,7 @@ suite() ->
     [{timetrap, {seconds, 30}}].
 
 all() ->
-    [{group, auto}, {group, manual}, http1_is_505, http3_calls].
+    [{group, auto}, {group, manual}, http1_is_505, http3_calls, http3_active_reads].
 
 groups() ->
     Common = [
@@ -126,7 +139,12 @@ groups() ->
         messages_follow_the_announced_encoding,
         route_compression_applies,
         recv_tells_a_compressed_message,
-        descriptor_service_calls
+        descriptor_service_calls,
+        active_reads,
+        active_reads_compressed,
+        active_message_too_large,
+        active_message_cut_short,
+        recv_after_recv_async
     ],
     [
         {auto, [], Common},
@@ -140,7 +158,14 @@ groups() ->
                     body_over_the_cap_is_resource_exhausted,
                     large_message_across_frames,
                     client_reset_stops_the_writes,
-                    body_past_the_window_waits_for_the_reader
+                    body_past_the_window_waits_for_the_reader,
+                    active_chat_interleaves_broadcasts,
+                    active_deadline_ends_the_wait,
+                    recv_after_recv_async_deadline,
+                    active_client_reset_is_cancelled,
+                    active_drain_is_unavailable,
+                    active_body_over_the_cap,
+                    server_stream_learns_of_a_drain
                 ]}
     ].
 
@@ -153,6 +178,8 @@ end_per_group(_Mode, _Config) ->
 init_per_testcase(http1_is_505, Config) ->
     start(Config, [http1], auto);
 init_per_testcase(http3_calls, Config) ->
+    start(Config, [http3], manual);
+init_per_testcase(http3_active_reads, Config) ->
     start(Config, [http3], manual);
 init_per_testcase(_Case, Config) ->
     start(Config, [http2], ?config(mode, Config)).
@@ -189,7 +216,11 @@ tls([http3]) -> #{tls => roadrunner_test_certs:server_opts()};
 tls(_Protocols) -> #{}.
 
 end_per_testcase(_Case, _Config) ->
-    ok = roadrunner_listener:stop(?MODULE).
+    %% A listener that drained has stopped.
+    case whereis(?MODULE) of
+        undefined -> ok;
+        _Listener -> ok = roadrunner_listener:stop(?MODULE)
+    end.
 
 unary(Config) ->
     {Headers, [~"hi"], Trailers, _} = call(Config, ~"Unary", [~"hi"]),
@@ -398,16 +429,7 @@ h3_call(Conn, Method, Messages) ->
     h3_call(Conn, Method, [], Messages).
 
 h3_call(Conn, Method, Extra, Messages) ->
-    Fields = [
-        {~":method", ~"POST"},
-        {~":scheme", ~"https"},
-        {~":authority", ~"localhost"},
-        {~":path", <<?SVC/binary, Method/binary>>},
-        {~"content-type", ~"application/grpc"},
-        {~"te", ~"trailers"}
-        | Extra
-    ],
-    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, Fields, false),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, h3_fields(Method, Extra), false),
     ok = roadrunner_quic_test_h3:send_data(
         Conn,
         StreamId,
@@ -415,6 +437,17 @@ h3_call(Conn, Method, Extra, Messages) ->
         true
     ),
     roadrunner_quic_test_h3:collect_all(Conn, StreamId).
+
+h3_fields(Method, Extra) ->
+    [
+        {~":method", ~"POST"},
+        {~":scheme", ~"https"},
+        {~":authority", ~"localhost"},
+        {~":path", <<?SVC/binary, Method/binary>>},
+        {~"content-type", ~"application/grpc"},
+        {~"te", ~"trailers"}
+        | Extra
+    ].
 
 content_type_parameters(Config) ->
     {Headers, [~"x"], _, _} = call(
@@ -708,7 +741,199 @@ descriptor_service_calls(Config) ->
     ),
     ?assertEqual(~"0", header(~"grpc-status", Trailers)).
 
+%% A method reading with `recv_async/1` and `info/2` gets each message
+%% whole: several in one DATA frame, one across frames (past 16 KB), and
+%% the end of the requests, with a deadline it beats.
+active_reads(Config) ->
+    Big = binary:copy(~"0123456789", 5000),
+    Extra = [{~"grpc-timeout", ~"10S"}],
+    {_, [Sum], Trailers, _} = call(Config, ~"ActiveSum", Extra, [~"a", Big, ~"c"]),
+    ?assertEqual(<<"a", Big/binary, "c">>, Sum),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)),
+    {_, [<<>>], _, _} = call(Config, ~"ActiveSum", []).
+
+active_reads_compressed(Config) ->
+    Gzip = [{~"grpc-encoding", ~"gzip"}],
+    Body = iolist_to_binary([
+        roadrunner_grpc_frame:encode(true, zlib:gzip(~"ab")),
+        roadrunner_grpc_frame:encode(false, ~"c")
+    ]),
+    {_, [~"abc"], Trailers, _} = raw_call(Config, ~"ActiveSum", Gzip, Body),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)).
+
+active_message_too_large(Config) ->
+    {Headers, [], trailers_only, _} = call(Config, ~"ActiveSum", [binary:copy(~"x", 100_001)]),
+    ?assertEqual(~"8", header(~"grpc-status", Headers)).
+
+active_message_cut_short(Config) ->
+    {Headers, [], trailers_only, _} = raw_call(Config, ~"ActiveSum", <<0, 0, 0, 0, 9, "abc">>),
+    ?assertEqual(~"13", header(~"grpc-status", Headers)).
+
+%% `recv/1` after `recv_async/1` waits for the read asked for, and reads on
+%% from it.
+recv_after_recv_async(Config) ->
+    Big = binary:copy(~"x", 40_000),
+    {_, [Sum], Trailers, _} =
+        call(Config, ~"MixedSum", [{~"grpc-timeout", ~"10S"}], [~"a", Big, ~"c"]),
+    ?assertEqual(<<"a", Big/binary, "c">>, Sum),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)).
+
+%% A bidi method waits on the client's messages and its own at once: each
+%% request is echoed, each broadcast the test sends the method goes out,
+%% in the order they came, and a message that is not the call's is left
+%% alone.
+active_chat_interleaves_broadcasts(Config) ->
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "ActiveChat">>, [
+        {~"grpc-timeout", ~"10S"}
+    ]),
+    Method = receive_held(),
+    {~"hello", C1} = next_message(roadrunner_grpc_test_client:send(C0, 1, frame(~"hello"))),
+    Method ! not_the_calls,
+    Method ! {broadcast, ~"news"},
+    {~"news", C2} = next_message(C1),
+    %% A message in pieces, with an empty DATA frame between them.
+    <<Head:3/binary, Tail/binary>> = frame(~"again"),
+    C3 = roadrunner_grpc_test_client:send(C2, 1, Head),
+    C4 = roadrunner_grpc_test_client:send(C3, 1, <<>>),
+    {~"again", C5} = next_message(roadrunner_grpc_test_client:send(C4, 1, Tail)),
+    Method ! {broadcast, ~"more news"},
+    {~"more news", C6} = next_message(C5),
+    %% Two messages in one DATA frame, the second read from what the first
+    %% read left.
+    C7 = roadrunner_grpc_test_client:send(C6, 1, <<(frame(~"one"))/binary, (frame(~"two"))/binary>>),
+    {~"one", C8} = next_message(C7),
+    {~"two", C9} = next_message(C8),
+    {Trailers, _} = roadrunner_grpc_test_client:trailers(
+        roadrunner_grpc_test_client:finish(C9, 1), 1
+    ),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)).
+
+%% A read asked for and still waiting at the call's deadline ends the call
+%% with DEADLINE_EXCEEDED.
+active_deadline_ends_the_wait(Config) ->
+    C = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "ActiveSum">>, [
+        {~"grpc-timeout", ~"100m"}
+    ]),
+    {Headers, [], trailers_only, _} = roadrunner_grpc_test_client:response(C, 1),
+    ?assertEqual(~"4", header(~"grpc-status", Headers)).
+
+recv_after_recv_async_deadline(Config) ->
+    C = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "MixedSum">>, [
+        {~"grpc-timeout", ~"100m"}
+    ]),
+    {Headers, [], trailers_only, _} = roadrunner_grpc_test_client:response(C, 1),
+    ?assertEqual(~"4", header(~"grpc-status", Headers)).
+
+%% A client that resets the call while the method waits is `cancelled`:
+%% the method returns, and the connection goes on serving.
+active_client_reset_is_cancelled(Config) ->
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "ActiveChat">>, []),
+    Method = receive_held(),
+    MRef = monitor(process, Method),
+    {~"hi", C1} = next_message(roadrunner_grpc_test_client:send(C0, 1, frame(~"hi"))),
+    C2 = roadrunner_grpc_test_client:reset(C1, 1),
+    receive
+        {'DOWN', MRef, process, Method, _} -> ok
+    end,
+    {_, [~"y"], Trailers, _} = roadrunner_grpc_test_client:call(
+        C2, 3, <<?SVC/binary, "Unary">>, [], [~"y"]
+    ),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)).
+
+%% A listener that drains tells a method waiting on its reads, which ends
+%% the call UNAVAILABLE for its client to call again elsewhere.
+active_drain_is_unavailable(Config) ->
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "ActiveChat">>, []),
+    _Method = receive_held(),
+    {~"hi", C1} = next_message(roadrunner_grpc_test_client:send(C0, 1, frame(~"hi"))),
+    Self = self(),
+    _ = spawn(fun() -> Self ! {drained, roadrunner_listener:drain(?MODULE, 10_000)} end),
+    {Trailers, _} = roadrunner_grpc_test_client:trailers(C1, 1),
+    ?assertEqual(~"14", header(~"grpc-status", Trailers)),
+    ?assertEqual(~"server shutting down", header(~"grpc-message", Trailers)),
+    receive
+        {drained, Drained} -> ?assertEqual({ok, drained}, Drained)
+    end.
+
+%% A server-streaming method waiting on its own messages learns of a drain
+%% from `info/2` too, which leaves alone a message that is not the call's.
+server_stream_learns_of_a_drain(Config) ->
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "Notify">>, []),
+    C1 = roadrunner_grpc_test_client:finish(
+        roadrunner_grpc_test_client:send(C0, 1, frame(~"x")), 1
+    ),
+    Method = receive_held(),
+    Method ! not_the_calls,
+    Method ! {notify, ~"news"},
+    {~"news", C2} = next_message(C1),
+    Self = self(),
+    _ = spawn(fun() -> Self ! {drained, roadrunner_listener:drain(?MODULE, 10_000)} end),
+    {Trailers, _} = roadrunner_grpc_test_client:trailers(C2, 1),
+    ?assertEqual(~"14", header(~"grpc-status", Trailers)),
+    receive
+        {drained, Drained} -> ?assertEqual({ok, drained}, Drained)
+    end.
+
+active_body_over_the_cap(Config) ->
+    Big = binary:copy(~"x", 90_000),
+    {Headers, [], trailers_only, _} = call(Config, ~"ActiveSum", [Big, Big, Big, Big]),
+    ?assertEqual(~"8", header(~"grpc-status", Headers)).
+
+%% The same over HTTP/3: a body that arrived whole, then a chat whose
+%% client sends as it goes, gets a broadcast, and cancels.
+http3_active_reads(Config) ->
+    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, ?config(port, Config)),
+    {[_, Trailers], Body} = h3_call(Conn, ~"ActiveSum", [], [~"a", ~"b"]),
+    ?assertEqual([~"ab"], roadrunner_grpc_test_client:messages(Body)),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)),
+    {[_, _], MixedBody} = h3_call(Conn, ~"MixedSum", [], [~"c", ~"d"]),
+    ?assertEqual([~"cd"], roadrunner_grpc_test_client:messages(MixedBody)),
+    true = register(roadrunner_grpc_held, self()),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(
+        Conn, h3_fields(~"ActiveChat", [{~"grpc-timeout", ~"10S"}]), false
+    ),
+    Method = receive_held(),
+    MRef = monitor(process, Method),
+    ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, frame(~"hi"), false),
+    ?assertEqual(~"hi", h3_message(Conn, StreamId)),
+    Method ! {broadcast, ~"news"},
+    ?assertEqual(~"news", h3_message(Conn, StreamId)),
+    ok = roadrunner_quic_test_h3:cancel(Conn, StreamId),
+    receive
+        {'DOWN', MRef, process, Method, _} -> ok
+    end,
+    _ = roadrunner_quic_test_h3:close(Conn),
+    ok.
+
 %% --- helpers ---
+
+receive_held() ->
+    receive
+        {held, Pid} -> Pid
+    end.
+
+%% The next message on an HTTP/3 call, the frames before it (its response
+%% headers) skipped; the call sends one at a time.
+h3_message(Conn, StreamId) ->
+    h3_message(Conn, StreamId, <<>>).
+
+h3_message(Conn, StreamId, Buf) ->
+    case roadrunner_quic_h3_frame:decode(Buf) of
+        {ok, {data, Body}, <<>>} ->
+            {ok, false, Message, <<>>} = roadrunner_grpc_frame:decode(Body, 1024),
+            Message;
+        {ok, _Headers, Rest} ->
+            h3_message(Conn, StreamId, Rest);
+        {more, _} ->
+            receive
+                {quic_test_stream, Conn, StreamId, Data, false} ->
+                    h3_message(Conn, StreamId, <<Buf/binary, Data/binary>>)
+            end
+    end.
 
 open(Config) ->
     roadrunner_grpc_test_client:open(?config(port, Config)).

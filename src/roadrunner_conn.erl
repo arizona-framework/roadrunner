@@ -74,6 +74,10 @@
     skip_continue/1,
     send_body/4,
     send_body_error/3,
+    demand_body/1,
+    body_message/2,
+    await_body/1,
+    withdraw_body/1,
     drain_reader/1,
     close_opts/1,
     keep_alive_decision/2,
@@ -1268,7 +1272,8 @@ stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
         recv => stream_recv(Conn, StreamId),
         deadline => Deadline,
         id => make_ref(),
-        max => Max
+        max => Max,
+        source => {Conn, StreamId}
     }.
 
 %% A manual-mode request whose body arrived whole before dispatch (an
@@ -1395,17 +1400,96 @@ stream_recv(Conn, StreamId) ->
     fun(Deadline) ->
         MRef = monitor(process, Conn),
         Conn ! {roadrunner_body_demand, self(), StreamId},
-        Timeout = remaining(Deadline, erlang:monotonic_time(millisecond)),
-        Result =
-            receive
-                {roadrunner_body, StreamId, Data, Fin} -> {ok, Data, Fin};
-                {roadrunner_body_error, StreamId, Reason} -> {error, Reason};
-                {'DOWN', MRef, process, Conn, _} -> {error, closed}
-            after Timeout -> withdraw_demand(Conn, StreamId, MRef)
-            end,
-        true = demonitor(MRef, [flush]),
-        Result
+        await_reply(Conn, StreamId, MRef, Deadline)
     end.
+
+%% Wait for the connection's answer to the demand sent before, until
+%% `Deadline`, watching it with `MRef`, which is taken down after.
+-spec await_reply(pid(), non_neg_integer(), reference(), roadrunner_req:deadline()) ->
+    {ok, iodata(), boolean()} | {error, term()}.
+await_reply(Conn, StreamId, MRef, Deadline) ->
+    Timeout = remaining(Deadline, erlang:monotonic_time(millisecond)),
+    Result =
+        receive
+            {roadrunner_body, StreamId, Data, Fin} -> {ok, Data, Fin};
+            {roadrunner_body_error, StreamId, Reason} -> {error, Reason};
+            {'DOWN', MRef, process, Conn, _} -> {error, closed}
+        after Timeout -> withdraw_demand(Conn, StreamId, MRef)
+        end,
+    true = demonitor(MRef, [flush]),
+    Result.
+
+%% A read in two steps, for a process that waits on messages of its own as
+%% the body arrives (`roadrunner_grpc:recv_async/1`): `demand_body/1` asks
+%% the connection for the next DATA without waiting, the answer lands in
+%% the mailbox, and `body_message/2` takes it in. `ready` is a reader whose
+%% next `next_chunk` read returns at once: bytes an earlier read left over,
+%% a body that has ended or failed, or one that arrived whole. The caller
+%% watches the connection itself; `await_body/1` waits for the answer
+%% instead, and `withdraw_body/1` takes the demand back.
+-doc false.
+-spec demand_body(roadrunner_req:body_reader()) -> demanded | ready.
+demand_body(#{source := {Conn, StreamId}, buffered := Buf, done := false} = BS) ->
+    case iolist_size(Buf) =:= 0 andalso not read_failed(BS) of
+        true ->
+            _ = Conn ! {roadrunner_body_demand, self(), StreamId},
+            demanded;
+        false ->
+            ready
+    end;
+demand_body(_BS) ->
+    ready.
+
+%% The connection's answer to `demand_body/1`'s demand, as a `next_chunk`
+%% read returns it, or `ignore` for any other message. An empty DATA that
+%% does not end the body comes back as `more` with no bytes.
+-doc false.
+-spec body_message(term(), roadrunner_req:body_reader()) ->
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
+    | {error, term()}
+    | ignore.
+body_message({roadrunner_body, StreamId, Data, Fin}, #{source := {_Conn, StreamId}} = BS) ->
+    delivered(BS, {ok, Data, Fin});
+body_message({roadrunner_body_error, StreamId, Reason}, #{source := {_Conn, StreamId}} = BS) ->
+    delivered(BS, {error, Reason});
+body_message(_Message, _BS) ->
+    ignore.
+
+%% Wait for the answer to `demand_body/1`'s demand, until the reader's
+%% deadline, as a `next_chunk` read would.
+-doc false.
+-spec await_body(roadrunner_req:body_reader()) ->
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
+    | {error, term()}.
+await_body(#{source := {Conn, StreamId}, deadline := Deadline} = BS) ->
+    MRef = monitor(process, Conn),
+    delivered(BS, await_reply(Conn, StreamId, MRef, Deadline)).
+
+%% Take `demand_body/1`'s demand back, as a read that timed out does: the
+%% body ends with `request_timeout`, and DATA handed over before is dropped.
+-doc false.
+-spec withdraw_body(roadrunner_req:body_reader()) -> {error, request_timeout}.
+withdraw_body(#{source := {Conn, StreamId}} = BS) ->
+    MRef = monitor(process, Conn),
+    Result = withdraw_demand(Conn, StreamId, MRef),
+    true = demonitor(MRef, [flush]),
+    delivered(BS, Result).
+
+%% The connection's answer taken into the reader, all of it handed out.
+-spec delivered(roadrunner_req:body_reader(), {ok, iodata(), boolean()} | {error, term()}) ->
+    {ok, iodata(), roadrunner_req:body_reader()}
+    | {more, iodata(), roadrunner_req:body_reader()}
+    | {error, term()}.
+delivered(BS, Answer) ->
+    Result =
+        case pulled(BS, Answer) of
+            {ok, #{buffered := Data, done := true} = BS1} -> {ok, Data, BS1#{buffered := <<>>}};
+            {ok, #{buffered := Data} = BS1} -> {more, Data, BS1#{buffered := <<>>}};
+            {error, _} = E -> E
+        end,
+    remember_reader(BS, Result).
 
 %% A read that timed out takes its demand back from the connection, which
 %% answers once it holds no more for this worker; anything it handed over
@@ -1782,18 +1866,22 @@ stream_next(#{buffered := Buf, done := Done} = BS) ->
 %% before), held to the reader's `max`.
 -spec stream_pull(roadrunner_req:body_reader()) ->
     {ok, roadrunner_req:body_reader()} | {error, term()}.
-stream_pull(#{recv := Recv, deadline := Deadline, bytes_read := Read, max := Max} = BS) ->
-    case Recv(Deadline) of
-        {ok, Data, Fin} ->
-            case Read + iolist_size(Data) of
-                Total when Total > Max ->
-                    {error, content_length_too_large};
-                Total ->
-                    {ok, BS#{buffered := Data, bytes_read := Total, done := Fin}}
-            end;
-        {error, _} = E ->
-            E
-    end.
+stream_pull(#{recv := Recv, deadline := Deadline} = BS) ->
+    pulled(BS, Recv(Deadline)).
+
+%% A round's answer: its DATA becomes `buffered`, held to the reader's
+%% `max`.
+-spec pulled(roadrunner_req:body_reader(), {ok, iodata(), boolean()} | {error, term()}) ->
+    {ok, roadrunner_req:body_reader()} | {error, term()}.
+pulled(#{bytes_read := Read, max := Max} = BS, {ok, Data, Fin}) ->
+    case Read + iolist_size(Data) of
+        Total when Total > Max ->
+            {error, content_length_too_large};
+        Total ->
+            {ok, BS#{buffered := Data, bytes_read := Total, done := Fin}}
+    end;
+pulled(_BS, {error, _} = E) ->
+    E.
 
 %% Pull decoded chunked-body bytes out of `BS` until either `Want`
 %% bytes are collected or the body is fully drained. `Want` is either
