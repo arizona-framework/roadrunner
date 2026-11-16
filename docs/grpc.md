@@ -162,6 +162,14 @@ HTTP/2 when the listener serves both. That is why a listener of its own is
 the best place for gRPC. Setting `body_buffering` per route is on the
 roadmap.
 
+### Beside an Arizona app
+
+An [Arizona](https://github.com/arizona-framework/arizona) app can serve
+gRPC on the same listener and port as its pages, through a `grpc` entry in
+its routes that uses `roadrunner_grpc:routes/1`. The
+[arizona_roadrunner](https://github.com/arizona-framework/arizona_roadrunner#grpc)
+README shows how.
+
 ### A service built at runtime
 
 When the methods are only known at runtime (read from a schema, say),
