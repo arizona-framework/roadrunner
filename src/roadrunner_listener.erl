@@ -495,10 +495,10 @@ ops-tuning rationale.
         | #{
             handler := module(),
             state => term(),
-            middlewares => roadrunner_middleware:middleware_list()
+            middlewares => roadrunner_middleware:middlewares()
         }
         | roadrunner_router:routes(),
-    middlewares => roadrunner_middleware:middleware_list(),
+    middlewares => roadrunner_middleware:middlewares(),
     max_content_length => non_neg_integer(),
     ws => ws_opts(),
     request_timeout => 0..16#FFFFFFFF,
@@ -2701,7 +2701,7 @@ build_dispatch(Opts, _ListenerName) ->
 -spec bake_dispatch(
     module(),
     opts(),
-    roadrunner_middleware:middleware_list(),
+    roadrunner_middleware:middlewares(),
     no_state | {state, term()}
 ) -> roadrunner_conn:dispatch().
 bake_dispatch(Handler, Opts, HandlerMws, StateArg0) ->
@@ -2806,7 +2806,7 @@ do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}} = State,
     atom(),
     roadrunner_conn:proto_opts(),
     ets:table() | undefined,
-    roadrunner_middleware:middleware_list()
+    roadrunner_middleware:middlewares()
 ) -> {ok | {error, {init_failed, term()}}, #state{}}.
 reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws) ->
     #{body_buffering := BodyBuffering} = ProtoOpts,

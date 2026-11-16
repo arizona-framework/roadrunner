@@ -193,7 +193,7 @@ every service (see the moduledoc).
     codecs => [module()],
     max_message_size => pos_integer(),
     max_content_length => roadrunner_router:body_limit(),
-    middlewares => roadrunner_middleware:middleware_list(),
+    middlewares => roadrunner_middleware:middlewares(),
     send_compression => encoding(),
     health => boolean(),
     reflection => boolean()

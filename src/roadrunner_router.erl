@@ -110,7 +110,7 @@ listener's `rate_limit`; unset → only the listener's.
         path := binary(),
         handler := module(),
         state => term(),
-        middlewares => roadrunner_middleware:middleware_list(),
+        middlewares => roadrunner_middleware:middlewares(),
         methods => methods(),
         max_content_length => body_limit(),
         rate_limit => rate_limit()
@@ -294,7 +294,7 @@ run). The conn loop calls the composed fun straight with the request —
 zero closure allocations per request. Pass `[]` for `ListenerMws`
 when compiling routes outside a listener (typically only in tests).
 """.
--spec compile(routes(), roadrunner_middleware:middleware_list()) -> compiled().
+-spec compile(routes(), roadrunner_middleware:middlewares()) -> compiled().
 compile(Routes, ListenerMws) ->
     compile(Routes, ListenerMws, auto).
 
@@ -306,7 +306,7 @@ listener reads a body whole before dispatch, the route keeps the
 listener's cap.
 """.
 -spec compile(
-    routes(), roadrunner_middleware:middleware_list(), roadrunner_listener:body_buffering()
+    routes(), roadrunner_middleware:middlewares(), roadrunner_listener:body_buffering()
 ) -> compiled().
 compile(Routes, ListenerMws, BodyBuffering) when
     is_list(Routes), is_list(ListenerMws), (BodyBuffering =:= auto orelse BodyBuffering =:= manual)
@@ -378,7 +378,7 @@ compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener, Bod
     binary(),
     module(),
     no_state | {state, term()},
-    roadrunner_middleware:middleware_list(),
+    roadrunner_middleware:middlewares(),
     method_lookup(),
     limits(),
     [roadrunner_middleware:resolved()]
@@ -450,7 +450,7 @@ route_limits(_Route, _BodyBuffering) -> undefined.
 %% A route's own middlewares, led by its `rate_limit` stage when it sets one:
 %% after the listener's middlewares (which still decorate a refusal) and ahead
 %% of the route's work. A route without a limit has no stage, so no check.
--spec route_middlewares(map()) -> roadrunner_middleware:middleware_list().
+-spec route_middlewares(map()) -> roadrunner_middleware:middlewares().
 route_middlewares(#{path := Path, rate_limit := RateLimit} = Route) ->
     Methods =
         case Route of

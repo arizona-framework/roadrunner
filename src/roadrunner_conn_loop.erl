@@ -116,7 +116,7 @@
     %% Saves ~8 hash lookups per request.
     requests_counter :: atomics:atomics_ref() | undefined,
     dispatch :: roadrunner_conn:dispatch() | undefined,
-    middlewares = [] :: roadrunner_middleware:middleware_list(),
+    middlewares = [] :: roadrunner_middleware:middlewares(),
     max_content_length = 0 :: non_neg_integer(),
     max_keep_alive_requests = 1 :: pos_integer(),
     %% Read-phase deadlines: `request_timeout` for the first request on a
