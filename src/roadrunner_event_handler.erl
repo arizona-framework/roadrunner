@@ -306,12 +306,13 @@ How a gRPC call ended, as carried by `grpc_call_stop`, with the
 - `error`: it ended with another status, the method's
   (`{error, Status, Message, Stream}`) or one roadrunner answered for it
   (an unknown method, a request message too large or malformed, a read
-  still waiting at the deadline, and so on)
+  still waiting at the deadline, and so on), a call its method ended
+  `unavailable` on a drain among them
 - `cancelled`: the client cancelled the call (reset its stream) or its
   connection went away before it could read the call's status: a write
   or read failed with it, or it was seen before a Trailers-Only status,
-  which goes out without waiting (including when `cancelled/2` told the
-  method); `Status` is `cancelled`
+  which goes out without waiting (including when `roadrunner_grpc:info/2`
+  or `cancelled/2` told the method); `Status` is `cancelled`
 - `deadline`: as `cancelled`, but from 50 ms before the call's
   `grpc-timeout` ran out on: roadrunner cancelled it a second after the
   deadline, or the client did at its own deadline; `Status` is
@@ -322,10 +323,10 @@ How a gRPC call ended, as carried by `grpc_call_stop`, with the
   `deadline` only when the call started within about 50 ms of the
   request's arrival; a body that took longer to arrive makes it
   `cancelled`. The time compared is when the call learned the stream
-  was gone: when `roadrunner_grpc:cancelled/2` told the method, or else
-  when a write or read failed or the status was about to go out, which
-  can be well after the reset came in (a method that keeps working
-  without reading or writing)
+  was gone: when `roadrunner_grpc:info/2` or `cancelled/2` told the
+  method, or else when a write or read failed or the status was about to
+  go out, which can be well after the reset came in (a method that keeps
+  working without reading or writing)
 - `stopped`: no gRPC status went out: the method stopped the call on
   purpose (`exit({shutdown, _})`), or its response headers were too
   large for the client and the request was answered `500`; `Status` is
