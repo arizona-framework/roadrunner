@@ -32,7 +32,7 @@ ends the call with `INTERNAL`.
 The files are the serialized `google.protobuf.FileDescriptorProto`s each
 service gives: the `files/0` callback of a service module, or the `files`
 of a descriptor (`roadrunner_grpc_service`); `roadrunner_grpc_protobuf`
-fills it from a gpb module generated with its `descriptor` option. A
+can fill it in for its services. A
 service whose files do not declare it is left out of `list_services`, so
 that every service listed can be described: tools such as `grpcurl` and
 `grpcui` describe each one they are told of, and stop at the first they
