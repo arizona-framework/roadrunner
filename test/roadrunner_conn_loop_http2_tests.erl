@@ -33,6 +33,7 @@ all_test_() ->
         fun post_with_body_via_data_frame/0,
         fun default_receive_windows_advertised/0,
         fun windows_refill_below_half_their_peak/0,
+        fun ending_data_refills_only_connection_window/0,
         fun continuation_assembles_header_block/0,
         fun push_promise_from_client_triggers_goaway/0,
         fun even_stream_id_triggers_goaway/0,
@@ -766,6 +767,51 @@ windows_refill_below_half_their_peak() ->
     %% 80000: the connection is down to 60000 and refills to its peak.
     serve_recv(ConnPid, Data),
     {ok, {window_update, 0, 80000}, <<>>} = roadrunner_http2_frame:parse(expect_send(), 16384),
+    cleanup(Pid, Ref).
+
+ending_data_refills_only_connection_window() ->
+    %% A buffered body's last DATA leaves its stream nothing more to
+    %% receive: no stream WINDOW_UPDATE goes out for it, only the
+    %% connection's refill once that window is below half its peak
+    %% (140000 down to 60000 here), then the response.
+    {ok, _} = roadrunner_test_event_handler:start(),
+    drain_mailbox(),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{
+        http2_conn_window => 140000,
+        http2_stream_window => 1000000,
+        http2_window_refill_threshold => unset
+    }),
+    _ = expect_send(),
+    _ = expect_send(),
+    serve_recv(ConnPid, ?PREFACE),
+    serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
+    _ = expect_send(),
+    {Hpack, _} = roadrunner_http2_hpack:encode(
+        [
+            {~":method", ~"POST"},
+            {~":scheme", ~"https"},
+            {~":authority", ~"x"},
+            {~":path", ~"/"}
+        ],
+        roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    Encode = fun(Frame) -> iolist_to_binary(roadrunner_http2_frame:encode(Frame)) end,
+    Small = Encode({data, 1, 16#01, ~"body"}),
+    %% A small body leaves both windows above their thresholds: the
+    %% response is all that goes out.
+    serve_recv(ConnPid, Encode({headers, 1, 16#04, undefined, iolist_to_binary(Hpack)})),
+    serve_recv(ConnPid, Small),
+    ?assertMatch([{headers, 1, _} | _], parse_frames(collect_until_end_stream(<<>>))),
+    %% A body still to come grows its stream at its first DATA, as
+    %% before; its last, 80000 bytes in, takes the connection down to
+    %% 59996, which alone refills.
+    Data = binary:copy(~"a", 16000),
+    serve_recv(ConnPid, Encode({headers, 3, 16#04, undefined, iolist_to_binary(Hpack)})),
+    [serve_recv(ConnPid, Encode({data, 3, 0, Data})) || _ <- [1, 2, 3, 4]],
+    {ok, {window_update, 3, 950465}, <<>>} = roadrunner_http2_frame:parse(expect_send(), 16384),
+    serve_recv(ConnPid, Encode({data, 3, 16#01, Data})),
+    {ok, {window_update, 0, 80004}, <<>>} = roadrunner_http2_frame:parse(expect_send(), 16384),
+    ?assertMatch([{headers, 3, _} | _], parse_frames(collect_until_end_stream(<<>>))),
     cleanup(Pid, Ref).
 
 continuation_assembles_header_block() ->

@@ -1587,10 +1587,14 @@ on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
                             },
                             case State1#loop.body_buffering of
                                 auto ->
-                                    State2 = maybe_refill_recv_windows(State1, StreamId),
+                                    %% The DATA that ends the body leaves the
+                                    %% stream no more to receive, so only the
+                                    %% connection's window may need credit back.
                                     case EndStream of
-                                        true -> dispatch_stream(StreamId, State2);
-                                        false -> frame_loop(State2)
+                                        true ->
+                                            dispatch_stream(StreamId, refill_conn_window(State1));
+                                        false ->
+                                            frame_loop(maybe_refill_recv_windows(State1, StreamId))
                                     end;
                                 manual ->
                                     %% Every stream with a body is already
