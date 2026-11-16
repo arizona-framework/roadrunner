@@ -130,7 +130,27 @@ are advertised to the peer in the initial `SETTINGS` frame.
 
 A frame whose declared length exceeds the negotiated max frame size is
 rejected on its 9-byte header, before the body is buffered. Streams over
-the concurrency limit are refused. The cumulative header block has no
+the concurrency limit are refused with `REFUSED_STREAM`, which a client
+may retry (RFC 9113 §8.7).
+
+A stream the client resets is closed for the client, but its handler may
+still be running: it learns of the reset at its next read or write, and
+it is not stopped, so it can clean up. Until it ends it still counts
+toward the concurrency limit, so a client that opens and resets streams
+in a loop (the HTTP/2 rapid reset attack, CVE-2023-44487) runs no more
+unfinished handlers at once on a connection than the limit allows. The
+limit counts streams whose response is not complete: a handler that keeps
+working after its response is complete no longer counts (RFC 9113
+§5.1.2), and a reset does not make it count again; `max_concurrent_requests`
+bounds those. When the handlers of reset streams fill the whole limit on
+their own and the client keeps opening streams, it is refused as many
+times as the limit, then the connection is closed with
+`GOAWAY(ENHANCE_YOUR_CALM)`. The count starts over each time one of
+those handlers ends, and a client that still has streams of its own open
+is only refused, so a client that resets its requests now and then is
+not closed for it.
+
+The cumulative header block has no
 `SETTINGS` counterpart yet, so it is enforced silently: a peer that
 overruns it gets `GOAWAY(ENHANCE_YOUR_CALM)`. The concurrency and
 header-block caps are tuned under `{http2, #{...}}` in the `protocols`
@@ -248,9 +268,9 @@ BEAM process limit (`+P`, default 262144), so under heavy multiplexing it
 can exhaust the VM-global process table — failing spawns everywhere, not
 just this listener — on top of unbounded handler memory.
 `max_concurrent_requests` caps that product directly: a listener-wide
-ceiling on live handler processes for the multiplexed protocols. It also
-counts a handler still running after its client reset the stream, which
-`max_concurrent_streams` no longer does. Over the
+ceiling on live handler processes for the multiplexed protocols. Like
+`max_concurrent_streams`, it counts a handler still running after its
+client reset the stream. Over the
 ceiling, a new HTTP/2 or HTTP/3 stream is refused with `REFUSED_STREAM` /
 `H3_REQUEST_REJECTED` (both retry-safe per RFC 9113 §8.7) before any
 handler runs, and the refusal emits `request_throttled` and
