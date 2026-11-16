@@ -3,9 +3,11 @@
 
 %% HTTP/2 (RFC 9113) connection process.
 %%
-%% Driven by either TLS ALPN-negotiated `h2` or a plaintext listener
-%% configured with `protocols => [http2]` (RFC 7540 §3.4 prior-knowledge).
-%% The dispatch decision lives in `roadrunner_conn_loop:awaiting_shoot/3`;
+%% Driven by either TLS ALPN-negotiated `h2` or a plaintext connection
+%% with prior knowledge (RFC 9113 §3.3): every connection on a
+%% `protocols => [http2]` listener, and on an `[http1, http2]` one each
+%% connection that opens with the preface (`preface/1`).
+%% The dispatch decision lives in `roadrunner_conn_loop:serve/5`;
 %% this module is transport-agnostic and reads frames via
 %% `roadrunner_transport:recv/3` either way.
 %%
@@ -72,7 +74,7 @@
 %% | `{send, _, Fun}` | yes (each `roadrunner_send` call as its shape) |
 %% | `{websocket, ...}`, `roadrunner_send:websocket/4` | 501 (RFC 8441, roadmap) |
 
--export([enter/6]).
+-export([enter/6, preface/1]).
 
 %% Hibernate continuation — invoked via `erlang:hibernate/3` when an
 %% idle conn parks past `hibernate_after`. Must stay exported so the
@@ -418,9 +420,11 @@ Top-level entry from the HTTP/1.1 dispatch fork. Owns the socket
 from this point on; takes responsibility for releasing the listener
 slot and firing the `listener_conn_close` event for `ConnSpan`.
 
-`Buffered` seeds the connection's initial read buffer — the bytes a
+`Buffered` seeds the connection's initial read buffer: the bytes a
 coalesced TCP segment carried after a stripped PROXY-protocol header
-(which may be the start of the client preface). Empty for the normal path.
+(which may be the start of the client preface), or, on a plain-TCP port
+shared with HTTP/1.1, the bytes that matched the preface. Empty for the
+normal path.
 """.
 -spec enter(
     roadrunner_transport:socket(),
@@ -560,6 +564,22 @@ idle_timeout(ProtoOpts) ->
         Override ->
             Override
     end.
+
+%% What the first bytes of a plain-TCP connection on a port shared with
+%% HTTP/1.1 say: `http2` once they hold the whole client preface, `more`
+%% while they are a proper prefix of it (none yet included), and `http1`
+%% as soon as they leave it. See `roadrunner_conn_loop:sniff_preface/2`.
+-spec preface(binary()) -> http2 | http1 | more.
+preface(<<?PREFACE, _/binary>>) ->
+    http2;
+preface(Buf) when byte_size(Buf) < ?PREFACE_LEN ->
+    Size = byte_size(Buf),
+    case binary:longest_common_prefix([Buf, <<?PREFACE>>]) of
+        Size -> more;
+        _ -> http1
+    end;
+preface(_Buf) ->
+    http1.
 
 -spec handshake_phase_preface(#loop{}) -> no_return().
 handshake_phase_preface(#loop{buffer = <<?PREFACE, Rest/binary>>} = State) ->

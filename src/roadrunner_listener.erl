@@ -439,7 +439,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   and drops it before it hibernates; `ws.heap_floor` tunes it for
   sessions. Default `#{max => 46422}` (about 360 KB).
 - `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
-  On TLS this drives `alpn_preferred_protocols` automatically.
+  On TLS this drives `alpn_preferred_protocols` automatically. On
+  plain TCP, `[http1, http2]` serves HTTP/1.1 and prior-knowledge
+  HTTP/2 on the one port.
 - `tls` — `[ssl:tls_server_option()]` for HTTPS. Absent for plain
   HTTP. The listener starts the `ssl` application when it is set, so
   a release that serves TLS must include `ssl`. Prefer an ECDSA P-256
@@ -622,9 +624,10 @@ ops-tuning rationale.
     %% On plain TCP, `[http1]` serves HTTP/1.1 only; `[http2]` serves
     %% h2c prior-knowledge (client sends the h2 connection preface
     %% `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` directly, no Upgrade
-    %% negotiation). `[http1, http2]` on plain TCP is rejected at
-    %% `init/1` — roadrunner has no `Upgrade: h2c` implementation,
-    %% so the two cannot share a plaintext port.
+    %% negotiation). `[http1, http2]` on plain TCP serves both on the
+    %% one port: a connection that opens with the preface is HTTP/2,
+    %% any other is HTTP/1.1. `Upgrade: h2c` is not offered (RFC 9113
+    %% deprecates it); a request carrying it is served as HTTP/1.1.
     %%
     %% HTTP/1 tunables live under the `http1` tuple's opts map (see
     %% `t:http1_opts/0`): `max_request_line`, `max_header_line`,
@@ -675,8 +678,11 @@ On TLS the list drives `alpn_preferred_protocols` for the TCP
 protocols, `h2` before `http/1.1` whatever their order here, so a
 client that speaks HTTP/2 gets it. An explicit
 `alpn_preferred_protocols` in `tls` sets another preference. On plain TCP, `[http2]` means prior-knowledge h2c (client
-sends the h2 preface directly); `[http1, http2]` on plain TCP is
-rejected at `init/1` since there's no `Upgrade: h2c` implementation.
+sends the h2 preface directly), and `[http1, http2]` serves both on
+one port: a connection that opens with the HTTP/2 connection preface
+(RFC 9113 §3.4) is HTTP/2, any other is HTTP/1.1. `Upgrade: h2c` is not
+offered, as RFC 9113 deprecates it; a request carrying it is served as
+HTTP/1.1.
 
 `http3` runs HTTP/3 over QUIC on the UDP port of the same number, and
 requires `tls` (QUIC mandates TLS 1.3) — listing it without `tls` is
@@ -2143,34 +2149,21 @@ alt_svc_value(Port) ->
 %%   empty list, non-list, unknown atom, malformed tuple, unknown
 %%   sub-option key, out-of-range sub-option value, or duplicate
 %%   entries.
-%% - `{listener_opt_conflict, protocols, V, no_h2c_upgrade}` for the
-%%   one combo we have to reject at config time: both `http1` and
-%%   `http2` on a plain-TCP listener. Roadrunner has no
-%%   `Upgrade: h2c` implementation, so the two cannot share a
-%%   plaintext port; the reason token spells that out so the error
-%%   message is honest.
+%% - `{listener_opt_conflict, protocols, V, http3_requires_tls}` for
+%%   `http3` on a listener without `tls`.
 -spec normalize_protocols(opts()) -> {[http1 | http2 | http3, ...], #{atom() => term()}}.
 normalize_protocols(Opts) ->
     Raw = maps:get(protocols, Opts, [http1]),
     HasTls = maps:is_key(tls, Opts),
     Entries = normalize_protocols_list(Raw),
     Names = [N || {N, _} <- Entries],
-    %% QUIC mandates TLS 1.3, so `http3` without `tls` is a config
-    %% error — caught here before the `[http1, http2]` h2c check below
-    %% (which only fires on plain TCP, where `http3` can't appear).
+    %% QUIC mandates TLS 1.3, so `http3` without `tls` is a config error.
     ok = require_tls_for_h3(Names, HasTls, Raw),
-    case Names of
-        [http1, http2] when not HasTls ->
-            error({listener_opt_conflict, protocols, Raw, no_h2c_upgrade});
-        [http2, http1] when not HasTls ->
-            error({listener_opt_conflict, protocols, Raw, no_h2c_upgrade});
-        _ ->
-            {Names,
-                maps:merge(
-                    flatten_http1_opts(Entries),
-                    maps:merge(flatten_http2_opts(Entries), flatten_http3_opts(Entries))
-                )}
-    end.
+    {Names,
+        maps:merge(
+            flatten_http1_opts(Entries),
+            maps:merge(flatten_http2_opts(Entries), flatten_http3_opts(Entries))
+        )}.
 
 -spec require_tls_for_h3([http1 | http2 | http3, ...], boolean(), term()) -> ok.
 require_tls_for_h3(Names, HasTls, Raw) ->

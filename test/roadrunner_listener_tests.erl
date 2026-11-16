@@ -712,25 +712,6 @@ listener_rejects_invalid_http1_opt_test() ->
         ]
     ).
 
-listener_rejects_h1_and_h2_on_plain_tcp_test() ->
-    %% `[http1, http2]` (and the reverse order) on plain TCP needs
-    %% `Upgrade: h2c` to share the port — roadrunner doesn't implement
-    %% that, so either ordering must surface as an error at `init/1`.
-    process_flag(trap_exit, true),
-    lists:foreach(
-        fun(Protos) ->
-            R = roadrunner_listener:start_link(listener_test_protocols_no_h2c_upgrade, #{
-                port => 0,
-                protocols => Protos,
-                routes => roadrunner_hello_handler
-            }),
-            ?assertMatch(
-                {error, {{listener_opt_conflict, protocols, Protos, no_h2c_upgrade}, _Stack}}, R
-            )
-        end,
-        [[http1, http2], [http2, http1]]
-    ).
-
 listener_rejects_invalid_proxy_protocol_test() ->
     %% `proxy_protocol` must be a boolean.
     process_flag(trap_exit, true),
