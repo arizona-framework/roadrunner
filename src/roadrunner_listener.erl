@@ -162,7 +162,8 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `max_content_length` — request-body cap across HTTP/1.1, HTTP/2, and
   HTTP/3; an over-cap body answers `413 Payload Too Large` (and resets
   the stream on h2/h3). Default 10 MB. A route can set its own, larger or
-  smaller (`t:roadrunner_router:route/0`).
+  smaller, or `infinity` for bodies its handler reads as they arrive with
+  `body_buffering => manual` (`t:roadrunner_router:route/0`).
 - `ws` — WebSocket session tunables as a nested map (see
   `t:ws_opts/0`): `max_frame_size` (per-frame payload cap) and
   `max_message_size` (reassembled + decompressed message cap), both
@@ -1558,7 +1559,9 @@ setup_rate_limit_sweep(_ProtoOpts) ->
 %% table died with that listener.
 -spec publish_routes(atom(), opts(), roadrunner_conn:proto_opts()) -> ets:table() | undefined.
 publish_routes(ListenerName, #{routes := Routes} = Opts, ProtoOpts) when is_list(Routes) ->
-    Compiled = roadrunner_router:compile(Routes, maps:get(middlewares, Opts, [])),
+    Compiled = roadrunner_router:compile(
+        Routes, maps:get(middlewares, Opts, []), maps:get(body_buffering, Opts, auto)
+    ),
     RouteBuckets =
         case route_rate_limited(Routes) of
             true ->
@@ -2797,7 +2800,8 @@ do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}} = State,
     roadrunner_middleware:middleware_list()
 ) -> {ok | {error, {init_failed, term()}}, #state{}}.
 reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws) ->
-    try roadrunner_router:compile(Routes, ListenerMws) of
+    #{body_buffering := BodyBuffering} = ProtoOpts,
+    try roadrunner_router:compile(Routes, ListenerMws, BodyBuffering) of
         Compiled ->
             %% The first table with a route `rate_limit` gets the bucket
             %% store, published before the routes that use it.

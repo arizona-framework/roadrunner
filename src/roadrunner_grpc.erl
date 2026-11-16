@@ -41,12 +41,13 @@ from starting:
 - `reflection`: `true` adds gRPC's server reflection
   (`roadrunner_grpc_reflection`) to the routes; by default `false`
 - `max_content_length`: the most a call's requests may add up to, in bytes,
-  for `routes/1` to set on each route in place of the listener's (10 MiB
-  by default); past it the call ends with `RESOURCE_EXHAUSTED` with
-  `manual` buffering, and with `auto` the request is answered `413`, as
-  the body is read before the call starts. A client or
-  bidi stream that lives long can carry more than that over its life, so
-  set it to what such a call may total
+  for `routes/1` to set on each route, past which the call ends with
+  `RESOURCE_EXHAUSTED`; by default `infinity`: gRPC has no such total, a
+  client or bidi stream may go on for as long as it lives, and
+  `max_message_size` bounds what one message holds. With `auto`
+  buffering, where the body is read whole before the call starts, a call
+  is held to the listener's `max_content_length` instead of `infinity`,
+  and one over the cap is answered `413`
 - `middlewares`: route middlewares (`roadrunner_middleware`) for every
   route `routes/1` returns, the health and reflection ones among them;
   one answers a call with a gRPC status with `reject/3`
@@ -60,7 +61,7 @@ With `body_buffering => manual` a call reads its requests as they come, so
 client streams and bidi streams flow both ways; a dedicated gRPC listener
 is the place for it. With `auto`, the default, the whole request body is
 read before the method runs, which suits unary and server-streaming calls
-and a client stream that fits `max_content_length`.
+and a client stream that fits the listener's `max_content_length`.
 
 ## What the client gets
 
@@ -186,7 +187,7 @@ every service (see the moduledoc).
     services := [module() | roadrunner_grpc_service:descriptor()],
     codecs => [module()],
     max_message_size => pos_integer(),
-    max_content_length => non_neg_integer(),
+    max_content_length => non_neg_integer() | infinity,
     middlewares => roadrunner_middleware:middleware_list(),
     send_compression => encoding(),
     health => boolean(),
@@ -314,14 +315,17 @@ routes(#{services := Services} = Opts) when is_list(Services) ->
 routes(Opts) ->
     error({invalid_grpc_opts, Opts}).
 
-%% The route keys of the services' routes: `max_content_length` and
-%% `middlewares`, which the router checks entry by entry as the routes
-%% compile. The health and reflection routes take the `middlewares`.
+%% The route keys of the services' routes: `max_content_length`, by
+%% default `infinity`, and `middlewares`, which the router checks as the
+%% routes compile. The health and reflection routes take the
+%% `middlewares`.
 -spec route_keys(map()) -> map().
 route_keys(#{middlewares := Middlewares}) when not is_list(Middlewares) ->
     error({invalid_grpc_opt, middlewares, Middlewares});
 route_keys(Opts) ->
-    maps:with([max_content_length, middlewares], Opts).
+    maps:merge(
+        #{max_content_length => infinity}, maps:with([max_content_length, middlewares], Opts)
+    ).
 
 %% The health service's route, with `health => true`: it speaks its own
 %% protobuf messages, so it takes the raw codec whatever the services use.

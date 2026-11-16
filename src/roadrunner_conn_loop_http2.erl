@@ -241,8 +241,9 @@
     %% END_STREAM (RFC 9113 §8.1.2.6).
     body_len := non_neg_integer(),
     %% The body cap: the listener's `max_content_length` until a body
-    %% outgrows it and its route raises it (`stream_body_cap/4`).
-    body_cap := non_neg_integer(),
+    %% outgrows it and its route raises it (`stream_body_cap/4`), to
+    %% `infinity` for a route that sets no cap.
+    body_cap := non_neg_integer() | infinity,
     send_window := integer(),
     recv_window := non_neg_integer(),
     worker_pid := undefined | pid(),
@@ -1791,8 +1792,8 @@ refill_conn_window(State) ->
 %% the stream's own `Cap` while the body fits in it, else its route's,
 %% looked up only once a body outgrows the cap it has (the listener's, at
 %% first) and kept on the stream from then on.
--spec stream_body_cap(non_neg_integer(), non_neg_integer(), map(), #loop{}) ->
-    non_neg_integer().
+-spec stream_body_cap(non_neg_integer(), non_neg_integer() | infinity, map(), #loop{}) ->
+    non_neg_integer() | infinity.
 stream_body_cap(NewLen, Cap, _Stream, _State) when NewLen =< Cap ->
     Cap;
 stream_body_cap(

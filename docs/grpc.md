@@ -122,7 +122,8 @@ every service in it:
   `[roadrunner_grpc_codec_raw]`
 - `max_message_size`: the largest request message, in bytes
 - `max_content_length`: the most all of a call's requests may add up to,
-  in bytes, set on each route in place of the listener's
+  in bytes, by default `infinity` (see
+  [Message size limits](#message-size-limits))
 - `middlewares`: middlewares for every route, see
   [Middlewares](#middlewares)
 - `send_compression`: how responses are compressed, `identity` (the
@@ -146,9 +147,9 @@ setting to use for gRPC.
 
 With `auto` (the listener's default), the whole request body is read
 before the method runs. That works for unary and server-streaming calls,
-and for a client stream that fits in `max_content_length`. But a bidi
-method then sees all the requests at once, only after the client has
-finished sending, and a call over `max_content_length` is answered
+and for a client stream that fits in the listener's `max_content_length`.
+But a bidi method then sees all the requests at once, only after the
+client has finished sending, and a call over the cap is answered
 `413 Payload Too Large` instead of a gRPC status.
 
 `body_buffering` is a listener option, and with `manual` every other
@@ -593,21 +594,30 @@ Two limits bound what a client can send:
   after it is decompressed, so a small compressed message cannot expand
   into a huge one; a larger message ends the call with
   `RESOURCE_EXHAUSTED`
-- `max_content_length` bounds all of a call's requests together; with
-  `manual` buffering, a call over it ends with `RESOURCE_EXHAUSTED`, and
-  with `auto` the request is answered `413`
+- `max_content_length` bounds all of a call's requests together, by
+  default `infinity`: no bound
 
-A client stream or bidi stream that lives long can send a lot over its
-life, so set `max_content_length` on the routes to what such a call may
-total:
+gRPC has no limit on a whole call: a client stream or bidi stream may go
+on for as long as it lives, and gRPC servers such as grpc-go and
+grpc-java set none. With `manual` buffering a call never holds more than
+the message it is reading, which `max_message_size` bounds, and the
+client sends only as fast as the method reads (HTTP/2 and HTTP/3 flow
+control), so the default stays `infinity`. Set `max_content_length` on
+the routes to end a call that sends more than that in all with
+`RESOURCE_EXHAUSTED`:
 
 ```erlang
 roadrunner_grpc:routes(#{
-    services => [chat_service],
+    services => [upload_service],
     max_message_size => 1_048_576,
     max_content_length => 1_073_741_824
 })
 ```
+
+With `auto` buffering the listener reads a call's whole body before the
+method runs, so a route left at `infinity` keeps the listener's
+`max_content_length` (10 MB by default), and a body over it is answered
+`413`.
 
 See [Resource limits](resource_limits.md) for the defaults.
 

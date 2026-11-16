@@ -340,6 +340,9 @@ listener's mode when to start a stream's worker (at the end of the headers
 or of the body), and the worker is what resolves the route, so the choice
 has to move to after routing. Today a gRPC listener of its own is the
 workaround.
+A route's `max_content_length => infinity`, which holds only for bodies
+read as they arrive, would then follow the route's mode in place of the
+listener's (`roadrunner_router:compile/3`).
 
 **Scope:** large.
 

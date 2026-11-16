@@ -194,7 +194,7 @@ closure takes it, so `set_body_timeout/2` can move it.
     deadline := deadline(),
     %% Tells this reader apart, so a failed read ends this body only.
     id := reference(),
-    max := non_neg_integer(),
+    max := non_neg_integer() | infinity,
     %% Present while a 100 Continue is owed to a client holding its body
     %% back: the connection process and stream a streaming response asks
     %% for it before it starts.
@@ -218,10 +218,13 @@ closure takes it, so `set_body_timeout/2` can move it.
     request_deadline := integer(),
     %% Tells this reader apart, so a failed read ends this body only.
     id := reference(),
-    max := non_neg_integer(),
+    max := non_neg_integer() | infinity,
     %% Trailer-header limits `{max_header_line, max_header_block,
     %% max_header_count}` threaded to `roadrunner_http1:parse_chunk/2`.
     trailer_limits := {pos_integer(), pos_integer(), pos_integer()},
+    %% What the chunk a chunked body is partway through still lacks, `0`
+    %% between chunks (`roadrunner_http1:parse_chunk_part/4`).
+    chunk_left := non_neg_integer(),
     %% Present while a 100 Continue is owed to a client holding its body
     %% back: the transport socket the first read sends it on, the minimum
     %% byte rate of the recv that read then starts, and the flag that has it
@@ -529,7 +532,9 @@ read_body(Req, _Opts) ->
 Read the next decoded HTTP chunk from a chunked-encoded request body.
 
 Mirrors cowboy's chunk-at-a-time read pattern: each call returns one
-chunk's payload. `{more, Bytes, Req2}` means more chunks remain;
+chunk's payload, or, for a chunk over 64 KB, the part of it that has
+arrived, so a read never waits to hold a large chunk whole.
+`{more, Bytes, Req2}` means more chunks remain;
 `{ok, <<>>, Req2}` signals end-of-body (the size-0 last chunk has
 been seen).
 

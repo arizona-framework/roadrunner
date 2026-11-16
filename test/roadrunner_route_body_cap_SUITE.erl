@@ -2,7 +2,8 @@
 -moduledoc """
 A route's own `max_content_length` over HTTP/1.1 (buffered and manual body
 reads) and HTTP/2 (h2c). The listener caps bodies at 8 bytes; `/up` raises
-its cap to 64, `/small` lowers it to 2 and `/plain` keeps the listener's. The
+its cap to 64, `/small` lowers it to 2, `/open` sets none with manual body
+reads (`infinity`) and `/plain` keeps the listener's. The
 HTTP/3 cases live in `roadrunner_http3_SUITE`.
 """.
 
@@ -34,7 +35,10 @@ HTTP/3 cases live in `roadrunner_http3_SUITE`.
     h2_route_without_cap_keeps_listener_cap/1,
     h2_expect_continue_within_raised_cap/1,
     h2_expect_continue_over_lowered_cap/1,
-    h2_expect_continue_without_length/1
+    h2_expect_continue_without_length/1,
+    open_route_reads_past_the_listener_cap/1,
+    open_route_keeps_the_listener_cap_when_buffered/1,
+    h2_open_route_keeps_the_listener_cap_when_buffered/1
 ]).
 
 -define(LISTENER_CAP, 8).
@@ -56,8 +60,14 @@ groups() ->
         expect_continue_over_lowered_cap
     ],
     [
-        {http1, [], [unmatched_path_keeps_listener_cap | Http1]},
-        {http1_manual, [], [manual_over_cap_answer_says_close | Http1]},
+        {http1, [], [
+            unmatched_path_keeps_listener_cap,
+            open_route_keeps_the_listener_cap_when_buffered
+            | Http1
+        ]},
+        {http1_manual, [], [
+            manual_over_cap_answer_says_close, open_route_reads_past_the_listener_cap | Http1
+        ]},
         {http2, [], [
             h2_body_within_raised_cap,
             h2_body_over_raised_cap,
@@ -65,7 +75,8 @@ groups() ->
             h2_route_without_cap_keeps_listener_cap,
             h2_expect_continue_within_raised_cap,
             h2_expect_continue_over_lowered_cap,
-            h2_expect_continue_without_length
+            h2_expect_continue_without_length,
+            h2_open_route_keeps_the_listener_cap_when_buffered
         ]}
     ].
 
@@ -97,6 +108,11 @@ init_per_testcase(_Case, Config) ->
                         path => ~"/small",
                         handler => roadrunner_body_size_handler,
                         max_content_length => 2
+                    },
+                    #{
+                        path => ~"/open",
+                        handler => roadrunner_body_size_handler,
+                        max_content_length => infinity
                     },
                     {~"/plain", roadrunner_body_size_handler}
                 ]
@@ -139,6 +155,22 @@ chunked_body_within_raised_cap(Config) ->
         ~"a\r\n0123456789\r\na\r\n0123456789\r\n0\r\n\r\n"
     ]),
     ?assertEqual({200, ~"20"}, status_body(Reply)).
+
+%% With manual reads, `infinity` lets a body of any size through, sized
+%% or chunked.
+open_route_reads_past_the_listener_cap(Config) ->
+    ?assertEqual({200, ~"100"}, h1_post(Config, ~"/open", binary:copy(~"x", 100))),
+    Reply = h1_exchange(Config, [
+        ~"POST /open HTTP/1.1\r\nHost: x\r\nConnection: close\r\n",
+        ~"Transfer-Encoding: chunked\r\n\r\n",
+        ~"a\r\n0123456789\r\na\r\n0123456789\r\n0\r\n\r\n"
+    ]),
+    ?assertEqual({200, ~"20"}, status_body(Reply)).
+
+%% A body read whole before dispatch keeps the listener's cap.
+open_route_keeps_the_listener_cap_when_buffered(Config) ->
+    ?assertEqual({200, ~"8"}, h1_post(Config, ~"/open", binary:copy(~"x", 8))),
+    ?assertMatch({413, _}, h1_post(Config, ~"/open", binary:copy(~"x", 9))).
 
 expect_continue_within_raised_cap(Config) ->
     %% The declared length is over the listener's cap but within the
@@ -189,6 +221,9 @@ h2_body_over_lowered_cap(Config) ->
 h2_route_without_cap_keeps_listener_cap(Config) ->
     ?assertEqual({[200], ~"8"}, h2_request(Config, ~"/plain", [], [binary:copy(~"x", 8)])),
     ?assertMatch({[413], _}, h2_request(Config, ~"/plain", [], [binary:copy(~"x", 9)])).
+
+h2_open_route_keeps_the_listener_cap_when_buffered(Config) ->
+    ?assertMatch({[413], _}, h2_request(Config, ~"/open", [], [binary:copy(~"x", 9)])).
 
 h2_expect_continue_within_raised_cap(Config) ->
     Expect = [{~"content-length", ~"20"}, {~"expect", ~"100-continue"}],

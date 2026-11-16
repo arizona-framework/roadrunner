@@ -47,6 +47,14 @@ sending.
 A route can set its own cap with the `max_content_length` key of its map
 form, larger or smaller than the listener's; it applies to the requests
 that route answers, and requests no route answers keep the listener's.
+`infinity` sets no cap on a route whose handler reads its body as it
+arrives (`body_buffering => manual`), where the handler decides how much
+it holds; with `auto`, where the listener reads the body whole first, the
+route keeps the listener's cap. A manual read holds only what it asks
+for: a chunk over 64 KB comes in parts as it arrives, whatever size it
+declares, and a body the handler leaves unread is read and dropped 64 KB
+at a time after the response, within the request's deadline, so an
+uncapped body takes time but not memory.
 HTTP/1.1 routes each request before reading its body, so the route's cap
 governs the read, the `100 Continue` answer and the early 413. HTTP/2 and
 HTTP/3 hold a body to the listener's cap and ask its route when the body
@@ -105,13 +113,15 @@ it. See the [gRPC guide](grpc.md).
 | Limit | Default | What it bounds |
 |---|---|---|
 | `max_message_size` | 4 MB | one request message, both as it arrives and after it is decompressed; over it the call ends with `RESOURCE_EXHAUSTED` |
-| `max_content_length` | the listener's | all of a call's request messages together, set on each gRPC route; over it the call ends with `RESOURCE_EXHAUSTED` with `body_buffering => manual`, and is answered 413 with `auto` |
+| `max_content_length` | `infinity` | all of a call's request messages together, set on each gRPC route; over it the call ends with `RESOURCE_EXHAUSTED`. With `body_buffering => auto` a route at `infinity` keeps the listener's cap, and a body over it is answered 413 |
 
 A compressed message is inflated in bounded chunks against
 `max_message_size`, so a small message cannot expand into unbounded
-memory. A client stream or bidi stream that lives long can send more
-than the listener's body cap over its life; raise `max_content_length`
-on its routes to what such a call may total.
+memory. gRPC has no limit on a whole call, so a client stream or bidi
+stream may go on for as long as it lives: with `manual` buffering a call
+holds one message at a time, which `max_message_size` bounds, and flow
+control keeps the client to the pace the method reads at. Set
+`max_content_length` on the routes to cap what a call may send in all.
 
 ## HTTP/2 framing limits
 

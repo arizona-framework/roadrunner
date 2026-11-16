@@ -171,7 +171,8 @@ read_body_manual_state_full_drain_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     Req = (sample_req())#{body_reader => BS},
     {ok, Bytes, Req2} = roadrunner_req:read_body(Req),
@@ -187,7 +188,8 @@ read_body_manual_state_partial_returns_more_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     Req = (sample_req())#{body_reader => BS},
     {more, First, Req2} = roadrunner_req:read_body(Req, #{length => 4}),
@@ -204,7 +206,8 @@ read_body_manual_state_error_propagates_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> {error, closed} end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     Req = (sample_req())#{body_reader => BS},
     ?assertEqual({error, closed}, roadrunner_req:read_body(Req)).
@@ -226,11 +229,33 @@ read_body_chunked_manual_state_yields_one_chunk_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> error(unused) end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     Req = (sample_req())#{body_reader => BS},
     {more, Bytes, _Req2} = roadrunner_req:read_body_chunked(Req),
     ?assertEqual(~"foo", Bytes).
+
+%% A reader without a cap (a route's `max_content_length => infinity`)
+%% reads a chunked body chunk by chunk and whole.
+read_body_chunked_manual_without_a_cap_test() ->
+    BS = #{
+        framing => chunked,
+        buffered => ~"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n",
+        bytes_read => 0,
+        pending => <<>>,
+        done => false,
+        deadline => infinity,
+        id => make_ref(),
+        recv => fun(_Deadline) -> error(unused) end,
+        max => infinity,
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
+    },
+    Req = (sample_req())#{body_reader => BS},
+    {more, ~"foo", _} = roadrunner_req:read_body_chunked(Req),
+    {ok, Body, _} = roadrunner_req:read_body(Req),
+    ?assertEqual(~"foobar", iolist_to_binary(Body)).
 
 %% --- forwarded_for/1 ---
 
@@ -381,7 +406,8 @@ read_form_urlencoded_body_read_error_propagates_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> {error, closed} end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     Req = (sample_req())#{
         headers => [{~"content-type", ~"application/x-www-form-urlencoded"}],
@@ -400,7 +426,8 @@ read_form_multipart_body_read_error_propagates_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> {error, closed} end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     Req = (sample_req())#{
         headers => [{~"content-type", ~"multipart/form-data; boundary=B"}],
@@ -426,7 +453,8 @@ read_body_chunked_manual_state_error_propagates_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> {error, closed} end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     Req = (sample_req())#{body_reader => BS},
     ?assertEqual({error, closed}, roadrunner_req:read_body_chunked(Req)).
@@ -448,7 +476,8 @@ read_body_chunked_manual_pending_then_recv_error_test() ->
         id => make_ref(),
         recv => fun(_Deadline) -> {error, closed} end,
         max => 1000,
-        trailer_limits => {8192, 10240, 100}
+        trailer_limits => {8192, 10240, 100},
+        chunk_left => 0
     },
     Req = (sample_req())#{body_reader => BS},
     ?assertEqual(

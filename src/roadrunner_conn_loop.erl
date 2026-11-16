@@ -1392,7 +1392,7 @@ reset_heap_floor(S) ->
     | chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding},
-    non_neg_integer()
+    non_neg_integer() | infinity
 ) -> continue | too_large | none.
 expect_answer(#loop_state{buffered = ~""}, Req, Framing, MaxCL) ->
     case roadrunner_conn:expects_continue(Req) of
@@ -1429,7 +1429,7 @@ expect_answer(_S, _Req, _Framing, _MaxCL) ->
     | chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding},
-    non_neg_integer(),
+    non_neg_integer() | infinity,
     roadrunner_conn:resolved(),
     integer()
 ) -> no_return().

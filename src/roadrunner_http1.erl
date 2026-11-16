@@ -17,6 +17,7 @@
     parse_chunk/1,
     parse_chunk/2,
     parse_chunk/3,
+    parse_chunk_part/4,
     response/3,
     response/4,
     compute_cached_decisions/1
@@ -28,6 +29,9 @@
 -define(MAX_HEADER_LINE, 8192).
 -define(MAX_HEADER_BLOCK, 10240).
 -define(MAX_HEADER_COUNT, 100).
+%% The largest chunk `parse_chunk_part/4` waits to have whole; a larger one
+%% comes in parts as it arrives.
+-define(WHOLE_CHUNK, 65536).
 -define(MAX_CHUNK_HEADER, 8192).
 
 -include("roadrunner_swar.hrl").
@@ -1220,6 +1224,69 @@ parse_chunk(Bin, Limits, Budget) when is_binary(Bin) ->
         Other ->
             Other
     end.
+
+-doc """
+Like `parse_chunk/3`, but hands back the data of a chunk over 64 KB as it
+arrives instead of waiting for the whole chunk, so a reader holds no more
+of a large chunk than the bytes it has received, whatever size the chunk
+declares. A chunk up to 64 KB comes whole, as from `parse_chunk/3`. `Left`
+is what the chunk an earlier call started handing back in parts still
+lacks (`0` between chunks): with `Left > 0`, `Bin` goes on with that
+chunk's data.
+
+Returns `{part, Data, Left1}` for a large chunk not yet whole: `Data` is
+all of `Bin` that belongs to it (possibly empty, a size line with no data
+yet), `Left1` what it still lacks, and nothing of `Bin` is left over. A
+chunk whole in `Bin`, the last chunk, `more` and errors are as
+`parse_chunk/3` returns them; `more` here means a size line, trailers, a
+small chunk's data or a chunk's closing CRLF still to come.
+""".
+-spec parse_chunk_part(
+    binary(),
+    {pos_integer(), pos_integer(), pos_integer()},
+    non_neg_integer() | infinity,
+    non_neg_integer()
+) ->
+    {ok, Data :: binary(), Rest :: binary()}
+    | {part, Data :: binary(), Left :: pos_integer()}
+    | {ok, last, Trailers :: headers(), Rest :: binary()}
+    | {more, undefined}
+    | {error,
+        bad_chunk_size
+        | bad_chunk
+        | bad_header
+        | header_too_long
+        | header_block_too_long
+        | too_many_headers
+        | conflicting_framing
+        | content_length_too_large}.
+parse_chunk_part(Bin, _Limits, _Budget, Left) when is_binary(Bin), Left > 0 ->
+    chunk_data_part(Left, Bin);
+parse_chunk_part(Bin, Limits, Budget, 0) when is_binary(Bin) ->
+    case parse_chunk_size_line(Bin) of
+        {ok, 0, AfterSize} ->
+            parse_last_chunk(AfterSize, Limits);
+        {ok, Size, _AfterSize} when is_integer(Budget), Size > Budget ->
+            {error, content_length_too_large};
+        {ok, Size, AfterSize} when Size > ?WHOLE_CHUNK ->
+            chunk_data_part(Size, AfterSize);
+        {ok, Size, AfterSize} ->
+            parse_chunk_data(Size, AfterSize);
+        Other ->
+            Other
+    end.
+
+%% A large chunk's data with `Size` bytes of it still to come: part of it
+%% when `Bin` holds less, else the whole rest and its CRLF.
+-spec chunk_data_part(pos_integer(), binary()) ->
+    {ok, binary(), binary()}
+    | {part, binary(), pos_integer()}
+    | {more, undefined}
+    | {error, bad_chunk}.
+chunk_data_part(Size, Bin) when byte_size(Bin) < Size ->
+    {part, Bin, Size - byte_size(Bin)};
+chunk_data_part(Size, Bin) ->
+    parse_chunk_data(Size, Bin).
 
 -spec parse_last_chunk(binary(), {pos_integer(), pos_integer(), pos_integer()}) ->
     {ok, last, headers(), binary()}

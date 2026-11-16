@@ -13,6 +13,7 @@ routes_test() ->
             #{
                 path => ~"/test.Echo/:method",
                 handler => ?M,
+                max_content_length => infinity,
                 state => #{service => ?SVC, max_message_size => 9}
             }
         ],

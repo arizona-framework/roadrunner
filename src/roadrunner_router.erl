@@ -61,7 +61,7 @@ matching only walks the branches a request's segments can follow instead
 of trying every route in turn.
 """.
 
--export([compile/2, validate/1, match/3, resolve/3, init_handler_state/3]).
+-export([compile/2, compile/3, validate/1, match/3, resolve/3, init_handler_state/3]).
 
 -export_type([
     route/0,
@@ -95,7 +95,10 @@ for `State` instead (see `compile/2`).
 `methods` is a list of uppercase method binaries the route answers;
 unset → every method. `max_content_length` is the route's own request-body
 cap in bytes, in place of the listener's (larger or smaller) for the
-requests the route answers; unset → the listener's. `rate_limit` is the
+requests the route answers; unset → the listener's. `infinity` sets no cap
+on a body the handler reads as it arrives (`body_buffering => manual`);
+a body the listener reads whole first (`auto`) keeps the listener's, so
+the memory a request may take stays bounded. `rate_limit` is the
 route's own per-client request rate (`t:rate_limit/0`), on top of the
 listener's `rate_limit`; unset → only the listener's.
 """.
@@ -108,7 +111,7 @@ listener's `rate_limit`; unset → only the listener's.
         state => term(),
         middlewares => roadrunner_middleware:middleware_list(),
         methods => methods(),
-        max_content_length => non_neg_integer(),
+        max_content_length => non_neg_integer() | infinity,
         rate_limit => rate_limit()
     }.
 
@@ -153,7 +156,7 @@ Why a route table was rejected, as returned by `validate/1` and raised by
 - `{invalid_route_methods, Methods}` — a `methods` key that is not a non-empty
   list of binaries.
 - `{invalid_route_max_content_length, Value}` — a `max_content_length` key that
-  is not a non-negative integer.
+  is not a non-negative integer or `infinity`.
 - `{invalid_route_rate_limit, Value}` — a `rate_limit` key that is not a
   `t:rate_limit/0` map of positive integers with `rate` set.
 - `{invalid_route_path, Path, wildcard_not_last}` — a segment after the
@@ -181,7 +184,7 @@ compiled entry so the one dispatch match yields them: `undefined` for a route
 that sets none, else the overrides it declares. A route's `rate_limit` is not
 here: it is a stage of the route's pipeline (`roadrunner_route_rate_limit`).
 """.
--type limits() :: undefined | #{max_content_length => non_neg_integer()}.
+-type limits() :: undefined | #{max_content_length => non_neg_integer() | infinity}.
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
@@ -274,6 +277,9 @@ Only a route left with nothing to answer is unreachable. Two routes
 on the same path declaring disjoint `methods` both stay reachable,
 which is how same-path method dispatch works.
 
+Compiled this way, a route's `max_content_length => infinity` keeps the
+listener's cap, as with `auto` body buffering (`compile/3`).
+
 `ListenerMws` is the listener-wide middleware list; it is resolved
 **once** (running each module's `init/1` a single time) and reused
 across every route, composed outermost around each route's own
@@ -283,11 +289,24 @@ zero closure allocations per request. Pass `[]` for `ListenerMws`
 when compiling routes outside a listener (typically only in tests).
 """.
 -spec compile(routes(), roadrunner_middleware:middleware_list()) -> compiled().
-compile(Routes, ListenerMws) when is_list(Routes), is_list(ListenerMws) ->
+compile(Routes, ListenerMws) ->
+    compile(Routes, ListenerMws, auto).
+
+-doc """
+`compile/2` for a listener whose `body_buffering` is `BodyBuffering`: with
+`manual`, a route's `max_content_length => infinity` sets no cap on its
+bodies, which handlers read as they arrive; with `auto`, where the
+listener reads a body whole before dispatch, the route keeps the
+listener's cap.
+""".
+-spec compile(routes(), roadrunner_middleware:middleware_list(), auto | manual) -> compiled().
+compile(Routes, ListenerMws, BodyBuffering) when
+    is_list(Routes), is_list(ListenerMws), (BodyBuffering =:= auto orelse BodyBuffering =:= manual)
+->
     case validate(Routes) of
         ok ->
             ResolvedListener = roadrunner_middleware:resolve(ListenerMws),
-            build_table([compile_route(R, ResolvedListener) || R <- Routes]);
+            build_table([compile_route(R, ResolvedListener, BodyBuffering) || R <- Routes]);
         {error, Reason} ->
             error(Reason)
     end.
@@ -314,13 +333,17 @@ validate(Routes) when is_list(Routes) ->
         check_shadowing(Specs)
     end.
 
--spec compile_route(route(), [roadrunner_middleware:resolved()]) ->
+-spec compile_route(route(), [roadrunner_middleware:resolved()], auto | manual) ->
     {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup(), limits()}.
-compile_route({Path, Handler}, ResolvedListener) when is_binary(Path), is_atom(Handler) ->
+compile_route({Path, Handler}, ResolvedListener, _BodyBuffering) when
+    is_binary(Path), is_atom(Handler)
+->
     build_route(Path, Handler, no_state, [], undefined, undefined, ResolvedListener);
-compile_route({Path, Handler, State}, ResolvedListener) when is_binary(Path), is_atom(Handler) ->
+compile_route({Path, Handler, State}, ResolvedListener, _BodyBuffering) when
+    is_binary(Path), is_atom(Handler)
+->
     build_route(Path, Handler, {state, State}, [], undefined, undefined, ResolvedListener);
-compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener) when
+compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener, BodyBuffering) when
     is_binary(Path), is_atom(Handler)
 ->
     StateArg =
@@ -334,7 +357,7 @@ compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener) whe
         StateArg,
         route_middlewares(Route),
         compile_methods(maps:get(methods, Route, undefined)),
-        route_limits(Route),
+        route_limits(Route, BodyBuffering),
         ResolvedListener
     ).
 
@@ -407,9 +430,12 @@ has_init_route(Handler) ->
         {error, _Reason} -> false
     end.
 
--spec route_limits(map()) -> limits().
-route_limits(#{max_content_length := Max}) -> #{max_content_length => Max};
-route_limits(_Route) -> undefined.
+%% A route's `max_content_length => infinity` holds for bodies read as they
+%% arrive; one the listener reads whole first keeps the listener's cap.
+-spec route_limits(map(), auto | manual) -> limits().
+route_limits(#{max_content_length := infinity}, auto) -> undefined;
+route_limits(#{max_content_length := Max}, _BodyBuffering) -> #{max_content_length => Max};
+route_limits(_Route, _BodyBuffering) -> undefined.
 
 %% A route's own middlewares, led by its `rate_limit` stage when it sets one:
 %% after the listener's middlewares (which still decorate a refusal) and ahead
@@ -590,6 +616,8 @@ route_methods(_Route) ->
 
 -spec check_max_content_length(route()) -> ok | {error, validation_error()}.
 check_max_content_length(#{max_content_length := Max}) when is_integer(Max), Max >= 0 ->
+    ok;
+check_max_content_length(#{max_content_length := infinity}) ->
     ok;
 check_max_content_length(#{max_content_length := Max}) ->
     {error, {invalid_route_max_content_length, Max}};
