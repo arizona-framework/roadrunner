@@ -113,8 +113,8 @@ watch(Request, Stream) ->
     end.
 
 %% Send each change until the call is over: the client cancelled it or
-%% went away (`roadrunner_grpc:cancelled/2`), the listener drains (the
-%% service goes NOT_SERVING for it first, so a balancer moves away), or the
+%% went away, or the listener drains (`roadrunner_grpc:info/2`; the service
+%% goes NOT_SERVING for the drain first, so a balancer moves away), or the
 %% statuses went with their store (UNAVAILABLE: the client watches again).
 -spec watching({binary(), reference()}, 1..3, roadrunner_grpc:stream()) ->
     {ok, roadrunner_grpc:stream()} | {error, unavailable, binary(), roadrunner_grpc:stream()}.
@@ -131,14 +131,13 @@ watching({Service, Store} = Watch, Sent, Stream) ->
                         roadrunner_grpc:send(roadrunner_grpc_health_proto:response(Status), Stream)
                     )
             end;
-        {roadrunner_drain, _Deadline} ->
-            {ok, last(?NOT_SERVING, Sent, Stream)};
         {'DOWN', Store, process, _Pid, _Reason} ->
             {error, unavailable, ~"health statuses restarted", Stream};
         Other ->
-            case roadrunner_grpc:cancelled(Other, Stream) of
-                true -> {ok, Stream};
-                false -> watching(Watch, Sent, Stream)
+            case roadrunner_grpc:info(Other, Stream) of
+                drain -> {ok, last(?NOT_SERVING, Sent, Stream)};
+                cancelled -> {ok, Stream};
+                ignore -> watching(Watch, Sent, Stream)
             end
     end.
 
