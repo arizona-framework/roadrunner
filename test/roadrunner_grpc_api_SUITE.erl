@@ -15,6 +15,8 @@ gRPC's rich error details, decoded here as a client would.
 
 -export([suite/0, all/0, init_per_testcase/2, end_per_testcase/2]).
 -export([
+    shadowing_route_is_refused/1,
+    other_methods_are_405/1,
     request_tells_what_the_metadata_leaves_out/1,
     middleware_rejects_with_a_status/1,
     middleware_lets_a_call_through/1,
@@ -34,6 +36,8 @@ suite() ->
 
 all() ->
     [
+        shadowing_route_is_refused,
+        other_methods_are_405,
         request_tells_what_the_metadata_leaves_out,
         middleware_rejects_with_a_status,
         middleware_lets_a_call_through,
@@ -61,11 +65,14 @@ init_per_testcase(http3_stream_runs_past_the_listener_cap, Config) ->
     start(Config, tls, (capped(manual))#{protocols => [http3]});
 init_per_testcase(auto_keeps_the_listener_cap, Config) ->
     start(Config, tcp, capped(auto));
+init_per_testcase(shadowing_route_is_refused, Config) ->
+    Config;
 init_per_testcase(_Case, Config) ->
     start(Config, tcp, #{
         routes => roadrunner_grpc:routes(#{
             services => [roadrunner_grpc_test_service],
             health => true,
+            reflection => true,
             middlewares => [{fun api_key/3, ~"secret"}]
         })
     }).
@@ -99,8 +106,45 @@ api_key(Req, Next, Key) ->
             roadrunner_grpc:reject(unauthenticated, ~"bad api key: café", Req)
     end.
 
+end_per_testcase(shadowing_route_is_refused, _Config) ->
+    ok;
 end_per_testcase(_Case, _Config) ->
     ok = roadrunner_listener:stop(?MODULE).
+
+%% The routes answer POST only, so a route above them that answers every
+%% method on the same paths leaves them nothing: the listener refuses the
+%% table instead of letting that route take every call.
+shadowing_route_is_refused(_Config) ->
+    process_flag(trap_exit, true),
+    ?assertMatch(
+        {error, {{unreachable_route, 2, ~"/test.Echo/:method", [{1, ~"/:a/:b"}]}, _}},
+        roadrunner_listener:start_link(?MODULE, #{
+            port => 0,
+            protocols => [http2],
+            routes => [
+                {~"/:a/:b", roadrunner_hello_handler}
+                | roadrunner_grpc:routes(#{services => [roadrunner_grpc_test_service]})
+            ]
+        })
+    ).
+
+%% Any other method gets the router's 405, on the health and reflection
+%% routes too.
+other_methods_are_405(Config) ->
+    lists:foreach(
+        fun(Path) ->
+            {Headers, _, _, _} = roadrunner_grpc_test_client:call(
+                open(Config), 1, Path, [{~":method", ~"GET"}], [<<>>]
+            ),
+            ?assertEqual(~"405", header(~":status", Headers)),
+            ?assertEqual(~"POST", header(~"allow", Headers))
+        end,
+        [
+            <<?SVC/binary, "Unary">>,
+            ~"/grpc.health.v1.Health/Check",
+            ~"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        ]
+    ).
 
 %% The listener asks for a certificate (`verify_peer`); the method reads
 %% the one the client presents, a middleware's value, the request id and

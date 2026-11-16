@@ -110,7 +110,11 @@ means for the other routes). With TLS, add HTTP/3 too:
 ```
 
 `routes/1` returns a plain list of routes, so you can add other routes
-next to them.
+next to them. Its routes answer `POST` only (`methods => [~"POST"]`): a
+route above them that answers every method on the same paths, such as
+`/:a/:b`, would take every call, so the listener refuses that table as it
+starts (`unreachable_route`). Put the gRPC routes first, or give the
+other route its own `methods`.
 
 ### Options
 
@@ -466,7 +470,7 @@ roadrunner answers some calls for you:
 Some requests are refused at the HTTP level, before any call starts:
 
 - over HTTP/1.1: `505`
-- a method other than `POST`: `405`
+- a method other than `POST`: the router's `405`, with `allow: POST`
 - a `content-type` none of the codecs speak: `415`
 - an unknown service: the router's `404`, which gRPC clients read as
   `UNIMPLEMENTED`

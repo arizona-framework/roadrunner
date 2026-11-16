@@ -13,6 +13,7 @@ routes_test() ->
             #{
                 path => ~"/test.Echo/:method",
                 handler => ?M,
+                methods => [~"POST"],
                 max_content_length => infinity,
                 state => #{service => ?SVC, max_message_size => 9}
             }
@@ -76,6 +77,7 @@ routes_health_test() ->
             #{
                 path => ~"/grpc.health.v1.Health/:method",
                 handler => ?M,
+                methods => [~"POST"],
                 state => #{service => roadrunner_grpc_health}
             }
         ],
@@ -322,3 +324,9 @@ reject_with_details_and_trailers_test() ->
             internal, ~"m", #{trailers => [{~"grpc-status-details-bin", <<>>}]}, #{headers => []}
         )
     ).
+
+%% Used as a handler of its own, outside `routes/1`, `handle/1` still
+%% answers a method other than POST with 405 itself.
+handle_other_method_test() ->
+    Req = #{version => {2, 0}, method => ~"GET"},
+    ?assertEqual({{405, [{~"allow", ~"POST"}], <<>>}, Req}, ?M:handle(Req)).

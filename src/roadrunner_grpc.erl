@@ -72,7 +72,9 @@ Stream}`, with gRPC's rich error details, `t:details/0`), `INTERNAL`
 when the method crashes.
 A call that fails before any response is answered Trailers-Only, the
 status in the response headers. The rest is answered as HTTP: `505` over
-HTTP/1.1, `405` for a method other than `POST`, `415` for a
+HTTP/1.1, the router's `405` for a method other than `POST` (`routes/1`
+sets `methods`; `handle/1` answers it the same way as a handler of its
+own), `415` for a
 `content-type` none of the codecs speak, the router's `404` for an
 unknown service, and `500` for response headers over the client's
 SETTINGS_MAX_HEADER_LIST_SIZE. An unknown method of a known service is `UNIMPLEMENTED`,
@@ -313,7 +315,7 @@ that is not the call's.
 
 -doc """
 The routes for `Opts`'s `services`, one per service, at
-`/package.Service/:method`: `max_content_length` set on each route,
+`/package.Service/:method`, answering `POST` only: `max_content_length` set on each route,
 `middlewares` on each route, the health and reflection ones among them,
 the other options its state.
 """.
@@ -328,6 +330,7 @@ routes(#{services := Services} = Opts) when is_list(Services) ->
             Keys#{
                 path => <<"/", (service_name(Service, Services))/binary, "/:method">>,
                 handler => ?MODULE,
+                methods => [~"POST"],
                 state => Shared#{service => Service}
             }
          || Service <- Services
@@ -355,6 +358,7 @@ health_route(#{health := true}, Keys) ->
         (maps:with([middlewares], Keys))#{
             path => <<"/", (roadrunner_grpc_health:name())/binary, "/:method">>,
             handler => ?MODULE,
+            methods => [~"POST"],
             state => #{service => roadrunner_grpc_health}
         }
     ];
@@ -378,6 +382,7 @@ reflection_routes(#{reflection := true}, Services, Health, Keys) ->
         (maps:with([middlewares], Keys))#{
             path => <<"/", Name/binary, "/:method">>,
             handler => ?MODULE,
+            methods => [~"POST"],
             state => #{service => Service, reflection => Described}
         }
      || #{name := Name} = Service <- Reflection
