@@ -48,6 +48,7 @@
     send/4,
     reset_stream/3,
     stop_sending/3,
+    send_frames/2,
     grant_stream_credit/3,
     drop_fin/2,
     server_cids/1,
@@ -140,6 +141,10 @@
     %% Whether the owner is told of each new server connection id, as
     %% `{quic_test_new_cid, Conn, Seq, CID}` (the `cid_events` connect option).
     cid_events = false :: boolean(),
+    %% Whether the owner is told of each MAX_STREAMS the server sends, as
+    %% `{quic_test_max_streams, Conn, bidi | uni, Max}` (the
+    %% `max_streams_events` connect option).
+    max_streams_events = false :: boolean(),
     %% The sequence number of the next connection id the client issues to the
     %% server (its handshake SCID is 0, RFC 9000 §5.1.1).
     next_cid_seq = 1 :: pos_integer(),
@@ -179,7 +184,9 @@ TLS cipher suites (default TLS_AES_128_GCM_SHA256 only), so a test can
 drive the server onto another suite's packet protection. `group => x25519 |
 secp256r1` is the one key exchange group offered, with its key share
 (default x25519). `cid_events => true` tells the owner of each connection
-id the server issues, as `{quic_test_new_cid, Conn, Seq, CID}`. `token =>
+id the server issues, as `{quic_test_new_cid, Conn, Seq, CID}`.
+`max_streams_events => true` tells the owner of each MAX_STREAMS the server
+sends, as `{quic_test_max_streams, Conn, bidi | uni, Max}`. `token =>
 Token` puts an address validation token in the Initial (RFC 9000 §8.1.3).
 `initial_sends => N` sends the first Initial `N` times (default 1): 0 as if
 it was lost, so the client's resend carries the handshake, 2 as a duplicate.
@@ -250,6 +257,20 @@ reset_stream(Pid, StreamId, ErrorCode) ->
 -spec stop_sending(pid(), non_neg_integer(), non_neg_integer()) -> ok.
 stop_sending(Pid, StreamId, ErrorCode) ->
     cast_frame(Pid, {stop_sending, StreamId, ErrorCode}).
+
+-doc """
+Send `Frames` together in one 1-RTT packet, as written: a STREAM frame
+carries its own offset, and moves the stream's send offset past its data.
+""".
+-spec send_frames(pid(), [roadrunner_quic_frame:frame()]) -> ok.
+send_frames(Pid, Frames) ->
+    Ref = make_ref(),
+    Pid ! {frames, self(), Ref, Frames},
+    receive
+        {Ref, ok} -> ok
+    after 5000 ->
+        {error, timeout}
+    end.
 
 -doc """
 Grant `StreamId` more send credit by sending a MAX_STREAM_DATA raising its
@@ -412,7 +433,8 @@ init(Parent, Ref, Host, Port, Opts) ->
         server_initial_keys = roadrunner_quic_keys:initial_server(Dcid0),
         conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ?CONN_MAX_DATA}),
         ack = roadrunner_quic_ack:new(),
-        cid_events = maps:get(cid_events, Opts, false)
+        cid_events = maps:get(cid_events, Opts, false),
+        max_streams_events = maps:get(max_streams_events, Opts, false)
     },
     case handshake(Conn) of
         {ok, Conn1} ->
@@ -756,6 +778,20 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
             Conn1 = send_frame(Conn, Frame),
             From ! {Ref, ok},
             connected_loop(Conn1);
+        {frames, From, Ref, Frames} ->
+            Offsets = lists:foldl(
+                fun
+                    ({stream, Sid, Offset, Data, _Fin}, Acc) ->
+                        Acc#{Sid => max(maps:get(Sid, Acc, 0), Offset + byte_size(Data))};
+                    (_Frame, Acc) ->
+                        Acc
+                end,
+                Conn#conn.send_offsets,
+                Frames
+            ),
+            Conn1 = send_packet(Conn#conn{send_offsets = Offsets}, #{frames => Frames}),
+            From ! {Ref, ok},
+            connected_loop(Conn1);
         stop ->
             %% RFC 9000 §10.2: send an application CONNECTION_CLOSE so the
             %% server tears the connection down promptly (its owner loop
@@ -959,6 +995,9 @@ handle_app_frame({stop_sending, StreamId, ErrorCode}, #conn{owner = Owner} = Con
     Conn;
 handle_app_frame({connection_close, _Domain, ErrorCode, _FrameType, _Reason}, Conn) ->
     _ = Conn#conn.owner ! {quic_test_closed, self(), ErrorCode},
+    Conn;
+handle_app_frame({max_streams, Type, Max}, #conn{max_streams_events = true} = Conn) ->
+    _ = Conn#conn.owner ! {quic_test_max_streams, self(), Type, Max},
     Conn;
 handle_app_frame({path_challenge, Data}, Conn) ->
     %% RFC 9000 §8.2.2: answer on the path the challenge came on (the

@@ -411,6 +411,11 @@
     %% stream.
     bidi_opened = 0 :: non_neg_integer(),
     uni_opened = 0 :: non_neg_integer(),
+    %% How many client request (bidirectional) streams have closed, both
+    %% sides done and pruned. The bidi limit is raised from this count, not
+    %% from `bidi_opened` (`grant_max_streams_bidi/1`), so at most
+    %% `initial_max_streams_bidi` request streams are open at once.
+    bidi_closed = 0 :: non_neg_integer(),
     %% Peer stream ids below the high-water that no frame has opened yet:
     %% opening a stream opens every lower one of its type (RFC 9000 §3.2), so
     %% a stream whose first frame arrives after a higher one's is still new.
@@ -1025,15 +1030,27 @@ handle_call(From, Ref, open_uni, Now, #state{next_uni = Id, peer_max_streams_uni
 handle_call(From, Ref, {reset_stream, Sid, ErrorCode}, Now, State) ->
     {State1, SendEffects} = do_reset_stream(Sid, ErrorCode, Now, State),
     {State1, [{reply, From, Ref, ok} | SendEffects]};
-handle_call(From, Ref, {release_stream, Sid}, _Now, #state{streams = Streams} = State) ->
+handle_call(
+    From, Ref, {release_stream, Sid}, Now, #state{streams = Streams, max_streams_bidi = Max} = State
+) ->
     State1 =
         case Streams of
             #{Sid := {Stream, Flow}} ->
-                put_stream(Sid, roadrunner_quic_stream:release(Stream), Flow, State);
+                grant_max_streams_bidi(
+                    put_stream(Sid, roadrunner_quic_stream:release(Stream), Flow, State)
+                );
             #{} ->
                 State
         end,
-    {State1, [{reply, From, Ref, ok}]};
+    case State1 of
+        #state{max_streams_bidi = Max} ->
+            {State1, [{reply, From, Ref, ok}]};
+        #state{} ->
+            %% Pruned now, the request stream gave its credit back and the
+            %% bidi limit rose: send the MAX_STREAMS.
+            {State2, SendEffects} = send_pass(Now, State1),
+            {State2, [{reply, From, Ref, ok} | SendEffects]}
+    end;
 handle_call(From, Ref, {stop_sending, Sid, ErrorCode}, Now, State) ->
     {State1, SendEffects} = do_stop_sending(Sid, ErrorCode, Now, State),
     {State1, [{reply, From, Ref, ok} | SendEffects]};
@@ -2715,7 +2732,7 @@ process_stream(Sid, Offset, Data, Fin, State) ->
                 {ConnFlow2, State2} = grant_conn_credit(ConnFlow1, State1),
                 {StreamFlow2, State3} = grant_stream_credit(Sid, StreamFlow1, State2),
                 State4 = put_stream(Sid, Stream1, StreamFlow2, State3#state{conn_flow = ConnFlow2}),
-                deliver_stream(Sid, Deliverable, FinReached, State4)
+                deliver_stream(Sid, Deliverable, FinReached, Stream1, State4)
             else
                 {error, Reason} -> connection_fatal(application, Reason, State)
             end
@@ -3025,13 +3042,10 @@ negotiated_idle_timeout(OurParams, PeerParams) ->
     end.
 
 %% Advance the per-type high-water past `Sid`'s ordinal, recording any ids it
-%% jumps over as skipped (still to open). Opening a bidi stream also tops up
-%% the peer's bidi-stream credit.
+%% jumps over as skipped (still to open).
 -spec bump_opened(non_neg_integer(), t()) -> t().
 bump_opened(Sid, #state{bidi_opened = Opened} = State) when Sid rem 4 =:= 0 ->
-    grant_max_streams_bidi(
-        skip_below(Sid, Opened, State#state{bidi_opened = max(Opened, Sid div 4 + 1)})
-    );
+    skip_below(Sid, Opened, State#state{bidi_opened = max(Opened, Sid div 4 + 1)});
 bump_opened(Sid, #state{uni_opened = Opened} = State) ->
     skip_below(Sid, Opened, State#state{uni_opened = max(Opened, Sid div 4 + 1)}).
 
@@ -3045,29 +3059,39 @@ skip_below(Sid, Opened, #state{skipped = Skipped} = State) when Sid div 4 > Open
 skip_below(_Sid, _Opened, State) ->
     State.
 
-%% Keep the peer in bidi-stream credit (RFC 9000 §4.6): once the opened count is
-%% within a quarter-window of the advertised limit, raise the limit to a fresh
-%% window above what is opened and queue a MAX_STREAMS so the peer can keep
-%% opening request streams. Mirrors the receive-flow MAX_DATA refill
-%% (`roadrunner_quic_flow`, the 3/4 threshold); the window is the originally
-%% advertised `initial_max_streams_bidi`.
+%% Give the peer back the bidi-stream credit of the request streams that
+%% closed (RFC 9000 §4.6), so it may have `initial_max_streams_bidi` of them
+%% open at once and open any number over the connection's life. The limit is
+%% the closed count plus that window: a stream counts until both its sides are
+%% done, and a request stream the client reset is not done while its handler
+%% still runs (the h3 loop releases it when the handler ends), so resetting
+%% streams cannot run more handlers at once than the window (the HTTP/3 form
+%% of CVE-2023-44487). The raise is sent once the credit the peer has left is
+%% at most half of what it would have, so a busy client gets one MAX_STREAMS
+%% per closed stream while one well inside its window gets one now and then.
 -spec grant_max_streams_bidi(t()) -> t().
 grant_max_streams_bidi(
     #state{
+        phase = connected,
         bidi_opened = Opened,
+        bidi_closed = Closed,
         max_streams_bidi = Max,
         info = #{transport_params := #{initial_max_streams_bidi := Window}}
     } = State
 ) ->
-    case Opened > Max - Window * 3 div 4 of
+    NewMax = Closed + Window,
+    case NewMax > Max andalso 2 * (Max - Opened) =< NewMax - Opened of
         true ->
-            NewMax = Opened + Window,
             queue_frame(
                 application, {max_streams, bidi, NewMax}, State#state{max_streams_bidi = NewMax}
             );
         false ->
             State
-    end.
+    end;
+grant_max_streams_bidi(State) ->
+    %% Closing or draining: nothing but a CONNECTION_CLOSE goes out (RFC 9000
+    %% §10.2), and no stream will open again.
+    State.
 
 %% Our advertised receive window for a stream by type (RFC 9000 §18.2):
 %% client-initiated bidirectional streams (Sid rem 4 == 0) get
@@ -3095,10 +3119,10 @@ put_stream(Sid, Stream, Flow, #state{streams = Streams, sendable = Sendable} = S
     %% pass never emits STREAM frames on a stream the peer reset.
     case roadrunner_quic_stream:is_terminal(Stream) of
         true ->
-            State#state{
+            stream_closed(Sid, State#state{
                 streams = maps:remove(Sid, Streams),
                 sendable = ordsets:del_element(Sid, Sendable)
-            };
+            });
         false ->
             Sendable1 =
                 case
@@ -3111,12 +3135,34 @@ put_stream(Sid, Stream, Flow, #state{streams = Streams, sendable = Sendable} = S
             State#state{streams = Streams#{Sid => {Stream, Flow}}, sendable = Sendable1}
     end.
 
+%% A stream was pruned, which happens once, from `streams` (a stream only
+%% becomes terminal there). A client request stream is counted closed; the
+%% send pass gives its credit back (`grant_max_streams_bidi/1`). The
+%% MAX_STREAMS is not queued here: a stream is also pruned while the send pass
+%% builds a packet, which would overwrite the frame queued under it.
+-spec stream_closed(non_neg_integer(), t()) -> t().
+stream_closed(Sid, #state{bidi_closed = Closed} = State) when Sid rem 4 =:= 0 ->
+    State#state{bidi_closed = Closed + 1};
+stream_closed(_Sid, State) ->
+    State.
+
 %% Emit {stream_data, ...} when there are newly-contiguous bytes OR the FIN
 %% was reached (the FIN-only {<<>>, true} end-of-stream the h3 layer needs).
--spec deliver_stream(non_neg_integer(), binary(), boolean(), t()) -> t().
-deliver_stream(Sid, Deliverable, FinReached, State) when Deliverable =/= <<>>; FinReached ->
-    emit({stream_data, Sid, Deliverable, FinReached}, State);
-deliver_stream(_Sid, _Deliverable, _FinReached, State) ->
+%% A stream the owner released (`release_stream`) is one it is done with:
+%% its bytes are dropped and only its end is told, so what the peer still
+%% sends on it can never be read as a fresh request, which would run a
+%% handler on a stream whose credit is about to come back.
+-spec deliver_stream(non_neg_integer(), binary(), boolean(), roadrunner_quic_stream:t(), t()) ->
+    t().
+deliver_stream(Sid, Deliverable, FinReached, Stream, State) when
+    Deliverable =/= <<>>; FinReached
+->
+    case roadrunner_quic_stream:released(Stream) of
+        false -> emit({stream_data, Sid, Deliverable, FinReached}, State);
+        true when FinReached -> emit({stream_data, Sid, <<>>, true}, State);
+        true -> State
+    end;
+deliver_stream(_Sid, _Deliverable, _FinReached, _Stream, State) ->
     State.
 
 %% =============================================================================
@@ -3125,7 +3171,7 @@ deliver_stream(_Sid, _Deliverable, _FinReached, State) ->
 
 -spec send_pass(integer(), t()) -> {t(), [effect()]}.
 send_pass(Now, #state{phase = Before} = State) ->
-    case drain_send(Now, State, []) of
+    case drain_granted(Now, State) of
         {#state{phase = Before} = State1, RevSends} ->
             %% Release any parked send reply whose stream drained (or was
             %% aborted) this pass. The release effects ride AFTER the reversed
@@ -3149,6 +3195,25 @@ send_pass(Now, #state{phase = Before} = State) ->
             %% would for a close found while folding a datagram.
             {State2, Effects} = finish_datagram(Now, Before, State1),
             {State2, lists:reverse(RevSends, Effects)}
+    end.
+
+%% Send what is ready, with the MAX_STREAMS the request streams closed since
+%% the last pass have earned (`grant_max_streams_bidi/1`). A response FIN
+%% this pass puts out may close its stream here too. Its credit then waits
+%% for the next pass, which the peer's ACK of that FIN brings, unless the
+%% peer has no credit left: then it goes out now, in a packet of its own, so
+%% a client using all its streams is not held up for an ACK delay.
+-spec drain_granted(integer(), t()) -> {t(), [effect()]}.
+drain_granted(Now, State0) ->
+    {State1, RevSends} = drain_send(Now, grant_max_streams_bidi(State0), []),
+    case State1 of
+        #state{bidi_opened = Max, max_streams_bidi = Max} ->
+            case grant_max_streams_bidi(State1) of
+                #state{max_streams_bidi = Max} -> {State1, RevSends};
+                State2 -> drain_send(Now, State2, RevSends)
+            end;
+        #state{} ->
+            {State1, RevSends}
     end.
 
 %% What follows a send pass's sends: the (single) timer effect, or, when the

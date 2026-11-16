@@ -105,9 +105,11 @@ sends after its `STOP_SENDING` is discarded.
 On both, work the handler is in the middle of runs on, so a long
 computation should check in between, and whatever it answers is dropped.
 While the connection lasts, the request still counts toward
-`max_concurrent_requests` until the handler returns, so that limit also
-bounds the handlers a client leaves running by opening streams and
-resetting them.
+`max_concurrent_requests` until the handler returns, and, if its
+response was not complete, it also counts toward the connection's stream
+limit (`max_concurrent_streams` on HTTP/2, `max_streams_bidi` on
+HTTP/3), so these limits also bound the handlers a client leaves running
+by opening streams and resetting them.
 """.
 
 -export_type([send_fun/0, stream_fun/0, push_fun/0, sendfile_spec/0, response/0, result/0]).

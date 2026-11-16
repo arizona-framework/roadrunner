@@ -1385,7 +1385,38 @@ stop_unanswered(#h3{blocked = Blocked} = State, StreamId, Stream) ->
 release_unwritten(#h3{conn = Conn, worker_pids = WorkerPids}, StreamId) ->
     case WorkerPids of
         #{StreamId := _} -> ok;
-        #{} -> roadrunner_quic:release_stream(Conn, StreamId)
+        #{} -> release_stream(Conn, StreamId)
+    end.
+
+%% Release a request stream to the QUIC connection: this loop writes to it no
+%% more and is done reading it, so the connection drops what the peer still
+%% sends on it and may prune it (giving its stream credit back) once the
+%% peer's side ends. Data the connection handed over before the release is
+%% already in the mailbox, ahead of the call's reply, since both come from the
+%% connection process: it is dropped here too, keeping only the end of the
+%% stream, so none of it can be read as a fresh request on a stream whose
+%% credit is coming back (the peer may send STOP_SENDING and then a request
+%% on the same stream in one packet).
+-spec release_stream(pid(), non_neg_integer()) -> ok.
+release_stream(Conn, StreamId) ->
+    ok = roadrunner_quic:release_stream(Conn, StreamId),
+    case drop_delivered(Conn, StreamId, false) of
+        true ->
+            _ = self() ! {quic, Conn, {stream_data, StreamId, <<>>, true}},
+            ok;
+        false ->
+            ok
+    end.
+
+%% Drop the `stream_data` of `StreamId` waiting in the mailbox, and say
+%% whether its end was among it.
+-spec drop_delivered(pid(), non_neg_integer(), boolean()) -> boolean().
+drop_delivered(Conn, StreamId, Fin0) ->
+    receive
+        {quic, Conn, {stream_data, StreamId, _Data, Fin}} ->
+            drop_delivered(Conn, StreamId, Fin0 orelse Fin)
+    after 0 ->
+        Fin0
     end.
 
 %% A reader of a stream whose response the peer stopped: its read fails,
@@ -1432,7 +1463,7 @@ cancel_response(#h3{conn = Conn}, StreamId) ->
 -spec cancel_and_release(#h3{}, non_neg_integer()) -> ok.
 cancel_and_release(#h3{conn = Conn} = State, StreamId) ->
     ok = cancel_response(State, StreamId),
-    roadrunner_quic:release_stream(Conn, StreamId).
+    release_stream(Conn, StreamId).
 
 %% A cancelled stream's worker ended: it writes no more, so the QUIC
 %% connection may drop the stream once the peer's side ends too.
@@ -1440,7 +1471,7 @@ cancel_and_release(#h3{conn = Conn} = State, StreamId) ->
 release_cancelled(#h3{conn = Conn, cancelled = Cancelled} = State, StreamId) when
     is_map_key(StreamId, Cancelled)
 ->
-    ok = roadrunner_quic:release_stream(Conn, StreamId),
+    ok = release_stream(Conn, StreamId),
     State#h3{cancelled = maps:remove(StreamId, Cancelled)};
 release_cancelled(State, _StreamId) ->
     State.
@@ -2162,7 +2193,7 @@ reset_and_drop(#h3{conn = Conn, worker_pids = WorkerPids} = State0, StreamId, Er
                 Cancelled = State0#h3.cancelled,
                 State0#h3{cancelled = Cancelled#{StreamId => []}};
             #{} ->
-                ok = roadrunner_quic:release_stream(Conn, StreamId),
+                ok = release_stream(Conn, StreamId),
                 State0
         end,
     ok = stream_cancellation(State, StreamId),

@@ -50,7 +50,10 @@
 %% `RST_STREAM(INTERNAL_ERROR)` and the other in-flight streams
 %% keep running. `MAX_CONCURRENT_STREAMS` is advertised (default 100,
 %% overridable via the `max_concurrent_streams` http2 listener opt);
-%% HEADERS beyond that limit get `RST_STREAM(REFUSED_STREAM)`.
+%% HEADERS beyond that limit get `RST_STREAM(REFUSED_STREAM)`. A worker
+%% whose stream is reset is told, not stopped, and counts toward the limit
+%% until it exits (`reset_workers`), so resetting streams cannot run more
+%% handlers at once than the limit (CVE-2023-44487, rapid reset).
 %%
 %% Client header limit (RFC 9113 §6.5.2): a client that sent
 %% SETTINGS_MAX_HEADER_LIST_SIZE may treat a larger header section as
@@ -324,6 +327,19 @@
     %% client that refills the moment it sees our END_STREAM would otherwise
     %% race that DOWN and eat a spurious REFUSED_STREAM).
     live_streams = 0 :: non_neg_integer(),
+    %% The monitors of workers still running for streams reset while they
+    %% counted toward `max_concurrent_streams` (`drop_reset_stream/2`): the
+    %% stream is closed (RFC 9113 §5.1), but its handler is not done, so
+    %% admission counts it with `live_streams` until its `DOWN`. Without this
+    %% a client could open and reset streams in a loop, each reset freeing a
+    %% slot while the handler it started ran on (the HTTP/2 rapid reset
+    %% attack, CVE-2023-44487), and run any number of handlers at once.
+    reset_workers = #{} :: #{reference() => []},
+    %% Streams refused while `reset_workers` alone held the whole limit, since
+    %% the last one of those workers ended. Past `max_concurrent_streams` the
+    %% client is resetting far beyond the limit and gets
+    %% GOAWAY(ENHANCE_YOUR_CALM) (`refuse_over_limit/5`).
+    reset_refusals = 0 :: non_neg_integer(),
     %% Cumulative HEADERS+CONTINUATION block cap (CONTINUATION-flood guard).
     %% Read from proto_opts at `enter/6`.
     max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
@@ -1133,12 +1149,11 @@ on_headers(
     Flags,
     _Priority,
     Fragment,
-    #loop{live_streams = Live, max_concurrent_streams = MaxStreams} = State
+    #loop{live_streams = Live, reset_workers = Reset, max_concurrent_streams = MaxStreams} = State
 ) when
-    Live >= MaxStreams
+    Live + map_size(Reset) >= MaxStreams
 ->
-    %% Over the advertised concurrency limit — refuse the stream.
-    refuse_new_stream(StreamId, Flags, Fragment, refused_stream, State);
+    refuse_over_limit(StreamId, Flags, Fragment, map_size(Reset) >= MaxStreams, State);
 on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     EndHeaders = (Flags band 16#04) =/= 0,
     EndStream = (Flags band 16#01) =/= 0,
@@ -1165,6 +1180,30 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
         EndHeaders -> finalize_headers(StreamId, State1);
         true -> frame_loop(State1)
     end.
+
+%% A stream over the concurrency limit is refused with REFUSED_STREAM, which
+%% the client may retry (RFC 9113 §8.7). When the handlers of reset streams
+%% fill the whole limit on their own (the `true` clauses), the client has no stream
+%% left that it waits on and nothing it opens can be admitted until one of
+%% those handlers ends. `max_concurrent_streams` refusals in that state,
+%% with none of the handlers ending in between, mean it keeps opening
+%% streams far beyond the limit: the connection ends with
+%% GOAWAY(ENHANCE_YOUR_CALM), the code for a peer exhausting resources
+%% (§5.4.1, §7). A client that still has streams of its own open is only
+%% refused, as it may have opened the new stream before it saw our SETTINGS,
+%% or while a stream it reset still had its handler running.
+-spec refuse_over_limit(stream_id(), non_neg_integer(), binary(), boolean(), #loop{}) ->
+    no_return().
+refuse_over_limit(_StreamId, _Flags, _Fragment, true, #loop{reset_refusals = Refusals} = State) when
+    Refusals >= State#loop.max_concurrent_streams
+->
+    goaway_exit(State, enhance_your_calm);
+refuse_over_limit(StreamId, Flags, Fragment, true, #loop{reset_refusals = Refusals} = State) ->
+    refuse_new_stream(
+        StreamId, Flags, Fragment, refused_stream, State#loop{reset_refusals = Refusals + 1}
+    );
+refuse_over_limit(StreamId, Flags, Fragment, false, State) ->
+    refuse_new_stream(StreamId, Flags, Fragment, refused_stream, State).
 
 %% RFC 9113 §4.3, §6.8: a field block updates the connection's HPACK
 %% state even when we refuse its stream, so the block is decoded (once its
@@ -2093,12 +2132,25 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
                 #{StreamId := #{worker_ref := MonRef}} ->
                     worker_ended(State, StreamId, Refs1, Reason);
                 #{} ->
-                    %% Its stream was reset while it ran (`reset_stream/2`),
+                    %% Its stream was reset while it ran (`drop_reset_stream/2`),
                     %% gone or left as a placeholder for a header block
                     %% still arriving (`forget_stream/3`): nothing is left
-                    %% to answer.
-                    State#loop{worker_refs = Refs1}
+                    %% to answer, and the stream it held toward
+                    %% `max_concurrent_streams` is free.
+                    reset_worker_ended(State#loop{worker_refs = Refs1}, MonRef)
             end;
+        #{} ->
+            State
+    end.
+
+%% A worker whose stream was reset ended. If the stream counted toward
+%% `max_concurrent_streams` when it was reset, the worker held its place
+%% until now (`reset_workers`): give it back.
+-spec reset_worker_ended(#loop{}, reference()) -> #loop{}.
+reset_worker_ended(#loop{reset_workers = Reset} = State, MonRef) ->
+    case Reset of
+        #{MonRef := _} ->
+            State#loop{reset_workers = maps:remove(MonRef, Reset), reset_refusals = 0};
         #{} ->
             State
     end.
@@ -2547,16 +2599,18 @@ cancel_stream(#loop{streams = Streams} = State, StreamId) ->
 %% to bail, then drop our stream entry. Pending sends get reset
 %% notifications so workers waiting on `h2_send_ack` unwind, as does a
 %% worker waiting on a manual-mode body read. A worker still computing
-%% learns of it at its next write or read; it keeps its in-flight slot
-%% until it exits (`handle_worker_down/3`), so work a client abandons
-%% still counts toward `max_concurrent_requests` while it runs.
+%% learns of it at its next write or read; until it exits
+%% (`handle_worker_down/3`) it keeps its in-flight slot and counts as a
+%% stream toward `max_concurrent_streams` (`reset_workers`), so work a
+%% client abandons still counts against both limits while it runs.
 reset_stream(State, StreamId) ->
     drop_reset_stream(remember_reset(State, StreamId), StreamId).
 
 %% `reset_stream/2` for the peer's own RST_STREAM: nothing it sent before
 %% is in flight, so the stream is not remembered.
 -spec drop_reset_stream(#loop{}, stream_id()) -> #loop{}.
-drop_reset_stream(State0, StreamId) ->
+drop_reset_stream(#loop{streams = Streams0} = State0, StreamId) ->
+    #{StreamId := #{counted := Counted}} = Streams0,
     #loop{streams = Streams} = State = uncount_stream(State0, StreamId),
     #{
         StreamId := #{
@@ -2571,13 +2625,27 @@ drop_reset_stream(State0, StreamId) ->
             #{reader := Reader} -> roadrunner_conn:send_body_error(Reader, StreamId, closed);
             _ -> ok
         end,
-    _ =
+    Reset =
         case WorkerRef of
             %% RST landed before END_STREAM dispatched a worker.
-            undefined -> ok;
-            _MonRef -> WorkerPid ! {h2_stream_reset, StreamId}
+            undefined ->
+                State#loop.reset_workers;
+            MonRef ->
+                WorkerPid ! {h2_stream_reset, StreamId},
+                hold_reset_slot(State#loop.reset_workers, MonRef, Counted)
         end,
-    withdraw_parked(State#loop{streams = forget_stream(State, StreamId, Streams)}, StreamId).
+    withdraw_parked(
+        State#loop{streams = forget_stream(State, StreamId, Streams), reset_workers = Reset},
+        StreamId
+    ).
+
+%% A worker whose stream is reset while it counts toward
+%% `max_concurrent_streams` keeps counting until it ends. One whose stream
+%% had already ended both ways (its response complete) was not counted, and
+%% is not now.
+-spec hold_reset_slot(#{reference() => []}, reference(), boolean()) -> #{reference() => []}.
+hold_reset_slot(Reset, MonRef, true) -> Reset#{MonRef => []};
+hold_reset_slot(Reset, _MonRef, false) -> Reset.
 
 %% Called by `handle_worker_down/3` when a worker dies abnormally.
 %% Send RST_STREAM(error_code) to the peer and drop our state.
