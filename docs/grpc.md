@@ -363,6 +363,23 @@ say_hello(Name, Stream0) ->
 `roadrunner_grpc:peer/1` returns the client's address as
 `{IP, Port}`.
 
+`roadrunner_grpc:request/1` returns the call's HTTP request, for what
+the metadata leaves out. Read it with the `roadrunner_req` functions:
+the client's certificate with `roadrunner_req:peercert/1`, its TLS
+session with `roadrunner_req:tls_info/1`, what a middleware put on the
+request with `roadrunner_req:private/2`, the `request_id`, and any header,
+`grpc-*` ones included, with `roadrunner_req:header/2`. It is for
+reading: the call reads the request body itself, so read the requests
+with `recv/1` or `recv_async/1`, not through the request.
+
+```erlang
+whoami(_Request, Stream) ->
+    case roadrunner_req:peercert(roadrunner_grpc:request(Stream)) of
+        {ok, Der} -> {reply, subject(Der), Stream};
+        {error, _} -> {error, unauthenticated, ~"no client certificate", Stream}
+    end.
+```
+
 ## Errors and status codes
 
 A call answers HTTP `200` and ends with a gRPC status in its trailers:

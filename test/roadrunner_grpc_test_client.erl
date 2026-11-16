@@ -11,6 +11,7 @@
 
 -export([
     open/1, open/2,
+    open_tls/2,
     after_preface/2,
     start/4,
     send/3,
@@ -37,6 +38,19 @@ open(Port, Settings) ->
     ok = gen_tcp:send(Sock, [~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" | setup_frames(Settings)]),
     client(Sock).
 
+%% The same over TLS, HTTP/2 picked by ALPN, with the client's own
+%% `SslOpts` (a certificate, say).
+open_tls(Port, SslOpts) ->
+    {ok, Sock} = ssl:connect(
+        {127, 0, 0, 1},
+        Port,
+        [binary, {active, false}, {verify, verify_none}, {alpn_advertised_protocols, [~"h2"]}] ++
+            SslOpts,
+        5000
+    ),
+    ok = ssl:send(Sock, [~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" | setup_frames([])]),
+    (client(Sock))#{transport := ssl}.
+
 %% The rest of the setup on a socket that already sent the whole preface,
 %% for a test that sends the preface its own way.
 after_preface(Sock, Settings) ->
@@ -55,6 +69,7 @@ setup_frames(Settings) ->
 client(Sock) ->
     #{
         sock => Sock,
+        transport => gen_tcp,
         buf => <<>>,
         enc => roadrunner_http2_hpack:new_encoder(4096),
         dec => roadrunner_http2_hpack:new_decoder(4096),
@@ -70,7 +85,7 @@ client(Sock) ->
 %% Open a call on `StreamId` to `Path`, with `Extra` headers after the
 %% gRPC ones (a header given there replaces the default of that name).
 start(
-    #{sock := Sock, enc := Enc, initial_window := Initial, windows := Windows} = C,
+    #{sock := Sock, transport := T, enc := Enc, initial_window := Initial, windows := Windows} = C,
     StreamId,
     Path,
     Extra
@@ -86,7 +101,7 @@ start(
             [{N, V} || {N, V} <- Defaults, not lists:keymember(N, 1, Extra)] ++
             [{N, V} || {N, V} <- Extra, N =/= ~":method", V =/= omit],
     {Block, Enc1} = roadrunner_http2_hpack:encode(Fields, Enc),
-    ok = gen_tcp:send(
+    ok = T:send(
         Sock, roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block})
     ),
     C#{enc := Enc1, windows := Windows#{StreamId => Initial}}.
@@ -119,8 +134,12 @@ send_window(#{conn_window := ConnWindow, windows := Windows}, StreamId) ->
         #{StreamId := Window} -> min(Window, ConnWindow)
     end.
 
-send_data(#{sock := Sock, conn_window := ConnWindow, windows := Windows} = C, StreamId, Chunk) ->
-    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({data, StreamId, 0, Chunk})),
+send_data(
+    #{sock := Sock, transport := T, conn_window := ConnWindow, windows := Windows} = C,
+    StreamId,
+    Chunk
+) ->
+    ok = T:send(Sock, roadrunner_http2_frame:encode({data, StreamId, 0, Chunk})),
     #{StreamId := Window} = Windows,
     Size = byte_size(Chunk),
     C#{conn_window := ConnWindow - Size, windows := Windows#{StreamId := Window - Size}}.
@@ -130,13 +149,13 @@ await_window(C) ->
     {Frame, #{pending := Pending} = C1} = read_frame(C),
     C1#{pending := queue:in(Frame, Pending)}.
 
-reset(#{sock := Sock} = C, StreamId) ->
-    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({rst_stream, StreamId, cancel})),
+reset(#{sock := Sock, transport := T} = C, StreamId) ->
+    ok = T:send(Sock, roadrunner_http2_frame:encode({rst_stream, StreamId, cancel})),
     C.
 
 %% A zero-length DATA frame, needing no window, ends the requests.
-finish(#{sock := Sock} = C, StreamId) ->
-    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({data, StreamId, 16#01, <<>>})),
+finish(#{sock := Sock, transport := T} = C, StreamId) ->
+    ok = T:send(Sock, roadrunner_http2_frame:encode({data, StreamId, 16#01, <<>>})),
     C.
 
 %% A whole call: framed `Messages` (binaries) then the end of the requests.
@@ -197,7 +216,7 @@ next_frame(#{pending := Pending} = C) ->
         {empty, _} -> read_frame(C)
     end.
 
-read_frame(#{sock := Sock, buf := Buf, dec := Dec} = C) ->
+read_frame(#{sock := Sock, transport := T, buf := Buf, dec := Dec} = C) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME) of
         {ok, {headers, StreamId, Flags, _Priority, Block}, Rest} ->
             {ok, Fields, Dec1} = roadrunner_http2_hpack:decode(Block, Dec),
@@ -206,14 +225,14 @@ read_frame(#{sock := Sock, buf := Buf, dec := Dec} = C) ->
         {ok, Frame, Rest} ->
             {Frame, flow(Frame, C#{buf := Rest})};
         _More ->
-            {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+            {ok, Data} = T:recv(Sock, 0, 5000),
             read_frame(C#{buf := <<Buf/binary, Data/binary>>})
     end.
 
 %% What a frame from the server does to the send windows (RFC 9113 §6.9).
-flow({settings, 0, Params}, #{sock := Sock} = C) ->
+flow({settings, 0, Params}, #{sock := Sock, transport := T} = C) ->
     %% RFC 9113 §6.5.3: every SETTINGS frame is acknowledged.
-    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({settings, 1, []})),
+    ok = T:send(Sock, roadrunner_http2_frame:encode({settings, 1, []})),
     lists:foldl(fun apply_setting/2, C, Params);
 flow({window_update, 0, Increment}, #{conn_window := ConnWindow} = C) ->
     C#{conn_window := ConnWindow + Increment};

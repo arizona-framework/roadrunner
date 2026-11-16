@@ -124,13 +124,16 @@ end; others raise, so the call ends `INTERNAL`.
 A metadata name ending in `-bin` carries bytes: its value is base64 on the
 wire and plain bytes here, both ways; a request's comma-separated values
 are each an entry, and one that is not base64 ends the call with
-`INTERNAL` before the method runs.
+`INTERNAL` before the method runs. `request/1` is the call's HTTP request,
+to read what the metadata leaves out: the client's certificate, the
+`request_id`, what a middleware put on the request.
 """.
 
 -behaviour(roadrunner_handler).
 
 -export([routes/1, init_route/1, handle/1]).
 -export([recv/1, send/2, send/3, metadata/1, set_headers/2, set_trailers/2, deadline/1, peer/1]).
+-export([request/1]).
 -export([set_send_compression/2, cancelled/2, recv_compressed/1]).
 -export([recv_async/1, info/2]).
 -export([reflection_index/1]).
@@ -1569,3 +1572,24 @@ reflection_index(#stream{req = Req}) ->
 -spec peer(stream()) -> {inet:ip_address(), inet:port_number()} | undefined.
 peer(#stream{req = Req}) ->
     roadrunner_req:peer(Req).
+
+-doc """
+The call's HTTP request, for what the stream does not tell itself: the
+client's certificate (`roadrunner_req:peercert/1`) and TLS session
+(`roadrunner_req:tls_info/1`), what a middleware put on the request
+(`roadrunner_req:private/2`), the `request_id`, and the headers
+`metadata/1` leaves out (`roadrunner_req:header/2`). It is for reading:
+the call reads the body through the stream, so read it with `recv/1` or
+`recv_async/1`, never through the request.
+
+```erlang
+whoami(_Request, Stream) ->
+    case roadrunner_req:peercert(roadrunner_grpc:request(Stream)) of
+        {ok, Der} -> {reply, subject(Der), Stream};
+        {error, _} -> {error, unauthenticated, ~"no client certificate", Stream}
+    end.
+```
+""".
+-spec request(stream()) -> roadrunner_req:request().
+request(#stream{req = Req}) ->
+    Req.

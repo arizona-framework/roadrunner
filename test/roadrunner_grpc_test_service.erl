@@ -10,6 +10,7 @@
 -export([stale_compression/2, held/1, was_compressed/2, flood/2, big_trailer/2]).
 -export([hold/2, watch/2, stop_after/2, reset_at/2, watch_late/2, keys/2]).
 -export([active_sum/1, active_chat/1, mixed_sum/1, notify/2]).
+-export([request/2]).
 
 name() -> ~"test.Echo".
 
@@ -53,7 +54,8 @@ rpcs() ->
         ~"ActiveSum" => rpc(active_sum, client_stream),
         ~"ActiveChat" => rpc(active_chat, bidi_stream),
         ~"MixedSum" => rpc(mixed_sum, client_stream),
-        ~"Notify" => rpc(notify, server_stream)
+        ~"Notify" => rpc(notify, server_stream),
+        ~"Request" => rpc(request, unary)
     }.
 
 rpc(Function, Kind) ->
@@ -352,3 +354,15 @@ until(Time) ->
     receive
     after max(0, Time - erlang:monotonic_time(millisecond)) -> ok
     end.
+
+%% What the call's HTTP request tells beyond the metadata.
+request(_Request, Stream) ->
+    Req = roadrunner_grpc:request(Stream),
+    {reply,
+        term_to_binary(#{
+            peercert => roadrunner_req:peercert(Req),
+            private => roadrunner_req:private(roadrunner_grpc_test, Req),
+            request_id => roadrunner_req:request_id(Req),
+            timeout => roadrunner_req:header(~"grpc-timeout", Req),
+            metadata => roadrunner_grpc:metadata(Stream)
+        }), Stream}.
