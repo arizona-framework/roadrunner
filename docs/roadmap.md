@@ -183,6 +183,28 @@ profiles the leaderboard scores.
 
 ## Other
 
+### Production gRPC client — large
+
+**What:** `roadrunner_grpc_client` is a small client for tests, tooling
+and simple calls. A client for production traffic needs more, each a
+piece of its own:
+
+- reconnect with backoff after the connection closes (medium)
+- keepalive pings, to notice a dead connection before a call does (small)
+- a name resolver and load balancing over several addresses (large)
+- retries and hedging, honoring server pushback, and gRPC's service
+  config (large)
+- connection pooling, moving new calls to a new connection after a
+  GOAWAY (medium)
+- HTTP/3, over roadrunner's own QUIC (large)
+- client-side interceptors (small)
+- client telemetry events, like the server's call events (small)
+- an interop run against a non-roadrunner server, such as grpc-go's
+  interop server (medium)
+
+**Why deferred:** the client was built for roadrunner's own tests and
+tools; these matter only once it carries production traffic.
+
 ### CI bench-vs-baseline comparison
 
 **What:** The `Bench` workflow (`.github/workflows/bench.yml`) writes its

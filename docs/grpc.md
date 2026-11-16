@@ -3,8 +3,9 @@
 Roadrunner serves gRPC services on its HTTP/2 and HTTP/3 listeners. This
 guide shows how to write a service, put it on a listener, and use what a
 call can do: streams, metadata, status codes, deadlines, compression,
-telemetry, the health service and server reflection. The last part shows how to use
-Protocol Buffers.
+telemetry, the health service and server reflection. Then it shows how to use
+Protocol Buffers, how to write a codec, and the small gRPC client roadrunner
+comes with.
 
 ## What you get
 
@@ -24,6 +25,8 @@ Protocol Buffers.
 - gRPC's server reflection, for tools such as `grpcurl`
 - pluggable codecs: raw bytes by default, Protocol Buffers through the
   `roadrunner_grpc_protobuf` package, or your own
+- a small gRPC client, `roadrunner_grpc_client`, for tests, tooling and
+  simple calls
 
 gRPC needs HTTP/2 or later, so a call that comes in over HTTP/1.1 is
 answered `505 HTTP Version Not Supported`.
@@ -731,3 +734,35 @@ roadrunner_grpc:routes(#{services => [greeter], codecs => [my_json_codec]})
 
 This codec answers `application/grpc+json`. If `decode/2` raises, the
 call ends with `INTERNAL`.
+
+## gRPC client
+
+`roadrunner_grpc_client` calls gRPC servers, roadrunner's own or any
+other, over HTTP/2: cleartext h2c or TLS with ALPN `h2`. It is made for
+tests, tooling and simple service-to-service calls.
+
+```erlang
+{ok, Conn} = roadrunner_grpc_client:connect("localhost", 50051, #{}),
+{ok, Reply, _Meta} =
+    roadrunner_grpc_client:unary(Conn, ~"/helloworld.Greeter/SayHello", ~"world", #{
+        timeout => 1000
+    }),
+ok = roadrunner_grpc_client:close(Conn).
+```
+
+It does the four call kinds (`unary/4`, and `stream/3` with `send/2`,
+`close_send/1` and `recv/2` for the streaming ones), metadata both ways
+with `-bin` values as plain bytes, every status code, deadlines it sends
+as `grpc-timeout` and also enforces itself, cancellation, `gzip` and
+`deflate` compression both ways, and a limit on the size of each
+response message. Calls take the same codecs as your services, so
+`codec => my_json_codec` sends `application/grpc+json`. A non-`OK` call
+returns `{error, {grpc, Status, Message, Trailers}}`.
+
+It is not a production client. It has no HTTP/3, no reconnect or
+backoff, no keepalive pings, no name resolution or load balancing, no
+retries, hedging or service config, no connection pooling (one
+connection, with every call multiplexed on it), no interceptors and no
+telemetry events, and it talks to one address. Response header lists are
+capped at its `max_header_list_size` (64 KiB by default). See
+`roadrunner_grpc_client` for the whole API and its limitations.
