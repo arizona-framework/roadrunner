@@ -42,7 +42,14 @@ All duration and interval values in `opts()` are in milliseconds —
 %% port shared with another socket is rare, so it takes many picks to see.
 -export([resolve_quic_port/3]).
 
--export_type([opts/0]).
+-export_type([opts/0, body_buffering/0]).
+
+-doc """
+How a listener reads request bodies (`body_buffering` in `t:opts/0`):
+`auto` reads the whole body before the handler runs, `manual` leaves it
+to the handler.
+""".
+-type body_buffering() :: auto | manual.
 
 -define(DEFAULT_MAX_CONTENT_LENGTH, 10485760).
 -define(DEFAULT_REQUEST_TIMEOUT, 30000).
@@ -521,7 +528,7 @@ ops-tuning rationale.
     %% exercise rate-check fires deterministically without
     %% second-scale waits; ops can tune for chattier observability.
     rate_check_interval => pos_integer(),
-    body_buffering => auto | manual,
+    body_buffering => body_buffering(),
     slot_reconciliation => disabled | #{interval := pos_integer()},
     %% Opt out of the per-conn drain registry. Default `true`
     %% (current behavior). Set to `false` for short-lived h1-only

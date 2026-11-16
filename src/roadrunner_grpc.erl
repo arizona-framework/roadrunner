@@ -192,7 +192,7 @@ every service (see the moduledoc).
     services := [module() | roadrunner_grpc_service:descriptor()],
     codecs => [module()],
     max_message_size => pos_integer(),
-    max_content_length => non_neg_integer() | infinity,
+    max_content_length => roadrunner_router:body_limit(),
     middlewares => roadrunner_middleware:middleware_list(),
     send_compression => encoding(),
     health => boolean(),

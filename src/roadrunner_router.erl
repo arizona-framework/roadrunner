@@ -71,7 +71,8 @@ of trying every route in turn.
     methods/0,
     rate_limit/0,
     validation_error/0,
-    limits/0
+    limits/0,
+    body_limit/0
 ]).
 
 -doc """
@@ -111,7 +112,7 @@ listener's `rate_limit`; unset → only the listener's.
         state => term(),
         middlewares => roadrunner_middleware:middleware_list(),
         methods => methods(),
-        max_content_length => non_neg_integer() | infinity,
+        max_content_length => body_limit(),
         rate_limit => rate_limit()
     }.
 
@@ -179,12 +180,17 @@ Why a route table was rejected, as returned by `validate/1` and raised by
 -type method_lookup() :: #{binary() => true} | undefined.
 
 -doc """
+A cap on a request body in bytes, or `infinity` for none.
+""".
+-type body_limit() :: non_neg_integer() | infinity.
+
+-doc """
 A route's request limits the connection reads before dispatch, carried in its
 compiled entry so the one dispatch match yields them: `undefined` for a route
 that sets none, else the overrides it declares. A route's `rate_limit` is not
 here: it is a stage of the route's pipeline (`roadrunner_route_rate_limit`).
 """.
--type limits() :: undefined | #{max_content_length => non_neg_integer() | infinity}.
+-type limits() :: undefined | #{max_content_length => body_limit()}.
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
@@ -299,7 +305,9 @@ bodies, which handlers read as they arrive; with `auto`, where the
 listener reads a body whole before dispatch, the route keeps the
 listener's cap.
 """.
--spec compile(routes(), roadrunner_middleware:middleware_list(), auto | manual) -> compiled().
+-spec compile(
+    routes(), roadrunner_middleware:middleware_list(), roadrunner_listener:body_buffering()
+) -> compiled().
 compile(Routes, ListenerMws, BodyBuffering) when
     is_list(Routes), is_list(ListenerMws), (BodyBuffering =:= auto orelse BodyBuffering =:= manual)
 ->
@@ -333,7 +341,9 @@ validate(Routes) when is_list(Routes) ->
         check_shadowing(Specs)
     end.
 
--spec compile_route(route(), [roadrunner_middleware:resolved()], auto | manual) ->
+-spec compile_route(
+    route(), [roadrunner_middleware:resolved()], roadrunner_listener:body_buffering()
+) ->
     {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup(), limits()}.
 compile_route({Path, Handler}, ResolvedListener, _BodyBuffering) when
     is_binary(Path), is_atom(Handler)
@@ -432,7 +442,7 @@ has_init_route(Handler) ->
 
 %% A route's `max_content_length => infinity` holds for bodies read as they
 %% arrive; one the listener reads whole first keeps the listener's cap.
--spec route_limits(map(), auto | manual) -> limits().
+-spec route_limits(map(), roadrunner_listener:body_buffering()) -> limits().
 route_limits(#{max_content_length := infinity}, auto) -> undefined;
 route_limits(#{max_content_length := Max}, _BodyBuffering) -> #{max_content_length => Max};
 route_limits(_Route, _BodyBuffering) -> undefined.

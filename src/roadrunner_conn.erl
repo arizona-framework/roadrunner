@@ -231,7 +231,7 @@ deadline in milliseconds. The shed form answers it `503` with the
     rate_limit := undefined | rate_limit(),
     rate_limited_counter := atomics:atomics_ref(),
     min_bytes_per_second := non_neg_integer(),
-    body_buffering := auto | manual,
+    body_buffering := roadrunner_listener:body_buffering(),
     listener_name => atom(),
     %% When `false`, conns skip registering in the listener's drain
     %% registry (`drain_table`). The registry is the mechanism
@@ -1086,7 +1086,7 @@ resolve_handler({router, ListenerName}, Req) ->
 %% The body cap of a resolved request: its route's `max_content_length` when
 %% the route sets one, else the listener's `Default`.
 -doc false.
--spec body_cap(resolved(), non_neg_integer()) -> non_neg_integer() | infinity.
+-spec body_cap(resolved(), non_neg_integer()) -> roadrunner_router:body_limit().
 body_cap({ok, _Handler, _Bindings, _Pipeline, _State, #{max_content_length := Max}}, _Default) ->
     Max;
 body_cap(_Resolved, Default) ->
@@ -1101,7 +1101,7 @@ body_cap(_Resolved, Default) ->
 %% an `Expect: 100-continue` request needs its answer now.
 -doc false.
 -spec route_body_cap(dispatch(), roadrunner_http:headers(), non_neg_integer()) ->
-    non_neg_integer() | infinity.
+    roadrunner_router:body_limit().
 route_body_cap({router, ListenerName}, Headers, Default) ->
     case {lists:keyfind(~":method", 1, Headers), lists:keyfind(~":path", 1, Headers)} of
         {{_, Method}, {_, Target}} ->
@@ -1239,7 +1239,7 @@ expects_continue(Req) ->
     none | chunked | {content_length, non_neg_integer()},
     binary(),
     fun((roadrunner_req:deadline()) -> {ok, binary()} | {error, term()}),
-    non_neg_integer() | infinity,
+    roadrunner_router:body_limit(),
     {pos_integer(), pos_integer(), pos_integer()},
     integer()
 ) -> roadrunner_req:body_reader().
@@ -1968,7 +1968,7 @@ chunked_collect(
 
 %% What a chunked body may still bring under its reader's `max`: no cap
 %% for a route that sets `max_content_length => infinity`.
--spec budget(non_neg_integer() | infinity, non_neg_integer()) -> non_neg_integer() | infinity.
+-spec budget(roadrunner_router:body_limit(), non_neg_integer()) -> roadrunner_router:body_limit().
 budget(infinity, _Read) -> infinity;
 budget(Max, Read) -> Max - Read.
 

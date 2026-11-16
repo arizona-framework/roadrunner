@@ -194,7 +194,7 @@ closure takes it, so `set_body_timeout/2` can move it.
     deadline := deadline(),
     %% Tells this reader apart, so a failed read ends this body only.
     id := reference(),
-    max := non_neg_integer() | infinity,
+    max := roadrunner_router:body_limit(),
     %% Present while a 100 Continue is owed to a client holding its body
     %% back: the connection process and stream a streaming response asks
     %% for it before it starts.
@@ -218,7 +218,7 @@ closure takes it, so `set_body_timeout/2` can move it.
     request_deadline := integer(),
     %% Tells this reader apart, so a failed read ends this body only.
     id := reference(),
-    max := non_neg_integer() | infinity,
+    max := roadrunner_router:body_limit(),
     %% Trailer-header limits `{max_header_line, max_header_block,
     %% max_header_count}` threaded to `roadrunner_http1:parse_chunk/2`.
     trailer_limits := {pos_integer(), pos_integer(), pos_integer()},

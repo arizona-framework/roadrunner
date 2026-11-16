@@ -1244,7 +1244,7 @@ small chunk's data or a chunk's closing CRLF still to come.
 -spec parse_chunk_part(
     binary(),
     {pos_integer(), pos_integer(), pos_integer()},
-    non_neg_integer() | infinity,
+    roadrunner_router:body_limit(),
     non_neg_integer()
 ) ->
     {ok, Data :: binary(), Rest :: binary()}

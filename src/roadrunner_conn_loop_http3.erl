@@ -237,7 +237,7 @@
     %% `auto` buffers a request's body and dispatches at the stream's FIN;
     %% `manual` dispatches at the end of the headers and hands the worker
     %% the body as it reads (`dispatch_reading/4`). Read from proto_opts.
-    body_buffering = auto :: auto | manual,
+    body_buffering = auto :: roadrunner_listener:body_buffering(),
     %% Cap on the encoded request field section (HEADERS block). Read from
     %% proto_opts at conn start; defaults to `?MAX_HEADER_BLOCK`.
     max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
