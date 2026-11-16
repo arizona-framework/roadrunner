@@ -124,8 +124,8 @@ are advertised to the peer in the initial `SETTINGS` frame.
 | `SETTINGS_MAX_CONCURRENT_STREAMS` | 100 | yes |
 | HPACK decoder table | 4 KB | no (fixed) |
 | Header block (HEADERS + CONTINUATION) | 16 KB | yes |
-| Connection receive window (`conn_window`) | 65535 | yes |
-| Stream receive window (`stream_window`) | 65535 | yes |
+| Connection receive window (`conn_window`) | 2^31-1 (the largest allowed) | yes |
+| Stream receive window (`stream_window`) | 16 MB | yes |
 | Unread socket reads per connection (`active`) | 16 | yes |
 
 A frame whose declared length exceeds the negotiated max frame size is
