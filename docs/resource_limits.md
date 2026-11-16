@@ -444,10 +444,11 @@ server's CPU.
 An HTTP/1.1 connection therefore keeps a heap floor: after each request
 it raises its `min_heap_size` to the heap that request needed, up to
 `handler_spawn`'s `heap_floor` `max` (46422 words, about 360 KB, by default),
-and the next request starts at that size. Every 16 requests, and before
-the connection hibernates or runs a WebSocket session, the floor drops
-back and is learned again. Dropping it costs a connection whose requests
-still need the heap nothing, since the heap only shrinks at a collection
+and the next request starts at that size. Every 16 requests the floor
+drops back and is learned again, and before the connection hibernates or
+runs a WebSocket session it drops to the spawn `min_heap_size`. Dropping
+it costs a connection whose requests still need the heap nothing, since
+the heap only shrinks at a collection
 that finds it mostly empty, while a connection that served one large
 response and now serves small ones gives the memory back: without that,
 it would keep the large heap as long as it stayed busy. In a
@@ -461,10 +462,35 @@ GET/POST loads (1024 connections, a fresh server per run):
 | mixed GET/POST | 366k req/s | 385k req/s (+5%) |
 
 Busy connections held about 10% more memory on the JSON load and the
-same on the others. Idle connections cost the same with and without it,
-since a connection that waits collects nothing and so keeps the heap its
-last request left either way: 1000 connections idle after a large JSON
-response held the same memory. Set `heap_floor => false` to turn it off.
+same on the others. A connection that waits collects nothing and so
+keeps the heap its last request left: 1000 connections idle after a
+large JSON response held the same memory with and without the floor
+(after small requests they keep the least floor described below). With
+a `max_heap_size` set, in `handler_spawn`'s `opts` or as the emulator's
+default when the connection started, the floor is off, the least one
+included, as for stream workers below. Set `heap_floor => false` to
+turn it off.
+
+The floor a request teaches is the smallest heap that fits it, so a
+request still fills that heap and collects about once each time. On a
+large heap that collection costs mostly the copying of what is live, and
+a larger floor saves little; on a small one it costs mostly its fixed
+price. So once a connection has served a request its floor stays at
+least 2586 words (about 20 KB, or `max` when lower), and the relearning
+every 16 requests drops it back to that rather than to the spawn size.
+In a two-sided A/B at 256 connections (4 runs per side, fresh server
+per run), keep-alive GETs answered by a tiny handler went from 0.5 to
+1.0 collections per request (which of the two depends on how the heap
+happened to grow) to 0.29, and used about 5-8% less CPU per request on
+average; 16-deep
+pipelined GETs used about 16% less, and larger JSON responses were
+unchanged. Tail latency stayed the same. The price is memory on
+connections whose requests need less than that: 1000 such connections
+idle after a burst held 21.6 KB of process memory each instead of
+8.8 KB (about 130 MB more per 10,000 idle connections), while
+connections serving larger responses already keep more than the least
+floor and hold the same. `hibernate_after` gives that memory back from
+connections that stay idle.
 
 HTTP/2 and HTTP/3 run each request in a stream worker of its own, which
 lives for that request alone, so there the connection keeps the floor and
@@ -505,7 +531,10 @@ instead of five times, and a push took 48 µs instead of 78 to 82 µs,
 round trip included. Inbound frames run no floor code, so an echo or
 chat session answering small messages costs exactly what it did. An
 idle session holds the heap its last event left with or without the
-floor.
+floor. A session that runs in an HTTP/1.1 connection inherits the heap
+the requests before it left, so with its floor on it collects once as
+it starts when that heap is over its base, and learns its floor from
+its own data rather than from those requests.
 
 Only a `handle_info/2` that needed at least the `min` of `ws.heap_floor`
 (2586 words, about 20 KB, by default) raises the floor, so small

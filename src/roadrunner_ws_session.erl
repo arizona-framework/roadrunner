@@ -1221,12 +1221,32 @@ heap_floor(#{ws_heap_floor_min := Min, ws_heap_floor_max := Cap}) ->
     {min_heap_size, Base} = erlang:process_info(self(), min_heap_size),
     case Cap > Base of
         true ->
+            ok = start_from_live_data(Base),
             {Base, Base, Cap, Min};
         false ->
             undefined
     end;
 heap_floor(#{}) ->
     undefined.
+
+%% A session that runs in an HTTP/1.1 connection gets the heap the
+%% requests before it left: nothing collects between requests, so one
+%% large response, or the connection's own floor, leaves it grown. The
+%% floor learns from the heap's size after an event, so a session holding
+%% that heap would raise its floor on its first event, however small.
+%% Collecting once, when the heap is over the session's base, starts it
+%% from its own live data instead. It runs after `apply_gc_settings/1`,
+%% so the collection sizes the heap by the session's settings, its own
+%% `min_heap_size` included, rather than the connection's.
+-spec start_from_live_data(pos_integer()) -> ok.
+start_from_live_data(Base) ->
+    case erlang:process_info(self(), heap_size) of
+        {heap_size, Heap} when Heap > Base ->
+            true = erlang:garbage_collect(),
+            ok;
+        {heap_size, _} ->
+            ok
+    end.
 
 %% Rewrites the record only when the floor changes, and counts toward
 %% relearning only while the floor is raised: at the base, a message pays

@@ -419,21 +419,25 @@ Optional middleware and timing knobs (durations in milliseconds):
   up to `max`, as its `min_heap_size`, and the next request
   starts at that size. A handler that builds a sizeable response then
   collects a few times per request instead of several, which cost
-  connections serving such handlers about a fifth of their CPU. Every
-  16 requests, and before the connection hibernates or runs a WebSocket
-  session, the floor drops back to `min_heap_size` (or the emulator's
-  default) and is learned again, so a connection whose requests got
-  smaller gives the larger heap back. A connection between requests
-  holds about the same heap either way, since it collects nothing while
-  it waits. HTTP/2 and HTTP/3 run each request in a stream worker of
-  its own, so there the connection keeps the floor and starts each
-  worker at it: a worker that collected while it built its response
-  raises the floor by half, up to `max`, and every 16th stream starts at
-  half the floor and lowers it to that if it did not collect. A streamed
-  or file response teaches the floor only what happened before its body
-  started. With a `max_heap_size` set, in `opts` or as the emulator's
-  default, the floor is off, since a raised `min_heap_size` can make a
-  collection reach the limit.
+  connections serving such handlers about a fifth of their CPU. Once a
+  connection has served a request its floor is at least 2586 words
+  (about 20 KB, or `max` when lower), so a handler that allocates
+  little does not collect on almost every request. Every 16 requests
+  the floor drops back to that and is learned again, so a connection
+  whose requests got smaller gives the larger heap back; before the
+  connection hibernates or runs a WebSocket session it drops to
+  `min_heap_size` (or the emulator's default). A connection between
+  requests collects nothing while it waits, so it keeps the heap its last
+  request left: the same as without the floor after larger requests, and
+  the least floor's 20 KB after small ones. HTTP/2 and HTTP/3 run each
+  request in a stream worker of its own, so there the connection keeps
+  the floor and starts each worker at it: a worker that collected while
+  it built its response raises the floor by half, up to `max`, and every
+  16th stream starts at half the floor and lowers it to that if it did
+  not collect. A streamed or file response teaches the floor only what
+  happened before its body started. With a `max_heap_size` set, in `opts`
+  or as the emulator's default, the floor is off for every protocol,
+  since a raised `min_heap_size` can make a collection reach the limit.
   A WebSocket session learns its floor from its `handle_info/2` calls,
   where a server push is built, relearns every 16 of them while raised
   and drops it before it hibernates; `ws.heap_floor` tunes it for
@@ -940,7 +944,10 @@ WebSocket session tunables (under `ws` in the listener opts).
   sizeable pushes starts each at the size the last one needed. `max`
   defaults to `handler_spawn`'s `heap_floor`, `min` to `2586` (about
   20 KB, so small messages leave the floor; `0` lets every message
-  raise it). `false` turns it off. Inbound frames never raise it.
+  raise it). `false` turns it off. Inbound frames never raise it. With
+  the floor on, a session collects once as it starts when the heap it
+  inherited from the connection is over its base, so it learns from its
+  own data.
 
 An upgrade can set each of these for its own session
 (`t:roadrunner_ws_handler:upgrade_opts/0`).
