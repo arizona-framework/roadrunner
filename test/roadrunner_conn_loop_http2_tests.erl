@@ -877,11 +877,12 @@ continuation_without_pending_triggers_goaway() ->
     end.
 
 continuation_flood_triggers_goaway() ->
-    %% HEADERS without END_HEADERS, then a CONTINUATION that pushes the
-    %% assembled block past ?MAX_HEADER_BLOCK. Each frame is within
-    %% MAX_FRAME_SIZE but the cumulative block is not (the HTTP/2
-    %% CONTINUATION Flood), so the conn is torn down with
-    %% GOAWAY(ENHANCE_YOUR_CALM). The fragments are never HPACK-decoded.
+    %% HEADERS without END_HEADERS, then CONTINUATION frames that push the
+    %% assembled block past its ceiling, the default MAX_HEADER_LIST_SIZE
+    %% (32768). Each frame is within MAX_FRAME_SIZE but the cumulative
+    %% block is not (the HTTP/2 CONTINUATION Flood), so the conn is torn
+    %% down with GOAWAY(ENHANCE_YOUR_CALM). The fragments are never
+    %% HPACK-decoded.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
@@ -896,7 +897,7 @@ continuation_flood_triggers_goaway() ->
     ContinuationF = iolist_to_binary(
         roadrunner_http2_frame:encode({continuation, 1, 0, binary:copy(~"x", 16384)})
     ),
-    serve_recv(ConnPid, ContinuationF),
+    serve_recv(ConnPid, [ContinuationF, ContinuationF]),
     Out = expect_send(),
     %% GOAWAY (type 7) carrying ENHANCE_YOUR_CALM (0x0B): after the 9-byte
     %% frame header the payload is Last-Stream-Id (32 bits) then the error
@@ -909,10 +910,11 @@ continuation_flood_triggers_goaway() ->
     end.
 
 configured_max_header_block_triggers_goaway() ->
-    %% With `max_header_block => 200`, a CONTINUATION block of ~300 bytes
-    %% (well UNDER the default 16384) must still trip the flood guard and
-    %% close with GOAWAY(ENHANCE_YOUR_CALM) — proving the configured cap,
-    %% not the macro default, is what's enforced.
+    %% With `max_header_block => 200` the ceiling is the 400 list size it
+    %% implies, so a CONTINUATION block of ~500 bytes (well UNDER the
+    %% default ceiling) must still trip the flood guard and close with
+    %% GOAWAY(ENHANCE_YOUR_CALM), proving the configured cap, not the
+    %% macro default, is what's enforced.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(#{http2_max_header_block => 200}),
@@ -925,7 +927,7 @@ configured_max_header_block_triggers_goaway() ->
     ),
     serve_recv(ConnPid, HeadersF),
     ContinuationF = iolist_to_binary(
-        roadrunner_http2_frame:encode({continuation, 1, 0, binary:copy(~"x", 300)})
+        roadrunner_http2_frame:encode({continuation, 1, 0, binary:copy(~"x", 400)})
     ),
     serve_recv(ConnPid, ContinuationF),
     Out = expect_send(),
