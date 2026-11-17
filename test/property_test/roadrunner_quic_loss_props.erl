@@ -44,9 +44,7 @@ prop_rtt_and_pto_invariants() ->
         {integer(1, 1000), integer(0, 100), list({integer(1, 500), integer(0, 100)}),
             integer(0, 8)},
         begin
-            S0 = roadrunner_quic_loss:new(#{
-                initial_rtt => InitialRtt, max_ack_delay => MaxAckDelay
-            }),
+            S0 = roadrunner_quic_loss:new(false, MaxAckDelay, 3, InitialRtt),
             {Sn, RttOk} = lists:foldl(fun rtt_step/2, {S0, true}, Samples),
             BasePto = roadrunner_quic_loss:get_pto(Sn),
             SnPto = apply_pto(PtoCount, Sn, fun roadrunner_quic_loss:on_pto_expired/1),
@@ -93,14 +91,13 @@ prop_loss_classification_invariants() ->
         {non_empty(list(boolean())), list(integer(0, 19)), integer(0, 5000),
             integer(0, 2000), integer(0, 5)},
         begin
-            Opts = #{initial_rtt => 100, max_ack_delay => 25},
             NumPackets = length(Eliciting),
             Sent = lists:zip(lists:seq(0, NumPackets - 1), Eliciting),
             Ssent = lists:foldl(
                 fun({PN, AckEliciting}, S) ->
                     roadrunner_quic_loss:on_packet_sent(PN, 100, AckEliciting, PN, PN, S)
                 end,
-                roadrunner_quic_loss:new(Opts),
+                roadrunner_quic_loss:new(false, 25, 3, 100),
                 Sent
             ),
             InFlightOk =

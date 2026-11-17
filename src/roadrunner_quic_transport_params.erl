@@ -23,6 +23,7 @@
 %% send, and silently ignoring unknown/reserved ids.
 
 -export([encode/1, decode/1]).
+-export([max_ack_delay/1, ack_delay_exponent/1]).
 
 -export_type([param_key/0, params/0]).
 
@@ -103,6 +104,10 @@
 -define(MIN_ACTIVE_CONNECTION_ID_LIMIT, 2).
 -define(MAX_STREAMS_LIMIT, 1152921504606846976).
 
+%% RFC 9000 §18.2 defaults of the parameters a set may leave out.
+-define(DEFAULT_MAX_ACK_DELAY, 25).
+-define(DEFAULT_ACK_DELAY_EXPONENT, 3).
+
 %% =============================================================================
 %% encode/1
 %% =============================================================================
@@ -141,6 +146,20 @@ Returns `{ok, Params}` or `{error, Reason}` (a flat atom).
 -spec decode(binary()) -> {ok, params()} | {error, atom()}.
 decode(Data) ->
     decode_params(Data, #{}, #{}).
+
+%% =============================================================================
+%% Accessors
+%% =============================================================================
+
+-doc "The `max_ack_delay` (ms), 25 when absent (RFC 9000 §18.2).".
+-spec max_ack_delay(params()) -> non_neg_integer().
+max_ack_delay(#{max_ack_delay := V}) -> V;
+max_ack_delay(#{}) -> ?DEFAULT_MAX_ACK_DELAY.
+
+-doc "The `ack_delay_exponent`, 3 when absent (RFC 9000 §18.2).".
+-spec ack_delay_exponent(params()) -> non_neg_integer().
+ack_delay_exponent(#{ack_delay_exponent := V}) -> V;
+ack_delay_exponent(#{}) -> ?DEFAULT_ACK_DELAY_EXPONENT.
 
 %% =============================================================================
 %% Internal — encode

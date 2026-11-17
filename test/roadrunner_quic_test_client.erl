@@ -11,6 +11,7 @@
 %% server-reply decoding so neither is duplicated.
 
 -include_lib("public_key/include/public_key.hrl").
+-include("../include/roadrunner_quic.hrl").
 
 -export([key_material/0, gen_keypair/0]).
 -export([client_hello_framed/1, client_hello_framed/3, client_hello_framed/4]).
@@ -214,7 +215,7 @@ padded to 1200, satisfying the server's anti-amplification budget.
     binary()
 ) -> binary().
 seal(Level, PN, Keys, Frames, DCID, SCID) ->
-    Entries = #{Level => #{frames => Frames, keys => Keys, pn => PN}},
+    Entries = #{Level => #quic_entry{frames = Frames, keys = Keys, pn = PN}},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
     Datagram.
 
@@ -231,7 +232,7 @@ with PADDING frames to the 1200-byte floor (§14.1).
     binary(),
     binary()
 ) -> binary().
-seal_initial(PN, #{key := Key, iv := IV, hp := HP}, Frames, DCID, SCID, Token) ->
+seal_initial(PN, #quic_keys{key = Key, iv = IV, hp = HP}, Frames, DCID, SCID, Token) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     Encoded = iolist_to_binary([roadrunner_quic_frame:encode(F) || F <- Frames]),
     %% The header with a 2-byte Length field (every size up to 16383), so
@@ -260,7 +261,7 @@ deliberately malformed frame, mirroring the send path's header sizing.
     binary(),
     binary()
 ) -> binary().
-seal_raw(Level, PN, #{key := Key, iv := IV, hp := HP}, Plaintext, DCID, SCID) ->
+seal_raw(Level, PN, #quic_keys{key = Key, iv = IV, hp = HP}, Plaintext, DCID, SCID) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     SealedSize = byte_size(Plaintext) + 16,
     [Header, _Payload] = roadrunner_quic_packet:encode_long(
@@ -283,7 +284,7 @@ PROTOCOL_VIOLATION once it authenticates (RFC 9000 §17.2).
     binary(),
     binary()
 ) -> binary().
-seal_raw_reserved(Level, PN, #{key := Key, iv := IV, hp := HP}, Plaintext, DCID, SCID) ->
+seal_raw_reserved(Level, PN, #quic_keys{key = Key, iv = IV, hp = HP}, Plaintext, DCID, SCID) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     SealedSize = byte_size(Plaintext) + 16,
     [<<FirstByte, HeaderRest/binary>>, _Payload] = roadrunner_quic_packet:encode_long(
@@ -307,7 +308,7 @@ concat reassembles the flight.
 -spec crypto_bytes(
     [binary()],
     roadrunner_quic_recv:level(),
-    #{roadrunner_quic_recv:level() => map()},
+    #{roadrunner_quic_recv:level() => roadrunner_quic_recv:keys()},
     non_neg_integer()
 ) -> binary().
 crypto_bytes(Datagrams, Level, Keys, DCIDLen) ->
@@ -318,7 +319,7 @@ crypto_bytes(Datagrams, Level, Keys, DCIDLen) ->
 -spec frames(
     [binary()],
     roadrunner_quic_recv:level(),
-    #{roadrunner_quic_recv:level() => map()},
+    #{roadrunner_quic_recv:level() => roadrunner_quic_recv:keys()},
     non_neg_integer()
 ) -> [roadrunner_quic_frame:frame()].
 frames(Datagrams, Level, Keys, DCIDLen) ->
@@ -326,7 +327,7 @@ frames(Datagrams, Level, Keys, DCIDLen) ->
 
 level_frames(Datagram, Level, Keys, DCIDLen) ->
     Outcomes = roadrunner_quic_recv:datagram(Datagram, DCIDLen, Keys, #{}),
-    lists:append([Fs || {ok, #{level := L, frames := Fs}} <- Outcomes, L =:= Level]).
+    lists:append([Fs || {ok, #quic_decoded{level = L, frames = Fs}} <- Outcomes, L =:= Level]).
 
 %% =============================================================================
 %% Handshake-message decoding

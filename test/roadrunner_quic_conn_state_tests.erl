@@ -1,6 +1,7 @@
 -module(roadrunner_quic_conn_state_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("../include/roadrunner_quic.hrl").
 
 -define(M, roadrunner_quic_conn_state).
 -define(TC, roadrunner_quic_test_client).
@@ -323,7 +324,9 @@ undecryptable_packet_dropped_test() ->
     %% A packet sealed with the wrong keys is silently dropped (RFC 9001
     %% §5.4.2); the connection neither advances nor replies.
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
-    WrongKeys = #{key => {aes_128_gcm, <<0:128>>}, iv => <<0:96>>, hp => {aes_128_ecb, <<0:128>>}},
+    WrongKeys = #quic_keys{
+        key = {aes_128_gcm, <<0:128>>}, iv = <<0:96>>, hp = {aes_128_ecb, <<0:128>>}
+    },
     Datagram = ?TC:seal(initial, 0, WrongKeys, [{crypto, 0, ~"hello"}], ?DCID, ?SCID),
     {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
@@ -3886,7 +3889,7 @@ peer_key_update_switches_both_directions_test() ->
     ?assertEqual([], sends(Effects1)),
     {_State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{ack, 0, _, 0, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{ack, 0, _, 0, [], undefined} | _]}}],
         app_packets(Effects2, generation_keys(ServerApSecret, 1))
     ),
     ?assertEqual(
@@ -3909,7 +3912,7 @@ forged_key_phase_changes_nothing_test() ->
     {_State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, Data, State1),
     ?assert(lists:member({emit, self(), {stream_data, 0, ~"hello", true}}, emits(Effects2))),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 0, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 1, _, 0, [], undefined} | _]}}],
         app_packets(Effects2, generation_keys(ServerApSecret, 0))
     ).
 
@@ -3980,7 +3983,11 @@ second_update_before_ack_closes_test() ->
     ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, key_update_error}}}], emits(Effects)),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{connection_close, transport, 16#0e, 0, <<>>}]}}],
+        [
+            {ok, #quic_decoded{
+                key_phase = 1, frames = [{connection_close, transport, 16#0e, 0, <<>>}]
+            }}
+        ],
         app_packets(Effects, generation_keys(ServerApSecret, 1))
     ).
 
@@ -3996,7 +4003,7 @@ second_update_after_ack_commits_test() ->
     ?assertEqual(connected, ?M:phase(State3)),
     {_State4, Effects} = ?M:handle_timeout(?NOW + 50, ack, State3),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 1, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 1, _, 1, [], undefined} | _]}}],
         app_packets(Effects, generation_keys(ServerApSecret, 2))
     ).
 
@@ -4017,7 +4024,7 @@ chacha20_peer_key_update_test() ->
     ?assertEqual(connected, ?M:phase(State1)),
     {State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{ack, 0, _, 0, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{ack, 0, _, 0, [], undefined} | _]}}],
         app_packets(Effects2, generation_keys(chacha20_poly1305, ServerApSecret, 1))
     ),
     ?assertEqual(
@@ -4030,7 +4037,7 @@ chacha20_peer_key_update_test() ->
     ?assertEqual(connected, ?M:phase(State3)),
     {_State4, Effects4} = ?M:handle_timeout(?NOW + 50, ack, State3),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 1, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 1, _, 1, [], undefined} | _]}}],
         app_packets(Effects4, generation_keys(chacha20_poly1305, ServerApSecret, 2))
     ).
 
@@ -4047,7 +4054,7 @@ aes_256_gcm_peer_key_update_test() ->
     ?assertEqual(connected, ?M:phase(State1)),
     {State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{ack, 0, _, 0, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{ack, 0, _, 0, [], undefined} | _]}}],
         app_packets(Effects2, generation_keys(aes_256_gcm, ServerApSecret, 1))
     ),
     ?assertEqual(
@@ -4058,7 +4065,7 @@ aes_256_gcm_peer_key_update_test() ->
     ?assertEqual(connected, ?M:phase(State3)),
     {_State4, Effects4} = ?M:handle_timeout(?NOW + 50, ack, State3),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 1, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 1, _, 1, [], undefined} | _]}}],
         app_packets(Effects4, generation_keys(aes_256_gcm, ServerApSecret, 2))
     ).
 
@@ -4219,7 +4226,7 @@ own_key_update_then_peer_update_test() ->
     State1 = ?M:key_limit(1 bsl 22, Later, send_phase_acked(State, ClientApSecret)),
     {State2, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"hello", true, Later, State1),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{stream, 0, 0, ~"hello", true}]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{stream, 0, 0, ~"hello", true}]}}],
         app_packets(Effects2, generation_keys(ServerApSecret, 1))
     ),
     Response = phase_datagram([ping], 1, generation_keys(ClientApSecret, 1), 1),
@@ -4227,7 +4234,7 @@ own_key_update_then_peer_update_test() ->
     ?assertEqual(connected, ?M:phase(State3)),
     {State4, Effects4} = ?M:handle_timeout(Later + 20, ack, State3),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{ack, 1, _, 1, [], undefined}]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{ack, 1, _, 1, [], undefined}]}}],
         app_packets(Effects4, generation_keys(ServerApSecret, 1))
     ),
     Again = phase_datagram([ping], 2, generation_keys(ClientApSecret, 2), 0),
@@ -4235,7 +4242,7 @@ own_key_update_then_peer_update_test() ->
     ?assertEqual(connected, ?M:phase(State5)),
     {_State6, Effects6} = ?M:handle_timeout(Later + 50, ack, State5),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 2, _, 2, [], undefined}]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 2, _, 2, [], undefined}]}}],
         app_packets(Effects6, generation_keys(ServerApSecret, 2))
     ).
 
@@ -4256,7 +4263,7 @@ own_key_update_waits_for_peer_response_test() ->
     Much = Later + 60000,
     State4 = ?M:key_limit(1 bsl 22, Much, State3),
     {_State5, Effects5} = ?M:handle_send(self(), make_ref(), 0, ~"b", true, Much, State4),
-    [{ok, #{key_phase := 1, frames := Frames}}] =
+    [{ok, #quic_decoded{key_phase = 1, frames = Frames}}] =
         app_packets(Effects5, generation_keys(ServerApSecret, 1)),
     ?assert(lists:member({stream, 0, 1, ~"b", true}, Frames)).
 
@@ -4269,12 +4276,14 @@ own_key_update_needs_acknowledged_phase_test() ->
     Unacked = ?M:key_limit(1 bsl 22, ?NOW + 60000, State),
     {_, Effects1} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, ?NOW + 60000, Unacked),
     ?assertMatch(
-        [{ok, #{key_phase := 0}}], app_packets(Effects1, generation_keys(ServerApSecret, 0))
+        [{ok, #quic_decoded{key_phase = 0}}],
+        app_packets(Effects1, generation_keys(ServerApSecret, 0))
     ),
     TooSoon = ?M:key_limit(1 bsl 22, ?NOW + 1, send_phase_acked(State, ClientApSecret)),
     {_, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, ?NOW + 1, TooSoon),
     ?assertMatch(
-        [{ok, #{key_phase := 0}}], app_packets(Effects2, generation_keys(ServerApSecret, 0))
+        [{ok, #quic_decoded{key_phase = 0}}],
+        app_packets(Effects2, generation_keys(ServerApSecret, 0))
     ),
     #{state1 := Handshaking} = connect(),
     ?assertEqual(
@@ -4293,8 +4302,8 @@ confidentiality_limit_closes_without_update_test() ->
     ?assertEqual(draining, ?M:phase(Closed)),
     ?assertMatch(
         [
-            {ok, #{frames := [{stream, 0, 0, ~"last", true}]}},
-            {ok, #{frames := [{connection_close, transport, 16#0f, 0, <<>>}]}}
+            {ok, #quic_decoded{frames = [{stream, 0, 0, ~"last", true}]}},
+            {ok, #quic_decoded{frames = [{connection_close, transport, 16#0f, 0, <<>>}]}}
         ],
         app_packets(Effects, generation_keys(ServerApSecret, 0))
     ),
@@ -4315,13 +4324,13 @@ chacha20_confidentiality_limit_test() ->
     Gcm = ?M:key_limit(1 bsl 23, Later, Acked),
     {_, Effects1} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, Later, Gcm),
     ?assertMatch(
-        [{ok, #{key_phase := 0}}],
+        [{ok, #quic_decoded{key_phase = 0}}],
         app_packets(Effects1, generation_keys(chacha20_poly1305, ServerApSecret, 0))
     ),
     Half = ?M:key_limit(1 bsl 61, Later, Acked),
     {_, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, Later, Half),
     ?assertMatch(
-        [{ok, #{key_phase := 1}}],
+        [{ok, #quic_decoded{key_phase = 1}}],
         app_packets(Effects2, generation_keys(chacha20_poly1305, ServerApSecret, 1))
     ).
 
@@ -4338,7 +4347,7 @@ aes_256_gcm_confidentiality_limit_test() ->
     Half = ?M:key_limit(1 bsl 22, Later, Acked),
     {_, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, Later, Half),
     ?assertMatch(
-        [{ok, #{key_phase := 1}}],
+        [{ok, #quic_decoded{key_phase = 1}}],
         app_packets(Effects2, generation_keys(aes_256_gcm, ServerApSecret, 1))
     ).
 
@@ -4738,7 +4747,7 @@ validated_move(Peer, State, ClientApSecret, ServerApSecret) ->
 
 %% Seal a peer 1-RTT datagram with the given keys and Key Phase bit.
 phase_datagram(Frames, PN, Keys, KeyPhase) ->
-    Entry = #{frames => Frames, keys => Keys, pn => PN, key_phase => KeyPhase},
+    Entry = #quic_entry{frames = Frames, keys = Keys, pn = PN, key_phase = KeyPhase},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(#{application => Entry}, ?DCID, ?SCID),
     Datagram.
 
@@ -4750,10 +4759,11 @@ generation_keys(Secret, N) ->
     generation_keys(aes_128_gcm, Secret, N).
 
 generation_keys(Aead, Secret, N) ->
-    maps:merge(roadrunner_quic_keys:traffic_keys(Aead, Secret), packet_keys(Aead, Secret, N)).
+    #quic_keys{key = Key, iv = IV} = packet_keys(Aead, Secret, N),
+    (roadrunner_quic_keys:traffic_keys(Aead, Secret))#quic_keys{key = Key, iv = IV}.
 
 packet_keys(Aead, Secret, 0) ->
-    maps:with([key, iv], roadrunner_quic_keys:traffic_keys(Aead, Secret));
+    (roadrunner_quic_keys:traffic_keys(Aead, Secret))#quic_keys{hp = undefined};
 packet_keys(Aead, Secret, N) ->
     {Updated, _PacketKeys} = roadrunner_quic_keys:update(Aead, Secret),
     packet_keys(Aead, Updated, N - 1).
@@ -4771,7 +4781,7 @@ updated_at(PN, ClientApSecret, State) ->
 %% HANDSHAKE_DONE) at `?NOW`, from its own first 1-RTT packet: a packet of the
 %% server's current key phase is acknowledged (RFC 9001 §6.1). `Keys` seal it,
 %% the client's AES-128-GCM first generation unless given.
-send_phase_acked(State, #{} = Keys) ->
+send_phase_acked(State, #quic_keys{} = Keys) ->
     Ack = phase_datagram([{ack, 0, 0, 0, [], undefined}], 0, Keys, 0),
     {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Ack, State),
     State1;
@@ -4782,7 +4792,9 @@ send_phase_acked(State, ClientApSecret) ->
 app_acks(Effects, ServerApSecret) ->
     [
         Frame
-     || {ok, #{frames := Frames}} <- app_packets(Effects, generation_keys(ServerApSecret, 0)),
+     || {ok, #quic_decoded{frames = Frames}} <- app_packets(
+            Effects, generation_keys(ServerApSecret, 0)
+        ),
         Frame <- Frames,
         is_ack(Frame)
     ].
@@ -4869,7 +4881,7 @@ largest_app_pn(Effects, ServerApSecret) ->
     PNs = [
         PN
      || Datagram <- sends(Effects),
-        {ok, #{level := application, pn := PN}} <-
+        {ok, #quic_decoded{level = application, pn = PN}} <-
             roadrunner_quic_recv:datagram(Datagram, byte_size(?DCID), Keys, #{})
     ],
     lists:max(PNs).

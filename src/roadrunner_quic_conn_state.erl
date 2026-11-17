@@ -133,6 +133,8 @@
 %% of our own, nor the 2^23 that close the connection.
 -export([key_limit/3]).
 
+-include("roadrunner_quic.hrl").
+
 -export_type([t/0, config/0, effect/0, event/0, info/0]).
 
 %% RFC 9000 §17.2: the server uses a fixed-length SCID so short headers demux.
@@ -632,10 +634,12 @@ initial_amp(#{}) ->
     roadrunner_quic_amp:new().
 
 %% A handshake-time space (Initial, Handshake), whose packets the peer
-%% acknowledges at once (RFC 9000 §13.2.1, `roadrunner_quic_loss:new/1`).
+%% acknowledges at once (RFC 9000 §13.2.1, `roadrunner_quic_loss:new/1`). The
+%% peer's ACK delay parameters take their defaults until they arrive
+%% (`peer_ack_delay/1`).
 -spec new_space() -> #space{}.
 new_space() ->
-    new_space(roadrunner_quic_loss:new(#{handshake => true})).
+    new_space(roadrunner_quic_loss:new(true)).
 
 -spec new_space(roadrunner_quic_loss:t()) -> #space{}.
 new_space(Loss) ->
@@ -835,7 +839,7 @@ open_held(Now, Packet, #state{recv_keys = RecvKeys} = State0) ->
 %% had been acknowledged (§4.1.2). That is a KEY_UPDATE_ERROR, as it was when
 %% one arrived during the handshake, never a committed update.
 -spec held_outcome(integer(), roadrunner_quic_recv:outcome(), t()) -> t().
-held_outcome(_Now, {ok, #{generation := next}}, #state{phase = connected} = State) ->
+held_outcome(_Now, {ok, #quic_decoded{generation = next}}, #state{phase = connected} = State) ->
     connection_fatal(application, key_update_error, State);
 held_outcome(Now, Outcome, State) ->
     process_outcome(Now, Outcome, State).
@@ -1317,14 +1321,15 @@ process_outcome(_Now, _Outcome, #state{phase = Phase} = State) when
     State;
 process_outcome(
     Now,
-    {ok, #{generation := next, pn := PN} = Decoded},
-    #state{key_phase = Phase, recv_keys = #{application := #{phase := RecvPhase}}} = State
+    {ok, #quic_decoded{generation = next, pn = PN} = Decoded},
+    #state{key_phase = Phase, recv_keys = #{application := #quic_phased_keys{phase = RecvPhase}}} =
+        State
 ) when Phase =/= RecvPhase ->
     %% Our send keys are a generation ahead: this is the peer's response to
     %% our own key update (RFC 9001 §6.2), its send keys now the ones ours
     %% moved to. Only the receive keys move; the update is not a new one.
     process_packet(Now, Decoded, promote_recv_keys(Now, PN, State));
-process_outcome(Now, {ok, #{generation := next, pn := PN} = Decoded}, State) ->
+process_outcome(Now, {ok, #quic_decoded{generation = next, pn = PN} = Decoded}, State) ->
     %% The packet authenticated with the next 1-RTT keys, so the peer has
     %% updated its keys (RFC 9001 §6.2). Only now, after that trial decryption
     %% succeeded, is the update committed: a forged packet with a flipped Key
@@ -1335,14 +1340,16 @@ process_outcome(Now, {ok, #{generation := next, pn := PN} = Decoded}, State) ->
     end;
 process_outcome(
     Now,
-    {ok, #{generation := current, pn := PN} = Decoded},
-    #state{recv_keys = #{application := #{prev_below := Below} = Keys} = RecvKeys} = State
-) when PN < Below ->
+    {ok, #quic_decoded{generation = current, pn = PN} = Decoded},
+    #state{
+        recv_keys = #{application := #quic_phased_keys{prev_below = Below} = Keys} = RecvKeys
+    } = State
+) when is_integer(Below), PN < Below ->
     %% A current-phase packet reordered ahead of the one that began the phase:
     %% only packets numbered below it can be from the previous phase (§6.5), so
     %% the previous keys never open a packet numbered above one the newer keys
     %% opened (§6.4).
-    Keys1 = Keys#{prev_below := PN},
+    Keys1 = Keys#quic_phased_keys{prev_below = PN},
     process_packet(Now, Decoded, State#state{recv_keys = RecvKeys#{application := Keys1}});
 process_outcome(Now, {ok, Decoded}, State) ->
     process_packet(Now, Decoded, State);
@@ -1385,7 +1392,9 @@ process_outcome(_Now, {frame_error, Level, _Reason}, State) ->
 %% Fold a decrypted packet's frames into the connection and record it for
 %% acknowledgment.
 -spec process_packet(integer(), roadrunner_quic_recv:decoded(), t()) -> t().
-process_packet(Now, #{level := Level, pn := PN, frames := Frames}, #state{spaces = Spaces} = State) ->
+process_packet(
+    Now, #quic_decoded{level = Level, pn = PN, frames = Frames}, #state{spaces = Spaces} = State
+) ->
     case Spaces of
         #{Level := #space{ack = Ack}} ->
             case roadrunner_quic_ack:received(PN, Ack) of
@@ -1451,15 +1460,16 @@ promote_recv_keys(
         aead = Aead
     } = State
 ) ->
-    #{key := Key, iv := IV, phase := Phase, next := #{key := NextKey, iv := NextIV}} = Recv,
+    #quic_phased_keys{key = Key, iv = IV, phase = Phase, next = Next} = Recv,
+    #quic_keys{key = NextKey, iv = NextIV} = Next,
     {RecvSecret1, AfterNext} = roadrunner_quic_keys:update(Aead, RecvSecret),
-    Recv1 = Recv#{
-        key := NextKey,
-        iv := NextIV,
-        phase := 1 - Phase,
-        next := roadrunner_quic_keys:for_connection(AfterNext, open),
-        prev => #{key => Key, iv => IV},
-        prev_below => PN
+    Recv1 = Recv#quic_phased_keys{
+        key = NextKey,
+        iv = NextIV,
+        phase = 1 - Phase,
+        next = roadrunner_quic_keys:for_connection(AfterNext, open),
+        prev = #quic_keys{key = Key, iv = IV},
+        prev_below = PN
     },
     #space{loss = Loss} = space(application, State),
     State#state{
@@ -1484,10 +1494,10 @@ advance_send_keys(
     } = State
 ) ->
     {SendSecret1, SendNext} = roadrunner_quic_keys:update(Aead, SendSecret),
-    #{key := SendKey, iv := SendIV} = roadrunner_quic_keys:for_connection(SendNext, seal),
+    #quic_keys{key = SendKey, iv = SendIV} = roadrunner_quic_keys:for_connection(SendNext, seal),
     #space{next_pn = NextPN} = space(application, State),
     State#state{
-        send_keys = SendKeys#{application := Send#{key := SendKey, iv := SendIV}},
+        send_keys = SendKeys#{application := Send#quic_keys{key = SendKey, iv = SendIV}},
         send_secret = SendSecret1,
         key_phase = 1 - Phase,
         sealed = 0,
@@ -1553,7 +1563,7 @@ own_update_permitted(
         phase = connected,
         own_update_at = At,
         key_phase = Phase,
-        recv_keys = #{application := #{phase := Phase}}
+        recv_keys = #{application := #quic_phased_keys{phase = Phase}}
     }
 ) when is_integer(At), Now >= At ->
     true;
@@ -1586,7 +1596,9 @@ expire_previous_keys(
 ) when is_integer(Until), Now >= Until ->
     State#state{
         prev_keys_until = undefined,
-        recv_keys = RecvKeys#{application := maps:without([prev, prev_below], Keys)}
+        recv_keys = RecvKeys#{
+            application := Keys#quic_phased_keys{prev = undefined, prev_below = undefined}
+        }
     };
 expire_previous_keys(_Now, State) ->
     State.
@@ -2144,9 +2156,7 @@ start_validation(Now, Stage, State) ->
     #space{loss = Loss} = space(application, State),
     Interval = max(
         roadrunner_quic_loss:get_pto(Loss),
-        roadrunner_quic_loss:get_pto(
-            roadrunner_quic_loss:new(maps:with([max_ack_delay], State#state.peer_params))
-        )
+        roadrunner_quic_loss:get_pto(peer_loss(State#state.peer_params))
     ),
     queue_challenge(State#state{
         validation = #validation{
@@ -2343,8 +2353,8 @@ path_packet(Now, Path, Frames, #state{scid = SCID, sealed = Sealed} = State) ->
             none;
         {DCID, Budget} ->
             #space{next_pn = PN} = Space = space(application, State),
-            Entry = (entry(application, Frames, PN, State))#{
-                pad_to => path_pad(Budget, pad_keep(Path, Frames, State))
+            Entry = (entry(application, Frames, PN, State))#quic_entry{
+                pad_to = path_pad(Budget, pad_keep(Path, Frames, State))
             },
             {Datagram, [Sent]} = roadrunner_quic_send:datagram(#{application => Entry}, DCID, SCID),
             case byte_size(Datagram) =< Budget of
@@ -2399,9 +2409,9 @@ path_target(_Path, #state{}) ->
 path_sent(Now, current, Sent, Size, #state{amp = Amp} = State) ->
     record_one_sent(Now, Sent, State#state{amp = roadrunner_quic_amp:sent(Size, Amp)});
 path_sent(Now, {validated, _Addr, _DCID}, Sent, _Size, State) ->
-    record_one_sent(Now, Sent#{ack_eliciting := false}, State);
+    record_one_sent(Now, Sent#quic_sent{ack_eliciting = false}, State);
 path_sent(Now, probe, Sent, Size, #state{probe_path = {Addr, Seq, Amp}} = State) ->
-    record_one_sent(Now, Sent#{ack_eliciting := false}, State#state{
+    record_one_sent(Now, Sent#quic_sent{ack_eliciting = false}, State#state{
         probe_path = {Addr, Seq, roadrunner_quic_amp:sent(Size, Amp)}
     }).
 
@@ -2535,9 +2545,15 @@ install_key({application, server, Aead, Secret}, State) ->
 install_key({Level, server, Aead, Secret}, State) ->
     install_send_keys(Level, Aead, Secret, State);
 install_key({application, client, Aead, Secret}, #state{recv_keys = RecvKeys} = State) ->
-    Keys = connection_keys(Aead, Secret, open),
+    #quic_keys{key = Key, iv = IV, hp = HP} = connection_keys(Aead, Secret, open),
     {NextSecret, Next} = roadrunner_quic_keys:update(Aead, Secret),
-    AppKeys = Keys#{phase => 0, next => roadrunner_quic_keys:for_connection(Next, open)},
+    AppKeys = #quic_phased_keys{
+        key = Key,
+        iv = IV,
+        hp = HP,
+        phase = 0,
+        next = roadrunner_quic_keys:for_connection(Next, open)
+    },
     ensure_space(application, State#state{
         recv_keys = RecvKeys#{application => AppKeys}, recv_secret = NextSecret, aead = Aead
     });
@@ -2569,24 +2585,35 @@ connection_keys(Aead, Secret, Direction) ->
 ensure_space(application, #state{spaces = #{application := _}} = State) ->
     State;
 ensure_space(application, #state{spaces = Spaces, peer_params = PeerParams} = State) ->
-    Loss = roadrunner_quic_loss:new(maps:with([max_ack_delay, ack_delay_exponent], PeerParams)),
-    State#state{spaces = Spaces#{application => new_space(Loss)}};
+    State#state{spaces = Spaces#{application => new_space(peer_loss(PeerParams))}};
 ensure_space(_Level, State) ->
     State.
+
+%% A fresh application-space loss state for the peer's ACK delay parameters.
+-spec peer_loss(roadrunner_quic_transport_params:params()) -> roadrunner_quic_loss:t().
+peer_loss(PeerParams) ->
+    roadrunner_quic_loss:new(
+        false,
+        roadrunner_quic_transport_params:max_ack_delay(PeerParams),
+        roadrunner_quic_transport_params:ack_delay_exponent(PeerParams)
+    ).
 
 %% The handshake-time spaces open before the peer's transport parameters
 %% arrive. Its max_ack_delay still sets their persistent congestion duration
 %% (RFC 9002 §7.6.1), and its exponent decodes their ACKs (RFC 9000 §19.3).
 -spec peer_ack_delay(t()) -> t().
 peer_ack_delay(#state{peer_params = PeerParams, spaces = Spaces} = State) ->
-    Params = maps:with([max_ack_delay, ack_delay_exponent], PeerParams),
+    MaxAckDelay = roadrunner_quic_transport_params:max_ack_delay(PeerParams),
+    Exponent = roadrunner_quic_transport_params:ack_delay_exponent(PeerParams),
     State#state{
         spaces = maps:map(
             fun
                 (application, Space) ->
                     Space;
                 (_Level, #space{loss = Loss} = Space) ->
-                    Space#space{loss = roadrunner_quic_loss:set_ack_delay(Params, Loss)}
+                    Space#space{
+                        loss = roadrunner_quic_loss:set_ack_delay(MaxAckDelay, Exponent, Loss)
+                    }
             end,
             Spaces
         )
@@ -2661,11 +2688,11 @@ apply_ack(Now, Level, Ack, Space, #state{cc = Cc} = State) ->
 -spec apply_cc_signal(roadrunner_quic_loss:cc_signal(), integer(), roadrunner_quic_cc_newreno:t()) ->
     roadrunner_quic_cc_newreno:t().
 apply_cc_signal(
-    #{
-        acked_bytes := AckedBytes,
-        largest_acked_time := AckedTime,
-        largest_lost_time := LostTime,
-        persistent_congestion := Persistent
+    #quic_cc_signal{
+        acked_bytes = AckedBytes,
+        largest_acked_time = AckedTime,
+        largest_lost_time = LostTime,
+        persistent_congestion = Persistent
     },
     Now,
     Cc
@@ -3357,7 +3384,7 @@ drain_built(Now, Levels, State, Acc) ->
             %% pass, and so do the probes a probe timeout queued (§7.5). On a
             %% block, return the pre-build State so the consumed ACK / stream
             %% slice stays pending for the next pass.
-            AckEliciting = lists:any(fun(#{ack_eliciting := Elicit}) -> Elicit end, Sent),
+            AckEliciting = lists:any(fun(#quic_sent{ack_eliciting = Elicit}) -> Elicit end, Sent),
             CcOk =
                 not AckEliciting orelse Probes > 0 orelse
                     roadrunner_quic_cc_newreno:can_send(total_bytes_in_flight(State), Cc),
@@ -3429,7 +3456,8 @@ send_ack_only(Now, Levels, State, Acc) ->
             end
     end.
 
--spec build_ack_only([level()], integer(), t()) -> none | {#{level() => map()}, t()}.
+-spec build_ack_only([level()], integer(), t()) ->
+    none | {#{level() => roadrunner_quic_send:entry()}, t()}.
 build_ack_only([], _Now, _State) ->
     none;
 build_ack_only([Level | Rest], Now, State) ->
@@ -3452,7 +3480,8 @@ build_ack_only([Level | Rest], Now, State) ->
 %% flight would overflow. It also makes the forbidden Initial+1-RTT
 %% coalescing structurally impossible. Coalescing Initial+Handshake is a
 %% deferred optimization. Returns `none` when nothing is pending anywhere.
--spec build_first([level()], integer(), t()) -> none | {#{level() => map()}, t()}.
+-spec build_first([level()], integer(), t()) ->
+    none | {#{level() => roadrunner_quic_send:entry()}, t()}.
 build_first([], _Now, _State) ->
     none;
 build_first([Level | Rest], Now, State) ->
@@ -3461,7 +3490,7 @@ build_first([Level | Rest], Now, State) ->
         {Entry, Built} -> {#{Level => Entry}, Built}
     end.
 
--spec build_level(level(), integer(), t()) -> none | {map(), t()}.
+-spec build_level(level(), integer(), t()) -> none | {roadrunner_quic_send:entry(), t()}.
 build_level(Level, Now, State) ->
     Space = space(Level, State),
     {AckFrames, Ack} = take_ack(Space#space.ack, Now),
@@ -3545,7 +3574,7 @@ ack_due(_Level, _Now, _Space) ->
 %% fresh data: CRYPTO at the handshake levels, application STREAM frames at
 %% the application level (which never carries CRYPTO).
 -spec build_data(level(), [roadrunner_quic_frame:frame()], boolean(), #space{}, t()) ->
-    none | {map(), t()}.
+    none | {roadrunner_quic_send:entry(), t()}.
 build_data(application, AckFrames, AckDue, #space{next_pn = PN} = Space, State) ->
     {StreamFrames, State1} = take_stream(AckFrames, PN, State),
     case {StreamFrames, AckDue} of
@@ -3652,7 +3681,8 @@ stream_blocked_frame(_Sid, ok, _StreamFlow) ->
 %% A 1-RTT packet counts toward its send keys' confidentiality limit (RFC
 %% 9001 §6.6); a datagram that does not go out returns the state from before
 %% it, so only packets sent are counted.
--spec build_entry(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> {map(), t()}.
+-spec build_entry(level(), [roadrunner_quic_frame:frame()], #space{}, t()) ->
+    {roadrunner_quic_send:entry(), t()}.
 build_entry(application, Frames, #space{next_pn = PN} = Space, #state{sealed = Sealed} = State) ->
     Entry = entry(application, Frames, PN, State),
     State1 = ack_in_phase(application, Frames, State#state{sealed = Sealed + 1}),
@@ -3667,10 +3697,10 @@ build_entry(Level, Frames, #space{next_pn = PN} = Space, State) ->
 -spec entry(level(), [roadrunner_quic_frame:frame()], non_neg_integer(), t()) ->
     roadrunner_quic_send:entry().
 entry(application, Frames, PN, #state{send_keys = #{application := Keys}, key_phase = Phase}) ->
-    #{frames => Frames, keys => Keys, pn => PN, key_phase => Phase};
+    #quic_entry{frames = Frames, keys = Keys, pn = PN, key_phase = Phase};
 entry(Level, Frames, PN, #state{send_keys = SendKeys}) ->
     #{Level := Keys} = SendKeys,
-    #{frames => Frames, keys => Keys, pn => PN}.
+    #quic_entry{frames = Frames, keys = Keys, pn = PN}.
 
 %% A 1-RTT packet carrying an ACK, the first since a key update, completes
 %% the update (RFC 9001 §6.2): it acknowledges a packet of the new phase, so
@@ -3732,7 +3762,9 @@ record_sent(Now, Sent, State) ->
 -spec record_one_sent(integer(), roadrunner_quic_send:sent(), t()) -> t().
 record_one_sent(
     Now,
-    #{level := Level, pn := PN, length := Len, ack_eliciting := AckEliciting, frames := Frames},
+    #quic_sent{
+        level = Level, pn = PN, length = Len, ack_eliciting = AckEliciting, frames = Frames
+    },
     State
 ) ->
     Space = space(Level, State),

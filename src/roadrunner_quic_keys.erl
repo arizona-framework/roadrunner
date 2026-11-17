@@ -30,15 +30,15 @@
     for_connection/2
 ]).
 
+-include("roadrunner_quic.hrl").
+
 -export_type([keys/0, packet_keys/0]).
 
--type keys() :: #{
-    key := roadrunner_quic_aead:aead_key(), iv := binary(), hp := roadrunner_quic_aead:hp()
-}.
+-type keys() :: #quic_keys{hp :: roadrunner_quic_aead:hp()}.
 
 %% The AEAD key and IV of one 1-RTT key generation: what a key update
 %% changes, since the header-protection key stays the same (RFC 9001 §6.1).
--type packet_keys() :: #{key := roadrunner_quic_aead:aead_key(), iv := binary()}.
+-type packet_keys() :: #quic_keys{hp :: undefined}.
 
 %% RFC 9001 §5.2: the QUIC v1 Initial salt,
 %% 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a.
@@ -91,7 +91,7 @@ traffic_keys(Cipher, Secret) ->
     HP = roadrunner_quic_hkdf:expand_label(
         hash(Cipher), Secret, ~"quic hp", <<>>, key_len(Cipher)
     ),
-    (packet_keys(Cipher, Secret))#{hp => {hp_cipher(Cipher), HP}}.
+    (packet_keys(Cipher, Secret))#quic_keys{hp = {hp_cipher(Cipher), HP}}.
 
 -doc """
 Derive the next key generation for a key update (RFC 9001 §6.1):
@@ -126,10 +126,10 @@ update (`update/2`) carry no header-protection key, so only their AEAD
 key is prepared.
 """.
 -spec for_connection(Keys, seal | open) -> Keys when Keys :: keys() | packet_keys().
-for_connection(#{key := {Cipher, Key}, hp := HP} = Keys, Direction) ->
-    Keys#{key := aead_state(Cipher, Key, Direction), hp := hp_state(HP)};
-for_connection(#{key := {Cipher, Key}} = Keys, Direction) ->
-    Keys#{key := aead_state(Cipher, Key, Direction)}.
+for_connection(#quic_keys{key = {Cipher, Key}, hp = undefined} = Keys, Direction) ->
+    Keys#quic_keys{key = aead_state(Cipher, Key, Direction)};
+for_connection(#quic_keys{key = {Cipher, Key}, hp = HP} = Keys, Direction) ->
+    Keys#quic_keys{key = aead_state(Cipher, Key, Direction), hp = hp_state(HP)}.
 
 %% =============================================================================
 %% Internal
@@ -139,13 +139,13 @@ for_connection(#{key := {Cipher, Key}} = Keys, Direction) ->
 -spec packet_keys(roadrunner_quic_aead:cipher(), binary()) -> packet_keys().
 packet_keys(Cipher, Secret) ->
     Hash = hash(Cipher),
-    #{
-        key =>
+    #quic_keys{
+        key =
             {Cipher,
                 roadrunner_quic_hkdf:expand_label(
                     Hash, Secret, ~"quic key", <<>>, key_len(Cipher)
                 )},
-        iv => roadrunner_quic_hkdf:expand_label(Hash, Secret, ~"quic iv", <<>>, 12)
+        iv = roadrunner_quic_hkdf:expand_label(Hash, Secret, ~"quic iv", <<>>, 12)
     }.
 
 %% The hash of the cipher suite an AEAD belongs to (RFC 8446 Appendix B.4):

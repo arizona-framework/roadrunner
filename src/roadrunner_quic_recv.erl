@@ -56,40 +56,28 @@
 %% path used by the round-trip tests.
 -export([reconstruct_pn/3]).
 
--export_type([level/0, keys/0, generation/0, decoded/0, outcome/0]).
+-include("roadrunner_quic.hrl").
+
+-export_type([level/0, keys/0, phased_keys/0, generation/0, decoded/0, outcome/0]).
 
 %% The three QUIC packet-number spaces (RFC 9000 §12.3); a 1-RTT
 %% short-header packet belongs to the application space.
 -type level() :: initial | handshake | application.
 
 %% A level's receive keys. The application keys may also carry the key
-%% update generations (see the module comment): `phase` is the Key Phase
-%% bit of the current keys and `next` the generation after them; `prev` is
-%% the previous generation, kept for packets numbered below `prev_below`
-%% (the lowest packet number seen in the current phase). Without `phase`
-%% the keys open every packet, whatever its Key Phase bit.
--type keys() :: #{
-    key := roadrunner_quic_aead:aead_key(),
-    iv := binary(),
-    hp := roadrunner_quic_aead:hp(),
-    phase => 0 | 1,
-    next => roadrunner_quic_keys:packet_keys(),
-    prev => roadrunner_quic_keys:packet_keys(),
-    prev_below => non_neg_integer()
+%% update generations (see the module comment), as `#quic_phased_keys{}`;
+%% plain keys open every packet, whatever its Key Phase bit.
+-type keys() :: roadrunner_quic_keys:keys() | phased_keys().
+
+-type phased_keys() :: #quic_phased_keys{
+    next :: roadrunner_quic_keys:packet_keys(),
+    prev :: roadrunner_quic_keys:packet_keys() | undefined
 }.
 
 %% The 1-RTT key generation that opened a packet (RFC 9001 §6).
 -type generation() :: previous | current | next.
 
--type decoded() :: #{
-    level := level(),
-    pn := non_neg_integer(),
-    frames := [roadrunner_quic_frame:frame()],
-    %% Present only for application packets: the 1-RTT Key Phase bit and
-    %% the key generation that opened the packet.
-    key_phase => 0 | 1,
-    generation => generation()
-}.
+-type decoded() :: #quic_decoded{}.
 
 -type outcome() ::
     {ok, decoded()}
@@ -129,12 +117,12 @@ datagram(Datagram, DCIDLen, Keys, Largest) ->
 packet(Packet, DCIDLen, Keys, Largest) ->
     maybe
         {ok, Level} ?= classify(Packet),
-        {ok, #{hp := HP} = LevelKeys} ?= level_keys(Level, Packet, Keys),
+        {ok, LevelKeys} ?= level_keys(Level, Packet, Keys),
         {ok, PNOffset} ?= roadrunner_quic_packet:pn_offset(Packet, DCIDLen),
         {ok, Header, PNLen, TruncPN, Ciphertext} ?=
-            roadrunner_quic_aead:unprotect_header(HP, Packet, PNOffset),
+            roadrunner_quic_aead:unprotect_header(hp(LevelKeys), Packet, PNOffset),
         PN = reconstruct_pn(level_largest(Level, Largest), PNLen, TruncPN),
-        {Generation, #{key := Key, iv := IV}} = generation_keys(Header, PN, LevelKeys),
+        {Generation, Key, IV} = generation_keys(Header, PN, LevelKeys),
         {ok, Plaintext} ?= open(Level, Key, IV, PN, Header, Ciphertext),
         %% RFC 9000 §17.2 / §17.3.1: the header's reserved bits MUST be 0.
         %% Checked only after the packet authenticates (open/6 above) so a
@@ -180,6 +168,12 @@ level_largest(Level, Largest) ->
         #{} -> undefined
     end.
 
+%% The header-protection key, the same for every key generation (RFC 9001
+%% §6.1).
+-spec hp(keys()) -> roadrunner_quic_aead:hp().
+hp(#quic_keys{hp = HP}) -> HP;
+hp(#quic_phased_keys{hp = HP}) -> HP.
+
 %% Reconstruct the full packet number from the truncated wire value and
 %% the largest received in this space (RFC 9000 §A.3). A fresh space
 %% (`undefined`) uses the truncated value directly.
@@ -205,19 +199,24 @@ reconstruct_pn(Largest, PNLen, TruncPN) ->
 %% and keys without one open every packet. Each choice opens the packet
 %% exactly once, so the time it takes does not tell which keys were tried.
 -spec generation_keys(binary(), non_neg_integer(), keys()) ->
-    {generation(), roadrunner_quic_keys:packet_keys() | keys()}.
-generation_keys(<<FirstByte, _/binary>>, PN, #{phase := Phase, next := Next} = Keys) ->
+    {generation(), roadrunner_quic_aead:aead_key(), binary()}.
+generation_keys(<<FirstByte, _/binary>>, PN, #quic_phased_keys{phase = Phase} = Keys) ->
     case roadrunner_quic_packet:key_phase(FirstByte) of
         Phase ->
-            {current, Keys};
+            #quic_phased_keys{key = Key, iv = IV} = Keys,
+            {current, Key, IV};
         _Flipped ->
             case Keys of
-                #{prev := Prev, prev_below := Below} when PN < Below -> {previous, Prev};
-                #{} -> {next, Next}
+                #quic_phased_keys{prev = #quic_keys{key = Key, iv = IV}, prev_below = Below} when
+                    PN < Below
+                ->
+                    {previous, Key, IV};
+                #quic_phased_keys{next = #quic_keys{key = Key, iv = IV}} ->
+                    {next, Key, IV}
             end
     end;
-generation_keys(_Header, _PN, Keys) ->
-    {current, Keys}.
+generation_keys(_Header, _PN, #quic_keys{key = Key, iv = IV}) ->
+    {current, Key, IV}.
 
 %% Normalise the AEAD open result (a bare `error`) to the tagged
 %% authentication failure the packet/4 maybe expects.
@@ -244,15 +243,15 @@ decode_frames(Level, Generation, PN, Header, Plaintext) ->
 -spec decoded(level(), generation(), non_neg_integer(), binary(), [roadrunner_quic_frame:frame()]) ->
     decoded().
 decoded(application, Generation, PN, <<FirstByte, _/binary>>, Frames) ->
-    #{
-        level => application,
-        pn => PN,
-        frames => Frames,
-        key_phase => roadrunner_quic_packet:key_phase(FirstByte),
-        generation => Generation
+    #quic_decoded{
+        level = application,
+        pn = PN,
+        frames = Frames,
+        key_phase = roadrunner_quic_packet:key_phase(FirstByte),
+        generation = Generation
     };
 decoded(Level, _Generation, PN, _Header, Frames) ->
-    #{level => Level, pn => PN, frames => Frames}.
+    #quic_decoded{level = Level, pn = PN, frames = Frames}.
 
 %% RFC 9000 §17.2 (long header) / §17.3.1 (short header): the reserved
 %% bits of the unprotected first byte are 0 in a conformant packet.
