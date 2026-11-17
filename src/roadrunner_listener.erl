@@ -211,11 +211,13 @@ Optional middleware and timing knobs (durations in milliseconds):
   precedes the handshake. Default 5 s, at most `16#FFFFFFFF` ms.
 - `keep_alive_timeout` — idle timeout between requests on a
   keep-alive conn: on HTTP/1.1 between one request and the next, on
-  HTTP/2 how long the connection may stay quiet before it is closed with
-  a GOAWAY, or, while a handler is still at work, checked with a PING
-  (at least 1 s, so a client has time to send its first request and to
-  answer the PING), and on HTTP/3 the QUIC idle timeout the server
-  offers (at least 1 s; the connection uses the smaller of it and the
+  HTTP/2 how long after its last request ended (or after it opened) a
+  connection with no request open is closed with a GOAWAY, whatever
+  else the client sends meanwhile (gRPC's `max_connection_idle`), and
+  how long one with a handler still at work may stay quiet before it is
+  checked with a PING (at least 1 s, so a client has time to send its
+  first request and to answer the PING), and on HTTP/3 the QUIC idle
+  timeout the server offers (at least 1 s; the connection uses the smaller of it and the
   client's, and closes once it passes with nothing received; a client
   waiting on a response keeps it open, as RFC 9114 §5.1 expects of it,
   while the server does not). Default 60 s, at most `16#FFFFFFFF` ms.

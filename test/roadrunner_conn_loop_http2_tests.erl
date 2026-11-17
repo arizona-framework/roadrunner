@@ -2528,7 +2528,9 @@ idle_timeout_closes_when_the_liveness_ping_goes_unanswered() ->
 idle_timeout_after_the_handler_ends_is_a_plain_idle_close() ->
     %% A liveness PING goes out, then the handler answers and ends: with
     %% nothing left serving, the next idle timeout is a plain idle close,
-    %% even with that PING unanswered.
+    %% even with that PING unanswered. Stream 3, its request body still
+    %% to come, keeps the conn from being idle (no `idle_deadline`), so it
+    %% is the liveness wait that ends.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     Self = self(),
@@ -2547,6 +2549,7 @@ idle_timeout_after_the_handler_ends_is_a_plain_idle_close() ->
         serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
         _ = expect_send(),
         serve_recv(ConnPid, complete_get_headers(1, ~"/block")),
+        serve_recv(ConnPid, open_headers(3, ~"/")),
         Worker = wait_for_register(roadrunner_h2_block_test, 1000),
         ?assertMatch(<<0, 0, 8, 6, 0, 0:32, "rr-alive">>, expect_send()),
         Worker ! release,

@@ -391,6 +391,13 @@
     %% hook) is captured at `enter/6`, so it must be set before connect.
     handshake_timeout = ?HANDSHAKE_TIMEOUT_DEFAULT :: non_neg_integer(),
     idle_timeout = ?IDLE_TIMEOUT_DEFAULT :: non_neg_integer(),
+    %% When (`erlang:monotonic_time(millisecond)`) the conn closes for
+    %% being idle: set once it has no stream and no worker left (from the
+    %% start, and as its last stream goes, `idle_deadline/3`), cleared by
+    %% the next stream it opens, and moved by nothing else, so no frame a
+    %% client sends without a request (PING, SETTINGS, WINDOW_UPDATE...)
+    %% keeps an unused conn open. `undefined` while it serves.
+    idle_deadline = undefined :: integer() | undefined,
     %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
     %% Prepended to every response by `roadrunner_http:auto_headers/2`.
     %% Read from proto_opts at `enter/6`.
@@ -544,7 +551,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
         real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
         handshake_timeout = HandshakeTimeout,
-        idle_timeout = IdleTimeout
+        idle_timeout = IdleTimeout,
+        idle_deadline = erlang:monotonic_time(millisecond) + IdleTimeout
     },
     handshake(State).
 
@@ -771,23 +779,20 @@ recv_more(
         recv_idle_expired(State)
     end.
 
-%% Idle-wait timeout selection. When no streams are in flight, no worker
-%% runs (one whose stream was reset may), AND the listener opted into a
-%% `hibernate_after` shorter than the idle
-%% timeout, park for that window so `recv_idle_expired/1` can
-%% hibernate. Otherwise the GOAWAY idle timeout applies: whenever
-%% streams are active, where worker messages are imminent and
-%% hibernating would be pointless, and when the idle timeout comes
-%% first anyway.
+%% Idle-wait timeout selection. A conn still serving waits the idle
+%% timeout from its last message: worker messages are imminent, and the
+%% quiet wire only brings the liveness PING (`recv_idle_expired/1`). An
+%% idle one waits what is left until its `idle_deadline`, or, when the
+%% listener opted into a `hibernate_after` shorter than that, parks for
+%% that window so `recv_idle_expired/1` can hibernate.
 -spec recv_timeout(#loop{}) -> non_neg_integer().
-recv_timeout(#loop{
-    streams = Streams, worker_refs = Refs, hibernate_after = Ms, idle_timeout = T
-}) when
-    map_size(Streams) =:= 0, map_size(Refs) =:= 0, Ms > 0, Ms < T
-->
-    Ms;
-recv_timeout(#loop{idle_timeout = T}) ->
-    T.
+recv_timeout(#loop{idle_deadline = undefined, idle_timeout = T}) ->
+    T;
+recv_timeout(#loop{idle_deadline = Deadline, hibernate_after = Ms}) ->
+    case max(0, Deadline - erlang:monotonic_time(millisecond)) of
+        Left when Ms > 0, Ms < Left -> Ms;
+        Left -> Left
+    end.
 
 %% Fired when `recv_more/1` sees no traffic for `recv_timeout/1`. With
 %% no stream and no worker and `hibernate_after` the shorter wait, collapse
@@ -805,13 +810,15 @@ recv_timeout(#loop{idle_timeout = T}) ->
 %% idle timeout pass, which closes the conn. Otherwise emit the idle
 %% GOAWAY now.
 -spec recv_idle_expired(#loop{}) -> no_return().
-recv_idle_expired(
-    #loop{streams = Streams, worker_refs = Refs, hibernate_after = Ms, idle_timeout = T} = State
-) when
-    map_size(Streams) =:= 0, map_size(Refs) =:= 0, Ms > 0, Ms < T
-->
-    TRef = erlang:start_timer(T - Ms, self(), ?MODULE),
-    erlang:hibernate(?MODULE, recv_more_hib, [State, TRef]);
+recv_idle_expired(#loop{idle_deadline = Deadline} = State) when is_integer(Deadline) ->
+    %% Idle: time left means the `hibernate_after` wait ran out first.
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Left when Left > 0 ->
+            TRef = erlang:start_timer(Left, self(), ?MODULE),
+            erlang:hibernate(?MODULE, recv_more_hib, [State, TRef]);
+        _Passed ->
+            idle_goaway(State)
+    end;
 recv_idle_expired(#loop{liveness_ping = false} = State) ->
     case serving(State) of
         true ->
@@ -860,6 +867,21 @@ idle_goaway(State, Reason) ->
     %% Closing an idle conn is no error (RFC 9113 §6.8, §7).
     _ = send_goaway(State, no_error),
     exit_clean(State, Reason).
+
+%% The `idle_deadline` once `Streams` and `Refs` are what the conn holds:
+%% the idle timeout from now when they leave it with no stream and no
+%% worker, the deadline it already has otherwise. Set as the last stream
+%% or worker goes, in the update that drops it: every path that drops a
+%% stream (`remove_stream/3`, `drop_reset_stream/2`, `abort_stream/3`) or
+%% a worker whose stream is gone (`handle_worker_down/3`) asks it.
+-spec idle_deadline(#{stream_id() => stream_entry()}, #{reference() => stream_id()}, #loop{}) ->
+    integer() | undefined.
+idle_deadline(Streams, Refs, #loop{idle_deadline = undefined, idle_timeout = T}) when
+    map_size(Streams) =:= 0, map_size(Refs) =:= 0
+->
+    erlang:monotonic_time(millisecond) + T;
+idle_deadline(_Streams, _Refs, #loop{idle_deadline = Deadline}) ->
+    Deadline.
 
 %% Hibernate re-entry (see `recv_idle_expired/1`). Drops the idle
 %% timer and resumes the unified mailbox loop after an idle conn wakes
@@ -1239,6 +1261,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     State1 = State#loop{
         streams = (State#loop.streams)#{StreamId => Stream},
         live_streams = State#loop.live_streams + 1,
+        idle_deadline = undefined,
         last_stream_id = StreamId,
         peer_stream_id = StreamId,
         awaiting_continuation =
@@ -2222,7 +2245,13 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
                     %% still arriving (`forget_stream/3`): nothing is left
                     %% to answer, and the stream it held toward
                     %% `max_concurrent_streams` is free.
-                    reset_worker_ended(State#loop{worker_refs = Refs1}, MonRef)
+                    reset_worker_ended(
+                        State#loop{
+                            worker_refs = Refs1,
+                            idle_deadline = idle_deadline(State#loop.streams, Refs1, State)
+                        },
+                        MonRef
+                    )
             end;
         #{} ->
             State
@@ -2719,8 +2748,13 @@ drop_reset_stream(#loop{streams = Streams0} = State0, StreamId) ->
                 WorkerPid ! {h2_stream_reset, StreamId},
                 hold_reset_slot(State#loop.reset_workers, MonRef, Counted)
         end,
+    Streams1 = forget_stream(State, StreamId, Streams),
     withdraw_parked(
-        State#loop{streams = forget_stream(State, StreamId, Streams), reset_workers = Reset},
+        State#loop{
+            streams = Streams1,
+            reset_workers = Reset,
+            idle_deadline = idle_deadline(Streams1, State#loop.worker_refs, State)
+        },
         StreamId
     ).
 
@@ -2739,8 +2773,15 @@ abort_stream(State0, StreamId, ErrorCode) ->
     #{StreamId := #{pending_sends := Pending}} = Streams,
     notify_pending_reset(StreamId, Pending),
     _ = send_rst_stream(State, StreamId, ErrorCode),
+    Streams1 = forget_stream(State, StreamId, Streams),
     withdraw_parked(
-        remember_reset(State#loop{streams = forget_stream(State, StreamId, Streams)}, StreamId),
+        remember_reset(
+            State#loop{
+                streams = Streams1,
+                idle_deadline = idle_deadline(Streams1, State#loop.worker_refs, State)
+            },
+            StreamId
+        ),
         StreamId
     ).
 
@@ -2778,7 +2819,12 @@ remove_reset_stream(State, StreamId) ->
 -spec remove_stream(#loop{}, stream_id(), #{reference() => stream_id()}) -> #loop{}.
 remove_stream(State0, StreamId, Refs) ->
     #loop{streams = Streams} = State = withdraw_parked(uncount_stream(State0, StreamId), StreamId),
-    State#loop{streams = forget_stream(State, StreamId, Streams), worker_refs = Refs}.
+    Streams1 = forget_stream(State, StreamId, Streams),
+    State#loop{
+        streams = Streams1,
+        worker_refs = Refs,
+        idle_deadline = idle_deadline(Streams1, Refs, State)
+    }.
 
 %% Drop a stream's entry, unless its header block (trailers) is still
 %% arriving in CONTINUATION frames: then the entry stays, as a closed
