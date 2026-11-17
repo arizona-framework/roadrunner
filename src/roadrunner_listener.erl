@@ -245,8 +245,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   to move clients to other servers now and then, for example behind a
   load balancer that only balances new connections. The response that
   reaches it carries `Connection: close`, and requests pipelined after
-  it are not served. HTTP/2 and HTTP/3 connections have no request
-  count limit.
+  it are not served: the close lingers over them for the `http1`
+  `linger_timeout`, so the client reads that response instead of losing
+  it to a reset. HTTP/2 and HTTP/3 connections have no request count
+  limit.
 - `max_clients`: concurrent connection cap. Default 16384 (the modern
   Erlang/Elixir HTTP-server norm). A connection counts from the moment
   it is accepted, so on a TLS listener one still in its handshake holds
@@ -749,7 +751,9 @@ cookies / tracing metadata); lower them to tighten the attack surface.
   `431`. Default `100`.
 - `linger_timeout` — after a response that closes the connection before
   the request was read to its end (a 413 over the body cap, a 431, a
-  handler answering without reading its body), how long in milliseconds
+  handler answering without reading its body, the response that reaches
+  `max_keep_alive_requests` while the client may have pipelined more),
+  how long in milliseconds
   the connection keeps reading and dropping what the client still sends
   before it closes. Closing with unread input makes the kernel reset the
   connection, which can wipe the response before the client reads it

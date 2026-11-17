@@ -2069,7 +2069,7 @@ buffered_finish(S0, Req, Headers) ->
                     %% `ensure_close_signaled/3` added `Connection: close`
                     %% because this request tripped `max_keep_alive_requests`
                     %% — both land here, and both close the connection.
-                    exit_normal(S, normal);
+                    exit_closing(S);
                 keep_alive ->
                     Leftover = pipelined_leftover(Req, S, ManualLeftover),
                     S1 = release_request_slot(S),
@@ -2084,6 +2084,19 @@ buffered_finish(S0, Req, Headers) ->
             %% be sending.
             exit_lingering(S, normal)
     end.
+
+%% Close after a response that said `Connection: close`. At the request
+%% ceiling the client did not ask for it, so it may already have pipelined
+%% more requests behind that response: closing with them unread would send a
+%% reset that can wipe the response before the client reads it, so the close
+%% lingers over them (RFC 9112 §9.6).
+-spec exit_closing(#loop_state{}) -> no_return().
+exit_closing(#loop_state{requests_served = Served, max_keep_alive_requests = Max} = S) when
+    Served >= Max
+->
+    exit_lingering(S, normal);
+exit_closing(S) ->
+    exit_normal(S, normal).
 
 %% The close path a WebSocket session runs in this process once it ends:
 %% the websocket finishing path (`request_stop`, any unread manual-mode
