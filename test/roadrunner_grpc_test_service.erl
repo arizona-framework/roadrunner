@@ -10,6 +10,7 @@
 -export([stale_compression/2, held/1, was_compressed/2, flood/2, big_trailer/2]).
 -export([hold/2, watch/2, stop_after/2, reset_at/2, watch_late/2, keys/2]).
 -export([active_sum/1, active_chat/1, mixed_sum/1, notify/2]).
+-export([read_sum/1, read_watch/2, read_watch_late/2]).
 -export([request/2, rich_fail/2, rich_fail_after/2]).
 
 name() -> ~"test.Echo".
@@ -22,6 +23,7 @@ rpcs() ->
         ~"Unary" => rpc(unary, unary),
         ~"Count" => rpc(count, server_stream),
         ~"Sum" => rpc(sum, client_stream),
+        ~"ReadSum" => rpc(read_sum, client_stream),
         ~"Chat" => rpc(chat, bidi_stream),
         ~"Fail" => rpc(fail, unary),
         ~"Crash" => rpc(crash, unary),
@@ -47,9 +49,11 @@ rpcs() ->
         ~"BigTrailer" => rpc(big_trailer, unary),
         ~"Hold" => rpc(hold, unary),
         ~"Watch" => rpc(watch, server_stream),
+        ~"ReadWatch" => rpc(read_watch, server_stream),
         ~"StopAfter" => rpc(stop_after, server_stream),
         ~"ResetAt" => rpc(reset_at, unary),
         ~"WatchLate" => rpc(watch_late, server_stream),
+        ~"ReadWatchLate" => rpc(read_watch_late, server_stream),
         ~"Keys" => rpc(keys, unary),
         ~"ActiveSum" => rpc(active_sum, client_stream),
         ~"ActiveChat" => rpc(active_chat, bidi_stream),
@@ -82,6 +86,13 @@ sum(Stream, Acc) ->
         {ok, M, Stream1} -> sum(Stream1, <<Acc/binary, M/binary>>);
         {eof, Stream1} -> {reply, Acc, Stream1}
     end.
+
+%% `Sum`, telling the process registered as `roadrunner_grpc_held` once
+%% it has read the first message.
+read_sum(Stream) ->
+    {ok, M, Stream1} = roadrunner_grpc:recv(Stream),
+    roadrunner_grpc_held ! {read, self()},
+    sum(Stream1, M).
 
 chat(Stream) ->
     case roadrunner_grpc:recv(Stream) of
@@ -242,6 +253,12 @@ watch(_Request, Stream) ->
             end
     end.
 
+%% `Watch`, telling the process registered as `roadrunner_grpc_held` it
+%% has read its request.
+read_watch(Request, Stream) ->
+    roadrunner_grpc_held ! {read, self()},
+    watch(Request, Stream).
+
 %% Stops on purpose after a response started.
 stop_after(Request, Stream) ->
     _ = roadrunner_grpc:send(Request, Stream),
@@ -265,6 +282,12 @@ watch_late(Request, Stream) ->
                     watch_late(Request, Stream)
             end
     end.
+
+%% `WatchLate`, telling the process registered as `roadrunner_grpc_held`
+%% it has read its request.
+read_watch_late(Request, Stream) ->
+    roadrunner_grpc_held ! {read, self()},
+    watch_late(Request, Stream).
 
 %% The keys the call keeps in its process dictionary, sorted, after
 %% `cancelled/2` told it a reset arrived when the request is `cancelled`.
