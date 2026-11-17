@@ -219,10 +219,10 @@ double_chunked_te_rejected_test() ->
     %% RFC 9112 §6.1: a server MUST reject this (chunked may appear
     %% only once and must be the final coding).
     %%
-    %% Roadrunner's `cached_decisions` flags any non-chunked TE as
-    %% `bad_transfer_encoding` at body-read time. The header parse
-    %% itself succeeds; parser reports {ok, _, _}.
+    %% The header parse itself succeeds; its decisions frame the body as
+    %% `bad_transfer_encoding`, which the conn answers with 400 + close.
     Bytes =
         <<"POST / HTTP/1.1\r\nHost: x\r\n", "Transfer-Encoding: chunked, chunked\r\n\r\n",
             "0\r\n\r\n">>,
-    ?assertMatch({ok, _, _}, roadrunner_http1:parse_request(Bytes)).
+    {ok, #{cached_decisions := D}, _} = roadrunner_http1:parse_request(Bytes),
+    ?assertEqual({error, bad_transfer_encoding}, roadrunner_http1:framing(D)).

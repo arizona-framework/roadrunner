@@ -945,17 +945,27 @@ compute_cached_decisions_loop([], Chunked, TE, Expect, Conn, CL, Host, CT) ->
 %% of that field's general clause. The literal is its own lowercase, so
 %% `ascii_lowercase/1` would walk it only to hand back the same term;
 %% matching the clause head compares it once instead.
+%%
+%% Transfer-Encoding lines combine into one list (RFC 9110 §5.3), and
+%% roadrunner frames only on a list that is exactly `chunked`: chunked must
+%% be the final coding and appear once (RFC 9112 §6.1, §6.3), and no other
+%% coding is supported. So the first line must be that list on its own, and
+%% any later line spoils it: it either adds a coding after chunked or
+%% repeats it. A spoiled list frames as `{error, bad_transfer_encoding}`
+%% (`framing/3`), which the conn answers with 400 and a close.
 compute_cached_decisions_loop(
-    [{~"transfer-encoding", ~"chunked"} | Rest], _Chunked, _TE, Expect, Conn, CL, Host, CT
+    [{~"transfer-encoding", ~"chunked"} | Rest], _Chunked, false, Expect, Conn, CL, Host, CT
 ) ->
     compute_cached_decisions_loop(Rest, true, true, Expect, Conn, CL, Host, CT);
 compute_cached_decisions_loop(
-    [{~"transfer-encoding", V} | Rest], Chunked, _TE, Expect, Conn, CL, Host, CT
+    [{~"transfer-encoding", V} | Rest], _Chunked, false, Expect, Conn, CL, Host, CT
 ) ->
-    case roadrunner_bin:ascii_lowercase(V) of
-        ~"chunked" -> compute_cached_decisions_loop(Rest, true, true, Expect, Conn, CL, Host, CT);
-        _ -> compute_cached_decisions_loop(Rest, Chunked, true, Expect, Conn, CL, Host, CT)
-    end;
+    Chunked = only_chunked(roadrunner_bin:ascii_lowercase(V)),
+    compute_cached_decisions_loop(Rest, Chunked, true, Expect, Conn, CL, Host, CT);
+compute_cached_decisions_loop(
+    [{~"transfer-encoding", _} | Rest], _Chunked, true, Expect, Conn, CL, Host, CT
+) ->
+    compute_cached_decisions_loop(Rest, false, true, Expect, Conn, CL, Host, CT);
 compute_cached_decisions_loop([{~"expect", V} | Rest], Chunked, TE, Was, Conn, CL, Host, CT) ->
     %% Every `Expect` line counts: one unsupported member anywhere makes
     %% the whole request's expectation unsupported.
@@ -1008,6 +1018,26 @@ compute_cached_decisions_loop([{~"host", _} | Rest], Chunked, TE, Expect, Conn, 
     compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, multiple, CT);
 compute_cached_decisions_loop([_ | Rest], Chunked, TE, Expect, Conn, CL, Host, CT) ->
     compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, CT).
+
+%% Whether a lowercased Transfer-Encoding value lists `chunked` alone. Empty
+%% list elements and the whitespace around them are skipped (RFC 9110
+%% §5.6.1), so `, chunked` and `chunked ,` qualify; any other coding, a
+%% parameter, or a second `chunked` does not.
+-spec only_chunked(binary()) -> boolean().
+only_chunked(<<C, Rest/binary>>) when C =:= $,; C =:= $\s; C =:= $\t ->
+    only_chunked(Rest);
+only_chunked(<<"chunked", Rest/binary>>) ->
+    only_separators(Rest);
+only_chunked(_) ->
+    false.
+
+-spec only_separators(binary()) -> boolean().
+only_separators(<<>>) ->
+    true;
+only_separators(<<C, Rest/binary>>) when C =:= $,; C =:= $\s; C =:= $\t ->
+    only_separators(Rest);
+only_separators(_) ->
+    false.
 
 %% The body's framing: a chunked Transfer-Encoding wins, any other
 %% coding is rejected (RFC 9112 §6.1: only identity and chunked are

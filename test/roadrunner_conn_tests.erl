@@ -41,6 +41,26 @@ body_framing_no_content_length_test() ->
     %% body for it (any buffered bytes are the pipelined next request).
     ?assertEqual(none, roadrunner_conn:body_framing(req_with_headers([]))).
 
+body_framing_combines_transfer_encoding_lines_test_() ->
+    %% A request map built without `cached_decisions` frames by the same
+    %% rules: every Transfer-Encoding line counts, not just the first.
+    [
+        ?_assertEqual(Want, roadrunner_conn:body_framing(req_with_headers(Headers)))
+     || {Headers, Want} <- [
+            {[{~"transfer-encoding", ~"chunked"}], chunked},
+            {
+                [{~"transfer-encoding", ~"chunked"}, {~"transfer-encoding", ~"gzip"}],
+                {error, bad_transfer_encoding}
+            },
+            {
+                [{~"transfer-encoding", ~"chunked"}, {~"transfer-encoding", ~"chunked"}],
+                {error, bad_transfer_encoding}
+            },
+            {[{~"content-length", ~"3"}], {content_length, 3}},
+            {[{~"content-length", ~"x"}], {error, bad_content_length}}
+        ]
+    ].
+
 read_body_cl_within_buffer_test() ->
     Req = req_with_headers([{~"content-length", ~"5"}]),
     NoRecv = fun() -> error(should_not_be_called) end,

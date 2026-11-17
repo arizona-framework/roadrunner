@@ -1536,24 +1536,10 @@ drop_delivered(StreamId) ->
     | {error, bad_content_length | bad_transfer_encoding}.
 body_framing(#{cached_decisions := Decisions}) ->
     roadrunner_http1:framing(Decisions);
-body_framing(Req) ->
-    %% Manually-built request maps without cached_decisions — full path.
-    case roadrunner_req:header_normalized(~"transfer-encoding", Req) of
-        undefined ->
-            case content_length(Req) of
-                none -> none;
-                {ok, N} -> {content_length, N};
-                {error, _} = Err -> Err
-            end;
-        Value ->
-            %% RFC 9110 §10.1.4: transfer-coding names are
-            %% case-insensitive. Accept `chunked`, `Chunked`,
-            %% `CHUNKED` etc. (clients in the wild send all variants).
-            case roadrunner_bin:ascii_lowercase(Value) of
-                ~"chunked" -> chunked;
-                _ -> {error, bad_transfer_encoding}
-            end
-    end.
+body_framing(#{headers := Headers}) ->
+    %% Manually-built request maps without cached_decisions: compute them
+    %% so both paths frame the body by the same rules.
+    roadrunner_http1:framing(roadrunner_http1:compute_cached_decisions(Headers)).
 
 -spec read_body_until(
     non_neg_integer(),
@@ -2059,19 +2045,6 @@ fill_iolist(Need, Recv) ->
             end;
         {error, _} = E ->
             E
-    end.
-
--spec content_length(roadrunner_req:request()) ->
-    none | {ok, non_neg_integer()} | {error, bad_content_length}.
-content_length(Req) ->
-    case roadrunner_req:header_normalized(~"content-length", Req) of
-        undefined ->
-            none;
-        Bin ->
-            case roadrunner_bin:digits_to_integer(Bin) of
-                {ok, _} = Ok -> Ok;
-                error -> {error, bad_content_length}
-            end
     end.
 
 -doc false.
