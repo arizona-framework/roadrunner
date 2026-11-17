@@ -96,6 +96,11 @@ care which protocol delivered the bytes.
     %% `roadrunner_req:read_body/1,2`. Never present in `auto` mode
     %% or in manually-constructed request maps.
     body_reader => body_reader(),
+    %% When the request's header block was decoded, in
+    %% `erlang:monotonic_time(millisecond)`, set on every HTTP/2 and
+    %% HTTP/3 request: a gRPC call's deadline counts from it. Internal:
+    %% read only by `roadrunner_grpc`.
+    headers_at => integer(),
     %% Per-request correlation token attached by `roadrunner_conn`
     %% once the headers parse. 16 lowercase hex chars (8 bytes of
     %% CSPRNG output). Mirrored into `logger:set_process_metadata/1`

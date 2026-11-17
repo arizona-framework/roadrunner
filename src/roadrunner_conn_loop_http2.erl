@@ -278,7 +278,11 @@
     reader => pid() | undefined,
     continue_owed => boolean(),
     body_error => undefined | content_length_too_large,
-    declared => none | {ok, non_neg_integer()}
+    declared => none | {ok, non_neg_integer()},
+    %% When the header block of a request whose body is still to come was
+    %% decoded, in `erlang:monotonic_time(millisecond)`: the request's
+    %% `headers_at` (`headers_at/1`).
+    headers_at => integer()
 }.
 
 -record(loop, {
@@ -1636,7 +1640,20 @@ finalize_headers(
     } = Streams,
     case roadrunner_http2_hpack:decode(iolist_to_binary(Fragment), Dec) of
         {ok, Headers, Dec1} ->
-            Stream1 = Stream#{headers := Headers, header_fragment := <<>>},
+            %% A request with a body still to come notes when its headers
+            %% were decoded (`headers_at`); one dispatched now takes the time
+            %% as it is built (`dispatch_request/5`).
+            Stream1 =
+                case EndStreamSeen of
+                    true ->
+                        Stream#{headers := Headers, header_fragment := <<>>};
+                    false ->
+                        Stream#{
+                            headers := Headers,
+                            header_fragment := <<>>,
+                            headers_at => erlang:monotonic_time(millisecond)
+                        }
+                end,
             %% Commit the mutated HPACK context even if we reject below: the
             %% decode advanced the dynamic table, so dropping it would desync
             %% our decoder from the peer's encoder for every later block.
@@ -2182,7 +2199,8 @@ dispatch_request(
         conn_info => ConnInfo,
         scheme => Scheme,
         listener_name => ListenerName,
-        request_id => RequestId
+        request_id => RequestId,
+        headers_at => headers_at(Stream)
     },
     case roadrunner_http2_request:from_headers(Headers, buffered_body(Body), RequestContext) of
         {ok, Req0} ->
@@ -2264,6 +2282,12 @@ dispatch_request(
             _ = send_rst_stream(State, StreamId, protocol_error),
             frame_loop(remove_reset_stream(State#loop{req_id_buffer = NewBuf}, StreamId))
     end.
+
+%% When the request's header block was decoded: noted on a stream whose
+%% body came after its headers, else now, as they were just decoded.
+-spec headers_at(map()) -> integer().
+headers_at(#{headers_at := At}) -> At;
+headers_at(#{}) -> erlang:monotonic_time(millisecond).
 
 -spec buffered_body({body, iodata()} | reader) -> iodata().
 buffered_body({body, Body}) -> Body;

@@ -326,17 +326,14 @@ How a gRPC call ended, as carried by `grpc_call_stop`, with the
 - `deadline`: as `cancelled`, but from 50 ms before the call's
   `grpc-timeout` ran out on: roadrunner cancelled it a second after the
   deadline, or the client did at its own deadline; `Status` is
-  `deadline_exceeded`. Roadrunner counts the deadline from when the call
-  starts: with `auto` buffering after the request's body was read, with
-  `manual` after the router and middlewares ran. The client's own
-  deadline comes that much earlier, so a client reset at it is
-  `deadline` only when the call started within about 50 ms of the
-  request's arrival; a body that took longer to arrive makes it
-  `cancelled`. The time compared is when the call learned the stream
-  was gone: when `roadrunner_grpc:info/2` or `cancelled/2` told the
-  method, or else when a write or read failed or the status was about to
-  go out, which can be well after the reset came in (a method that keeps
-  working without reading or writing)
+  `deadline_exceeded`. Roadrunner counts the deadline from when the
+  request's headers arrived, so a client reset at its own deadline,
+  which comes a little earlier, is `deadline`. The time compared is
+  when the call learned the stream was gone: when
+  `roadrunner_grpc:info/2` or `cancelled/2` told the method, or else
+  when a write or read failed or the status was about to go out, which
+  can be well after the reset came in (a method that keeps working
+  without reading or writing)
 - `stopped`: no gRPC status went out: the method stopped the call on
   purpose (`exit({shutdown, _})`), or its response headers were too
   large for the client and the request was answered `500`; `Status` is

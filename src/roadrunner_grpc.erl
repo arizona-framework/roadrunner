@@ -85,8 +85,11 @@ the call with `DEADLINE_EXCEEDED`; a call still running a second later is
 cancelled, as grpc-go and grpc-java do at the deadline: its stream is reset
 (`RST_STREAM` with `CANCEL` over HTTP/2, `H3_REQUEST_CANCELLED` over
 HTTP/3) and the method stops at its next write or read. Without a timeout
-a call may run for as long as the client stays connected. With `auto` buffering the deadline counts from
-when the body was read, a little after the client's.
+a call may run for as long as the client stays connected. The deadline
+counts from when the request's headers arrived, so time spent waiting for
+the body (`auto` buffering), for an in-flight slot or in middlewares
+counts too: a call whose deadline passed before the method would start
+ends with `DEADLINE_EXCEEDED` without running it.
 
 ## The method's process
 
@@ -158,15 +161,11 @@ to read what the metadata leaves out: the client's certificate, the
 %% when a reset counts as the deadline's (`gone/0`).
 -define(TIMER_KEY, {?MODULE, deadline_timer}).
 %% A stream gone this close to the call's deadline, or later, is the
-%% deadline's (`gone/0`). The deadline counts from when the call starts,
-%% rounded up to a millisecond: after the request's way here, and after its
-%% body was read with `auto` buffering, or the router and middlewares ran
-%% with `manual`. A client that cancels as its own deadline passes
-%% (grpc-go, grpc-java) has its reset here that much before roadrunner's
-%% deadline, less the reset's own way. The slack covers that gap for a
-%% call that starts as its request arrives (`manual` buffering, a body that
-%% has not had to wait); a call whose body took longer to arrive than the
-%% slack is reported `cancelled` instead.
+%% deadline's (`gone/0`). The deadline counts from when the request's
+%% headers arrived, to the millisecond: after the request's way here. A
+%% client that cancels as its own deadline passes (grpc-go, grpc-java) has
+%% its reset here that much before roadrunner's deadline, less the reset's
+%% own way. The slack covers that gap.
 -define(DEADLINE_SLACK, 50).
 %% When `cancelled/2` told the method the call is over, which takes the
 %% message that said so from the mailbox (`stream_gone/1`, `gone/0`).
@@ -692,15 +691,17 @@ run_call(Req, ContentType, Codec, #route{service = Service} = Route, Method, Rpc
         RecvEncoding = recv_encoding(Encoding),
         Accepted = accepted(roadrunner_req:header(~"grpc-accept-encoding", Req)),
         Timeout = timeout(roadrunner_req:header(~"grpc-timeout", Req)),
+        {Deadline, Left} = deadline_after(Timeout, Req),
         Stream = Stream0#stream{
             recv_encoding = RecvEncoding,
             accepted = Accepted,
             send_encoding = sendable(Route#route.send_compression, Accepted),
             metadata = request_metadata(roadrunner_req:headers(Req)),
-            req = roadrunner_req:set_body_timeout(Timeout, Req),
+            %% A read (`manual` buffering) waits at most until the deadline.
+            req = roadrunner_req:set_body_timeout(Left, Req),
             input = In,
             output = Out,
-            deadline = deadline_after(Timeout, Req),
+            deadline = Deadline,
             connection = watch_connection(Req)
         },
         finish(run(Kind, Service, Function, Stream))
@@ -781,22 +782,36 @@ timeout(Value) ->
         error -> throw({?MODULE, internal, <<"malformed grpc-timeout ", Value/binary>>, []})
     end.
 
-%% When the call's timeout runs out. A call still running a little after
+%% When the call's timeout runs out, counted from when the request's
+%% headers arrived (`headers_at`). A call whose deadline has come by the
+%% time its method would start (a body, an in-flight slot or middlewares
+%% that took that long, or a timeout of 0) ends `DEADLINE_EXCEEDED`
+%% without running it, as a stream gone from then on is the deadline's
+%% (`gone/0`). A call still running a little after
 %% (`?CANCEL_GRACE`, which leaves a read waiting at the deadline the time to
 %% end the call with `DEADLINE_EXCEEDED`) is cancelled: the stream is reset
 %% and the method stops at its next write or read. The timer is cancelled
-%% when the call ends before (`ended/1`).
+%% when the call ends before (`ended/1`). Returns the deadline and the
+%% time left until it.
 -spec deadline_after(non_neg_integer() | infinity, roadrunner_req:request()) ->
-    integer() | infinity.
+    {integer(), pos_integer()} | {infinity, infinity}.
 deadline_after(infinity, _Req) ->
-    infinity;
-deadline_after(Ms, Req) ->
-    %% A call runs over HTTP/2 or HTTP/3 (`handle/1` answers HTTP/1.1 with
-    %% 505), both of which can cancel a stream.
-    {ok, Timer} = roadrunner_send_writer:cancel_after(Ms + ?CANCEL_GRACE, Req),
-    Deadline = erlang:monotonic_time(millisecond) + Ms,
-    _ = put(?TIMER_KEY, {Timer, Deadline - ?DEADLINE_SLACK}),
-    Deadline.
+    {infinity, infinity};
+deadline_after(Ms, #{headers_at := HeadersAt} = Req) ->
+    Deadline = HeadersAt + Ms,
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Left when Left > 0 ->
+            %% A call runs over HTTP/2 or HTTP/3 (`handle/1` answers
+            %% HTTP/1.1 with 505), both of which can cancel a stream.
+            {ok, Timer} = roadrunner_send_writer:cancel_after(Left + ?CANCEL_GRACE, Req),
+            _ = put(?TIMER_KEY, {Timer, Deadline - ?DEADLINE_SLACK}),
+            {Deadline, Left};
+        _Passed ->
+            %% No timer to cancel, but a stream gone now is still the
+            %% deadline's (`gone/0`).
+            _ = put(?TIMER_KEY, {none, Deadline - ?DEADLINE_SLACK}),
+            throw({?MODULE, deadline_exceeded, ~"deadline exceeded", []})
+    end.
 
 -spec add_headers(roadrunner_http:headers(), stream()) -> stream().
 add_headers(Headers, #stream{headers = Own} = Stream) ->
@@ -897,7 +912,8 @@ ended({Ending, Req}) ->
     _ =
         case erase(?TIMER_KEY) of
             undefined -> ok;
-            {Timer, _Deadline} -> erlang:cancel_timer(Timer, [{async, true}, {info, false}])
+            {none, _Reached} -> ok;
+            {Timer, _Reached} -> erlang:cancel_timer(Timer, [{async, true}, {info, false}])
         end,
     _ =
         case erase(?CONN_KEY) of

@@ -326,5 +326,6 @@ request_context() ->
         conn_info => fun(_Query) -> {error, unavailable} end,
         scheme => https,
         listener_name => h2_test,
-        request_id => ~"abc123"
+        request_id => ~"abc123",
+        headers_at => 0
     }.

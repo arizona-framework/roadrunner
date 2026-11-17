@@ -41,6 +41,7 @@ call emitted.
     gone_told_to_the_method/1,
     client_resets_just_before_the_deadline/1,
     client_resets_well_before_the_deadline/1,
+    reset_in_a_slow_middleware_is_the_deadline/1,
     cancelled_long_before_a_late_return/1,
     stopped_after_a_response/1,
     encoding_of_a_call_refused_early/1,
@@ -108,6 +109,7 @@ groups() ->
             gone_told_to_the_method,
             client_resets_just_before_the_deadline,
             client_resets_well_before_the_deadline,
+            reset_in_a_slow_middleware_is_the_deadline,
             cancelled_long_before_a_late_return,
             stopped_after_a_response,
             encoding_of_a_call_refused_early,
@@ -149,10 +151,25 @@ init_per_testcase(Case, Config) ->
         body_buffering => manual,
         routes => roadrunner_grpc:routes(#{
             services => [roadrunner_grpc_test_service],
-            send_compression => gzip
+            send_compression => gzip,
+            middlewares => middlewares(Case)
         })
     }),
     [{port, roadrunner_listener:port(?MODULE)}, {handler_id, Id} | Config].
+
+%% A middleware that waits for the process registered as
+%% `roadrunner_grpc_held` to let it go, before the call starts.
+middlewares(reset_in_a_slow_middleware_is_the_deadline) ->
+    [
+        fun(Req, Next, _State) ->
+            roadrunner_grpc_held ! {held, self()},
+            receive
+                go -> Next(Req)
+            end
+        end
+    ];
+middlewares(_Case) ->
+    [].
 
 tls([http3]) -> #{tls => roadrunner_test_certs:server_opts()};
 tls(_Protocols) -> #{}.
@@ -441,6 +458,36 @@ client_resets_just_before_the_deadline(Config) ->
 client_resets_well_before_the_deadline(Config) ->
     {stop, _, Md} = reset_before_the_deadline(Config, ~"900"),
     ?assertMatch(#{status := cancelled, reason := cancelled}, Md).
+
+%% A client resets at its deadline while a slow middleware holds the call:
+%% the deadline has passed by the time the method would start, and the
+%% reset is the deadline's.
+reset_in_a_slow_middleware_is_the_deadline(Config) ->
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "Unary">>, [
+        {~"grpc-timeout", ~"1m"}
+    ]),
+    C = roadrunner_grpc_test_client:finish(roadrunner_grpc_test_client:send(C0, 1, frame(~"x")), 1),
+    Pid =
+        receive
+            {held, Held} -> Held
+        after 5000 -> ct:fail(not_held)
+        end,
+    true = unregister(roadrunner_grpc_held),
+    1 = erlang:trace(Pid, true, ['receive']),
+    %% The headers arrived before the middleware ran: 2 ms on, their 1 ms
+    %% deadline has passed.
+    Until = erlang:monotonic_time(millisecond) + 2,
+    receive
+    after max(0, Until - erlang:monotonic_time(millisecond)) -> ok
+    end,
+    _ = roadrunner_grpc_test_client:reset(C, 1),
+    ok = let_go(Pid, fun
+        ({h2_stream_reset, _}) -> true;
+        (_) -> false
+    end),
+    {_, {stop, _, Md}} = ended(),
+    ?assertMatch(#{status := deadline_exceeded, reason := deadline}, Md).
 
 reset_before_the_deadline(Config, Before) ->
     true = register(roadrunner_grpc_held, self()),
