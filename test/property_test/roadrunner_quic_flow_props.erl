@@ -33,10 +33,9 @@ prop_invariants() ->
         {Initial, Peer, Ops},
         {integer(1, 2000), integer(1, 2000), list(op())},
         begin
-            Opts = #{initial_max_data => Initial, peer_initial_max_data => Peer},
             %% RFC 9000 §4.1 refill fraction, matching roadrunner_quic_flow (3/4).
             Refill = Initial * 3 div 4,
-            check(Ops, roadrunner_quic_flow:new(Opts), Initial, Refill)
+            check(Ops, roadrunner_quic_flow:new(Initial, Peer), Initial, Refill)
         end
     ).
 

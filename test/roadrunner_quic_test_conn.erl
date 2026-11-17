@@ -38,6 +38,7 @@
 %% over the buffered datagrams as keys unlock reassembles the full flight.
 
 -include_lib("public_key/include/public_key.hrl").
+-include("../include/roadrunner_quic.hrl").
 
 -export([
     connect/2,
@@ -395,11 +396,11 @@ init(Parent, Ref, Host, Port, Opts) ->
                 signature_algorithms => ?SIG_SCHEMES,
                 key_shares => [{group_codepoint(Curve), EphPub}],
                 client_scid => Scid,
-                transport_params => #{
-                    initial_max_stream_data_bidi_local => StreamWindow,
-                    initial_max_stream_data_uni => StreamWindow,
-                    initial_max_streams_uni => maps:get(max_streams_uni, Opts, 3)
-                }
+                transport_params => [
+                    {initial_max_stream_data_bidi_local, StreamWindow},
+                    {initial_max_stream_data_uni, StreamWindow},
+                    {initial_max_streams_uni, maps:get(max_streams_uni, Opts, 3)}
+                ]
             },
             maps:with([cipher_suites], Opts)
         )
@@ -431,7 +432,7 @@ init(Parent, Ref, Host, Port, Opts) ->
         initial = Initial,
         owner = Parent,
         server_initial_keys = roadrunner_quic_keys:initial_server(Dcid0),
-        conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ?CONN_MAX_DATA}),
+        conn_flow = roadrunner_quic_flow:new(?CONN_MAX_DATA, 786432),
         ack = roadrunner_quic_ack:new(),
         cid_events = maps:get(cid_events, Opts, false),
         max_streams_events = maps:get(max_streams_events, Opts, false)
@@ -502,7 +503,7 @@ send_initial(Socket, Host, Port, Initial, Copies) ->
 -spec learn_server_scid(#conn{}) -> #conn{}.
 learn_server_scid(#conn{server_scid = undefined, datagrams = [First | _]} = Conn) ->
     case roadrunner_quic_packet:long_header_info(First) of
-        {ok, #{scid := ServerScid}} -> Conn#conn{server_scid = ServerScid};
+        {ok, _Version, _DCID, ServerScid} -> Conn#conn{server_scid = ServerScid};
         _ -> Conn
     end;
 learn_server_scid(Conn) ->
@@ -657,7 +658,7 @@ send_handshake(
     Frames
 ) ->
     {Datagram, _Sent} = roadrunner_quic_send:datagram(
-        #{handshake => #{frames => Frames, keys => ClientHsKeys, pn => Pn}}, ServerScid, Scid
+        #{handshake => #quic_entry{frames = Frames, keys = ClientHsKeys, pn = Pn}}, ServerScid, Scid
     ),
     ok = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
     Conn#conn{hs_pn = Pn + 1}.
@@ -789,7 +790,7 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
                 Conn#conn.send_offsets,
                 Frames
             ),
-            Conn1 = send_packet(Conn#conn{send_offsets = Offsets}, #{frames => Frames}),
+            Conn1 = send_packet(Conn#conn{send_offsets = Offsets}, Frames, 0),
             From ! {Ref, ok},
             connected_loop(Conn1);
         stop ->
@@ -850,7 +851,7 @@ send_stream_packet(
     Offset = maps:get(StreamId, Offsets, 0),
     Frame = {stream, StreamId, Offset, Chunk, Fin},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(
-        #{application => #{frames => [Frame], keys => Keys, pn => Pn}}, ServerScid, Scid
+        #{application => #quic_entry{frames = [Frame], keys = Keys, pn = Pn}}, ServerScid, Scid
     ),
     _ = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
     Conn#conn{send_pn = Pn + 1, send_offsets = Offsets#{StreamId => Offset + byte_size(Chunk)}}.
@@ -870,11 +871,11 @@ send_frame(Conn, Frame) ->
 
 -spec send_wire_frame(#conn{}, roadrunner_quic_frame:frame()) -> #conn{}.
 send_wire_frame(Conn, Frame) ->
-    send_packet(Conn, #{frames => [Frame]}).
+    send_packet(Conn, [Frame], 0).
 
-%% Send one 1-RTT packet of `Entry`'s frames (and its `pad_to`, if any)
+%% Send one 1-RTT packet of `Frames`, expanded to `PadTo` bytes (none at 0),
 %% addressed to the server's CID, taking the next 1-RTT packet number.
--spec send_packet(#conn{}, map()) -> #conn{}.
+-spec send_packet(#conn{}, [roadrunner_quic_frame:frame()], non_neg_integer()) -> #conn{}.
 send_packet(
     #conn{
         socket = Socket,
@@ -885,10 +886,13 @@ send_packet(
         app_client_keys = Keys,
         send_pn = Pn
     } = Conn,
-    Entry
+    Frames,
+    PadTo
 ) ->
     {Datagram, _Sent} = roadrunner_quic_send:datagram(
-        #{application => Entry#{keys => Keys, pn => Pn}}, ServerScid, Scid
+        #{application => #quic_entry{frames = Frames, keys = Keys, pn = Pn, pad_to = PadTo}},
+        ServerScid,
+        Scid
     ),
     _ = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
     Conn#conn{send_pn = Pn + 1}.
@@ -913,7 +917,7 @@ carries_dropped_fin(#conn{drop_fin = StreamId, app_server_keys = Keys, scid = Sc
     ),
     lists:any(
         fun
-            ({ok, #{frames := Frames}}) ->
+            ({ok, #quic_decoded{frames = Frames}}) ->
                 lists:any(
                     fun
                         ({stream, Id, _Offset, _Data, true}) -> Id =:= StreamId;
@@ -949,7 +953,7 @@ maybe_stateless_reset(_Outcomes, _Datagram, _Conn) ->
 %% Record one decrypted 1-RTT packet against the ack tracker (so its ack-eliciting
 %% packets get acknowledged) and fold its frames.
 -spec handle_app_packet(roadrunner_quic_recv:outcome(), #conn{}) -> #conn{}.
-handle_app_packet({ok, #{level := application, pn := PN, frames := Frames}}, Conn) ->
+handle_app_packet({ok, #quic_decoded{level = application, pn = PN, frames = Frames}}, Conn) ->
     Elicit = roadrunner_quic_send:ack_eliciting(Frames),
     Ack = roadrunner_quic_ack:record(PN, Elicit, 0, Conn#conn.ack),
     Unacked = Conn#conn.unacked + ack_eliciting_count(Elicit),
@@ -1002,7 +1006,7 @@ handle_app_frame({max_streams, Type, Max}, #conn{max_streams_events = true} = Co
 handle_app_frame({path_challenge, Data}, Conn) ->
     %% RFC 9000 §8.2.2: answer on the path the challenge came on (the
     %% client has one socket) in a datagram expanded to 1200 bytes.
-    send_packet(Conn, #{frames => [{path_response, Data}], pad_to => 1200});
+    send_packet(Conn, [{path_response, Data}], 1200);
 handle_app_frame(
     {new_connection_id, Seq, _Prior, CID, Token},
     #conn{server_cids = Cids, cid_events = Events, owner = Owner, reset_tokens = Tokens} = Conn

@@ -43,6 +43,8 @@
 %% decisions: the single source of truth for which frames are ack-eliciting.
 -export([ack_eliciting/1, is_ack_eliciting/1]).
 
+-include("roadrunner_quic.hrl").
+
 -export_type([level/0, entry/0, sent/0]).
 
 %% The QUIC v1 version number (RFC 9000 §15); this is a v1-only endpoint.
@@ -67,29 +69,15 @@
 
 -type level() :: initial | handshake | application.
 
--type entry() :: #{
-    frames := [roadrunner_quic_frame:frame()],
-    keys := roadrunner_quic_keys:keys(),
-    pn := non_neg_integer(),
-    %% 1-RTT key phase (application level only); defaults to 0.
-    key_phase => 0 | 1,
-    %% The size to expand a 1-RTT packet to with PADDING frames (application
-    %% level only); a packet already as large stays as it is.
-    pad_to => non_neg_integer()
-}.
+-type entry() :: #quic_entry{keys :: roadrunner_quic_keys:keys()}.
 
--type sent() :: #{
-    level := level(),
-    pn := non_neg_integer(),
-    length := non_neg_integer(),
-    ack_eliciting := boolean(),
-    frames := [roadrunner_quic_frame:frame()]
-}.
+-type sent() :: #quic_sent{}.
 
 -doc """
 Assemble one UDP datagram from the per-level send entries. `Entries` maps
-each encryption level to send to its `#{frames, keys, pn}` (plus an
-optional `key_phase` for the application level); packets are built in
+each encryption level to send to its `#quic_entry{}` (frames, keys, packet
+number, and for the application level the key phase and the size to pad
+to); packets are built in
 Initial, Handshake, 1-RTT order. `DCID` is the destination connection id
 (the peer's chosen source id) and `SCID` the server's source id (used by
 long headers only). Returns the datagram bytes and one sent-record per
@@ -123,30 +111,35 @@ build_levels([Level | Rest], Entries, DCID, SCID) ->
 %% Encode + seal + header-protect one packet, returning the wire bytes and
 %% its sent-record.
 -spec build_packet(level(), entry(), binary(), binary()) -> {binary(), sent()}.
-build_packet(Level, #{frames := Frames, keys := Keys, pn := PN} = Entry, DCID, SCID) ->
-    #{key := Key, iv := IV, hp := HP} = Keys,
+build_packet(
+    Level,
+    #quic_entry{
+        frames = Frames,
+        keys = #quic_keys{key = Key, iv = IV, hp = HP},
+        pn = PN,
+        key_phase = KeyPhase,
+        pad_to = PadTo
+    },
+    DCID,
+    SCID
+) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     Plaintext = pad_plaintext(
         iolist_to_binary([roadrunner_quic_frame:encode(F) || F <- Frames]),
-        plaintext_floor(Level, Entry, DCID, PNLen)
+        plaintext_floor(Level, PadTo, DCID, PNLen)
     ),
-    Header = header(Level, DCID, SCID, PN, byte_size(Plaintext) + ?TAG_LEN, key_phase(Entry)),
+    Header = header(Level, DCID, SCID, PN, byte_size(Plaintext) + ?TAG_LEN, KeyPhase),
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
     Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
     Wire = <<Protected/binary, Sealed/binary>>,
-    Record = #{
-        level => Level,
-        pn => PN,
-        length => byte_size(Wire),
-        ack_eliciting => ack_eliciting(Frames),
-        frames => Frames
+    Record = #quic_sent{
+        level = Level,
+        pn = PN,
+        length = byte_size(Wire),
+        ack_eliciting = ack_eliciting(Frames),
+        frames = Frames
     },
     {Wire, Record}.
-
-%% The 1-RTT key phase (application level only); defaults to 0.
--spec key_phase(entry()) -> 0 | 1.
-key_phase(#{key_phase := Phase}) -> Phase;
-key_phase(#{}) -> 0.
 
 %% The unprotected header through the packet number (the AEAD associated
 %% data). A long header's Length must count the sealed payload, so it is
@@ -158,24 +151,22 @@ header(application, DCID, _SCID, PN, _SealedSize, KeyPhase) ->
     [Header, _] = roadrunner_quic_packet:encode_short(DCID, PN, <<>>, false, KeyPhase),
     Header;
 header(Level, DCID, SCID, PN, SealedSize, _KeyPhase) ->
-    [Header, _] = roadrunner_quic_packet:encode_long(Level, ?QUIC_V1, DCID, SCID, #{
-        pn => PN, payload => <<0:(SealedSize * 8)>>
-    }),
+    [Header, _] = roadrunner_quic_packet:encode_long(
+        Level, ?QUIC_V1, DCID, SCID, <<>>, PN, <<0:(SealedSize * 8)>>
+    ),
     Header.
 
 %% The plaintext size a packet must reach: the header-protection-sample
 %% minimum (RFC 9001 §5.4.2), or, for a 1-RTT packet, the size that makes
-%% the whole packet (short header, plaintext and AEAD tag) its `pad_to`,
+%% the whole packet (short header, plaintext and AEAD tag) its `PadTo`,
 %% and never shorter than ?MIN_SHORT_PACKET, long.
--spec plaintext_floor(level(), entry(), binary(), 1..4) -> non_neg_integer().
-plaintext_floor(application, Entry, DCID, PNLen) ->
-    PadTo =
-        case Entry of
-            #{pad_to := Size} -> max(Size, ?MIN_SHORT_PACKET);
-            #{} -> ?MIN_SHORT_PACKET
-        end,
-    max(?MIN_SAMPLE_PLAINTEXT, PadTo - (1 + byte_size(DCID) + PNLen) - ?TAG_LEN);
-plaintext_floor(_Level, _Entry, _DCID, _PNLen) ->
+-spec plaintext_floor(level(), non_neg_integer(), binary(), 1..4) -> non_neg_integer().
+plaintext_floor(application, PadTo, DCID, PNLen) ->
+    max(
+        ?MIN_SAMPLE_PLAINTEXT,
+        max(PadTo, ?MIN_SHORT_PACKET) - (1 + byte_size(DCID) + PNLen) - ?TAG_LEN
+    );
+plaintext_floor(_Level, _PadTo, _DCID, _PNLen) ->
     ?MIN_SAMPLE_PLAINTEXT.
 
 %% Pad a packet's plaintext to `Floor` bytes with PADDING frames (zero

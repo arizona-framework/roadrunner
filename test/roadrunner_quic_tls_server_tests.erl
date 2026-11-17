@@ -87,8 +87,9 @@ assert_full_handshake(KeyType, Opts) ->
     ClientHelloBody = client_hello_for(Client, #{
         key_shares => [{group(Curve), ClientPub}], cipher_suites => [Suite]
     }),
-    {ok, Flight, Installs, _PeerParams, State1} =
+    {ok, InitialFlight, HandshakeFlight, Installs, _PeerParams, State1} =
         ?M:process_client_hello(ClientHelloBody, server_state(PrivKey)),
+    Flight = {InitialFlight, HandshakeFlight},
     assert_flight([], ClientHelloBody, Flight, Installs, State1, Client).
 
 %% The client lists x25519 but sends a key share only for X25519MLKEM768,
@@ -130,7 +131,9 @@ assert_hello_retry_request_handshake(Opts) ->
         server_hello_fields(HelloRetryRequest)
     ),
     ClientHello2 = client_hello_for(Client, Offer#{key_shares => [{?GROUP_X25519, ClientPub}]}),
-    {ok, Flight, Installs, _PeerParams, State2} = ?M:process_client_hello(ClientHello2, State1),
+    {ok, InitialFlight, HandshakeFlight, Installs, _PeerParams, State2} =
+        ?M:process_client_hello(ClientHello2, State1),
+    Flight = {InitialFlight, HandshakeFlight},
     ClientHello1Framed = iolist_to_binary(
         roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, ClientHello1)
     ),
@@ -154,7 +157,7 @@ assert_flight(Transcript, ClientHelloBody, Flight, Installs, State1, #{
 }) ->
     %% Flight grouping: ServerHello at Initial; EE/Cert/CertVerify/Finished
     %% at Handshake, in order, each properly framed and concatenable.
-    #{initial := InitialGroup, handshake := [Ee, Cert, CertVerify, Finished]} = Flight,
+    {InitialGroup, [Ee, Cert, CertVerify, Finished]} = Flight,
     ?assertEqual([?SERVER_HELLO], [T || {T, _} <- deframe_all(InitialGroup)]),
     ?assertEqual(
         [?ENCRYPTED_EXTENSIONS, ?CERTIFICATE, ?CERTIFICATE_VERIFY, ?FINISHED],
@@ -469,7 +472,7 @@ second_client_hello_invalid_share_rejected_test() ->
 client_hello_after_flight_rejected_test() ->
     #{client_pub := ClientPub, priv_key := PrivKey} = Client = client(rsa, #{}),
     ClientHello = client_hello_for(Client, #{key_shares => [{?GROUP_X25519, ClientPub}]}),
-    {ok, _Flight, _Installs, _PeerParams, State1} =
+    {ok, _InitialFlight, _HandshakeFlight, _Installs, _PeerParams, State1} =
         ?M:process_client_hello(ClientHello, server_state(PrivKey)),
     ?assertEqual({error, unexpected_message}, ?M:process_client_hello(ClientHello, State1)).
 
@@ -506,7 +509,9 @@ missing_transport_params_rejected_test() ->
 missing_initial_scid_rejected_test() ->
     ?assertEqual(
         {error, transport_parameter_error},
-        process_offering(#{transport_params => #{initial_max_data => 4096}})
+        process_offering(#{
+            transport_params => roadrunner_quic_transport_params:new([{initial_max_data, 4096}])
+        })
     ).
 
 %% RFC 9000 §7.3: the client's advertised initial_source_connection_id does not
@@ -514,7 +519,11 @@ missing_initial_scid_rejected_test() ->
 initial_scid_mismatch_rejected_test() ->
     ?assertEqual(
         {error, transport_parameter_error},
-        process_offering(#{transport_params => #{initial_source_connection_id => <<9, 9, 9, 9>>}})
+        process_offering(#{
+            transport_params => roadrunner_quic_transport_params:new([
+                {initial_source_connection_id, <<9, 9, 9, 9>>}
+            ])
+        })
     ).
 
 %% RFC 9000 §7.4 / §18.2: a transport parameter the codec rejects (here an
@@ -524,9 +533,9 @@ invalid_transport_param_rejected_test() ->
     ?assertEqual(
         {error, transport_parameter_error},
         process_offering(#{
-            transport_params => #{
-                initial_source_connection_id => ?CLIENT_SCID, max_ack_delay => 16384
-            }
+            transport_params => roadrunner_quic_transport_params:new([
+                {initial_source_connection_id, ?CLIENT_SCID}, {max_ack_delay, 16384}
+            ])
         })
     ).
 
@@ -534,10 +543,10 @@ server_only_transport_param_rejected_test() ->
     ?assertEqual(
         {error, transport_parameter_error},
         process_offering(#{
-            transport_params => #{
-                initial_source_connection_id => ?CLIENT_SCID,
-                original_destination_connection_id => <<5, 6, 7, 8>>
-            }
+            transport_params => roadrunner_quic_transport_params:new([
+                {initial_source_connection_id, ?CLIENT_SCID},
+                {original_destination_connection_id, <<5, 6, 7, 8>>}
+            ])
         })
     ).
 
@@ -547,20 +556,20 @@ server_only_transport_param_rejected_test() ->
 
 %% A fresh server handshake state signing with `PrivKey`.
 server_state(PrivKey) ->
-    ?M:new(#{
-        cert_chain => [~"leaf-cert-der", ~"intermediate-cert-der"],
-        priv_key => PrivKey,
-        alpn => ~"h3",
-        transport_params => server_transport_params(),
-        server_random => server_random(),
-        peer_scid => ?CLIENT_SCID
-    }).
+    ?M:new(
+        [~"leaf-cert-der", ~"intermediate-cert-der"],
+        PrivKey,
+        ~"h3",
+        server_transport_params(),
+        server_random(),
+        ?CLIENT_SCID
+    ).
 
 server_transport_params() ->
-    #{
-        original_destination_connection_id => <<5, 6, 7, 8>>,
-        initial_source_connection_id => <<1, 2, 3, 4>>
-    }.
+    roadrunner_quic_transport_params:new([
+        {original_destination_connection_id, <<5, 6, 7, 8>>},
+        {initial_source_connection_id, <<1, 2, 3, 4>>}
+    ]).
 
 server_random() ->
     binary:copy(<<16#5A>>, 32).
@@ -610,7 +619,9 @@ client_hello_for(#{scheme := Scheme}, Opts) ->
         maps:merge(
             #{
                 sig_algs => [Scheme],
-                transport_params => #{initial_source_connection_id => ?CLIENT_SCID}
+                transport_params => roadrunner_quic_transport_params:new([
+                    {initial_source_connection_id, ?CLIENT_SCID}
+                ])
             },
             Opts
         )
@@ -751,7 +762,7 @@ process_offering(Opts) ->
 
 %% The cipher suite the server selects from `Offered`.
 negotiated_cipher_suite(Offered) ->
-    {ok, #{initial := ServerHello}, _Installs, _PeerParams, _State} =
+    {ok, ServerHello, _HandshakeFlight, _Installs, _PeerParams, _State} =
         process_offering(#{cipher_suites => Offered}),
     #{cipher_suite := Suite} = server_hello_fields(ServerHello),
     Suite.
@@ -761,7 +772,7 @@ negotiated_cipher_suite(Offered) ->
 %% HelloRetryRequest.
 negotiated_key_share(Opts) ->
     case process_offering(Opts) of
-        {ok, #{initial := ServerHello}, _Installs, _PeerParams, _State} ->
+        {ok, ServerHello, _HandshakeFlight, _Installs, _PeerParams, _State} ->
             #{key_share := KeyShare} = server_hello_fields(ServerHello),
             KeyShare;
         {retry, HelloRetryRequest, _State} ->

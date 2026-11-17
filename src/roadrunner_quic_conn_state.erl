@@ -13,7 +13,7 @@
 %%
 %% Effects: `{send, Datagram}` (hand to the socket), `{arm_timer, Kind,
 %% AtMs}` ((re)arm a timer), `{emit, Owner, Event}` (async owner
-%% notification, e.g. `{connected, Info}`), `{reply, To, Ref, Result}`
+%% notification, e.g. `{connected, Alpn}`), `{reply, To, Ref, Result}`
 %% (answer a synchronous control call), `{register_cid, CID}` /
 %% `{unregister_cid, CID}` (route a connection id to this connection in the
 %% listener's registry, or stop routing it), `{register_reset, Token}` /
@@ -105,7 +105,8 @@
 %% / sent times / the oldest unacknowledged frames, a separate follow-up.
 
 -export([
-    new/2,
+    settings/7,
+    new/7,
     handle_datagram/4,
     handle_timeout/3,
     handle_call/5,
@@ -133,13 +134,12 @@
 %% of our own, nor the 2^23 that close the connection.
 -export([key_limit/3]).
 
--export_type([t/0, config/0, effect/0, event/0, info/0]).
+-include("roadrunner_quic.hrl").
+
+-export_type([t/0, settings/0, effect/0, event/0]).
 
 %% RFC 9000 §17.2: the server uses a fixed-length SCID so short headers demux.
 -define(SCID_LEN, 8).
-%% RFC 9000 §18.2: the active_connection_id_limit when a side does not send
-%% one (and the smallest value it may send).
--define(DEFAULT_ACTIVE_CID_LIMIT, 2).
 %% The most connection ids the server keeps active per connection, however
 %% many the client accepts (RFC 9000 §5.1.1 lets an endpoint limit them):
 %% enough for the client to migrate and probe a path more, while every one is
@@ -358,8 +358,11 @@
     %% The application owner: the async sink for `{emit, _, _}` events,
     %% installed by the listener (via set_owner) during handshaking.
     owner :: pid() | undefined,
-    %% The `connected` payload, built once at new/1.
-    info :: info(),
+    %% The negotiated ALPN protocol, the `connected` payload.
+    alpn :: binary(),
+    %% Our advertised transport parameters (RFC 9000 §18.2), which set the
+    %% windows and stream limits enforced on the peer.
+    params :: roadrunner_quic_transport_params:params(),
     %% Application streams, each with its own reassembly + flow window, keyed
     %% by stream id (peer-initiated on receive; server-initiated and client
     %% request streams on send).
@@ -440,9 +443,10 @@
     probes = 0 :: non_neg_integer(),
     %% The client's advertised transport parameters, captured from the
     %% ClientHello. The send windows (connection and per-stream) are seeded from
-    %% these so the server never sends past what the peer granted (RFC 9000 §4.1);
-    %% empty until the handshake delivers them.
-    peer_params = #{} :: roadrunner_quic_transport_params:params(),
+    %% these so the server never sends past what the peer granted (RFC 9000 §4.1).
+    %% Until the handshake delivers the peer's, an empty set that reads as the
+    %% RFC 9000 §18.2 defaults.
+    peer_params :: roadrunner_quic_transport_params:params(),
     %% Owner events and connection-id routing changes accumulated while
     %% folding a datagram's frames, drained in order at the end of
     %% handle_datagram (newest-first, reversed on drain), ahead of the sends.
@@ -477,27 +481,19 @@
 
 -opaque t() :: #state{}.
 
--type config() :: #{
-    dcid := binary(),
-    scid := binary(),
-    peer_scid := binary(),
-    peer := {inet:ip_address(), inet:port_number()},
-    reset_key := binary(),
-    token_key := <<_:256>>,
-    %% Whether the client's first Initial carried an address validation
-    %% token that validated its address (RFC 9000 §8.1.3); `false` when
-    %% absent.
-    address_validated => boolean(),
-    %% The listener's registry, for the shell to route the ids the core
-    %% issues; the core itself never reads it.
-    registry => roadrunner_quic_cid_registry:t(),
-    cert_chain := [binary()],
-    priv_key := public_key:private_key(),
-    alpn := binary(),
-    transport_params := roadrunner_quic_transport_params:params(),
-    server_random := binary(),
-    stream_credit => on_receipt | on_read
-}.
+%% What every connection of a listener shares (`settings/7`).
+-record(settings, {
+    cert_chain :: [binary()],
+    priv_key :: public_key:private_key(),
+    alpn :: binary(),
+    %% The base transport parameters; each connection adds its own ids.
+    transport_params :: roadrunner_quic_transport_params:params(),
+    reset_key :: binary(),
+    token_key :: <<_:256>>,
+    stream_credit :: on_receipt | on_read
+}).
+
+-opaque settings() :: #settings{}.
 
 %% A monotonic-clock millisecond, the same epoch `erlang:monotonic_time/1`
 %% returns (negative on the BEAM), so an `arm_timer` deadline is `integer()`.
@@ -525,7 +521,7 @@
 %% (idle-timeout joins them later), and `drained` the owner's graceful close
 %% going out once every response was sent.
 -type event() ::
-    {connected, info()}
+    {connected, binary()}
     | {stream_opened, non_neg_integer()}
     | {stream_data, non_neg_integer(), binary(), boolean()}
     | {stream_reset, non_neg_integer(), non_neg_integer()}
@@ -533,60 +529,96 @@
     | {peer_changed, address()}
     | {closed, {peer, non_neg_integer() | stateless_reset} | {local, atom()} | drained}.
 
-%% The `connected` payload. The h3 owner ignores it; it carries the
-%% negotiated ALPN and the advertised transport params for forward-compat.
--type info() :: #{alpn := binary(), transport_params := roadrunner_quic_transport_params:params()}.
+%% The `connected` payload is the negotiated ALPN protocol; the h3 owner
+%% ignores it.
 
 %% =============================================================================
 %% Construction
 %% =============================================================================
 
 -doc """
-Build the connection state from the per-connection config and the birth time
-`Now` (ms). Bootstraps the Initial keys from the client's Destination
-Connection ID (`dcid`), records the client's Source Connection ID (`peer_scid`)
-as the destination every reply is addressed to (RFC 9000 §7.2), the TLS server
-sequencer (the server transport parameters already carry the original/initial
-connection ids), the Initial and Handshake packet-number spaces (the Application
-space appears once 1-RTT keys arm), and the idle-timeout deadline anchored at
-`Now`.
+The settings every connection of a listener shares: the server's DER
+certificate chain (leaf first) and private key, the ALPN protocol, the base
+transport parameters (each connection adds its connection ids and reset
+token), the key the stateless reset tokens of its connection ids derive from,
+the key its NEW_TOKEN tokens are sealed under, and when a request stream's
+receive credit is granted back: as its data arrives (`on_receipt`), or as its
+owner consumes it (`on_read`, `roadrunner_quic:consumed/3`).
 """.
--spec new(config(), integer()) -> t().
+-spec settings(
+    [binary()],
+    public_key:private_key(),
+    binary(),
+    roadrunner_quic_transport_params:params(),
+    binary(),
+    <<_:256>>,
+    on_receipt | on_read
+) -> settings().
+settings(CertChain, PrivKey, Alpn, TransportParams, ResetKey, TokenKey, StreamCredit) ->
+    #settings{
+        cert_chain = CertChain,
+        priv_key = PrivKey,
+        alpn = Alpn,
+        transport_params = TransportParams,
+        reset_key = ResetKey,
+        token_key = TokenKey,
+        stream_credit = StreamCredit
+    }.
+
+-doc """
+Build the connection state from its listener's `Settings` and the birth time
+`Now` (ms). `DCID` is the client's original Destination Connection ID, `SCID`
+the server's own, `PeerSCID` the client's Source Connection ID, `Peer` the
+client's address, and `AddressValidated` whether the client's first Initial
+carried an address validation token that validated its address (RFC 9000
+§8.1.3). Bootstraps the Initial keys from `DCID`, records `PeerSCID` as the
+destination every reply is addressed to (RFC 9000 §7.2), the TLS server
+sequencer (its transport parameters carrying `DCID` as
+original_destination_connection_id, `SCID` as initial_source_connection_id and
+the stateless reset token of `SCID`, §7.3, §10.3), the Initial and Handshake
+packet-number spaces (the Application space appears once 1-RTT keys arm), and
+the idle-timeout deadline anchored at `Now`.
+""".
+-spec new(
+    settings(),
+    binary(),
+    binary(),
+    binary(),
+    {inet:ip_address(), inet:port_number()},
+    boolean(),
+    integer()
+) -> t().
 new(
-    #{
-        dcid := DCID,
-        scid := SCID,
-        peer_scid := PeerSCID,
-        peer := Peer,
-        reset_key := ResetKey,
-        token_key := TokenKey,
-        cert_chain := CertChain,
-        priv_key := PrivKey,
-        alpn := Alpn,
-        transport_params := TransportParams,
-        server_random := ServerRandom
-    } = Config,
+    #settings{
+        cert_chain = CertChain,
+        priv_key = PrivKey,
+        alpn = Alpn,
+        transport_params = BaseParams,
+        reset_key = ResetKey,
+        token_key = TokenKey,
+        stream_credit = StreamCredit
+    },
+    DCID,
+    SCID,
+    PeerSCID,
+    Peer,
+    AddressValidated,
     Now
 ) ->
-    Tls = roadrunner_quic_tls_server:new(#{
-        cert_chain => CertChain,
-        priv_key => PrivKey,
-        alpn => Alpn,
-        transport_params => TransportParams,
-        server_random => ServerRandom,
-        peer_scid => PeerSCID
-    }),
+    TransportParams = connection_params(DCID, SCID, ResetKey, BaseParams),
+    Tls = roadrunner_quic_tls_server:new(
+        CertChain, PrivKey, Alpn, TransportParams, crypto:strong_rand_bytes(32), PeerSCID
+    ),
     %% Seed the connection receive window and the stream-count limits from the
     %% values we advertise, so what is enforced (RFC 9000 §4.1 / §4.6) is exactly
     %% what the peer was told it may use, never a hardcoded default.
-    #{
-        initial_max_data := ConnMaxData,
-        initial_max_streams_bidi := MaxStreamsBidi,
-        initial_max_streams_uni := MaxStreamsUni
-    } = TransportParams,
+    ConnMaxData = roadrunner_quic_transport_params:initial_max_data(TransportParams),
+    MaxStreamsBidi = roadrunner_quic_transport_params:initial_max_streams_bidi(TransportParams),
+    MaxStreamsUni = roadrunner_quic_transport_params:initial_max_streams_uni(TransportParams),
     %% Until the ClientHello delivers the peer's value, the idle timeout is our
     %% own advertised one (RFC 9000 §10.1).
-    IdleTimeout = negotiated_idle_timeout(TransportParams, #{}),
+    PeerParams = roadrunner_quic_transport_params:new([]),
+    IdleTimeout = negotiated_idle_timeout(TransportParams, PeerParams),
     #state{
         dcid = DCID,
         scid = SCID,
@@ -610,13 +642,16 @@ new(
             )
         },
         spaces = #{initial => new_space(), handshake => new_space()},
-        amp = initial_amp(Config),
+        amp = initial_amp(AddressValidated),
         owner = undefined,
-        info = #{alpn => Alpn, transport_params => TransportParams},
+        alpn = Alpn,
+        params = TransportParams,
+        peer_params = PeerParams,
         max_streams_bidi = MaxStreamsBidi,
         max_streams_uni = MaxStreamsUni,
-        conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ConnMaxData}),
-        stream_credit = maps:get(stream_credit, Config, on_receipt),
+        %% No send credit until the ClientHello brings the peer's limit.
+        conn_flow = roadrunner_quic_flow:new(ConnMaxData, 0),
+        stream_credit = StreamCredit,
         cc = roadrunner_quic_cc_newreno:new(),
         idle_timeout = IdleTimeout,
         idle_deadline = Now + IdleTimeout,
@@ -625,17 +660,38 @@ new(
 
 %% A client whose first Initial carried a token that validated its address
 %% (RFC 9000 §8.1.3) is spared the three-times limit from the start.
--spec initial_amp(config()) -> roadrunner_quic_amp:t().
-initial_amp(#{address_validated := true}) ->
+-spec initial_amp(boolean()) -> roadrunner_quic_amp:t().
+initial_amp(true) ->
     roadrunner_quic_amp:validate(roadrunner_quic_amp:new());
-initial_amp(#{}) ->
+initial_amp(false) ->
     roadrunner_quic_amp:new().
 
+%% The connection's transport parameters: the listener's, with the ids the
+%% client must find there (RFC 9000 §7.3) and the stateless reset token of the
+%% handshake id (§10.3, §18.2); the ids issued later carry theirs in
+%% NEW_CONNECTION_ID.
+-spec connection_params(binary(), binary(), binary(), roadrunner_quic_transport_params:params()) ->
+    roadrunner_quic_transport_params:params().
+connection_params(DCID, SCID, ResetKey, BaseParams) ->
+    roadrunner_quic_transport_params:set(
+        stateless_reset_token,
+        roadrunner_quic_cid_registry:reset_token(ResetKey, SCID),
+        roadrunner_quic_transport_params:set(
+            initial_source_connection_id,
+            SCID,
+            roadrunner_quic_transport_params:set(
+                original_destination_connection_id, DCID, BaseParams
+            )
+        )
+    ).
+
 %% A handshake-time space (Initial, Handshake), whose packets the peer
-%% acknowledges at once (RFC 9000 §13.2.1, `roadrunner_quic_loss:new/1`).
+%% acknowledges at once (RFC 9000 §13.2.1, `roadrunner_quic_loss:new/1`). The
+%% peer's ACK delay parameters take their defaults until they arrive
+%% (`peer_ack_delay/1`).
 -spec new_space() -> #space{}.
 new_space() ->
-    new_space(roadrunner_quic_loss:new(#{handshake => true})).
+    new_space(roadrunner_quic_loss:new(true)).
 
 -spec new_space(roadrunner_quic_loss:t()) -> #space{}.
 new_space(Loss) ->
@@ -835,7 +891,7 @@ open_held(Now, Packet, #state{recv_keys = RecvKeys} = State0) ->
 %% had been acknowledged (§4.1.2). That is a KEY_UPDATE_ERROR, as it was when
 %% one arrived during the handshake, never a committed update.
 -spec held_outcome(integer(), roadrunner_quic_recv:outcome(), t()) -> t().
-held_outcome(_Now, {ok, #{generation := next}}, #state{phase = connected} = State) ->
+held_outcome(_Now, {ok, #quic_decoded{generation = next}}, #state{phase = connected} = State) ->
     connection_fatal(application, key_update_error, State);
 held_outcome(Now, Outcome, State) ->
     process_outcome(Now, Outcome, State).
@@ -970,15 +1026,15 @@ emit(Event, #state{owner = Owner, emits = Emits} = State) ->
 queue_effect(Effect, #state{emits = Emits} = State) ->
     State#state{emits = [Effect | Emits]}.
 
-%% Emit `{connected, Info}` exactly when this datagram drove the
+%% Emit `{connected, Alpn}` exactly when this datagram drove the
 %% handshaking -> connected transition AND an owner is installed. With no
 %% owner yet (the listener has not run set_owner), the emit is deferred to
 %% install_owner. The two sites are mutually exclusive, so it fires once.
 -spec connected_effects(phase(), t(), [effect()]) -> [effect()].
-connected_effects(handshaking, #state{phase = connected, owner = Owner, info = Info}, Tail) when
+connected_effects(handshaking, #state{phase = connected, owner = Owner, alpn = Alpn}, Tail) when
     is_pid(Owner)
 ->
-    [{emit, Owner, {connected, Info}} | Tail];
+    [{emit, Owner, {connected, Alpn}} | Tail];
 connected_effects(_Before, _State, Tail) ->
     Tail.
 
@@ -1170,12 +1226,12 @@ do_stop_sending(Sid, ErrorCode, Now, State) ->
     send_pass(Now, State1).
 
 %% Install the owner. When the handshake already completed before the owner
-%% was set (the deferred path), emit the once-only `{connected, Info}` now;
+%% was set (the deferred path), emit the once-only `{connected, Alpn}` now;
 %% normally the listener sets the owner during handshaking, so the emit
 %% instead rides out of handle_datagram at the transition.
 -spec install_owner(pid(), t()) -> {t(), [effect()]}.
-install_owner(Owner, #state{phase = connected, info = Info} = State) ->
-    {State#state{owner = Owner}, [{emit, Owner, {connected, Info}}]};
+install_owner(Owner, #state{phase = connected, alpn = Alpn} = State) ->
+    {State#state{owner = Owner}, [{emit, Owner, {connected, Alpn}}]};
 install_owner(Owner, State) ->
     {State#state{owner = Owner}, []}.
 
@@ -1290,7 +1346,7 @@ append_send(Sid, IoData, Fin, State) ->
     {roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
 stream_for_send(
     Sid,
-    #state{streams = Streams, info = #{transport_params := TP}, peer_params = PeerParams} = State
+    #state{streams = Streams, params = TP, peer_params = PeerParams} = State
 ) ->
     case Streams of
         #{Sid := {Stream, Flow}} ->
@@ -1299,10 +1355,9 @@ stream_for_send(
             %% A server-first stream (response on a client request stream, or a
             %% server control / QPACK stream): seed its send window from what the
             %% client granted for that stream type, like the receive path does.
-            Flow = roadrunner_quic_flow:new(#{
-                initial_max_data => stream_recv_window(Sid, TP),
-                peer_initial_max_data => peer_stream_send_window(Sid, PeerParams)
-            }),
+            Flow = roadrunner_quic_flow:new(
+                stream_recv_window(Sid, TP), peer_stream_send_window(Sid, PeerParams)
+            ),
             {roadrunner_quic_stream:new(), Flow, State}
     end.
 
@@ -1317,14 +1372,15 @@ process_outcome(_Now, _Outcome, #state{phase = Phase} = State) when
     State;
 process_outcome(
     Now,
-    {ok, #{generation := next, pn := PN} = Decoded},
-    #state{key_phase = Phase, recv_keys = #{application := #{phase := RecvPhase}}} = State
+    {ok, #quic_decoded{generation = next, pn = PN} = Decoded},
+    #state{key_phase = Phase, recv_keys = #{application := #quic_phased_keys{phase = RecvPhase}}} =
+        State
 ) when Phase =/= RecvPhase ->
     %% Our send keys are a generation ahead: this is the peer's response to
     %% our own key update (RFC 9001 §6.2), its send keys now the ones ours
     %% moved to. Only the receive keys move; the update is not a new one.
     process_packet(Now, Decoded, promote_recv_keys(Now, PN, State));
-process_outcome(Now, {ok, #{generation := next, pn := PN} = Decoded}, State) ->
+process_outcome(Now, {ok, #quic_decoded{generation = next, pn = PN} = Decoded}, State) ->
     %% The packet authenticated with the next 1-RTT keys, so the peer has
     %% updated its keys (RFC 9001 §6.2). Only now, after that trial decryption
     %% succeeded, is the update committed: a forged packet with a flipped Key
@@ -1335,14 +1391,16 @@ process_outcome(Now, {ok, #{generation := next, pn := PN} = Decoded}, State) ->
     end;
 process_outcome(
     Now,
-    {ok, #{generation := current, pn := PN} = Decoded},
-    #state{recv_keys = #{application := #{prev_below := Below} = Keys} = RecvKeys} = State
-) when PN < Below ->
+    {ok, #quic_decoded{generation = current, pn = PN} = Decoded},
+    #state{
+        recv_keys = #{application := #quic_phased_keys{prev_below = Below} = Keys} = RecvKeys
+    } = State
+) when is_integer(Below), PN < Below ->
     %% A current-phase packet reordered ahead of the one that began the phase:
     %% only packets numbered below it can be from the previous phase (§6.5), so
     %% the previous keys never open a packet numbered above one the newer keys
     %% opened (§6.4).
-    Keys1 = Keys#{prev_below := PN},
+    Keys1 = Keys#quic_phased_keys{prev_below = PN},
     process_packet(Now, Decoded, State#state{recv_keys = RecvKeys#{application := Keys1}});
 process_outcome(Now, {ok, Decoded}, State) ->
     process_packet(Now, Decoded, State);
@@ -1385,7 +1443,9 @@ process_outcome(_Now, {frame_error, Level, _Reason}, State) ->
 %% Fold a decrypted packet's frames into the connection and record it for
 %% acknowledgment.
 -spec process_packet(integer(), roadrunner_quic_recv:decoded(), t()) -> t().
-process_packet(Now, #{level := Level, pn := PN, frames := Frames}, #state{spaces = Spaces} = State) ->
+process_packet(
+    Now, #quic_decoded{level = Level, pn = PN, frames = Frames}, #state{spaces = Spaces} = State
+) ->
     case Spaces of
         #{Level := #space{ack = Ack}} ->
             case roadrunner_quic_ack:received(PN, Ack) of
@@ -1451,15 +1511,16 @@ promote_recv_keys(
         aead = Aead
     } = State
 ) ->
-    #{key := Key, iv := IV, phase := Phase, next := #{key := NextKey, iv := NextIV}} = Recv,
+    #quic_phased_keys{key = Key, iv = IV, phase = Phase, next = Next} = Recv,
+    #quic_keys{key = NextKey, iv = NextIV} = Next,
     {RecvSecret1, AfterNext} = roadrunner_quic_keys:update(Aead, RecvSecret),
-    Recv1 = Recv#{
-        key := NextKey,
-        iv := NextIV,
-        phase := 1 - Phase,
-        next := roadrunner_quic_keys:for_connection(AfterNext, open),
-        prev => #{key => Key, iv => IV},
-        prev_below => PN
+    Recv1 = Recv#quic_phased_keys{
+        key = NextKey,
+        iv = NextIV,
+        phase = 1 - Phase,
+        next = roadrunner_quic_keys:for_connection(AfterNext, open),
+        prev = #quic_keys{key = Key, iv = IV},
+        prev_below = PN
     },
     #space{loss = Loss} = space(application, State),
     State#state{
@@ -1484,10 +1545,10 @@ advance_send_keys(
     } = State
 ) ->
     {SendSecret1, SendNext} = roadrunner_quic_keys:update(Aead, SendSecret),
-    #{key := SendKey, iv := SendIV} = roadrunner_quic_keys:for_connection(SendNext, seal),
+    #quic_keys{key = SendKey, iv = SendIV} = roadrunner_quic_keys:for_connection(SendNext, seal),
     #space{next_pn = NextPN} = space(application, State),
     State#state{
-        send_keys = SendKeys#{application := Send#{key := SendKey, iv := SendIV}},
+        send_keys = SendKeys#{application := Send#quic_keys{key = SendKey, iv = SendIV}},
         send_secret = SendSecret1,
         key_phase = 1 - Phase,
         sealed = 0,
@@ -1553,7 +1614,7 @@ own_update_permitted(
         phase = connected,
         own_update_at = At,
         key_phase = Phase,
-        recv_keys = #{application := #{phase := Phase}}
+        recv_keys = #{application := #quic_phased_keys{phase = Phase}}
     }
 ) when is_integer(At), Now >= At ->
     true;
@@ -1586,7 +1647,9 @@ expire_previous_keys(
 ) when is_integer(Until), Now >= Until ->
     State#state{
         prev_keys_until = undefined,
-        recv_keys = RecvKeys#{application := maps:without([prev, prev_below], Keys)}
+        recv_keys = RecvKeys#{
+            application := Keys#quic_phased_keys{prev = undefined, prev_below = undefined}
+        }
     };
 expire_previous_keys(_Now, State) ->
     State.
@@ -1756,7 +1819,7 @@ on_max_stream_data(Sid, Max, #state{streams = Streams} = State) ->
 %% 9001 §5.7).
 -spec issue_cids(t()) -> t().
 issue_cids(#state{cids = Cids, peer_params = PeerParams} = State) ->
-    Limit = maps:get(active_connection_id_limit, PeerParams, ?DEFAULT_ACTIVE_CID_LIMIT),
+    Limit = roadrunner_quic_transport_params:active_connection_id_limit(PeerParams),
     issue_cids(min(Limit, ?ACTIVE_CID_LIMIT) - map_size(Cids), State).
 
 -spec issue_cids(integer(), t()) -> t().
@@ -1847,8 +1910,8 @@ add_peer_cid(
         peer_cids = PeerCids#{Seq => CID}, peer_reset_tokens = Tokens#{Seq => Token}
     }),
     State1 = retire_prior(Prior, Added),
-    #state{peer_cids = Active, info = #{transport_params := OurParams}} = State1,
-    case maps:get(active_connection_id_limit, OurParams, ?DEFAULT_ACTIVE_CID_LIMIT) of
+    #state{peer_cids = Active, params = OurParams} = State1,
+    case roadrunner_quic_transport_params:active_connection_id_limit(OurParams) of
         Limit when map_size(Active) > Limit ->
             connection_fatal(application, connection_id_limit_error, State1);
         _Limit ->
@@ -2144,9 +2207,7 @@ start_validation(Now, Stage, State) ->
     #space{loss = Loss} = space(application, State),
     Interval = max(
         roadrunner_quic_loss:get_pto(Loss),
-        roadrunner_quic_loss:get_pto(
-            roadrunner_quic_loss:new(maps:with([max_ack_delay], State#state.peer_params))
-        )
+        roadrunner_quic_loss:get_pto(peer_loss(State#state.peer_params))
     ),
     queue_challenge(State#state{
         validation = #validation{
@@ -2343,8 +2404,8 @@ path_packet(Now, Path, Frames, #state{scid = SCID, sealed = Sealed} = State) ->
             none;
         {DCID, Budget} ->
             #space{next_pn = PN} = Space = space(application, State),
-            Entry = (entry(application, Frames, PN, State))#{
-                pad_to => path_pad(Budget, pad_keep(Path, Frames, State))
+            Entry = (entry(application, Frames, PN, State))#quic_entry{
+                pad_to = path_pad(Budget, pad_keep(Path, Frames, State))
             },
             {Datagram, [Sent]} = roadrunner_quic_send:datagram(#{application => Entry}, DCID, SCID),
             case byte_size(Datagram) =< Budget of
@@ -2399,9 +2460,9 @@ path_target(_Path, #state{}) ->
 path_sent(Now, current, Sent, Size, #state{amp = Amp} = State) ->
     record_one_sent(Now, Sent, State#state{amp = roadrunner_quic_amp:sent(Size, Amp)});
 path_sent(Now, {validated, _Addr, _DCID}, Sent, _Size, State) ->
-    record_one_sent(Now, Sent#{ack_eliciting := false}, State);
+    record_one_sent(Now, Sent#quic_sent{ack_eliciting = false}, State);
 path_sent(Now, probe, Sent, Size, #state{probe_path = {Addr, Seq, Amp}} = State) ->
-    record_one_sent(Now, Sent#{ack_eliciting := false}, State#state{
+    record_one_sent(Now, Sent#quic_sent{ack_eliciting = false}, State#state{
         probe_path = {Addr, Seq, roadrunner_quic_amp:sent(Size, Amp)}
     }).
 
@@ -2459,19 +2520,18 @@ deframe(Buffer) ->
 process_handshake(
     initial,
     {?CLIENT_HELLO, Body},
-    #state{tls = Tls, info = #{transport_params := #{initial_max_data := OurMaxData} = OurParams}} =
-        State
+    #state{tls = Tls, params = OurParams} = State
 ) ->
     case roadrunner_quic_tls_server:process_client_hello(Body, Tls) of
-        {ok, #{initial := InitialFlight, handshake := HandshakeFlight}, Installs, PeerParams, Tls1} ->
+        {ok, InitialFlight, HandshakeFlight, Installs, PeerParams, Tls1} ->
             %% Seed the connection send window from the client's advertised
             %% initial_max_data (absent -> 0, RFC 9000 §18.2), not a default. Safe
             %% to re-create conn_flow here: no 1-RTT data flows before the
             %% handshake completes.
-            ConnFlow = roadrunner_quic_flow:new(#{
-                initial_max_data => OurMaxData,
-                peer_initial_max_data => maps:get(initial_max_data, PeerParams, 0)
-            }),
+            ConnFlow = roadrunner_quic_flow:new(
+                roadrunner_quic_transport_params:initial_max_data(OurParams),
+                roadrunner_quic_transport_params:initial_max_data(PeerParams)
+            ),
             %% Lower the idle timeout to the negotiated minimum (RFC 9000 §10.1)
             %% now that the peer's advertised value is known.
             IdleTimeout = negotiated_idle_timeout(OurParams, PeerParams),
@@ -2482,7 +2542,8 @@ process_handshake(
                     peer_params = PeerParams,
                     %% The limit on the server's own unidirectional streams
                     %% (absent -> 0, RFC 9000 §18.2).
-                    peer_max_streams_uni = maps:get(initial_max_streams_uni, PeerParams, 0),
+                    peer_max_streams_uni =
+                        roadrunner_quic_transport_params:initial_max_streams_uni(PeerParams),
                     conn_flow = ConnFlow,
                     idle_timeout = IdleTimeout,
                     idle_deadline = State#state.idle_since + IdleTimeout
@@ -2535,9 +2596,15 @@ install_key({application, server, Aead, Secret}, State) ->
 install_key({Level, server, Aead, Secret}, State) ->
     install_send_keys(Level, Aead, Secret, State);
 install_key({application, client, Aead, Secret}, #state{recv_keys = RecvKeys} = State) ->
-    Keys = connection_keys(Aead, Secret, open),
+    #quic_keys{key = Key, iv = IV, hp = HP} = connection_keys(Aead, Secret, open),
     {NextSecret, Next} = roadrunner_quic_keys:update(Aead, Secret),
-    AppKeys = Keys#{phase => 0, next => roadrunner_quic_keys:for_connection(Next, open)},
+    AppKeys = #quic_phased_keys{
+        key = Key,
+        iv = IV,
+        hp = HP,
+        phase = 0,
+        next = roadrunner_quic_keys:for_connection(Next, open)
+    },
     ensure_space(application, State#state{
         recv_keys = RecvKeys#{application => AppKeys}, recv_secret = NextSecret, aead = Aead
     });
@@ -2569,24 +2636,35 @@ connection_keys(Aead, Secret, Direction) ->
 ensure_space(application, #state{spaces = #{application := _}} = State) ->
     State;
 ensure_space(application, #state{spaces = Spaces, peer_params = PeerParams} = State) ->
-    Loss = roadrunner_quic_loss:new(maps:with([max_ack_delay, ack_delay_exponent], PeerParams)),
-    State#state{spaces = Spaces#{application => new_space(Loss)}};
+    State#state{spaces = Spaces#{application => new_space(peer_loss(PeerParams))}};
 ensure_space(_Level, State) ->
     State.
+
+%% A fresh application-space loss state for the peer's ACK delay parameters.
+-spec peer_loss(roadrunner_quic_transport_params:params()) -> roadrunner_quic_loss:t().
+peer_loss(PeerParams) ->
+    roadrunner_quic_loss:new(
+        false,
+        roadrunner_quic_transport_params:max_ack_delay(PeerParams),
+        roadrunner_quic_transport_params:ack_delay_exponent(PeerParams)
+    ).
 
 %% The handshake-time spaces open before the peer's transport parameters
 %% arrive. Its max_ack_delay still sets their persistent congestion duration
 %% (RFC 9002 §7.6.1), and its exponent decodes their ACKs (RFC 9000 §19.3).
 -spec peer_ack_delay(t()) -> t().
 peer_ack_delay(#state{peer_params = PeerParams, spaces = Spaces} = State) ->
-    Params = maps:with([max_ack_delay, ack_delay_exponent], PeerParams),
+    MaxAckDelay = roadrunner_quic_transport_params:max_ack_delay(PeerParams),
+    Exponent = roadrunner_quic_transport_params:ack_delay_exponent(PeerParams),
     State#state{
         spaces = maps:map(
             fun
                 (application, Space) ->
                     Space;
                 (_Level, #space{loss = Loss} = Space) ->
-                    Space#space{loss = roadrunner_quic_loss:set_ack_delay(Params, Loss)}
+                    Space#space{
+                        loss = roadrunner_quic_loss:set_ack_delay(MaxAckDelay, Exponent, Loss)
+                    }
             end,
             Spaces
         )
@@ -2661,11 +2739,11 @@ apply_ack(Now, Level, Ack, Space, #state{cc = Cc} = State) ->
 -spec apply_cc_signal(roadrunner_quic_loss:cc_signal(), integer(), roadrunner_quic_cc_newreno:t()) ->
     roadrunner_quic_cc_newreno:t().
 apply_cc_signal(
-    #{
-        acked_bytes := AckedBytes,
-        largest_acked_time := AckedTime,
-        largest_lost_time := LostTime,
-        persistent_congestion := Persistent
+    #quic_cc_signal{
+        acked_bytes = AckedBytes,
+        largest_acked_time = AckedTime,
+        largest_lost_time = LostTime,
+        persistent_congestion = Persistent
     },
     Now,
     Cc
@@ -2989,14 +3067,13 @@ opened_before(Sid, #state{uni_opened = Opened}) ->
     {ok, roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()}.
 open_stream(
     Sid,
-    #state{info = #{transport_params := TP}, peer_params = PeerParams, stream_credit = Credit} =
+    #state{params = TP, peer_params = PeerParams, stream_credit = Credit} =
         State
 ) ->
     Stream = roadrunner_quic_stream:new(),
-    Flow = roadrunner_quic_flow:new(#{
-        initial_max_data => stream_recv_window(Sid, TP),
-        peer_initial_max_data => peer_stream_send_window(Sid, PeerParams)
-    }),
+    Flow = roadrunner_quic_flow:new(
+        stream_recv_window(Sid, TP), peer_stream_send_window(Sid, PeerParams)
+    ),
     {ok, Stream, request_flow(Sid, Credit, Flow),
         emit({stream_opened, Sid}, bump_opened(Sid, State))}.
 
@@ -3018,9 +3095,9 @@ request_flow(_Sid, _Credit, Flow) ->
 -spec peer_stream_send_window(non_neg_integer(), roadrunner_quic_transport_params:params()) ->
     non_neg_integer().
 peer_stream_send_window(Sid, PeerParams) when Sid rem 4 =:= 0 ->
-    maps:get(initial_max_stream_data_bidi_local, PeerParams, 0);
+    roadrunner_quic_transport_params:initial_max_stream_data_bidi_local(PeerParams);
 peer_stream_send_window(Sid, PeerParams) when Sid rem 4 =:= 3 ->
-    maps:get(initial_max_stream_data_uni, PeerParams, 0);
+    roadrunner_quic_transport_params:initial_max_stream_data_uni(PeerParams);
 peer_stream_send_window(_Sid, _PeerParams) ->
     0.
 
@@ -3032,8 +3109,8 @@ peer_stream_send_window(_Sid, _PeerParams) ->
     roadrunner_quic_transport_params:params(), roadrunner_quic_transport_params:params()
 ) -> non_neg_integer().
 negotiated_idle_timeout(OurParams, PeerParams) ->
-    Ours = maps:get(max_idle_timeout, OurParams, 0),
-    Peer = maps:get(max_idle_timeout, PeerParams, 0),
+    Ours = roadrunner_quic_transport_params:max_idle_timeout(OurParams),
+    Peer = roadrunner_quic_transport_params:max_idle_timeout(PeerParams),
     case {Ours, Peer} of
         {0, 0} -> ?IDLE_TIMEOUT;
         {0, P} -> P;
@@ -3076,10 +3153,10 @@ grant_max_streams_bidi(
         bidi_opened = Opened,
         bidi_closed = Closed,
         max_streams_bidi = Max,
-        info = #{transport_params := #{initial_max_streams_bidi := Window}}
+        params = OurParams
     } = State
 ) ->
-    NewMax = Closed + Window,
+    NewMax = Closed + roadrunner_quic_transport_params:initial_max_streams_bidi(OurParams),
     case NewMax > Max andalso 2 * (Max - Opened) =< NewMax - Opened of
         true ->
             queue_frame(
@@ -3101,10 +3178,10 @@ grant_max_streams_bidi(State) ->
 %% receive window is moot since the server never receives there.
 -spec stream_recv_window(non_neg_integer(), roadrunner_quic_transport_params:params()) ->
     non_neg_integer().
-stream_recv_window(Sid, #{initial_max_stream_data_bidi_remote := Bidi}) when Sid rem 4 =:= 0 ->
-    Bidi;
-stream_recv_window(_Sid, #{initial_max_stream_data_uni := Uni}) ->
-    Uni.
+stream_recv_window(Sid, OurParams) when Sid rem 4 =:= 0 ->
+    roadrunner_quic_transport_params:initial_max_stream_data_bidi_remote(OurParams);
+stream_recv_window(_Sid, OurParams) ->
+    roadrunner_quic_transport_params:initial_max_stream_data_uni(OurParams).
 
 -spec put_stream(non_neg_integer(), roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()) ->
     t().
@@ -3357,7 +3434,7 @@ drain_built(Now, Levels, State, Acc) ->
             %% pass, and so do the probes a probe timeout queued (§7.5). On a
             %% block, return the pre-build State so the consumed ACK / stream
             %% slice stays pending for the next pass.
-            AckEliciting = lists:any(fun(#{ack_eliciting := Elicit}) -> Elicit end, Sent),
+            AckEliciting = lists:any(fun(#quic_sent{ack_eliciting = Elicit}) -> Elicit end, Sent),
             CcOk =
                 not AckEliciting orelse Probes > 0 orelse
                     roadrunner_quic_cc_newreno:can_send(total_bytes_in_flight(State), Cc),
@@ -3429,7 +3506,8 @@ send_ack_only(Now, Levels, State, Acc) ->
             end
     end.
 
--spec build_ack_only([level()], integer(), t()) -> none | {#{level() => map()}, t()}.
+-spec build_ack_only([level()], integer(), t()) ->
+    none | {#{level() => roadrunner_quic_send:entry()}, t()}.
 build_ack_only([], _Now, _State) ->
     none;
 build_ack_only([Level | Rest], Now, State) ->
@@ -3452,7 +3530,8 @@ build_ack_only([Level | Rest], Now, State) ->
 %% flight would overflow. It also makes the forbidden Initial+1-RTT
 %% coalescing structurally impossible. Coalescing Initial+Handshake is a
 %% deferred optimization. Returns `none` when nothing is pending anywhere.
--spec build_first([level()], integer(), t()) -> none | {#{level() => map()}, t()}.
+-spec build_first([level()], integer(), t()) ->
+    none | {#{level() => roadrunner_quic_send:entry()}, t()}.
 build_first([], _Now, _State) ->
     none;
 build_first([Level | Rest], Now, State) ->
@@ -3461,7 +3540,7 @@ build_first([Level | Rest], Now, State) ->
         {Entry, Built} -> {#{Level => Entry}, Built}
     end.
 
--spec build_level(level(), integer(), t()) -> none | {map(), t()}.
+-spec build_level(level(), integer(), t()) -> none | {roadrunner_quic_send:entry(), t()}.
 build_level(Level, Now, State) ->
     Space = space(Level, State),
     {AckFrames, Ack} = take_ack(Space#space.ack, Now),
@@ -3545,7 +3624,7 @@ ack_due(_Level, _Now, _Space) ->
 %% fresh data: CRYPTO at the handshake levels, application STREAM frames at
 %% the application level (which never carries CRYPTO).
 -spec build_data(level(), [roadrunner_quic_frame:frame()], boolean(), #space{}, t()) ->
-    none | {map(), t()}.
+    none | {roadrunner_quic_send:entry(), t()}.
 build_data(application, AckFrames, AckDue, #space{next_pn = PN} = Space, State) ->
     {StreamFrames, State1} = take_stream(AckFrames, PN, State),
     case {StreamFrames, AckDue} of
@@ -3652,7 +3731,8 @@ stream_blocked_frame(_Sid, ok, _StreamFlow) ->
 %% A 1-RTT packet counts toward its send keys' confidentiality limit (RFC
 %% 9001 §6.6); a datagram that does not go out returns the state from before
 %% it, so only packets sent are counted.
--spec build_entry(level(), [roadrunner_quic_frame:frame()], #space{}, t()) -> {map(), t()}.
+-spec build_entry(level(), [roadrunner_quic_frame:frame()], #space{}, t()) ->
+    {roadrunner_quic_send:entry(), t()}.
 build_entry(application, Frames, #space{next_pn = PN} = Space, #state{sealed = Sealed} = State) ->
     Entry = entry(application, Frames, PN, State),
     State1 = ack_in_phase(application, Frames, State#state{sealed = Sealed + 1}),
@@ -3667,10 +3747,10 @@ build_entry(Level, Frames, #space{next_pn = PN} = Space, State) ->
 -spec entry(level(), [roadrunner_quic_frame:frame()], non_neg_integer(), t()) ->
     roadrunner_quic_send:entry().
 entry(application, Frames, PN, #state{send_keys = #{application := Keys}, key_phase = Phase}) ->
-    #{frames => Frames, keys => Keys, pn => PN, key_phase => Phase};
+    #quic_entry{frames = Frames, keys = Keys, pn = PN, key_phase = Phase};
 entry(Level, Frames, PN, #state{send_keys = SendKeys}) ->
     #{Level := Keys} = SendKeys,
-    #{frames => Frames, keys => Keys, pn => PN}.
+    #quic_entry{frames = Frames, keys = Keys, pn = PN}.
 
 %% A 1-RTT packet carrying an ACK, the first since a key update, completes
 %% the update (RFC 9001 §6.2): it acknowledges a packet of the new phase, so
@@ -3732,7 +3812,9 @@ record_sent(Now, Sent, State) ->
 -spec record_one_sent(integer(), roadrunner_quic_send:sent(), t()) -> t().
 record_one_sent(
     Now,
-    #{level := Level, pn := PN, length := Len, ack_eliciting := AckEliciting, frames := Frames},
+    #quic_sent{
+        level = Level, pn = PN, length = Len, ack_eliciting = AckEliciting, frames = Frames
+    },
     State
 ) ->
     Space = space(Level, State),

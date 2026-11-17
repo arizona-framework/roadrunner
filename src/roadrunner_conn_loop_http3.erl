@@ -16,7 +16,7 @@
 %% The loop receives QUIC stream events as messages from the connection
 %% process:
 %%
-%%   {quic, Conn, {connected, Info}}            handshake complete
+%%   {quic, Conn, {connected, Alpn}}            handshake complete
 %%   {quic, Conn, {stream_opened, StreamId}}    peer opened a stream
 %%   {quic, Conn, {stream_data, StreamId, Bin, Fin}}
 %%   {quic, Conn, {stream_reset, StreamId, ErrorCode}}

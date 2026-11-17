@@ -64,9 +64,9 @@
 
 -include_lib("public_key/include/public_key.hrl").
 
--export([new/1, process_client_hello/2, process_client_finished/2]).
+-export([new/6, process_client_hello/2, process_client_finished/2]).
 
--export_type([t/0, config/0, flight/0, install/0]).
+-export_type([t/0, install/0]).
 
 %% ClientHello handshake type (RFC 8446 §4), for re-framing the body into
 %% the transcript; the server messages are framed by their builders.
@@ -116,17 +116,6 @@
 
 -opaque t() :: #server{}.
 
--type config() :: #{
-    cert_chain := [binary()],
-    priv_key := public_key:private_key(),
-    alpn := binary(),
-    transport_params := roadrunner_quic_transport_params:params(),
-    server_random := binary(),
-    peer_scid := binary()
-}.
-
--type flight() :: #{initial := iolist(), handshake := iolist()}.
-
 %% A traffic secret for one level and direction (RFC 8446 §7.1), with the
 %% AEAD of the negotiated cipher suite that the packet keys derived from it
 %% use (RFC 9001 §5.3).
@@ -147,24 +136,24 @@
 -type key_exchange() :: {share, group(), binary()} | {retry, group()}.
 
 -doc """
-Build the handshake state from the per-connection config: the server's DER
-certificate chain (leaf first) and private key, the selected ALPN
-protocol, the server transport parameters (already carrying the
+Build the handshake state for one connection: the server's DER certificate
+chain (leaf first) and private key, the selected ALPN protocol, the server
+transport parameters (already carrying the
 `original_destination_connection_id` and `initial_source_connection_id`
 the loop fills in), the ServerHello random, and the client's Initial Source
-Connection ID (`peer_scid`, the value the client's
+Connection ID (`PeerSCID`, the value the client's
 `initial_source_connection_id` transport parameter must match, RFC 9000
 §7.3).
 """.
--spec new(config()) -> t().
-new(#{
-    cert_chain := CertChain,
-    priv_key := PrivKey,
-    alpn := Alpn,
-    transport_params := TransportParams,
-    server_random := ServerRandom,
-    peer_scid := PeerSCID
-}) ->
+-spec new(
+    [binary()],
+    public_key:private_key(),
+    binary(),
+    roadrunner_quic_transport_params:params(),
+    binary(),
+    binary()
+) -> t().
+new(CertChain, PrivKey, Alpn, TransportParams, ServerRandom, PeerSCID) ->
     #server{
         cert_chain = CertChain,
         priv_key = PrivKey,
@@ -179,10 +168,11 @@ Process the client's ClientHello body (as handed up by
 `roadrunner_quic_tls_handshake:decode/1`) and produce the server's whole
 first flight, or a HelloRetryRequest.
 
-Returns `{ok, Flight, Installs, PeerParams, State}` where `Flight` groups
-the framed handshake messages by QUIC encryption level (`initial` carries
-the ServerHello; `handshake` carries EncryptedExtensions, Certificate,
-CertificateVerify, and the server Finished), `Installs` is the ordered
+Returns `{ok, InitialFlight, HandshakeFlight, Installs, PeerParams, State}`
+where the flights are the framed handshake messages of each QUIC
+encryption level (`InitialFlight` is the ServerHello; `HandshakeFlight` is
+EncryptedExtensions, Certificate, CertificateVerify, and the server
+Finished), `Installs` is the ordered
 list of traffic secrets the loop derives its packet-protection keys from
 (RFC 9001 §5.1), each with the negotiated suite's AEAD (§5.3): the
 handshake secrets (so it can read the client's encrypted Finished) before
@@ -215,7 +205,7 @@ is absent for) the Source Connection ID of its first Initial packet
 (`transport_parameter_error`, RFC 9000 §7.3).
 """.
 -spec process_client_hello(binary(), t()) ->
-    {ok, flight(), [install()], roadrunner_quic_transport_params:params(), t()}
+    {ok, iolist(), iolist(), [install()], roadrunner_quic_transport_params:params(), t()}
     | {retry, iolist(), t()}
     | {error, atom()}.
 process_client_hello(_ClientHelloBody, #server{stage = flight_sent}) ->
@@ -226,21 +216,21 @@ process_client_hello(
     ClientHelloBody, #server{priv_key = PrivKey, alpn = Alpn, peer_scid = PeerSCID} = State
 ) ->
     maybe
-        {ok,
-            #{
-                supported_versions := Versions,
-                cipher_suites := CipherSuites,
-                signature_algorithms := SigAlgs,
-                alpn_protocols := ClientAlpns
-            } = ClientHello} ?=
-            roadrunner_quic_tls_hello:parse_client_hello(ClientHelloBody),
-        ok ?= check_version(Versions),
-        {ok, CipherSuite} ?= select_cipher_suite(CipherSuites),
-        {ok, KeyExchange} ?= select_group(ClientHello),
-        {ok, Scheme} ?= negotiate_scheme(PrivKey, SigAlgs),
-        ok ?= check_alpn(Alpn, ClientAlpns),
-        ok ?= check_transport_params(ClientHello),
-        ok ?= check_initial_scid(ClientHello, PeerSCID),
+        {ok, ClientHello} ?= roadrunner_quic_tls_hello:parse_client_hello(ClientHelloBody),
+        ok ?= check_version(roadrunner_quic_tls_hello:supported_versions(ClientHello)),
+        {ok, CipherSuite} ?=
+            select_cipher_suite(roadrunner_quic_tls_hello:cipher_suites(ClientHello)),
+        {ok, KeyExchange} ?=
+            select_group(
+                roadrunner_quic_tls_hello:supported_groups(ClientHello),
+                roadrunner_quic_tls_hello:key_shares(ClientHello)
+            ),
+        {ok, Scheme} ?=
+            negotiate_scheme(PrivKey, roadrunner_quic_tls_hello:signature_algorithms(ClientHello)),
+        ok ?= check_alpn(Alpn, roadrunner_quic_tls_hello:alpn_protocols(ClientHello)),
+        PeerParams = roadrunner_quic_tls_hello:transport_params(ClientHello),
+        ok ?= check_transport_params(PeerParams),
+        ok ?= check_initial_scid(PeerParams, PeerSCID),
         respond(ClientHelloBody, ClientHello, CipherSuite, KeyExchange, Scheme, State)
     end.
 
@@ -317,15 +307,17 @@ select_cipher_suite(Offered) ->
 %% (§4.1.1). Without pre-shared keys, a TLS 1.3 ClientHello MUST carry both
 %% supported_groups and key_share (§9.2), so a missing one is a
 %% missing_extension alert.
--spec select_group(roadrunner_quic_tls_hello:client_hello()) ->
+-spec select_group(
+    [non_neg_integer()] | undefined, [{non_neg_integer(), binary()}] | undefined
+) ->
     {ok, key_exchange()} | {error, no_common_group | missing_extension}.
-select_group(#{supported_groups := Offered, key_shares := Shares}) ->
+select_group(Offered, Shares) when is_list(Offered), is_list(Shares) ->
     Supported = [{?GROUP_X25519, x25519}, {?GROUP_SECP256R1, secp256r1}],
     case [Group || {Codepoint, _Curve} = Group <- Supported, lists:member(Codepoint, Offered)] of
         [Preferred | _] = Candidates -> {ok, shared_group(Candidates, Shares, Preferred)};
         [] -> {error, no_common_group}
     end;
-select_group(#{}) ->
+select_group(_Offered, _Shares) ->
     {error, missing_extension}.
 
 %% The first candidate group the client sent a key share for, else a retry
@@ -356,7 +348,7 @@ shared_group([], _Shares, Preferred) ->
     non_neg_integer(),
     t()
 ) ->
-    {ok, flight(), [install()], roadrunner_quic_transport_params:params(), t()}
+    {ok, iolist(), iolist(), [install()], roadrunner_quic_transport_params:params(), t()}
     | {retry, iolist(), t()}
     | {error, illegal_parameter}.
 respond(
@@ -370,24 +362,42 @@ respond(
     flight([], ClientHelloBody, ClientHello, CipherSuite, Group, ClientShare, Scheme, State);
 respond(
     ClientHelloBody,
-    #{session_id := SessionId},
+    ClientHello,
     CipherSuite,
     {retry, Group},
     _Scheme,
     #server{stage = client_hello} = State
 ) ->
-    hello_retry_request(ClientHelloBody, SessionId, CipherSuite, Group, State);
+    hello_retry_request(
+        ClientHelloBody,
+        roadrunner_quic_tls_hello:session_id(ClientHello),
+        CipherSuite,
+        Group,
+        State
+    );
 respond(
     ClientHelloBody,
-    #{key_shares := [_]} = ClientHello,
+    ClientHello,
     CipherSuite,
     {share, Group, ClientShare},
     Scheme,
     #server{stage = {retried, Transcript, CipherSuite, Group}} = State
 ) ->
-    flight(
-        Transcript, ClientHelloBody, ClientHello, CipherSuite, Group, ClientShare, Scheme, State
-    );
+    case roadrunner_quic_tls_hello:key_shares(ClientHello) of
+        [_] ->
+            flight(
+                Transcript,
+                ClientHelloBody,
+                ClientHello,
+                CipherSuite,
+                Group,
+                ClientShare,
+                Scheme,
+                State
+            );
+        _ ->
+            {error, illegal_parameter}
+    end;
 respond(_ClientHelloBody, _ClientHello, _CipherSuite, _KeyExchange, _Scheme, _State) ->
     {error, illegal_parameter}.
 
@@ -405,9 +415,9 @@ hello_retry_request(
     {Codepoint, _Curve} = Group,
     State
 ) ->
-    HelloRetryRequest = roadrunner_quic_tls_hello:build_hello_retry_request(#{
-        session_id => SessionId, cipher_suite => Suite, group => Codepoint
-    }),
+    HelloRetryRequest = roadrunner_quic_tls_hello:build_hello_retry_request(
+        SessionId, Suite, Codepoint
+    ),
     ClientHello1 = roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, ClientHelloBody),
     Transcript = [roadrunner_quic_tls_crypto:message_hash(Hash, ClientHello1), HelloRetryRequest],
     {retry, HelloRetryRequest, State#server{stage = {retried, Transcript, CipherSuite, Group}}}.
@@ -426,12 +436,12 @@ hello_retry_request(
     non_neg_integer(),
     t()
 ) ->
-    {ok, flight(), [install()], roadrunner_quic_transport_params:params(), t()}
+    {ok, iolist(), iolist(), [install()], roadrunner_quic_transport_params:params(), t()}
     | {error, illegal_parameter}.
 flight(
     Transcript,
     ClientHelloBody,
-    #{session_id := SessionId, transport_params := PeerParams},
+    ClientHello,
     CipherSuite,
     {Codepoint, _Curve} = Group,
     ClientShare,
@@ -440,14 +450,18 @@ flight(
 ) ->
     maybe
         {ok, ServerShare, SharedSecret} ?= key_exchange(Group, ClientShare),
-        {ok, Flight, Installs, State1} = build_flight(Transcript, ClientHelloBody, State, #{
-            session_id => SessionId,
-            cipher_suite => CipherSuite,
-            server_share => {Codepoint, ServerShare},
-            shared_secret => SharedSecret,
-            scheme => Scheme
-        }),
-        {ok, Flight, Installs, PeerParams, State1}
+        {InitialFlight, HandshakeFlight, Installs, State1} = build_flight(
+            Transcript,
+            ClientHelloBody,
+            roadrunner_quic_tls_hello:session_id(ClientHello),
+            CipherSuite,
+            {Codepoint, ServerShare},
+            SharedSecret,
+            Scheme,
+            State
+        ),
+        PeerParams = roadrunner_quic_tls_hello:transport_params(ClientHello),
+        {ok, InitialFlight, HandshakeFlight, Installs, PeerParams, State1}
     end.
 
 %% ECDHE (RFC 8446 §7.4.2) between the client's share and a server key pair
@@ -477,27 +491,26 @@ ecdhe({_, Curve}, ClientShare) ->
     end.
 
 %% RFC 9001 §8.2: a ClientHello MUST carry the quic_transport_parameters
-%% extension; its absence is a fatal missing_extension. The codec leaves an
-%% absent extension out of the parsed map, so presence is the key being set (a
-%% present-but-malformed extension already failed the parse with its own error).
--spec check_transport_params(roadrunner_quic_tls_hello:client_hello()) ->
+%% extension; its absence is a fatal missing_extension. The codec reads an
+%% absent extension as `undefined` (a present-but-malformed extension already
+%% failed the parse with its own error).
+-spec check_transport_params(roadrunner_quic_transport_params:params() | undefined) ->
     ok | {error, missing_transport_params}.
-check_transport_params(#{transport_params := _}) -> ok;
-check_transport_params(#{}) -> {error, missing_transport_params}.
+check_transport_params(undefined) -> {error, missing_transport_params};
+check_transport_params(_Params) -> ok.
 
 %% RFC 9000 §7.3: the client's initial_source_connection_id transport parameter
 %% MUST equal the Source Connection ID of its first Initial packet (the value
-%% the loop captured as peer_scid). The first clause binds PeerSCID twice (the
-%% function argument and the map value), so it matches ONLY when they are equal;
-%% a mismatch, a missing initial_source_connection_id, or (after
-%% check_transport_params) an absent extension all fall to the second clause as
-%% a transport_parameter_error.
--spec check_initial_scid(roadrunner_quic_tls_hello:client_hello(), binary()) ->
+%% the loop captured as peer_scid); a mismatch or a missing
+%% initial_source_connection_id is a transport_parameter_error. The extension
+%% itself is present (check_transport_params/1 ran first).
+-spec check_initial_scid(roadrunner_quic_transport_params:params(), binary()) ->
     ok | {error, transport_parameter_error}.
-check_initial_scid(#{transport_params := #{initial_source_connection_id := PeerSCID}}, PeerSCID) ->
-    ok;
-check_initial_scid(#{}, _PeerSCID) ->
-    {error, transport_parameter_error}.
+check_initial_scid(Params, PeerSCID) ->
+    case roadrunner_quic_transport_params:initial_source_connection_id(Params) of
+        PeerSCID -> ok;
+        _ -> {error, transport_parameter_error}
+    end.
 
 %% The CertificateVerify scheme for the cert key, if the client offered it
 %% in its signature_algorithms. The scheme is fixed by the key type (v1
@@ -538,40 +551,38 @@ scheme_for_key(#'ECPrivateKey'{parameters = {namedCurve, ?'secp256r1'}}) ->
 %% ClientHello's message_hash and the HelloRetryRequest (RFC 8446 §4.4.1).
 %% The transcript is an iolist of framed messages; `transcript_hash/2`
 %% accepts iodata, so it is never flattened here.
--spec build_flight(iolist(), binary(), t(), #{
-    session_id := binary(),
-    cipher_suite := cipher_suite(),
-    server_share := {non_neg_integer(), binary()},
-    shared_secret := binary(),
-    scheme := non_neg_integer()
-}) -> {ok, flight(), [install()], t()}.
+-spec build_flight(
+    iolist(),
+    binary(),
+    binary(),
+    cipher_suite(),
+    {non_neg_integer(), binary()},
+    binary(),
+    non_neg_integer(),
+    t()
+) -> {iolist(), iolist(), [install()], t()}.
 build_flight(
     Transcript,
     ClientHelloBody,
+    SessionId,
+    {CipherSuite, Aead, Hash},
+    ServerShare,
+    SharedSecret,
+    Scheme,
     #server{
         cert_chain = CertChain,
         priv_key = PrivKey,
         alpn = Alpn,
         transport_params = TransportParams,
         server_random = ServerRandom
-    } = State,
-    #{
-        session_id := SessionId,
-        cipher_suite := {CipherSuite, Aead, Hash},
-        server_share := ServerShare,
-        shared_secret := SharedSecret,
-        scheme := Scheme
-    }
+    } = State
 ) ->
     %% ServerHello (Initial level); this ClientHello enters the transcript
     %% re-framed (byte-identical to the wire message).
     ClientHelloFramed = roadrunner_quic_tls_handshake:encode(?CLIENT_HELLO, ClientHelloBody),
-    ServerHello = roadrunner_quic_tls_hello:build_server_hello(#{
-        random => ServerRandom,
-        session_id => SessionId,
-        cipher_suite => CipherSuite,
-        key_share => ServerShare
-    }),
+    ServerHello = roadrunner_quic_tls_hello:build_server_hello(
+        ServerRandom, SessionId, CipherSuite, ServerShare
+    ),
     ThroughServerHello = [Transcript, ClientHelloFramed, ServerHello],
 
     %% Handshake traffic secrets from the transcript through ServerHello.
@@ -587,9 +598,9 @@ build_flight(
     ),
 
     %% EncryptedExtensions + Certificate (Handshake level).
-    EncryptedExtensions = roadrunner_quic_tls_hello:build_encrypted_extensions(#{
-        alpn => Alpn, transport_params => TransportParams
-    }),
+    EncryptedExtensions = roadrunner_quic_tls_hello:build_encrypted_extensions(
+        Alpn, TransportParams
+    ),
     Certificate = roadrunner_quic_tls_auth:build_certificate(CertChain),
     ThroughCertificate = [ThroughServerHello, EncryptedExtensions, Certificate],
 
@@ -617,10 +628,6 @@ build_flight(
         Hash, server, application, MasterSecret, FinishedHash
     ),
 
-    Flight = #{
-        initial => ServerHello,
-        handshake => [EncryptedExtensions, Certificate, CertificateVerify, Finished]
-    },
     Installs = [
         {handshake, server, Aead, ServerHsSecret},
         {handshake, client, Aead, ClientHsSecret},
@@ -633,4 +640,5 @@ build_flight(
         client_hs_secret = ClientHsSecret,
         client_finished_hash = FinishedHash
     },
-    {ok, Flight, Installs, State1}.
+    HandshakeFlight = [EncryptedExtensions, Certificate, CertificateVerify, Finished],
+    {ServerHello, HandshakeFlight, Installs, State1}.

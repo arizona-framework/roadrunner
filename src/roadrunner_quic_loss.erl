@@ -21,6 +21,8 @@
 
 -export([
     new/1,
+    new/3,
+    new/4,
     on_packet_sent/6,
     on_ack_received/3,
     cc_signal/1,
@@ -28,7 +30,7 @@
     loss_time/1,
     update_rtt/3,
     reset_rtt/2,
-    set_ack_delay/2,
+    set_ack_delay/3,
     get_pto/1,
     pto_period/1,
     pto_deadline/1,
@@ -45,7 +47,9 @@
     pto_count/1
 ]).
 
--export_type([t/0, opts/0, cc_signal/0]).
+-include("roadrunner_quic.hrl").
+
+-export_type([t/0, cc_signal/0]).
 
 %% RFC 9002 §6.1.1: a packet is lost if one numbered at least three higher
 %% has been acknowledged.
@@ -65,12 +69,7 @@
 %% RFC 9002 §7.6.1 kPersistentCongestionThreshold.
 -define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 %% A congestion-control signal with nothing acknowledged or lost.
--define(NO_CC_SIGNAL, #{
-    acked_bytes => 0,
-    largest_acked_time => undefined,
-    largest_lost_time => undefined,
-    persistent_congestion => false
-}).
+-define(NO_CC_SIGNAL, #quic_cc_signal{}).
 
 -record(sent, {
     pn :: non_neg_integer(),
@@ -124,41 +123,45 @@
 
 -opaque t() :: #loss{}.
 
--type cc_signal() :: #{
-    acked_bytes := non_neg_integer(),
-    largest_acked_time := non_neg_integer() | undefined,
-    largest_lost_time := non_neg_integer() | undefined,
-    persistent_congestion := boolean()
-}.
-
--type opts() :: #{
-    initial_rtt => non_neg_integer(),
-    max_ack_delay => non_neg_integer(),
-    ack_delay_exponent => non_neg_integer(),
-    handshake => boolean()
-}.
+-type cc_signal() :: #quic_cc_signal{}.
 
 %% =============================================================================
 %% State
 %% =============================================================================
 
 -doc """
-A fresh loss-detection state. `initial_rtt` seeds the smoothed RTT until
-the first sample (RFC 9002 §6.2.2, default 333ms); `max_ack_delay` and
-`ack_delay_exponent` are the peer's advertised values (defaults 25ms and
-3), the latter used to decode the ACK Delay field; `handshake` marks an
-Initial or Handshake space (default `false`).
+A fresh loss-detection state before the peer's transport parameters are
+known: its `max_ack_delay` and `ack_delay_exponent` take their RFC 9000
+§18.2 defaults (25ms and 3) until `set_ack_delay/3`. `Handshake` marks an
+Initial or Handshake space.
 """.
--spec new(opts()) -> t().
-new(Opts) ->
-    InitialRtt = maps:get(initial_rtt, Opts, ?DEFAULT_INITIAL_RTT),
+-spec new(boolean()) -> t().
+new(Handshake) ->
+    new(Handshake, ?DEFAULT_MAX_ACK_DELAY, ?DEFAULT_ACK_DELAY_EXPONENT).
+
+-doc """
+A fresh loss-detection state for the peer's advertised `MaxAckDelay` (ms)
+and `AckDelayExponent`, the latter used to decode the ACK Delay field, with
+the initial RTT of RFC 9002 §6.2.2 (333ms). `Handshake` marks an Initial or
+Handshake space.
+""".
+-spec new(boolean(), non_neg_integer(), non_neg_integer()) -> t().
+new(Handshake, MaxAckDelay, AckDelayExponent) ->
+    new(Handshake, MaxAckDelay, AckDelayExponent, ?DEFAULT_INITIAL_RTT).
+
+-doc """
+As `new/3`, with `InitialRtt` (ms) seeding the smoothed RTT until the first
+sample.
+""".
+-spec new(boolean(), non_neg_integer(), non_neg_integer(), non_neg_integer()) -> t().
+new(Handshake, MaxAckDelay, AckDelayExponent, InitialRtt) ->
     #loss{
         initial_rtt = InitialRtt,
         smoothed_rtt = InitialRtt,
         rtt_var = InitialRtt div 2,
-        max_ack_delay = maps:get(max_ack_delay, Opts, ?DEFAULT_MAX_ACK_DELAY),
-        ack_delay_exponent = maps:get(ack_delay_exponent, Opts, ?DEFAULT_ACK_DELAY_EXPONENT),
-        handshake = maps:get(handshake, Opts, false)
+        max_ack_delay = MaxAckDelay,
+        ack_delay_exponent = AckDelayExponent,
+        handshake = Handshake
     }.
 
 %% =============================================================================
@@ -227,11 +230,11 @@ on_ack_received(Ack, Now, Loss) ->
                 largest_acked = NewLargest,
                 pto_count = 0,
                 bytes_in_flight = max(0, Loss1#loss.bytes_in_flight - AckedBytes - LostBytes),
-                cc_signal = #{
-                    acked_bytes => AckedBytes,
-                    largest_acked_time => largest_acked_time(NewLargest, Acked),
-                    largest_lost_time => largest_lost_time(Lost),
-                    persistent_congestion => persistent_congestion(Lost, Loss1)
+                cc_signal = #quic_cc_signal{
+                    acked_bytes = AckedBytes,
+                    largest_acked_time = largest_acked_time(NewLargest, Acked),
+                    largest_lost_time = largest_lost_time(Lost),
+                    persistent_congestion = persistent_congestion(Lost, Loss1)
                 }
             },
             {Loss2, datas(Acked), datas(Lost)}
@@ -239,7 +242,7 @@ on_ack_received(Ack, Now, Loss) ->
 
 -doc """
 The congestion-control signal from the most recent `on_ack_received/3` or
-`detect_lost/2`: a map with the acknowledged bytes and the send times of the
+`detect_lost/2`: a `#quic_cc_signal{}` with the acknowledged bytes and the send times of the
 largest acknowledged and latest lost ack-eliciting packets (`undefined` when
 none), and whether the losses establish persistent congestion (RFC 9002
 §7.6.2), for the connection's congestion controller. A `detect_lost/2` pass
@@ -294,12 +297,7 @@ detect_lost(Now, #loss{sent = Sent, largest_acked = LargestAcked} = Loss) ->
         bytes_in_flight = max(0, Loss#loss.bytes_in_flight - in_flight_bytes(Lost)),
         %% Persistent congestion is established only on receipt of an ACK
         %% (RFC 9002 §7.6.2), so a timer pass never declares it.
-        cc_signal = #{
-            acked_bytes => 0,
-            largest_acked_time => undefined,
-            largest_lost_time => largest_lost_time(Lost),
-            persistent_congestion => false
-        }
+        cc_signal = #quic_cc_signal{largest_lost_time = largest_lost_time(Lost)}
     },
     {Loss1, datas(Lost)}.
 
@@ -362,20 +360,14 @@ sample_ack_delay(AckDelay, #loss{max_ack_delay = MaxAckDelay}) -> min(AckDelay, 
 
 -doc """
 Take the peer's `max_ack_delay` (ms) and `ack_delay_exponent` once its
-transport parameters are known (RFC 9000 §18.2), each kept as it was when
-absent: the exponent decodes the ACK Delay field of every ACK it sends
-(§19.3), and `max_ack_delay` caps that delay in RTT samples, pads the probe
-timeout (RFC 9002 §5.3, §6.2.1) and lengthens the persistent congestion
-duration (§7.6.1).
+transport parameters are known (RFC 9000 §18.2): the exponent decodes the
+ACK Delay field of every ACK it sends (§19.3), and `max_ack_delay` caps
+that delay in RTT samples, pads the probe timeout (RFC 9002 §5.3, §6.2.1)
+and lengthens the persistent congestion duration (§7.6.1).
 """.
--spec set_ack_delay(
-    #{max_ack_delay => non_neg_integer(), ack_delay_exponent => non_neg_integer()}, t()
-) -> t().
-set_ack_delay(Params, #loss{max_ack_delay = MaxAckDelay, ack_delay_exponent = Exponent} = Loss) ->
-    Loss#loss{
-        max_ack_delay = maps:get(max_ack_delay, Params, MaxAckDelay),
-        ack_delay_exponent = maps:get(ack_delay_exponent, Params, Exponent)
-    }.
+-spec set_ack_delay(non_neg_integer(), non_neg_integer(), t()) -> t().
+set_ack_delay(MaxAckDelay, AckDelayExponent, Loss) ->
+    Loss#loss{max_ack_delay = MaxAckDelay, ack_delay_exponent = AckDelayExponent}.
 
 -doc """
 Restart the RTT estimate for a new network path (RFC 9000 §9.4): every

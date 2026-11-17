@@ -43,8 +43,8 @@
 %% {quic, self(), Event}`). The connection only ever sends to the owner
 %% asynchronously, so it never blocks on it.
 
--export([start/2]).
--export([init/2]).
+-export([start/8]).
+-export([init/8]).
 
 -record(shell, {
     socket :: roadrunner_quic_socket:socket(),
@@ -64,23 +64,47 @@
 %% =============================================================================
 
 -doc """
-Spawn a connection shell over the (shared) socket for the given
-per-connection config. The first Initial arrives later as a
-`{quic_datagram, _, _}` message, the same as every subsequent datagram.
+Spawn a connection shell over the (shared) socket, with the listener's
+`Registry` to route the ids the connection issues and its `Settings`, for the
+client at `Peer` (the connection state's `new/7` takes the rest). The first
+Initial arrives later as a `{quic_datagram, _, _}` message, the same as every
+subsequent datagram.
 """.
--spec start(roadrunner_quic_socket:socket(), roadrunner_quic_conn_state:config()) -> {ok, pid()}.
-start(Socket, Config) ->
-    {ok, proc_lib:spawn_opt(?MODULE, init, [Socket, Config], [])}.
+-spec start(
+    roadrunner_quic_socket:socket(),
+    roadrunner_quic_cid_registry:t(),
+    roadrunner_quic_conn_state:settings(),
+    {inet:ip_address(), inet:port_number()},
+    binary(),
+    binary(),
+    binary(),
+    boolean()
+) -> {ok, pid()}.
+start(Socket, Registry, Settings, Peer, DCID, SCID, PeerSCID, AddressValidated) ->
+    Args = [Socket, Registry, Settings, Peer, DCID, SCID, PeerSCID, AddressValidated],
+    {ok, proc_lib:spawn_opt(?MODULE, init, Args, [])}.
 
 -doc false.
--spec init(roadrunner_quic_socket:socket(), roadrunner_quic_conn_state:config()) ->
+-spec init(
+    roadrunner_quic_socket:socket(),
+    roadrunner_quic_cid_registry:t(),
+    roadrunner_quic_conn_state:settings(),
+    {inet:ip_address(), inet:port_number()},
+    binary(),
+    binary(),
+    binary(),
+    boolean()
+) ->
     ok | no_return().
-init(Socket, #{peer := Peer, registry := Registry} = Config) ->
+init(Socket, Registry, Settings, Peer, DCID, SCID, PeerSCID, AddressValidated) ->
     proc_lib:set_label({?MODULE, Peer}),
+    Now = erlang:monotonic_time(millisecond),
     loop(#shell{
         socket = Socket,
         peer = Peer,
-        conn = roadrunner_quic_conn_state:new(Config, erlang:monotonic_time(millisecond)),
+        conn = roadrunner_quic_conn_state:new(
+            Settings, DCID, SCID, PeerSCID, Peer, AddressValidated, Now
+        ),
         timer = undefined,
         deadline = undefined,
         registry = Registry

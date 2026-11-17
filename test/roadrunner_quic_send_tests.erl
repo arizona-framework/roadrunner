@@ -1,6 +1,7 @@
 -module(roadrunner_quic_send_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("../include/roadrunner_quic.hrl").
 
 -define(M, roadrunner_quic_send).
 
@@ -16,23 +17,23 @@
 %% (the trailing zero padding is ignored by the receiver).
 initial_round_trip_test() ->
     Frames = [{crypto, 0, <<"server-hello-bytes">>}],
-    Entries = #{initial => #{frames => Frames, keys => initial_keys(), pn => 0}},
+    Entries = #{initial => #quic_entry{frames = Frames, keys = initial_keys(), pn = 0}},
     {Datagram, Sent} = ?M:datagram(Entries, ?DCID, ?SCID),
     ?assertEqual(1200, byte_size(Datagram)),
     ?assertEqual(
-        [{ok, #{level => initial, pn => 0, frames => Frames}}],
+        [{ok, #quic_decoded{level = initial, pn = 0, frames = Frames}}],
         recv(Datagram, #{initial => initial_keys()})
     ),
-    ?assertMatch([#{level := initial, pn := 0, ack_eliciting := true}], Sent).
+    ?assertMatch([#quic_sent{level = initial, pn = 0, ack_eliciting = true}], Sent).
 
 %% A Handshake-only datagram is not padded to 1200.
 handshake_round_trip_test() ->
     Frames = [{crypto, 0, <<"encrypted-extensions-and-cert">>}],
-    Entries = #{handshake => #{frames => Frames, keys => handshake_keys(), pn => 5}},
+    Entries = #{handshake => #quic_entry{frames = Frames, keys = handshake_keys(), pn = 5}},
     {Datagram, Sent} = ?M:datagram(Entries, ?DCID, ?SCID),
     ?assert(byte_size(Datagram) < 1200),
     ?assertEqual(
-        [{ok, #{level => handshake, pn => 5, frames => Frames}}],
+        [{ok, #quic_decoded{level = handshake, pn = 5, frames = Frames}}],
         recv(Datagram, #{handshake => handshake_keys()})
     ),
     %% A single non-Initial packet is the whole (unpadded) datagram, so its
@@ -40,12 +41,12 @@ handshake_round_trip_test() ->
     %% frames for retransmission.
     ?assertEqual(
         [
-            #{
-                level => handshake,
-                pn => 5,
-                length => byte_size(Datagram),
-                ack_eliciting => true,
-                frames => Frames
+            #quic_sent{
+                level = handshake,
+                pn = 5,
+                length = byte_size(Datagram),
+                ack_eliciting = true,
+                frames = Frames
             }
         ],
         Sent
@@ -55,20 +56,20 @@ handshake_round_trip_test() ->
 %% back to the same value.
 multi_byte_pn_round_trip_test() ->
     Frames = [{crypto, 0, <<"handshake-with-a-wide-packet-number">>}],
-    Entries = #{handshake => #{frames => Frames, keys => handshake_keys(), pn => 16#1234}},
+    Entries = #{handshake => #quic_entry{frames = Frames, keys = handshake_keys(), pn = 16#1234}},
     {Datagram, Sent} = ?M:datagram(Entries, ?DCID, ?SCID),
     ?assertEqual(
-        [{ok, #{level => handshake, pn => 16#1234, frames => Frames}}],
+        [{ok, #quic_decoded{level = handshake, pn = 16#1234, frames = Frames}}],
         recv(Datagram, #{handshake => handshake_keys()})
     ),
-    ?assertMatch([#{pn := 16#1234}], Sent).
+    ?assertMatch([#quic_sent{pn = 16#1234}], Sent).
 
 %% Version, DCID, and SCID are not header-protected, so a produced long
 %% packet's header fields can be read straight off the wire (pins the
 %% encode_long arguments independently of the receiver).
 header_fields_test() ->
     Frames = [{crypto, 0, <<"handshake-crypto-payload">>}],
-    Entries = #{handshake => #{frames => Frames, keys => handshake_keys(), pn => 5}},
+    Entries = #{handshake => #quic_entry{frames = Frames, keys = handshake_keys(), pn = 5}},
     {Datagram, _} = ?M:datagram(Entries, ?DCID, ?SCID),
     <<_FirstByte, Version:32, DCIDLen, AfterDCIDLen/binary>> = Datagram,
     <<DCID:DCIDLen/binary, SCIDLen, SCID:SCIDLen/binary, _/binary>> = AfterDCIDLen,
@@ -80,9 +81,11 @@ header_fields_test() ->
 %% trailing 1200 pad would corrupt the short-header packet).
 initial_with_application_rejected_test() ->
     Entries = #{
-        initial => #{frames => [{crypto, 0, <<"server-hello">>}], keys => initial_keys(), pn => 0},
-        application => #{
-            frames => [{stream, 0, 0, <<"body">>, true}], keys => application_keys(), pn => 0
+        initial => #quic_entry{
+            frames = [{crypto, 0, <<"server-hello">>}], keys = initial_keys(), pn = 0
+        },
+        application => #quic_entry{
+            frames = [{stream, 0, 0, <<"body">>, true}], keys = application_keys(), pn = 0
         }
     },
     ?assertError(initial_with_application_coalesced, ?M:datagram(Entries, ?DCID, ?SCID)).
@@ -91,12 +94,14 @@ initial_with_application_rejected_test() ->
 application_round_trip_test() ->
     Frames = [{stream, 0, 0, <<"application-response-body">>, true}],
     Entries = #{
-        application => #{frames => Frames, keys => application_keys(), pn => 9, key_phase => 1}
+        application => #quic_entry{
+            frames = Frames, keys = application_keys(), pn = 9, key_phase = 1
+        }
     },
     {Datagram, _Sent} = ?M:datagram(Entries, ?DCID, ?SCID),
     ?assert(byte_size(Datagram) < 1200),
     ?assertMatch(
-        [{ok, #{level := application, pn := 9, frames := Frames, key_phase := 1}}],
+        [{ok, #quic_decoded{level = application, pn = 9, frames = Frames, key_phase = 1}}],
         recv(Datagram, #{application => application_keys()})
     ).
 
@@ -106,16 +111,20 @@ application_round_trip_test() ->
 %% larger stays as it is.
 application_pad_to_test() ->
     Frames = [{path_response, ~"8 bytes!"}],
-    Entry = #{frames => Frames, keys => application_keys(), pn => 3, pad_to => 1200},
-    {Datagram, [#{length := 1200}]} = ?M:datagram(#{application => Entry}, ?DCID, ?SCID),
+    Entry = #quic_entry{frames = Frames, keys = application_keys(), pn = 3, pad_to = 1200},
+    {Datagram, [#quic_sent{length = 1200}]} = ?M:datagram(#{application => Entry}, ?DCID, ?SCID),
     ?assertEqual(1200, byte_size(Datagram)),
     ?assertMatch(
-        [{ok, #{level := application, pn := 3, frames := [{path_response, ~"8 bytes!"}, padding]}}],
+        [
+            {ok, #quic_decoded{
+                level = application, pn = 3, frames = [{path_response, ~"8 bytes!"}, padding]
+            }}
+        ],
         recv(Datagram, #{application => application_keys()})
     ),
-    Small = Entry#{pad_to => 10},
+    Small = Entry#quic_entry{pad_to = 10},
     {Bare, _} = ?M:datagram(#{application => Small}, ?DCID, ?SCID),
-    {Unpadded, _} = ?M:datagram(#{application => maps:remove(pad_to, Entry)}, ?DCID, ?SCID),
+    {Unpadded, _} = ?M:datagram(#{application => Entry#quic_entry{pad_to = 0}}, ?DCID, ?SCID),
     ?assertEqual(byte_size(Unpadded), byte_size(Bare)).
 
 %% RFC 9000 §10.3: a 1-RTT packet is at least 30 bytes (22 more than the
@@ -123,22 +132,22 @@ application_pad_to_test() ->
 %% from the client is indistinguishable from any packet of ours. A pad_to
 %% below that changes nothing.
 application_min_packet_size_test() ->
-    Entry = #{frames => [ping], keys => application_keys(), pn => 1},
+    Entry = #quic_entry{frames = [ping], keys = application_keys(), pn = 1},
     {Datagram, _} = ?M:datagram(#{application => Entry}, <<>>, ?SCID),
     ?assertEqual(30, byte_size(Datagram)),
-    {Small, _} = ?M:datagram(#{application => Entry#{pad_to => 10}}, <<>>, ?SCID),
+    {Small, _} = ?M:datagram(#{application => Entry#quic_entry{pad_to = 10}}, <<>>, ?SCID),
     ?assertEqual(30, byte_size(Small)),
     ?assertMatch(
-        [{ok, #{level := application, frames := [ping, padding]}}],
+        [{ok, #quic_decoded{level = application, frames = [ping, padding]}}],
         roadrunner_quic_recv:datagram(Datagram, 0, #{application => application_keys()}, #{})
     ).
 
 application_default_key_phase_test() ->
     Frames = [{stream, 0, 0, <<"more-body-data">>, false}],
-    Entries = #{application => #{frames => Frames, keys => application_keys(), pn => 1}},
+    Entries = #{application => #quic_entry{frames = Frames, keys = application_keys(), pn = 1}},
     {Datagram, _} = ?M:datagram(Entries, ?DCID, ?SCID),
     ?assertMatch(
-        [{ok, #{level := application, pn := 1, frames := Frames, key_phase := 0}}],
+        [{ok, #quic_decoded{level = application, pn = 1, frames = Frames, key_phase = 0}}],
         recv(Datagram, #{application => application_keys()})
     ).
 
@@ -148,26 +157,26 @@ coalesced_datagram_test() ->
     InitialFrames = [{crypto, 0, <<"server-hello">>}],
     HandshakeFrames = [{crypto, 0, <<"ee-cert-certverify-finished">>}],
     Entries = #{
-        initial => #{frames => InitialFrames, keys => initial_keys(), pn => 0},
-        handshake => #{frames => HandshakeFrames, keys => handshake_keys(), pn => 0}
+        initial => #quic_entry{frames = InitialFrames, keys = initial_keys(), pn = 0},
+        handshake => #quic_entry{frames = HandshakeFrames, keys = handshake_keys(), pn = 0}
     },
     {Datagram, Sent} = ?M:datagram(Entries, ?DCID, ?SCID),
     ?assertEqual(1200, byte_size(Datagram)),
     ?assertEqual(
         [
-            {ok, #{level => initial, pn => 0, frames => InitialFrames}},
-            {ok, #{level => handshake, pn => 0, frames => HandshakeFrames}}
+            {ok, #quic_decoded{level = initial, pn = 0, frames = InitialFrames}},
+            {ok, #quic_decoded{level = handshake, pn = 0, frames = HandshakeFrames}}
         ],
         recv(Datagram, #{initial => initial_keys(), handshake => handshake_keys()})
     ),
-    ?assertMatch([#{level := initial}, #{level := handshake}], Sent).
+    ?assertMatch([#quic_sent{level = initial}, #quic_sent{level = handshake}], Sent).
 
 %% A sub-4-byte payload (one PING) is padded for the header-protection
 %% sample; the PING survives and trailing PADDING frames fill the rest.
 small_packet_padded_test() ->
-    Entries = #{handshake => #{frames => [ping], keys => handshake_keys(), pn => 3}},
+    Entries = #{handshake => #quic_entry{frames = [ping], keys = handshake_keys(), pn = 3}},
     {Datagram, _} = ?M:datagram(Entries, ?DCID, ?SCID),
-    [{ok, #{frames := Frames}}] = recv(Datagram, #{handshake => handshake_keys()}),
+    [{ok, #quic_decoded{frames = Frames}}] = recv(Datagram, #{handshake => handshake_keys()}),
     ?assertEqual(ping, hd(Frames)),
     ?assert(lists:all(fun(F) -> F =:= padding end, tl(Frames))).
 
@@ -184,8 +193,8 @@ ack_eliciting_classification_test() ->
     ],
     [
         begin
-            Entry = #{frames => Frames, keys => handshake_keys(), pn => 1},
-            {_, [#{ack_eliciting := AckEliciting}]} = ?M:datagram(
+            Entry = #quic_entry{frames = Frames, keys = handshake_keys(), pn = 1},
+            {_, [#quic_sent{ack_eliciting = AckEliciting}]} = ?M:datagram(
                 #{handshake => Entry}, ?DCID, ?SCID
             ),
             ?assertEqual(Expected, AckEliciting)
@@ -234,7 +243,7 @@ stream_data_budget_never_exceeds_limit_test() ->
 budget_datagram_size(DCID, PN, AckFrames, Sid, Offset) ->
     Budget = ?M:stream_data_budget(DCID, PN, AckFrames, Sid, Offset),
     Frames = AckFrames ++ [{stream, Sid, Offset, <<0:(Budget * 8)>>, false}],
-    Entry = #{frames => Frames, keys => application_keys(), pn => PN},
+    Entry = #quic_entry{frames = Frames, keys = application_keys(), pn = PN},
     {Datagram, _} = ?M:datagram(#{application => Entry}, DCID, ?SCID),
     {Budget, byte_size(Datagram)}.
 
@@ -242,8 +251,8 @@ recv(Datagram, Keys) ->
     roadrunner_quic_recv:datagram(Datagram, byte_size(?DCID), Keys, #{}).
 
 initial_keys() ->
-    #{key => {aes_128_gcm, <<31:128>>}, iv => <<32:96>>, hp => {aes_128_ecb, <<33:128>>}}.
+    #quic_keys{key = {aes_128_gcm, <<31:128>>}, iv = <<32:96>>, hp = {aes_128_ecb, <<33:128>>}}.
 handshake_keys() ->
-    #{key => {aes_128_gcm, <<11:128>>}, iv => <<12:96>>, hp => {aes_128_ecb, <<13:128>>}}.
+    #quic_keys{key = {aes_128_gcm, <<11:128>>}, iv = <<12:96>>, hp = {aes_128_ecb, <<13:128>>}}.
 application_keys() ->
-    #{key => {aes_128_gcm, <<21:128>>}, iv => <<22:96>>, hp => {aes_128_ecb, <<23:128>>}}.
+    #quic_keys{key = {aes_128_gcm, <<21:128>>}, iv = <<22:96>>, hp = {aes_128_ecb, <<23:128>>}}.

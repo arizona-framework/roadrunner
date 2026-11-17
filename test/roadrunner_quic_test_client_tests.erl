@@ -13,12 +13,9 @@ server_hello_round_trip_test() ->
     Random = crypto:strong_rand_bytes(32),
     SessionId = crypto:strong_rand_bytes(8),
     {Pub, _Priv} = ?C:gen_keypair(),
-    Framed = roadrunner_quic_tls_hello:build_server_hello(#{
-        random => Random,
-        session_id => SessionId,
-        cipher_suite => 16#1303,
-        key_share => {16#001D, Pub}
-    }),
+    Framed = roadrunner_quic_tls_hello:build_server_hello(
+        Random, SessionId, 16#1303, {16#001D, Pub}
+    ),
     [{2, Body}] = ?C:deframe_all(Framed),
     Parsed = ?C:parse_server_hello(Body),
     ?assertEqual(Random, maps:get(random, Parsed)),
@@ -29,9 +26,7 @@ server_hello_round_trip_test() ->
 
 hello_retry_request_round_trip_test() ->
     %% A HelloRetryRequest names the group only, so it parses without a key.
-    Framed = roadrunner_quic_tls_hello:build_hello_retry_request(#{
-        session_id => <<>>, cipher_suite => 16#1301, group => 16#0017
-    }),
+    Framed = roadrunner_quic_tls_hello:build_hello_retry_request(<<>>, 16#1301, 16#0017),
     [{2, Body}] = ?C:deframe_all(Framed),
     ?assertEqual(
         #{
@@ -44,10 +39,8 @@ hello_retry_request_round_trip_test() ->
     ).
 
 encrypted_extensions_round_trip_test() ->
-    Params = #{initial_max_data => 65536},
-    Framed = roadrunner_quic_tls_hello:build_encrypted_extensions(#{
-        alpn => ~"h3", transport_params => Params
-    }),
+    Params = roadrunner_quic_transport_params:new([{initial_max_data, 65536}]),
+    Framed = roadrunner_quic_tls_hello:build_encrypted_extensions(~"h3", Params),
     [{8, Body}] = ?C:deframe_all(Framed),
     Parsed = ?C:parse_encrypted_extensions(Body),
     ?assertEqual(~"h3", maps:get(alpn, Parsed)),
@@ -60,7 +53,9 @@ encrypted_extensions_round_trip_test() ->
 
 encrypted_extensions_absent_extensions_test() ->
     %% No ALPN, no transport params: both keys are simply absent.
-    Framed = roadrunner_quic_tls_hello:build_encrypted_extensions(#{}),
+    Framed = roadrunner_quic_tls_hello:build_encrypted_extensions(
+        <<>>, roadrunner_quic_transport_params:new([])
+    ),
     [{8, Body}] = ?C:deframe_all(Framed),
     ?assertEqual(#{}, ?C:parse_encrypted_extensions(Body)).
 

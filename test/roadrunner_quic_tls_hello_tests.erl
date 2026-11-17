@@ -15,24 +15,24 @@ rfc8448_client_hello_parse_test() ->
     {ok, Parsed} = ?M:parse_client_hello(Body),
     ?assertEqual(
         hex("cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7"),
-        maps:get(random, Parsed)
+        ?M:random(Parsed)
     ),
-    ?assertEqual(<<>>, maps:get(session_id, Parsed)),
-    ?assertEqual([16#1301, 16#1303, 16#1302], maps:get(cipher_suites, Parsed)),
-    ?assertEqual([16#0304], maps:get(supported_versions, Parsed)),
+    ?assertEqual(<<>>, ?M:session_id(Parsed)),
+    ?assertEqual([16#1301, 16#1303, 16#1302], ?M:cipher_suites(Parsed)),
+    ?assertEqual([16#0304], ?M:supported_versions(Parsed)),
     ?assertEqual(
         [{16#001D, hex("99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c")}],
-        maps:get(key_shares, Parsed)
+        ?M:key_shares(Parsed)
     ),
     %% x25519, secp256r1, secp384r1, secp521r1, then ffdhe2048..ffdhe8192.
     ?assertEqual(
         [16#001D, 16#0017, 16#0018, 16#0019, 16#0100, 16#0101, 16#0102, 16#0103, 16#0104],
-        maps:get(supported_groups, Parsed)
+        ?M:supported_groups(Parsed)
     ),
-    ?assertEqual(<<"server">>, maps:get(server_name, Parsed)),
+    ?assertEqual(<<"server">>, ?M:server_name(Parsed)),
     %% This ClientHello carries no ALPN and no quic_transport_parameters.
-    ?assertEqual([], maps:get(alpn_protocols, Parsed)),
-    ?assertNot(maps:is_key(transport_params, Parsed)),
+    ?assertEqual([], ?M:alpn_protocols(Parsed)),
+    ?assertEqual(undefined, ?M:transport_params(Parsed)),
     ?assertEqual(
         [
             16#0403,
@@ -51,18 +51,17 @@ rfc8448_client_hello_parse_test() ->
             16#0602,
             16#0202
         ],
-        maps:get(signature_algorithms, Parsed)
+        ?M:signature_algorithms(Parsed)
     ).
 
 rfc8448_server_hello_build_test() ->
     Built = iolist_to_binary(
-        ?M:build_server_hello(#{
-            random => hex("a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e26928"),
-            session_id => <<>>,
-            cipher_suite => 16#1301,
-            key_share =>
-                {16#001D, hex("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f")}
-        })
+        ?M:build_server_hello(
+            hex("a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e26928"),
+            <<>>,
+            16#1301,
+            {16#001D, hex("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f")}
+        )
     ),
     ?assertEqual(rfc8448_server_hello(), Built).
 
@@ -74,27 +73,27 @@ rfc8448_server_hello_build_test() ->
 rfc8448_hello_retry_client_hellos_parse_test() ->
     {ok, {1, Body1}, <<>>} = ?FRAME:decode(rfc8448_hrr_client_hello1()),
     {ok, Parsed1} = ?M:parse_client_hello(Body1),
-    ?assertEqual([16#001D, 16#0017, 16#0018], maps:get(supported_groups, Parsed1)),
+    ?assertEqual([16#001D, 16#0017, 16#0018], ?M:supported_groups(Parsed1)),
     ?assertEqual(
         [{16#001D, hex("e8e8e3f3b93a25ed97a14a7dcacb8a272c6288e585c6484d05262fcad062ad1f")}],
-        maps:get(key_shares, Parsed1)
+        ?M:key_shares(Parsed1)
     ),
     %% The second ClientHello replaces the shares with one P-256 share (an
     %% uncompressed point) and keeps the rest (RFC 8446 §4.1.2).
     {ok, {1, Body2}, <<>>} = ?FRAME:decode(rfc8448_hrr_client_hello2()),
     {ok, Parsed2} = ?M:parse_client_hello(Body2),
-    ?assertEqual([16#001D, 16#0017, 16#0018], maps:get(supported_groups, Parsed2)),
-    ?assertEqual([{16#0017, rfc8448_hrr_client_p256_share()}], maps:get(key_shares, Parsed2)),
-    ?assertEqual(maps:get(random, Parsed1), maps:get(random, Parsed2)).
+    ?assertEqual([16#001D, 16#0017, 16#0018], ?M:supported_groups(Parsed2)),
+    ?assertEqual([{16#0017, rfc8448_hrr_client_p256_share()}], ?M:key_shares(Parsed2)),
+    ?assertEqual(?M:random(Parsed1), ?M:random(Parsed2)).
 
 rfc8448_p256_server_hello_build_test() ->
     Built = iolist_to_binary(
-        ?M:build_server_hello(#{
-            random => hex("bb341d847fd789c47c387172dc0c9bf147fccacb5043d86ca4c598d3ff571b98"),
-            session_id => <<>>,
-            cipher_suite => 16#1301,
-            key_share => {16#0017, rfc8448_hrr_server_p256_share()}
-        })
+        ?M:build_server_hello(
+            hex("bb341d847fd789c47c387172dc0c9bf147fccacb5043d86ca4c598d3ff571b98"),
+            <<>>,
+            16#1301,
+            {16#0017, rfc8448_hrr_server_p256_share()}
+        )
     ),
     ?assertEqual(rfc8448_hrr_server_hello(), Built).
 
@@ -104,9 +103,7 @@ rfc8448_p256_server_hello_build_test() ->
 %% supported_versions selecting TLS 1.3.
 hello_retry_request_build_test() ->
     Built = iolist_to_binary(
-        ?M:build_hello_retry_request(#{
-            session_id => <<>>, cipher_suite => 16#1301, group => 16#0017
-        })
+        ?M:build_hello_retry_request(<<>>, 16#1301, 16#0017)
     ),
     ?assertEqual(
         hex(
@@ -122,9 +119,7 @@ hello_retry_request_build_test() ->
 
 hello_retry_request_echoes_session_id_test() ->
     Built = iolist_to_binary(
-        ?M:build_hello_retry_request(#{
-            session_id => <<1, 2, 3>>, cipher_suite => 16#1303, group => 16#001D
-        })
+        ?M:build_hello_retry_request(<<1, 2, 3>>, 16#1303, 16#001D)
     ),
     <<2, _:24, 16#0303:16, _Random:32/binary, 3:8, 1, 2, 3, 16#1303:16, 0:8, 12:16, 16#0033:16,
         2:16, 16#001D:16, 16#002B:16, 2:16, 16#0304:16>> = Built.
@@ -134,9 +129,11 @@ hello_retry_request_echoes_session_id_test() ->
 %% =============================================================================
 
 encrypted_extensions_build_test() ->
-    Params = #{initial_max_data => 1048576, initial_max_streams_bidi => 16},
+    Params = roadrunner_quic_transport_params:new([
+        {initial_max_data, 1048576}, {initial_max_streams_bidi, 16}
+    ]),
     EE = iolist_to_binary(
-        ?M:build_encrypted_extensions(#{alpn => ~"h3", transport_params => Params})
+        ?M:build_encrypted_extensions(~"h3", Params)
     ),
     %% Framed message: type 8, then <<ExtLen:16, ALPN, TP>>.
     {ok, {8, Body}, <<>>} = ?FRAME:decode(EE),
@@ -149,16 +146,12 @@ encrypted_extensions_build_test() ->
     TP = <<16#0039:16, (byte_size(TPData)):16, TPData/binary>>,
     ?assertEqual(<<Alpn/binary, TP/binary>>, Exts).
 
-encrypted_extensions_omits_absent_test() ->
-    %% No alpn, no transport_params -> an empty extension list.
-    EE = iolist_to_binary(?M:build_encrypted_extensions(#{})),
-    {ok, {8, Body}, <<>>} = ?FRAME:decode(EE),
-    ?assertEqual(<<0:16>>, Body).
-
 encrypted_extensions_omits_empty_test() ->
-    %% A present-but-empty protocol or params map is treated as absent
+    %% An empty protocol or parameter set leaves its extension out
     %% (a zero-length ALPN ProtocolName would be invalid per RFC 7301).
-    EE = iolist_to_binary(?M:build_encrypted_extensions(#{alpn => <<>>, transport_params => #{}})),
+    EE = iolist_to_binary(
+        ?M:build_encrypted_extensions(<<>>, roadrunner_quic_transport_params:new([]))
+    ),
     {ok, {8, Body}, <<>>} = ?FRAME:decode(EE),
     ?assertEqual(<<0:16>>, Body).
 
@@ -167,7 +160,7 @@ encrypted_extensions_omits_empty_test() ->
 %% =============================================================================
 
 parse_extracts_alpn_and_transport_params_test() ->
-    Params = #{initial_max_data => 4096},
+    Params = roadrunner_quic_transport_params:new([{initial_max_data, 4096}]),
     TPData = iolist_to_binary(roadrunner_quic_transport_params:encode(Params)),
     Exts = [
         ext(16#0010, <<3:16, 2:8, "h3">>),
@@ -175,11 +168,11 @@ parse_extracts_alpn_and_transport_params_test() ->
         ext(16#0039, TPData)
     ],
     {ok, Parsed} = ?M:parse_client_hello(ch_body(<<>>, [16#1301], Exts)),
-    ?assertEqual([~"h3"], maps:get(alpn_protocols, Parsed)),
-    ?assertEqual({ok, Params}, {ok, maps:get(transport_params, Parsed)}),
+    ?assertEqual([~"h3"], ?M:alpn_protocols(Parsed)),
+    ?assertEqual({ok, Params}, {ok, ?M:transport_params(Parsed)}),
     ?assertEqual(
         [{16#001D, hex("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20")}],
-        maps:get(key_shares, Parsed)
+        ?M:key_shares(Parsed)
     ).
 
 parse_key_shares_in_client_order_test() ->
@@ -190,18 +183,18 @@ parse_key_shares_in_client_order_test() ->
     Entries = <<16#0017:16, 2:16, 9, 9, 16#001d:16, 32:16, X25519/binary, 16#0018:16, 5:16, 1>>,
     Exts = [ext(16#0033, <<(byte_size(Entries)):16, Entries/binary>>)],
     {ok, Parsed} = ?M:parse_client_hello(ch_body(<<>>, [16#1301], Exts)),
-    ?assertEqual([{16#0017, <<9, 9>>}, {16#001D, X25519}], maps:get(key_shares, Parsed)),
-    ?assertNot(maps:is_key(supported_groups, Parsed)),
-    ?assertEqual([], maps:get(alpn_protocols, Parsed)),
-    ?assertEqual([], maps:get(signature_algorithms, Parsed)).
+    ?assertEqual([{16#0017, <<9, 9>>}, {16#001D, X25519}], ?M:key_shares(Parsed)),
+    ?assertEqual(undefined, ?M:supported_groups(Parsed)),
+    ?assertEqual([], ?M:alpn_protocols(Parsed)),
+    ?assertEqual([], ?M:signature_algorithms(Parsed)).
 
 parse_empty_key_share_and_groups_test() ->
     %% An empty client_shares vector is a valid offer (the client asks the
     %% server to pick, RFC 8446 §4.2.8), kept apart from an absent one.
     Exts = [ext(16#0033, <<0:16>>), ext(16#000A, <<4:16, 16#001D:16, 16#0017:16>>)],
     {ok, Parsed} = ?M:parse_client_hello(ch_body(<<>>, [16#1301], Exts)),
-    ?assertEqual([], maps:get(key_shares, Parsed)),
-    ?assertEqual([16#001D, 16#0017], maps:get(supported_groups, Parsed)).
+    ?assertEqual([], ?M:key_shares(Parsed)),
+    ?assertEqual([16#001D, 16#0017], ?M:supported_groups(Parsed)).
 
 parse_rejects_bad_transport_params_test() ->
     %% A server-only transport parameter from a client is rejected by C4,
@@ -218,17 +211,17 @@ parse_supported_versions_test() ->
     %% the client's order, unknown values included.
     Exts = [ext(16#002B, <<6:8, 16#7A7A:16, 16#0304:16, 16#0303:16>>)],
     {ok, Parsed} = ?M:parse_client_hello(ch_body(<<>>, [16#1301], Exts)),
-    ?assertEqual([16#7A7A, 16#0304, 16#0303], maps:get(supported_versions, Parsed)).
+    ?assertEqual([16#7A7A, 16#0304, 16#0303], ?M:supported_versions(Parsed)).
 
 parse_empty_extensions_test() ->
     {ok, Parsed} = ?M:parse_client_hello(ch_body(<<1, 2, 3>>, [16#1301, 16#1302], [])),
-    ?assertEqual(<<1, 2, 3>>, maps:get(session_id, Parsed)),
-    ?assertEqual([16#1301, 16#1302], maps:get(cipher_suites, Parsed)),
+    ?assertEqual(<<1, 2, 3>>, ?M:session_id(Parsed)),
+    ?assertEqual([16#1301, 16#1302], ?M:cipher_suites(Parsed)),
     %% No supported_versions: a TLS 1.2-style ClientHello offers no TLS 1.3.
-    ?assertEqual([], maps:get(supported_versions, Parsed)),
-    ?assertNot(maps:is_key(key_shares, Parsed)),
-    ?assertNot(maps:is_key(supported_groups, Parsed)),
-    ?assertNot(maps:is_key(server_name, Parsed)).
+    ?assertEqual([], ?M:supported_versions(Parsed)),
+    ?assertEqual(undefined, ?M:key_shares(Parsed)),
+    ?assertEqual(undefined, ?M:supported_groups(Parsed)),
+    ?assertEqual(undefined, ?M:server_name(Parsed)).
 
 parse_lenient_on_malformed_extension_data_test() ->
     %% Each extension's inner length prefix overruns its data; extraction
@@ -244,12 +237,12 @@ parse_lenient_on_malformed_extension_data_test() ->
         ext(16#000A, <<16#FF:16>>)
     ],
     {ok, Parsed} = ?M:parse_client_hello(ch_body(<<>>, [16#1301], Exts)),
-    ?assertNot(maps:is_key(key_shares, Parsed)),
-    ?assertNot(maps:is_key(supported_groups, Parsed)),
-    ?assertEqual([], maps:get(supported_versions, Parsed)),
-    ?assertEqual([], maps:get(alpn_protocols, Parsed)),
-    ?assertEqual([], maps:get(signature_algorithms, Parsed)),
-    ?assertNot(maps:is_key(server_name, Parsed)).
+    ?assertEqual(undefined, ?M:key_shares(Parsed)),
+    ?assertEqual(undefined, ?M:supported_groups(Parsed)),
+    ?assertEqual([], ?M:supported_versions(Parsed)),
+    ?assertEqual([], ?M:alpn_protocols(Parsed)),
+    ?assertEqual([], ?M:signature_algorithms(Parsed)),
+    ?assertEqual(undefined, ?M:server_name(Parsed)).
 
 %% =============================================================================
 %% parse_client_hello — malformed input is a flat error, never a crash.

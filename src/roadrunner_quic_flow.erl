@@ -16,7 +16,7 @@
 %% counts back in.
 
 -export([
-    new/1,
+    new/2,
     can_send/2,
     on_data_sent/2,
     on_max_data_received/2,
@@ -32,11 +32,8 @@
     bytes_received/1
 ]).
 
--export_type([t/0, opts/0]).
+-export_type([t/0]).
 
-%% A reasonable default window when an option is omitted (RFC 9000 §4 sets
-%% no value; this matches the transport-parameter default used elsewhere).
--define(DEFAULT_INITIAL_MAX_DATA, 786432).
 %% Grant a new limit once more than a quarter of the window has been
 %% consumed since the last grant (RFC 9000 §4.1 leaves the fraction to the
 %% implementation), keeping the peer in credit under sustained transfer.
@@ -62,24 +59,17 @@
 
 -opaque t() :: #flow{}.
 
--type opts() :: #{
-    initial_max_data => non_neg_integer(),
-    peer_initial_max_data => non_neg_integer()
-}.
-
 %% =============================================================================
 %% State
 %% =============================================================================
 
 -doc """
-A fresh flow-control window. `initial_max_data` is the limit we advertise
-to the peer (our receive window); `peer_initial_max_data` is the peer's
-advertised limit on us (our send window).
+A fresh flow-control window. `Initial` is the limit we advertise to the
+peer (our receive window); `Peer` is the peer's advertised limit on us (our
+send window).
 """.
--spec new(opts()) -> t().
-new(Opts) ->
-    Initial = maps:get(initial_max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
-    Peer = maps:get(peer_initial_max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
+-spec new(non_neg_integer(), non_neg_integer()) -> t().
+new(Initial, Peer) ->
     #flow{send_max = Peer, recv_max = Initial, initial_max = Initial}.
 
 %% =============================================================================

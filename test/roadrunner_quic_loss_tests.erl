@@ -1,6 +1,7 @@
 -module(roadrunner_quic_loss_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("../include/roadrunner_quic.hrl").
 
 -define(M, roadrunner_quic_loss).
 
@@ -9,7 +10,7 @@
 %% =============================================================================
 
 new_defaults_test() ->
-    Loss = ?M:new(#{}),
+    Loss = ?M:new(false),
     ?assertEqual(333, ?M:smoothed_rtt(Loss)),
     ?assertEqual(166, ?M:rtt_var(Loss)),
     ?assertEqual(infinity, ?M:min_rtt(Loss)),
@@ -24,7 +25,7 @@ new_defaults_test() ->
 %% =============================================================================
 
 bytes_in_flight_counts_ack_eliciting_test() ->
-    Loss0 = ?M:new(#{}),
+    Loss0 = ?M:new(false),
     Loss1 = ?M:on_packet_sent(0, 1200, true, d0, 0, Loss0),
     ?assertEqual(1200, ?M:bytes_in_flight(Loss1)),
     %% A non-ack-eliciting packet (e.g. ACK-only) does not add.
@@ -36,7 +37,7 @@ bytes_in_flight_counts_ack_eliciting_test() ->
 %% =============================================================================
 
 update_rtt_first_sample_seeds_estimates_test() ->
-    Loss = ?M:update_rtt(50, 5, ?M:new(#{})),
+    Loss = ?M:update_rtt(50, 5, ?M:new(false)),
     ?assertEqual(50, ?M:smoothed_rtt(Loss)),
     ?assertEqual(25, ?M:rtt_var(Loss)),
     ?assertEqual(50, ?M:min_rtt(Loss)),
@@ -44,7 +45,7 @@ update_rtt_first_sample_seeds_estimates_test() ->
     ?assert(?M:has_rtt_sample(Loss)).
 
 update_rtt_subsequent_sample_test() ->
-    Base = ?M:update_rtt(50, 5, ?M:new(#{})),
+    Base = ?M:update_rtt(50, 5, ?M:new(false)),
     %% Latest (40) within min + ack delay: no ack-delay adjustment.
     NoAdjust = ?M:update_rtt(40, 2, Base),
     ?assertEqual(40, ?M:min_rtt(NoAdjust)),
@@ -58,13 +59,13 @@ update_rtt_subsequent_sample_test() ->
 %% exactly at min + delay is adjusted (Appendix A.7): 75 - 25 = 50 leaves
 %% the smoothed RTT where it was.
 update_rtt_caps_the_delay_first_test() ->
-    Base = ?M:update_rtt(50, 0, ?M:new(#{})),
+    Base = ?M:update_rtt(50, 0, ?M:new(false)),
     ?assertEqual(50, ?M:smoothed_rtt(?M:update_rtt(75, 1000, Base))).
 
 %% A handshake space's samples ignore the ACK delay (§5.3): 70 stands.
 handshake_update_rtt_ignores_the_ack_delay_test() ->
-    Base = ?M:update_rtt(50, 0, ?M:new(#{handshake => true})),
-    Plain = ?M:update_rtt(70, 0, ?M:update_rtt(50, 0, ?M:new(#{}))),
+    Base = ?M:update_rtt(50, 0, ?M:new(true)),
+    Plain = ?M:update_rtt(70, 0, ?M:update_rtt(50, 0, ?M:new(false))),
     ?assertEqual(?M:smoothed_rtt(Plain), ?M:smoothed_rtt(?M:update_rtt(70, 10, Base))).
 
 %% =============================================================================
@@ -72,7 +73,7 @@ handshake_update_rtt_ignores_the_ack_delay_test() ->
 %% =============================================================================
 
 pto_with_backoff_test() ->
-    Loss = ?M:new(#{initial_rtt => 100}),
+    Loss = ?M:new(false, 25, 3, 100),
     %% 100 + max(4*50, 1) + 25 = 325.
     ?assertEqual(325, ?M:get_pto(Loss)),
     ?assertEqual(650, ?M:get_pto(?M:on_pto_expired(Loss))),
@@ -81,13 +82,12 @@ pto_with_backoff_test() ->
 %% A handshake space's probe timeout leaves max_ack_delay out (§6.2.1):
 %% 100 + max(4*50, 1) = 300.
 handshake_pto_leaves_out_max_ack_delay_test() ->
-    ?assertEqual(300, ?M:get_pto(?M:new(#{initial_rtt => 100, handshake => true}))).
+    ?assertEqual(300, ?M:get_pto(?M:new(true, 25, 3, 100))).
 
-%% The peer's values replace the defaults, each kept when absent.
+%% The peer's values replace the defaults.
 set_ack_delay_test() ->
-    Loss = ?M:set_ack_delay(#{max_ack_delay => 100}, ?M:new(#{initial_rtt => 100})),
-    ?assertEqual(400, ?M:get_pto(Loss)),
-    ?assertEqual(400, ?M:get_pto(?M:set_ack_delay(#{}, Loss))).
+    Loss = ?M:set_ack_delay(100, 3, ?M:new(false, 25, 3, 100)),
+    ?assertEqual(400, ?M:get_pto(Loss)).
 
 %% =============================================================================
 %% ACK processing + loss detection (RFC 9002 §5-§6).
@@ -97,7 +97,7 @@ set_ack_delay_test() ->
 %% acknowledged, the RTT sample is 11; packets 0..6 fall to the packet
 %% threshold and 7 to the time threshold, leaving 8 in flight.
 on_ack_received_acks_and_detects_loss_test() ->
-    Loss = send_run(0, 9, ?M:new(#{})),
+    Loss = send_run(0, 9, ?M:new(false)),
     ?assertEqual(1000, ?M:bytes_in_flight(Loss)),
     {Loss1, Acked, Lost} = ?M:on_ack_received({ack, 9, 0, 0, []}, 20, Loss),
     ?assertEqual([9], Acked),
@@ -108,47 +108,52 @@ on_ack_received_acks_and_detects_loss_test() ->
 
 %% A gap range acknowledges two disjoint runs.
 on_ack_received_gap_range_test() ->
-    Loss = send_run(0, 9, ?M:new(#{})),
+    Loss = send_run(0, 9, ?M:new(false)),
     %% Largest 9, first range [9,9], gap 0 / range 0 -> [7,7].
     {_Loss1, Acked, _Lost} = ?M:on_ack_received({ack, 9, 0, 0, [{0, 0}]}, 20, Loss),
     ?assertEqual([7, 9], lists:sort(Acked)).
 
 %% The ECN variant carries the same fields plus counts.
 on_ack_received_ecn_variant_test() ->
-    Loss = send_run(0, 9, ?M:new(#{})),
+    Loss = send_run(0, 9, ?M:new(false)),
     {_Loss1, Acked, _Lost} = ?M:on_ack_received({ack, 9, 0, 0, [], {1, 2, 3}}, 20, Loss),
     ?assertEqual([9], Acked).
 
 %% The congestion-control signal an ACK leaves for the connection: acked bytes
 %% and the send times of the largest acked / latest lost ack-eliciting packets.
 cc_signal_test() ->
-    Fresh = ?M:cc_signal(?M:new(#{})),
-    ?assertEqual(0, maps:get(acked_bytes, Fresh)),
-    ?assertEqual(undefined, maps:get(largest_acked_time, Fresh)),
-    ?assertEqual(undefined, maps:get(largest_lost_time, Fresh)),
+    ?assertEqual(
+        #quic_cc_signal{
+            acked_bytes = 0,
+            largest_acked_time = undefined,
+            largest_lost_time = undefined,
+            persistent_congestion = false
+        },
+        ?M:cc_signal(?M:new(false))
+    ),
     %% Ack the largest of ten in-flight packets (send time = packet number): the
     %% signal carries the acked bytes, the largest's time, and the latest lost.
-    Loss = send_run(0, 9, ?M:new(#{})),
+    Loss = send_run(0, 9, ?M:new(false)),
     {Loss1, _, _} = ?M:on_ack_received({ack, 9, 0, 0, []}, 20, Loss),
     ?assertEqual(
-        #{
-            acked_bytes => 100,
-            largest_acked_time => 9,
-            largest_lost_time => 7,
-            persistent_congestion => false
+        #quic_cc_signal{
+            acked_bytes = 100,
+            largest_acked_time = 9,
+            largest_lost_time = 7,
+            persistent_congestion = false
         },
         ?M:cc_signal(Loss1)
     ),
     %% A non-ack-eliciting largest acked yields no acked send time and no lost
     %% time, so the connection grows nothing.
-    NonElic = ?M:on_packet_sent(3, 100, false, 3, 3, ?M:new(#{})),
+    NonElic = ?M:on_packet_sent(3, 100, false, 3, 3, ?M:new(false)),
     {Loss2, _, _} = ?M:on_ack_received({ack, 3, 0, 0, []}, 30, NonElic),
     ?assertEqual(
-        #{
-            acked_bytes => 0,
-            largest_acked_time => undefined,
-            largest_lost_time => undefined,
-            persistent_congestion => false
+        #quic_cc_signal{
+            acked_bytes = 0,
+            largest_acked_time = undefined,
+            largest_lost_time = undefined,
+            persistent_congestion = false
         },
         ?M:cc_signal(Loss2)
     ).
@@ -156,11 +161,11 @@ cc_signal_test() ->
 %% A non-ack-eliciting largest acked, and a largest we never sent, both
 %% leave the RTT untouched (no sample taken).
 on_ack_received_no_rtt_sample_test() ->
-    NonElic = ?M:on_packet_sent(0, 40, false, d0, 5, ?M:new(#{})),
+    NonElic = ?M:on_packet_sent(0, 40, false, d0, 5, ?M:new(false)),
     {Loss1, [d0], []} = ?M:on_ack_received({ack, 0, 0, 0, []}, 20, NonElic),
     ?assertNot(?M:has_rtt_sample(Loss1)),
     %% Largest acked 99 was never sent: nothing acked, no RTT sample.
-    Sent = ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(#{})),
+    Sent = ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(false)),
     {Loss2, [], _} = ?M:on_ack_received({ack, 99, 0, 0, []}, 20, Sent),
     ?assertNot(?M:has_rtt_sample(Loss2)).
 
@@ -170,7 +175,7 @@ on_ack_received_no_rtt_sample_test() ->
 %% RTT sample is taken and the loss delay stays small, yet 2..5 survive
 %% while 0 (below the largest, long past) is lost.
 on_ack_received_keeps_above_largest_test() ->
-    L0 = ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(#{})),
+    L0 = ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(false)),
     L1 = ?M:on_packet_sent(1, 100, false, d1, 1, L0),
     L2 = lists:foldl(
         fun(PN, Acc) -> ?M:on_packet_sent(PN, 100, true, PN, PN, Acc) end, L1, [2, 3, 4, 5]
@@ -185,8 +190,7 @@ on_ack_received_keeps_above_largest_test() ->
 %% minimum and a 150ms sample, the decoded delay (8000 -> 64ms) triggers
 %% the ack-delay adjustment; the raw value (8000) never would.
 on_ack_received_decodes_ack_delay_test() ->
-    Opts = #{initial_rtt => 100, max_ack_delay => 1000},
-    L0 = ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(Opts)),
+    L0 = ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(false, 1000, 3, 100)),
     {L1, _, _} = ?M:on_ack_received({ack, 0, 0, 0, []}, 50, L0),
     L2 = ?M:on_packet_sent(1, 100, true, d1, 100, L1),
     {L3, _, _} = ?M:on_ack_received({ack, 1, 8000, 0, []}, 250, L2),
@@ -194,7 +198,7 @@ on_ack_received_decodes_ack_delay_test() ->
 
 %% The largest acked carries across ACKs (kept as the maximum).
 largest_acked_is_monotonic_test() ->
-    Loss = send_run(0, 9, ?M:new(#{})),
+    Loss = send_run(0, 9, ?M:new(false)),
     {Loss1, _, _} = ?M:on_ack_received({ack, 5, 0, 0, []}, 20, Loss),
     ?assertEqual(5, ?M:largest_acked(Loss1)),
     {Loss2, _, _} = ?M:on_ack_received({ack, 3, 0, 0, []}, 21, Loss1),
@@ -204,7 +208,7 @@ largest_acked_is_monotonic_test() ->
 %% rejected, through the first range, a gap range, and a gap range deeper in
 %% the list (which propagates the error back up through the expansion).
 on_ack_received_rejects_negative_range_test() ->
-    Loss = send_run(0, 9, ?M:new(#{})),
+    Loss = send_run(0, 9, ?M:new(false)),
     ?assertEqual({error, negative_ack_range}, ?M:on_ack_received({ack, 9, 0, 10, []}, 20, Loss)),
     ?assertEqual(
         {error, negative_ack_range}, ?M:on_ack_received({ack, 9, 0, 0, [{7, 1}]}, 20, Loss)
@@ -216,7 +220,7 @@ on_ack_received_rejects_negative_range_test() ->
 
 %% A range down to exactly packet number 0 is valid, however long.
 on_ack_received_accepts_range_to_zero_test() ->
-    Loss = send_run(0, 9, ?M:new(#{})),
+    Loss = send_run(0, 9, ?M:new(false)),
     {_, Acked, []} = ?M:on_ack_received({ack, 9, 0, 0, [{0, 7}]}, 20, Loss),
     ?assertEqual(9, length(Acked)),
     {_, Acked2, []} = ?M:on_ack_received({ack, 100000, 0, 100000, []}, 20, Loss),
@@ -228,7 +232,7 @@ on_ack_received_accepts_range_to_zero_test() ->
 
 detect_lost_test() ->
     %% Nothing acknowledged yet: no loss decision possible.
-    Loss0 = send_run(0, 4, ?M:new(#{})),
+    Loss0 = send_run(0, 4, ?M:new(false)),
     ?assertEqual({Loss0, []}, ?M:detect_lost(100, Loss0)),
     %% ACK packet 4 at time 100: the RTT sample (96) makes the loss delay
     %% large enough that 2 and 3 survive the ACK (0 and 1 fall to the
@@ -240,11 +244,11 @@ detect_lost_test() ->
     %% RFC 9002 Appendix B.8: the timer-detected loss leaves a congestion signal
     %% with the latest lost send time and nothing acknowledged.
     ?assertEqual(
-        #{
-            acked_bytes => 0,
-            largest_acked_time => undefined,
-            largest_lost_time => 3,
-            persistent_congestion => false
+        #quic_cc_signal{
+            acked_bytes = 0,
+            largest_acked_time = undefined,
+            largest_lost_time = 3,
+            persistent_congestion = false
         },
         ?M:cc_signal(Loss2)
     ).
@@ -254,24 +258,24 @@ detect_lost_stops_at_in_flight_packet_test() ->
     %% not loss candidates; the loss timer reaches the oldest of them and stops,
     %% declaring nothing lost and leaving the in-flight set unchanged. The ACK's
     %% signal is replaced by an empty one, so it is never applied twice.
-    Loss0 = send_run(0, 4, ?M:new(#{})),
+    Loss0 = send_run(0, 4, ?M:new(false)),
     {Loss1, _, _} = ?M:on_ack_received({ack, 0, 0, 0, []}, 100, Loss0),
     {Loss2, []} = ?M:detect_lost(100, Loss1),
     ?assertEqual(?M:bytes_in_flight(Loss1), ?M:bytes_in_flight(Loss2)),
     ?assertEqual(
-        #{
-            acked_bytes => 0,
-            largest_acked_time => undefined,
-            largest_lost_time => undefined,
-            persistent_congestion => false
+        #quic_cc_signal{
+            acked_bytes = 0,
+            largest_acked_time = undefined,
+            largest_lost_time = undefined,
+            persistent_congestion = false
         },
         ?M:cc_signal(Loss2)
     ).
 
 loss_time_test() ->
-    ?assertEqual(undefined, ?M:loss_time(?M:new(#{}))),
+    ?assertEqual(undefined, ?M:loss_time(?M:new(false))),
     %% First sample sets srtt; oldest packet sent at 0, loss delay 9*srtt/8.
-    Loss = ?M:update_rtt(40, 0, ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(#{}))),
+    Loss = ?M:update_rtt(40, 0, ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(false))),
     ?assertEqual(0 + (9 * 40 div 8), ?M:loss_time(Loss)).
 
 %% =============================================================================
@@ -284,57 +288,57 @@ loss_time_test() ->
 %% with no max_ack_delay the duration is (10 + 12 + 0) * 3 = 66; the lost
 %% packets 1..7 span 20..140, 120ms with nothing between them acknowledged.
 persistent_congestion_established_test() ->
-    Loss = sampled_then_sent(#{max_ack_delay => 0}, [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]),
+    Loss = sampled_then_sent(?M:new(false, 0, 3), [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]),
     {Loss1, _, Lost} = ?M:on_ack_received({ack, 8, 0, 0, []}, 170, Loss),
     ?assertEqual([1, 2, 3, 4, 5, 6, 7], lists:sort(Lost)),
-    ?assertMatch(#{persistent_congestion := true}, ?M:cc_signal(Loss1)).
+    ?assertMatch(#quic_cc_signal{persistent_congestion = true}, ?M:cc_signal(Loss1)).
 
 %% The same losses with a 25ms max_ack_delay: the duration grows to
 %% (10 + 12 + 25) * 3 = 141, past the 120ms span (§7.6.1).
 persistent_congestion_needs_the_duration_test() ->
-    Loss = sampled_then_sent(#{max_ack_delay => 25}, [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]),
+    Loss = sampled_then_sent(?M:new(false, 25, 3), [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]),
     {Loss1, _, _} = ?M:on_ack_received({ack, 8, 0, 0, []}, 170, Loss),
-    ?assertMatch(#{persistent_congestion := false}, ?M:cc_signal(Loss1)).
+    ?assertMatch(#quic_cc_signal{persistent_congestion = false}, ?M:cc_signal(Loss1)).
 
 %% The same in a handshake space: its probe timeout leaves max_ack_delay
 %% out, but the persistent congestion duration keeps it (§7.6.1).
 persistent_congestion_keeps_max_ack_delay_in_a_handshake_space_test() ->
     Loss = sampled_then_sent(
-        #{max_ack_delay => 25, handshake => true}, [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]
+        ?M:new(true, 25, 3), [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]
     ),
     {Loss1, _, _} = ?M:on_ack_received({ack, 8, 0, 0, []}, 170, Loss),
-    ?assertMatch(#{persistent_congestion := false}, ?M:cc_signal(Loss1)).
+    ?assertMatch(#quic_cc_signal{persistent_congestion = false}, ?M:cc_signal(Loss1)).
 
 %% Acknowledging packet 4 too splits the losses into 1..3 and 5..7, each
 %% spanning 40ms: a packet between them was acknowledged (§7.6.2).
 persistent_congestion_broken_by_an_acknowledged_packet_test() ->
-    Loss = sampled_then_sent(#{max_ack_delay => 0}, [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]),
+    Loss = sampled_then_sent(?M:new(false, 0, 3), [{PN, 20 * PN, true} || PN <- lists:seq(1, 8)]),
     {Loss1, _, Lost} = ?M:on_ack_received({ack, 8, 0, 0, [{2, 0}]}, 170, Loss),
     ?assertEqual([1, 2, 3, 5, 6, 7], lists:sort(Lost)),
-    ?assertMatch(#{persistent_congestion := false}, ?M:cc_signal(Loss1)).
+    ?assertMatch(#quic_cc_signal{persistent_congestion = false}, ?M:cc_signal(Loss1)).
 
 %% Only ack-eliciting packets are endpoints (§7.6.2): with 1, 2 and 7 not
 %% ack-eliciting, the eligible 3..6 span 60ms, under the 66ms duration. The
 %% non-ack-eliciting packets still continue the run.
 persistent_congestion_needs_ack_eliciting_endpoints_test() ->
     Sends = [{PN, 20 * PN, not lists:member(PN, [1, 2, 7])} || PN <- lists:seq(1, 8)],
-    Loss = sampled_then_sent(#{max_ack_delay => 0}, Sends),
+    Loss = sampled_then_sent(?M:new(false, 0, 3), Sends),
     {Loss1, _, Lost} = ?M:on_ack_received({ack, 8, 0, 0, []}, 170, Loss),
     ?assertEqual([1, 2, 3, 4, 5, 6, 7], lists:sort(Lost)),
-    ?assertMatch(#{persistent_congestion := false}, ?M:cc_signal(Loss1)).
+    ?assertMatch(#quic_cc_signal{persistent_congestion = false}, ?M:cc_signal(Loss1)).
 
 %% Only packets sent after the first RTT sample count (Appendix B.8): here
 %% the ACK itself takes the first sample, so none of the 160ms of losses do.
 persistent_congestion_needs_a_prior_rtt_sample_test() ->
-    Loss = send_at([{PN, 20 * PN, true} || PN <- lists:seq(0, 8)], ?M:new(#{max_ack_delay => 0})),
+    Loss = send_at([{PN, 20 * PN, true} || PN <- lists:seq(0, 8)], ?M:new(false, 0, 3)),
     {Loss1, _, Lost} = ?M:on_ack_received({ack, 8, 0, 0, []}, 170, Loss),
     ?assertEqual([0, 1, 2, 3, 4, 5, 6, 7], lists:sort(Lost)),
-    ?assertMatch(#{persistent_congestion := false}, ?M:cc_signal(Loss1)).
+    ?assertMatch(#quic_cc_signal{persistent_congestion = false}, ?M:cc_signal(Loss1)).
 
-%% Packet 0 sent at 0 and acknowledged at 10 (the first RTT sample, 10ms),
+%% Packet 0 sent at 0 on a fresh `Loss` and acknowledged at 10 (the first RTT sample, 10ms),
 %% then the given `{PN, Time, AckEliciting}` sends.
-sampled_then_sent(Opts, Sends) ->
-    Sent0 = ?M:on_packet_sent(0, 100, true, 0, 0, ?M:new(Opts)),
+sampled_then_sent(Loss, Sends) ->
+    Sent0 = ?M:on_packet_sent(0, 100, true, 0, 0, Loss),
     {Sampled, [0], []} = ?M:on_ack_received({ack, 0, 0, 0, []}, 10, Sent0),
     send_at(Sends, Sampled).
 
@@ -354,20 +358,20 @@ send_at(Sends, Loss) ->
 %% sent, so a later non-ack-eliciting send does not move it, and with nothing
 %% ack-eliciting in flight there is none.
 pto_deadline_counts_from_last_ack_eliciting_send_test() ->
-    ?assertEqual(undefined, ?M:pto_deadline(?M:new(#{}))),
-    Sent = ?M:on_packet_sent(0, 100, true, d0, 1000, ?M:new(#{})),
+    ?assertEqual(undefined, ?M:pto_deadline(?M:new(false))),
+    Sent = ?M:on_packet_sent(0, 100, true, d0, 1000, ?M:new(false)),
     Deadline = 1000 + ?M:get_pto(Sent),
     ?assertEqual(Deadline, ?M:pto_deadline(Sent)),
     ?assertEqual(Deadline, ?M:pto_deadline(?M:on_packet_sent(1, 40, false, d1, 1500, Sent))),
     Later = ?M:on_packet_sent(1, 100, true, d1, 1500, Sent),
     ?assertEqual(1500 + ?M:get_pto(Later), ?M:pto_deadline(Later)),
-    ?assertEqual(undefined, ?M:pto_deadline(?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(#{})))).
+    ?assertEqual(undefined, ?M:pto_deadline(?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(false)))).
 
 %% RFC 9002 §6.2.4: the data a probe can carry again is the oldest
 %% unacknowledged ack-eliciting packet's, skipping ACK-only packets.
 oldest_ack_eliciting_test() ->
-    ?assertEqual([], ?M:oldest_ack_eliciting(?M:new(#{}))),
-    AckOnly = ?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(#{})),
+    ?assertEqual([], ?M:oldest_ack_eliciting(?M:new(false))),
+    AckOnly = ?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(false)),
     ?assertEqual([], ?M:oldest_ack_eliciting(AckOnly)),
     Mixed = ?M:on_packet_sent(2, 100, true, d2, 2, ?M:on_packet_sent(1, 100, true, d1, 1, AckOnly)),
     ?assertEqual([d1], ?M:oldest_ack_eliciting(Mixed)).
@@ -375,8 +379,8 @@ oldest_ack_eliciting_test() ->
 %% RFC 9002 §6.2.4: a handshake probe can carry every unacknowledged
 %% ack-eliciting packet's data, oldest first, skipping ACK-only packets.
 unacked_ack_eliciting_test() ->
-    ?assertEqual([], ?M:unacked_ack_eliciting(?M:new(#{}))),
-    AckOnly = ?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(#{})),
+    ?assertEqual([], ?M:unacked_ack_eliciting(?M:new(false))),
+    AckOnly = ?M:on_packet_sent(0, 40, false, d0, 0, ?M:new(false)),
     ?assertEqual([], ?M:unacked_ack_eliciting(AckOnly)),
     Mixed = ?M:on_packet_sent(2, 100, true, d2, 2, ?M:on_packet_sent(1, 100, true, d1, 1, AckOnly)),
     ?assertEqual([d1, d2], ?M:unacked_ack_eliciting(Mixed)).
@@ -392,8 +396,7 @@ send_run(First, Last, Loss) ->
 %% initial value, and a packet sent before the reset (on the old path) gives
 %% no sample, while one sent after it does.
 reset_rtt_test() ->
-    Opts = #{initial_rtt => 100},
-    L0 = ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(Opts)),
+    L0 = ?M:on_packet_sent(0, 100, true, d0, 0, ?M:new(false, 25, 3, 100)),
     {L1, _, _} = ?M:on_ack_received({ack, 0, 0, 0, []}, 40, L0),
     ?assertEqual(40, ?M:smoothed_rtt(L1)),
     L2 = ?M:on_packet_sent(1, 100, true, d1, 50, L1),

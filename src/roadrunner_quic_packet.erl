@@ -25,7 +25,7 @@
 %% doubles as the AEAD associated data.
 
 -export([
-    encode_long/5,
+    encode_long/7,
     encode_short/4,
     encode_short/5,
     encode_version_negotiation/3,
@@ -62,26 +62,22 @@
         payload := binary()
     }.
 
--type long_opts() :: #{
-    token => binary(),
-    pn => non_neg_integer(),
-    payload => iodata()
-}.
-
 %% =============================================================================
 %% Packet building
 %% =============================================================================
 
 -doc """
-Build a long-header packet (RFC 9000 §17.2). `payload` is the already
-AEAD-sealed ciphertext; the returned iolist's first element is the
-unprotected header (through the packet number), which the caller uses as
-the AEAD associated data and then header-protects.
+Build a long-header packet (RFC 9000 §17.2) numbered `PN`. `Token` is an
+Initial packet's address validation token (§17.2.2), which the other long
+types do not carry; `Payload` is the already AEAD-sealed ciphertext. The
+returned iolist's first element is the unprotected header (through the
+packet number), which the caller uses as the AEAD associated data and then
+header-protects.
 """.
--spec encode_long(long_type(), non_neg_integer(), binary(), binary(), long_opts()) -> iolist().
-encode_long(Type, Version, DCID, SCID, Opts) ->
-    PN = maps:get(pn, Opts, 0),
-    Payload = maps:get(payload, Opts, <<>>),
+-spec encode_long(
+    long_type(), non_neg_integer(), binary(), binary(), binary(), non_neg_integer(), iodata()
+) -> iolist().
+encode_long(Type, Version, DCID, SCID, Token, PN, Payload) ->
     PNLen = pn_length(PN),
     %% First byte: 1 (long) 1 (fixed) TT (type) RR (reserved 0) PP (pnlen-1).
     FirstByte = 2#11000000 bor (type_bits(Type) bsl 4) bor (PNLen - 1),
@@ -93,7 +89,7 @@ encode_long(Type, Version, DCID, SCID, Opts) ->
         DCID/binary,
         (byte_size(SCID)):8,
         SCID/binary,
-        (long_prefix(Type, Opts))/binary,
+        (long_prefix(Type, Token))/binary,
         (roadrunner_quic_varint:encode(Length))/binary,
         (encode_pn(PN, PNLen))/binary
     >>,
@@ -101,11 +97,10 @@ encode_long(Type, Version, DCID, SCID, Opts) ->
 
 %% Initial packets carry a token (RFC 9000 §17.2.2); the other long types
 %% have nothing between the connection IDs and the Length field.
--spec long_prefix(long_type(), long_opts()) -> binary().
-long_prefix(initial, Opts) ->
-    Token = maps:get(token, Opts, <<>>),
+-spec long_prefix(long_type(), binary()) -> binary().
+long_prefix(initial, Token) ->
     <<(roadrunner_quic_varint:encode(byte_size(Token)))/binary, Token/binary>>;
-long_prefix(_Type, _Opts) ->
+long_prefix(_Type, _Token) ->
     <<>>.
 
 -doc "Build a 1-RTT short-header packet (RFC 9000 §17.3) with key phase 0.".
@@ -187,12 +182,12 @@ decision (RFC 9000 §17.2.1). Returns `{error, not_long_header}` for a short
 header and `{error, truncated}` for a clipped long header.
 """.
 -spec long_header_info(binary()) ->
-    {ok, #{version := non_neg_integer(), dcid := binary(), scid := binary()}}
+    {ok, non_neg_integer(), binary(), binary()}
     | {error, not_long_header | truncated}.
 long_header_info(
     <<1:1, _:7, Version:32, DCIDLen, DCID:DCIDLen/binary, SCIDLen, SCID:SCIDLen/binary, _/binary>>
 ) ->
-    {ok, #{version => Version, dcid => DCID, scid => SCID}};
+    {ok, Version, DCID, SCID};
 long_header_info(<<1:1, _/bitstring>>) ->
     {error, truncated};
 long_header_info(_) ->

@@ -7,24 +7,42 @@
 %% `quic_transport_parameters` extension body (this module produces and
 %% parses that body, with no outer length of its own).
 %%
-%% Parameters are a map keyed by their RFC name (an atom, see
-%% `param_key/0`), mirroring `roadrunner_quic_h3_frame`'s `{settings,
-%% map()}` and the dep's own representation. Values are typed by
-%% parameter: an integer for the varint parameters, a `binary()` for the
-%% connection-id parameters and the 16-byte `stateless_reset_token`, and
-%% `true` for the zero-length `disable_active_migration` flag.
+%% A parameter set is an opaque record, built with `new/1` and `set/3` from
+%% the parameters' RFC names (atoms, see `param_key/0`) and read with one
+%% accessor per parameter, which answers the RFC 9000 §18.2 default for a
+%% parameter the set leaves out. Values are typed by parameter: an integer
+%% for the varint parameters, a `binary()` for the connection-id parameters
+%% and the 16-byte `stateless_reset_token`, and `true` for the zero-length
+%% `disable_active_migration` flag.
 %%
-%% `encode/1` emits every parameter in the map as an iolist (in
-%% map-iteration order; RFC 9000 §18 permits any order); choosing which
-%% parameters to send, and omitting ones left at their default, is the
-%% caller's concern. `decode/1` parses the peer's set with the §18.2
-%% validation a server applies to a client: range checks, duplicate
-%% rejection, rejection of the server-only parameters a client must not
-%% send, and silently ignoring unknown/reserved ids.
+%% `encode/1` emits every parameter the set holds as an iolist (RFC 9000
+%% §18 permits any order); choosing which parameters to send, and omitting
+%% ones left at their default, is the caller's concern. `decode/1` parses
+%% the peer's set with the §18.2 validation a server applies to a client:
+%% range checks, duplicate rejection, rejection of the server-only
+%% parameters a client must not send, and silently ignoring unknown/reserved
+%% ids.
 
--export([encode/1, decode/1]).
+-export([new/1, set/3, encode/1, decode/1]).
+-export([
+    original_destination_connection_id/1,
+    max_idle_timeout/1,
+    max_udp_payload_size/1,
+    initial_max_data/1,
+    initial_max_stream_data_bidi_local/1,
+    initial_max_stream_data_bidi_remote/1,
+    initial_max_stream_data_uni/1,
+    initial_max_streams_bidi/1,
+    initial_max_streams_uni/1,
+    ack_delay_exponent/1,
+    max_ack_delay/1,
+    disable_active_migration/1,
+    active_connection_id_limit/1,
+    initial_source_connection_id/1,
+    stateless_reset_token/1
+]).
 
--export_type([param_key/0, params/0]).
+-export_type([param_key/0, param_value/0, params/0]).
 
 -type param_key() ::
     original_destination_connection_id
@@ -43,25 +61,30 @@
     | initial_source_connection_id
     | stateless_reset_token.
 
--type params() :: #{
-    original_destination_connection_id => binary(),
-    max_idle_timeout => non_neg_integer(),
-    max_udp_payload_size => non_neg_integer(),
-    initial_max_data => non_neg_integer(),
-    initial_max_stream_data_bidi_local => non_neg_integer(),
-    initial_max_stream_data_bidi_remote => non_neg_integer(),
-    initial_max_stream_data_uni => non_neg_integer(),
-    initial_max_streams_bidi => non_neg_integer(),
-    initial_max_streams_uni => non_neg_integer(),
-    ack_delay_exponent => non_neg_integer(),
-    max_ack_delay => non_neg_integer(),
-    disable_active_migration => true,
-    active_connection_id_limit => non_neg_integer(),
-    initial_source_connection_id => binary(),
+-type param_value() :: non_neg_integer() | binary() | true.
+
+%% Each field is `undefined` while the set leaves its parameter out.
+-record(params, {
+    original_destination_connection_id = undefined :: binary() | undefined,
+    max_idle_timeout = undefined :: non_neg_integer() | undefined,
+    max_udp_payload_size = undefined :: non_neg_integer() | undefined,
+    initial_max_data = undefined :: non_neg_integer() | undefined,
+    initial_max_stream_data_bidi_local = undefined :: non_neg_integer() | undefined,
+    initial_max_stream_data_bidi_remote = undefined :: non_neg_integer() | undefined,
+    initial_max_stream_data_uni = undefined :: non_neg_integer() | undefined,
+    initial_max_streams_bidi = undefined :: non_neg_integer() | undefined,
+    initial_max_streams_uni = undefined :: non_neg_integer() | undefined,
+    ack_delay_exponent = undefined :: non_neg_integer() | undefined,
+    max_ack_delay = undefined :: non_neg_integer() | undefined,
+    disable_active_migration = undefined :: true | undefined,
+    active_connection_id_limit = undefined :: non_neg_integer() | undefined,
+    initial_source_connection_id = undefined :: binary() | undefined,
     %% Server-only (RFC 9000 §18.2): the stateless reset token of the
     %% connection id the server chose in the handshake.
-    stateless_reset_token => <<_:128>>
-}.
+    stateless_reset_token = undefined :: <<_:128>> | undefined
+}).
+
+-opaque params() :: #params{}.
 
 %% Ids already seen while decoding a set, for the RFC 9000 §7.4 duplicate
 %% check (a set: only the keys matter).
@@ -73,6 +96,25 @@
     {param, param_key(), non_neg_integer() | binary() | true}
     | ignore
     | {error, atom()}.
+
+%% Every parameter, in the order `encode/1` emits them (their names' order).
+-define(PARAM_KEYS, [
+    ack_delay_exponent,
+    active_connection_id_limit,
+    disable_active_migration,
+    initial_max_data,
+    initial_max_stream_data_bidi_local,
+    initial_max_stream_data_bidi_remote,
+    initial_max_stream_data_uni,
+    initial_max_streams_bidi,
+    initial_max_streams_uni,
+    initial_source_connection_id,
+    max_ack_delay,
+    max_idle_timeout,
+    max_udp_payload_size,
+    original_destination_connection_id,
+    stateless_reset_token
+]).
 
 %% RFC 9000 §18.2 transport parameter ids.
 -define(TP_ORIGINAL_DESTINATION_CONNECTION_ID, 16#00).
@@ -103,21 +145,42 @@
 -define(MIN_ACTIVE_CONNECTION_ID_LIMIT, 2).
 -define(MAX_STREAMS_LIMIT, 1152921504606846976).
 
+%% RFC 9000 §18.2 defaults of the parameters a set may leave out.
+-define(DEFAULT_MAX_UDP_PAYLOAD_SIZE, 65527).
+-define(DEFAULT_ACK_DELAY_EXPONENT, 3).
+-define(DEFAULT_MAX_ACK_DELAY, 25).
+-define(DEFAULT_ACTIVE_CONNECTION_ID_LIMIT, 2).
+
 %% =============================================================================
 %% encode/1
 %% =============================================================================
 
 -doc """
-Encode a transport-parameters map to its wire form (RFC 9000 §18), as an
-iolist, one `varint(Id), varint(Length), Value` triple per entry (in
-map-iteration order; §18 permits any order). The map holds only the
-parameters to send (the connection ids the server must include, plus
-whichever limits it advertises); a parameter left at its default is
-simply absent from the map.
+A parameter set holding each `{Key, Value}` of `Params` (a later one for
+the same key wins).
+""".
+-spec new([{param_key(), param_value()}]) -> params().
+new(Params) ->
+    lists:foldl(fun({Key, Value}, Acc) -> set(Key, Value, Acc) end, #params{}, Params).
+
+-doc "`Params` with `Key` set to `Value`.".
+-spec set(param_key(), param_value(), params()) -> params().
+set(Key, Value, #params{} = Params) ->
+    setelement(field(Key), Params, Value).
+
+-doc """
+Encode a parameter set to its wire form (RFC 9000 §18), as an iolist, one
+`varint(Id), varint(Length), Value` triple per parameter it holds (§18
+permits any order). The set holds only the parameters to send (the
+connection ids the server must include, plus whichever limits it
+advertises); a parameter left at its default is simply absent from it.
 """.
 -spec encode(params()) -> iolist().
-encode(Params) ->
-    [encode_param(Key, Value) || Key := Value <- Params].
+encode(#params{} = Params) ->
+    [
+        encode_param(Key, element(field(Key), Params))
+     || Key <- ?PARAM_KEYS, element(field(Key), Params) =/= undefined
+    ].
 
 %% =============================================================================
 %% decode/1
@@ -140,7 +203,102 @@ Returns `{ok, Params}` or `{error, Reason}` (a flat atom).
 """.
 -spec decode(binary()) -> {ok, params()} | {error, atom()}.
 decode(Data) ->
-    decode_params(Data, #{}, #{}).
+    decode_params(Data, #params{}, #{}).
+
+%% =============================================================================
+%% Accessors
+%% =============================================================================
+
+%% Each answers the parameter's RFC 9000 §18.2 default when the set leaves
+%% it out: 0 for the idle timeout (no timeout) and the flow-control and
+%% stream limits, `undefined` for the connection ids and the reset token,
+%% `false` for the migration flag.
+
+-doc "The `original_destination_connection_id`, `undefined` when absent.".
+-spec original_destination_connection_id(params()) -> binary() | undefined.
+original_destination_connection_id(#params{original_destination_connection_id = V}) -> V.
+
+-doc "The `max_idle_timeout` (ms), 0 (none) when absent.".
+-spec max_idle_timeout(params()) -> non_neg_integer().
+max_idle_timeout(#params{max_idle_timeout = V}) -> default(V, 0).
+
+-doc "The `max_udp_payload_size`, 65527 when absent.".
+-spec max_udp_payload_size(params()) -> non_neg_integer().
+max_udp_payload_size(#params{max_udp_payload_size = V}) ->
+    default(V, ?DEFAULT_MAX_UDP_PAYLOAD_SIZE).
+
+-doc "The `initial_max_data`, 0 when absent.".
+-spec initial_max_data(params()) -> non_neg_integer().
+initial_max_data(#params{initial_max_data = V}) -> default(V, 0).
+
+-doc "The `initial_max_stream_data_bidi_local`, 0 when absent.".
+-spec initial_max_stream_data_bidi_local(params()) -> non_neg_integer().
+initial_max_stream_data_bidi_local(#params{initial_max_stream_data_bidi_local = V}) ->
+    default(V, 0).
+
+-doc "The `initial_max_stream_data_bidi_remote`, 0 when absent.".
+-spec initial_max_stream_data_bidi_remote(params()) -> non_neg_integer().
+initial_max_stream_data_bidi_remote(#params{initial_max_stream_data_bidi_remote = V}) ->
+    default(V, 0).
+
+-doc "The `initial_max_stream_data_uni`, 0 when absent.".
+-spec initial_max_stream_data_uni(params()) -> non_neg_integer().
+initial_max_stream_data_uni(#params{initial_max_stream_data_uni = V}) -> default(V, 0).
+
+-doc "The `initial_max_streams_bidi`, 0 when absent.".
+-spec initial_max_streams_bidi(params()) -> non_neg_integer().
+initial_max_streams_bidi(#params{initial_max_streams_bidi = V}) -> default(V, 0).
+
+-doc "The `initial_max_streams_uni`, 0 when absent.".
+-spec initial_max_streams_uni(params()) -> non_neg_integer().
+initial_max_streams_uni(#params{initial_max_streams_uni = V}) -> default(V, 0).
+
+-doc "The `ack_delay_exponent`, 3 when absent.".
+-spec ack_delay_exponent(params()) -> non_neg_integer().
+ack_delay_exponent(#params{ack_delay_exponent = V}) -> default(V, ?DEFAULT_ACK_DELAY_EXPONENT).
+
+-doc "The `max_ack_delay` (ms), 25 when absent.".
+-spec max_ack_delay(params()) -> non_neg_integer().
+max_ack_delay(#params{max_ack_delay = V}) -> default(V, ?DEFAULT_MAX_ACK_DELAY).
+
+-doc "Whether the set carries the `disable_active_migration` flag.".
+-spec disable_active_migration(params()) -> boolean().
+disable_active_migration(#params{disable_active_migration = V}) -> V =:= true.
+
+-doc "The `active_connection_id_limit`, 2 when absent.".
+-spec active_connection_id_limit(params()) -> non_neg_integer().
+active_connection_id_limit(#params{active_connection_id_limit = V}) ->
+    default(V, ?DEFAULT_ACTIVE_CONNECTION_ID_LIMIT).
+
+-doc "The `initial_source_connection_id`, `undefined` when absent.".
+-spec initial_source_connection_id(params()) -> binary() | undefined.
+initial_source_connection_id(#params{initial_source_connection_id = V}) -> V.
+
+-doc "The `stateless_reset_token`, `undefined` when absent.".
+-spec stateless_reset_token(params()) -> <<_:128>> | undefined.
+stateless_reset_token(#params{stateless_reset_token = V}) -> V.
+
+-spec default(non_neg_integer() | undefined, non_neg_integer()) -> non_neg_integer().
+default(undefined, Default) -> Default;
+default(Value, _Default) -> Value.
+
+%% The record field holding a parameter.
+-spec field(param_key()) -> pos_integer().
+field(original_destination_connection_id) -> #params.original_destination_connection_id;
+field(max_idle_timeout) -> #params.max_idle_timeout;
+field(max_udp_payload_size) -> #params.max_udp_payload_size;
+field(initial_max_data) -> #params.initial_max_data;
+field(initial_max_stream_data_bidi_local) -> #params.initial_max_stream_data_bidi_local;
+field(initial_max_stream_data_bidi_remote) -> #params.initial_max_stream_data_bidi_remote;
+field(initial_max_stream_data_uni) -> #params.initial_max_stream_data_uni;
+field(initial_max_streams_bidi) -> #params.initial_max_streams_bidi;
+field(initial_max_streams_uni) -> #params.initial_max_streams_uni;
+field(ack_delay_exponent) -> #params.ack_delay_exponent;
+field(max_ack_delay) -> #params.max_ack_delay;
+field(disable_active_migration) -> #params.disable_active_migration;
+field(active_connection_id_limit) -> #params.active_connection_id_limit;
+field(initial_source_connection_id) -> #params.initial_source_connection_id;
+field(stateless_reset_token) -> #params.stateless_reset_token.
 
 %% =============================================================================
 %% Internal — encode
@@ -232,7 +390,7 @@ dup_check(Id, Seen) ->
 -spec accumulate(decoded(), non_neg_integer(), binary(), params(), seen()) ->
     {ok, params()} | {error, atom()}.
 accumulate({param, Key, Value}, Id, Rest, Acc, Seen) ->
-    decode_params(Rest, Acc#{Key => Value}, Seen#{Id => []});
+    decode_params(Rest, set(Key, Value, Acc), Seen#{Id => []});
 accumulate(ignore, Id, Rest, Acc, Seen) ->
     decode_params(Rest, Acc, Seen#{Id => []});
 accumulate({error, _} = Error, _Id, _Rest, _Acc, _Seen) ->

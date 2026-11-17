@@ -111,7 +111,7 @@
     %% and creates (and owns) its own.
     registry => roadrunner_quic_cid_registry:t(),
     %% When a request stream's receive credit is granted back
-    %% (`roadrunner_quic_conn_state:config()`); `on_receipt` by default.
+    %% (`roadrunner_quic_conn_state:settings/7`); `on_receipt` by default.
     stream_credit => on_receipt | on_read,
     %% When set and closed, a datagram that would start a new connection is
     %% dropped (RFC 9000 lets a server ignore an Initial). Unset, the
@@ -126,14 +126,10 @@
     %% supervisor, or a standalone owner. Its `'EXIT'` is a shutdown request.
     parent :: pid(),
     registry :: roadrunner_quic_cid_registry:t(),
-    cert_chain :: [binary()],
-    priv_key :: public_key:private_key(),
-    alpn :: binary(),
-    %% The base transport parameters (flow/stream/idle limits); the per-
-    %% connection original/initial connection ids are filled in at spawn.
-    transport_params :: roadrunner_quic_transport_params:params(),
+    %% What every connection shares (the certificate, ALPN, base transport
+    %% parameters, the registry's keys and the stream credit mode).
+    settings :: roadrunner_quic_conn_state:settings(),
     handler :: fun((pid()) -> {ok, pid()} | {error, term()}),
-    stream_credit = on_receipt :: on_receipt | on_read,
     accept_gate :: accept_gate() | undefined,
     %% The second (monotonic) the Stateless Resets counted were sent in, and
     %% how many (RFC 9000 §10.3.3).
@@ -213,17 +209,22 @@ init(
                     #{registry := Injected} -> Injected;
                     #{} -> roadrunner_quic_cid_registry:new()
                 end,
+            Settings = roadrunner_quic_conn_state:settings(
+                CertChain,
+                PrivKey,
+                Alpn,
+                TransportParams,
+                roadrunner_quic_cid_registry:reset_key(Registry),
+                roadrunner_quic_cid_registry:token_key(Registry),
+                maps:get(stream_credit, Opts, on_receipt)
+            ),
             loop(#listener{
                 socket = Socket,
                 port = BoundPort,
                 parent = Parent,
                 registry = Registry,
-                cert_chain = CertChain,
-                priv_key = PrivKey,
-                alpn = Alpn,
-                transport_params = TransportParams,
+                settings = Settings,
                 handler = Handler,
-                stream_credit = maps:get(stream_credit, Opts, on_receipt),
                 accept_gate = maps:get(accept_gate, Opts, undefined)
             });
         {error, Reason} ->
@@ -435,7 +436,7 @@ classify_unrouted(<<0:1, _:7, _/binary>> = Datagram, DCID, Registry) ->
 classify_unrouted(Datagram, DCID, _Registry) ->
     case is_v1_initial(Datagram) andalso byte_size(Datagram) >= ?MIN_INITIAL_DATAGRAM of
         true ->
-            {ok, #{scid := SCID}} = roadrunner_quic_packet:long_header_info(Datagram),
+            {ok, _Version, _DCID, SCID} = roadrunner_quic_packet:long_header_info(Datagram),
             {spawn, DCID, SCID};
         false ->
             maybe_version_negotiation(Datagram)
@@ -467,7 +468,7 @@ classify_short(_Datagram, _DCID, _Registry) ->
 -spec maybe_version_negotiation(binary()) -> {version_negotiation, binary(), binary()} | drop.
 maybe_version_negotiation(Datagram) when byte_size(Datagram) >= ?MIN_INITIAL_DATAGRAM ->
     case roadrunner_quic_packet:long_header_info(Datagram) of
-        {ok, #{version := Version, dcid := DCID, scid := SCID}} when
+        {ok, Version, DCID, SCID} when
             Version =/= 0, Version =/= ?QUIC_V1
         ->
             {version_negotiation, DCID, SCID};
@@ -498,13 +499,19 @@ spawn_connection(
     Peer,
     ClientDCID,
     ClientSCID,
-    #listener{socket = Socket, registry = Registry, handler = Handler} = State
+    #listener{socket = Socket, registry = Registry, settings = Settings, handler = Handler} = State
 ) ->
     ServerSCID = crypto:strong_rand_bytes(?SCID_LEN),
     {Ip, _Port} = Peer,
-    Config = conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, State),
     {ok, ConnPid} = roadrunner_quic_connection:start(
-        Socket, Config#{address_validated => token_validates(Datagram, Ip, Registry)}
+        Socket,
+        Registry,
+        Settings,
+        Peer,
+        ClientDCID,
+        ServerSCID,
+        ClientSCID,
+        token_validates(Datagram, Ip, Registry)
     ),
     true = link(ConnPid),
     ok = roadrunner_quic_cid_registry:register_pair(Registry, ClientDCID, ServerSCID, ConnPid),
@@ -568,41 +575,3 @@ set_owner_sync(ConnPid, Owner) ->
         {'DOWN', MonRef, process, ConnPid, _Reason} ->
             ok
     end.
-
--spec conn_config(
-    binary(), binary(), binary(), {inet:ip_address(), inet:port_number()}, #listener{}
-) ->
-    roadrunner_quic_conn_state:config().
-conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
-    registry = Registry,
-    cert_chain = CertChain,
-    priv_key = PrivKey,
-    alpn = Alpn,
-    transport_params = TransportParams,
-    stream_credit = StreamCredit
-}) ->
-    ResetKey = roadrunner_quic_cid_registry:reset_key(Registry),
-    #{
-        dcid => ClientDCID,
-        scid => ServerSCID,
-        peer_scid => ClientSCID,
-        peer => Peer,
-        %% The connection routes the spare ids it issues through the shared
-        %% registry, each with a reset token under the registry's key.
-        registry => Registry,
-        reset_key => ResetKey,
-        %% The key the NEW_TOKEN tokens the connection issues are sealed under.
-        token_key => roadrunner_quic_cid_registry:token_key(Registry),
-        cert_chain => CertChain,
-        priv_key => PrivKey,
-        alpn => Alpn,
-        transport_params => TransportParams#{
-            original_destination_connection_id => ClientDCID,
-            initial_source_connection_id => ServerSCID,
-            %% The handshake id's token (RFC 9000 §10.3, §18.2); the ids
-            %% issued later carry theirs in NEW_CONNECTION_ID.
-            stateless_reset_token => roadrunner_quic_cid_registry:reset_token(ResetKey, ServerSCID)
-        },
-        server_random => crypto:strong_rand_bytes(32),
-        stream_credit => StreamCredit
-    }.

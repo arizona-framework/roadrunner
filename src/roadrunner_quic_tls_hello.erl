@@ -12,22 +12,35 @@
 %% `roadrunner_quic_transport_params` is the body of the
 %% quic_transport_parameters extension (codepoint 0x0039, RFC 9001 §8.2).
 %% `parse_client_hello/1` takes the already-deframed ClientHello body and
-%% returns the fields a server needs as a map; the build functions return
-%% the fully framed handshake message as an iolist.
+%% returns the fields a server needs as an opaque record, read with one
+%% accessor per field; the build functions return the fully framed
+%% handshake message as an iolist.
 %%
 %% Pure codec: it parses and builds wire bytes and never crashes on a
 %% malformed buffer (flat `{error, atom()}`). It does NOT negotiate or
 %% validate the peer's choices (TLS version, cipher, group selection,
 %% mandatory-extension presence) - that is the connection layer's job, so
 %% `parse_client_hello/1` extracts what is present and leaves absent
-%% extensions out of the map. The server build does not generate keys: the
+%% extensions `undefined`. The server build does not generate keys: the
 %% caller owns the ephemeral key pair and passes the public key in.
 
 -export([
     parse_client_hello/1,
-    build_server_hello/1,
-    build_hello_retry_request/1,
-    build_encrypted_extensions/1
+    build_server_hello/4,
+    build_hello_retry_request/3,
+    build_encrypted_extensions/2
+]).
+-export([
+    random/1,
+    session_id/1,
+    cipher_suites/1,
+    supported_versions/1,
+    alpn_protocols/1,
+    signature_algorithms/1,
+    supported_groups/1,
+    key_shares/1,
+    server_name/1,
+    transport_params/1
 ]).
 
 -export_type([client_hello/0]).
@@ -58,18 +71,21 @@
 %% SNI name_type 0 = host_name (RFC 6066 §3).
 -define(SNI_HOST_NAME, 16#00).
 
--type client_hello() :: #{
-    random := binary(),
-    session_id := binary(),
-    cipher_suites := [non_neg_integer()],
-    supported_versions := [non_neg_integer()],
-    alpn_protocols := [binary()],
-    signature_algorithms := [non_neg_integer()],
-    supported_groups => [non_neg_integer()],
-    key_shares => [{non_neg_integer(), binary()}],
-    server_name => binary(),
-    transport_params => roadrunner_quic_transport_params:params()
-}.
+%% The extensions a ClientHello may leave out are `undefined` while absent.
+-record(client_hello, {
+    random :: binary(),
+    session_id :: binary(),
+    cipher_suites :: [non_neg_integer()],
+    supported_versions :: [non_neg_integer()],
+    alpn_protocols :: [binary()],
+    signature_algorithms :: [non_neg_integer()],
+    supported_groups = undefined :: [non_neg_integer()] | undefined,
+    key_shares = undefined :: [{non_neg_integer(), binary()}] | undefined,
+    server_name = undefined :: binary() | undefined,
+    transport_params = undefined :: roadrunner_quic_transport_params:params() | undefined
+}).
+
+-opaque client_hello() :: #client_hello{}.
 
 %% =============================================================================
 %% parse_client_hello/1
@@ -78,7 +94,7 @@
 -doc """
 Parse a ClientHello body (RFC 8446 §4.1.2), as handed up by
 `roadrunner_quic_tls_handshake:decode/1`. Returns the fields a server
-needs as a map: the random and legacy session id (echoed in the
+needs: the random and legacy session id (echoed in the
 ServerHello), the offered cipher suites and TLS versions
 (supported_versions, RFC 8446 §4.2.1), the offered ALPN protocols and
 signature schemes, and (when present) the offered groups
@@ -86,7 +102,7 @@ signature schemes, and (when present) the offered groups
 KeyExchange}` pairs in its order (key_share, §4.2.8), the SNI host name,
 and the decoded QUIC transport parameters. The version, ALPN and signature
 lists read as empty when their extension is absent; the other absent
-extensions are simply left out of the map, so a caller can tell an absent
+extensions read as `undefined`, so a caller can tell an absent
 supported_groups or key_share (RFC 8446 §9.2) from an empty one. Returns
 `{error, Reason}` on a malformed buffer.
 """.
@@ -104,74 +120,105 @@ parse_client_hello(_) ->
     {error, malformed_client_hello}.
 
 %% =============================================================================
-%% build_server_hello/1
+%% build_server_hello/4
 %% =============================================================================
 
 -doc """
-Build a ServerHello (RFC 8446 §4.1.3), framed, as an iolist. Inputs:
-`random` (32 bytes), `session_id` (the client's legacy session id, echoed
-verbatim), `cipher_suite` (the selected suite's codepoint), and
-`key_share`, the server's `{Group, PublicKey}` for the selected group (a
-KeyShareEntry, RFC 8446 §4.2.8). The two server extensions are key_share
-then supported_versions (selecting TLS 1.3).
+Build a ServerHello (RFC 8446 §4.1.3), framed, as an iolist, from its
+`Random` (32 bytes), the client's legacy `SessionId` (echoed verbatim), the
+selected suite's `CipherSuite` codepoint, and the server's `{Group,
+PublicKey}` key share for the selected group (a KeyShareEntry, RFC 8446
+§4.2.8). The two server extensions are key_share then supported_versions
+(selecting TLS 1.3).
 """.
--spec build_server_hello(#{
-    random := binary(),
-    session_id := binary(),
-    cipher_suite := non_neg_integer(),
-    key_share := {non_neg_integer(), binary()}
-}) -> iolist().
-build_server_hello(#{
-    random := Random,
-    session_id := SessionId,
-    cipher_suite := CipherSuite,
-    key_share := {Group, PubKey}
-}) ->
+-spec build_server_hello(
+    binary(), binary(), non_neg_integer(), {non_neg_integer(), binary()}
+) -> iolist().
+build_server_hello(Random, SessionId, CipherSuite, {Group, PubKey}) ->
     KeyShareEntry = [<<Group:16, (byte_size(PubKey)):16>>, PubKey],
     server_hello(Random, SessionId, CipherSuite, KeyShareEntry).
 
 %% =============================================================================
-%% build_hello_retry_request/1
+%% build_hello_retry_request/3
 %% =============================================================================
 
 -doc """
 Build a HelloRetryRequest (RFC 8446 §4.1.4), framed, as an iolist: a
 ServerHello whose Random is the fixed HelloRetryRequest value (§4.1.3),
-asking the client for a key share in the selected `group`. Inputs:
-`session_id` (echoed verbatim) and `cipher_suite`, as for a ServerHello.
-The two extensions are key_share, carrying just the selected group
+asking the client for a key share in the selected `Group`. `SessionId`
+(echoed verbatim) and `CipherSuite` are as for a ServerHello. The two
+extensions are key_share, carrying just the selected group
 (KeyShareHelloRetryRequest, §4.2.8), then supported_versions (selecting
 TLS 1.3); no cookie is sent.
 """.
--spec build_hello_retry_request(#{
-    session_id := binary(), cipher_suite := non_neg_integer(), group := non_neg_integer()
-}) -> iolist().
-build_hello_retry_request(#{session_id := SessionId, cipher_suite := CipherSuite, group := Group}) ->
+-spec build_hello_retry_request(binary(), non_neg_integer(), non_neg_integer()) -> iolist().
+build_hello_retry_request(SessionId, CipherSuite, Group) ->
     server_hello(?HELLO_RETRY_RANDOM, SessionId, CipherSuite, <<Group:16>>).
 
 %% =============================================================================
-%% build_encrypted_extensions/1
+%% build_encrypted_extensions/2
 %% =============================================================================
 
 -doc """
 Build an EncryptedExtensions message (RFC 8446 §4.3.1), framed, as an
-iolist. Carries the selected `alpn` protocol (RFC 7301) and the server's
-QUIC `transport_params` (RFC 9001 §8.2); each is omitted if absent or
-empty.
+iolist. Carries the selected `Alpn` protocol (RFC 7301) and the server's
+QUIC `TransportParams` (RFC 9001 §8.2); each is omitted if empty.
 """.
--spec build_encrypted_extensions(#{
-    alpn => binary(), transport_params => roadrunner_quic_transport_params:params()
-}) -> iolist().
-build_encrypted_extensions(Opts) ->
-    Extensions = [alpn_extension(Opts), transport_params_extension(Opts)],
+-spec build_encrypted_extensions(binary(), roadrunner_quic_transport_params:params()) -> iolist().
+build_encrypted_extensions(Alpn, TransportParams) ->
+    Extensions = [alpn_extension(Alpn), transport_params_extension(TransportParams)],
     Body = [<<(iolist_size(Extensions)):16>>, Extensions],
     roadrunner_quic_tls_handshake:encode(?ENCRYPTED_EXTENSIONS, Body).
+
+%% =============================================================================
+%% ClientHello accessors
+%% =============================================================================
+
+-doc "The ClientHello's 32-byte Random.".
+-spec random(client_hello()) -> binary().
+random(#client_hello{random = V}) -> V.
+
+-doc "The legacy session id, echoed in the ServerHello.".
+-spec session_id(client_hello()) -> binary().
+session_id(#client_hello{session_id = V}) -> V.
+
+-doc "The offered cipher suite codepoints, in the client's order.".
+-spec cipher_suites(client_hello()) -> [non_neg_integer()].
+cipher_suites(#client_hello{cipher_suites = V}) -> V.
+
+-doc "The offered TLS versions (supported_versions), empty when absent.".
+-spec supported_versions(client_hello()) -> [non_neg_integer()].
+supported_versions(#client_hello{supported_versions = V}) -> V.
+
+-doc "The offered ALPN protocols, empty when absent.".
+-spec alpn_protocols(client_hello()) -> [binary()].
+alpn_protocols(#client_hello{alpn_protocols = V}) -> V.
+
+-doc "The offered signature schemes, empty when absent.".
+-spec signature_algorithms(client_hello()) -> [non_neg_integer()].
+signature_algorithms(#client_hello{signature_algorithms = V}) -> V.
+
+-doc "The offered groups (supported_groups), `undefined` when absent.".
+-spec supported_groups(client_hello()) -> [non_neg_integer()] | undefined.
+supported_groups(#client_hello{supported_groups = V}) -> V.
+
+-doc "The client's `{Group, KeyExchange}` key shares, `undefined` when absent.".
+-spec key_shares(client_hello()) -> [{non_neg_integer(), binary()}] | undefined.
+key_shares(#client_hello{key_shares = V}) -> V.
+
+-doc "The SNI host name, `undefined` when absent.".
+-spec server_name(client_hello()) -> binary() | undefined.
+server_name(#client_hello{server_name = V}) -> V.
+
+-doc "The client's QUIC transport parameters, `undefined` when absent.".
+-spec transport_params(client_hello()) -> roadrunner_quic_transport_params:params() | undefined.
+transport_params(#client_hello{transport_params = V}) -> V.
 
 %% =============================================================================
 %% Internal - ClientHello field extraction
 %% =============================================================================
 
-%% Assemble the client_hello() map from the parsed pieces. The structural
+%% Assemble the client_hello() record from the parsed pieces. The structural
 %% extractors are lenient (a malformed extension is treated as absent);
 %% only the transport parameters carry a validating decoder whose error
 %% is propagated.
@@ -180,26 +227,23 @@ build_encrypted_extensions(Opts) ->
 }) ->
     {ok, client_hello()} | {error, atom()}.
 finalize_client_hello(Random, SessionId, Ciphers, Extensions) ->
-    Base = #{
-        random => Random,
-        session_id => SessionId,
-        cipher_suites => Ciphers,
-        supported_versions => extract_supported_versions(Extensions),
-        alpn_protocols => extract_alpn(Extensions),
-        signature_algorithms => extract_signature_algorithms(Extensions)
-    },
-    WithGroups = maybe_put(supported_groups, extract_supported_groups(Extensions), Base),
-    WithKeyShares = maybe_put(key_shares, extract_key_shares(Extensions), WithGroups),
-    WithName = maybe_put(server_name, extract_server_name(Extensions), WithKeyShares),
     case extract_transport_params(Extensions) of
-        none -> {ok, WithName};
-        {ok, Params} -> {ok, WithName#{transport_params => Params}};
-        {error, _} = Error -> Error
+        {error, _} = Error ->
+            Error;
+        TransportParams ->
+            {ok, #client_hello{
+                random = Random,
+                session_id = SessionId,
+                cipher_suites = Ciphers,
+                supported_versions = extract_supported_versions(Extensions),
+                alpn_protocols = extract_alpn(Extensions),
+                signature_algorithms = extract_signature_algorithms(Extensions),
+                supported_groups = extract_supported_groups(Extensions),
+                key_shares = extract_key_shares(Extensions),
+                server_name = extract_server_name(Extensions),
+                transport_params = TransportParams
+            }}
     end.
-
--spec maybe_put(atom(), undefined | term(), map()) -> map().
-maybe_put(_Key, undefined, Map) -> Map;
-maybe_put(Key, Value, Map) -> Map#{Key => Value}.
 
 %% The offered groups (RFC 8446 §4.2.7: a two-byte-length list of 16-bit
 %% NamedGroups) in the client's order, or undefined if the extension is
@@ -287,16 +331,16 @@ extract_server_name(#{}) ->
 %% out of range, duplicated, or server-only) is a TRANSPORT_PARAMETER_ERROR
 %% (RFC 9000 §7.4, §18.2), not a TLS alert.
 -spec extract_transport_params(#{non_neg_integer() => binary()}) ->
-    none
-    | {ok, roadrunner_quic_transport_params:params()}
+    roadrunner_quic_transport_params:params()
+    | undefined
     | {error, transport_parameter_error}.
 extract_transport_params(#{?EXT_QUIC_TRANSPORT_PARAMS := Data}) ->
     case roadrunner_quic_transport_params:decode(Data) of
-        {ok, _} = Ok -> Ok;
+        {ok, Params} -> Params;
         {error, _} -> {error, transport_parameter_error}
     end;
 extract_transport_params(#{}) ->
-    none.
+    undefined.
 
 -spec parse_cipher_suites(binary()) -> [non_neg_integer()].
 parse_cipher_suites(Bin) ->
@@ -358,23 +402,21 @@ server_hello(Random, SessionId, CipherSuite, KeyShare) ->
 %% protocol (RFC 7301 §3.1), or [] when no protocol was selected. An empty
 %% protocol is treated as absent: a zero-length ProtocolName is invalid
 %% (RFC 7301 §3.1), so it is omitted rather than emitted malformed.
--spec alpn_extension(#{alpn => binary(), _ => _}) -> iolist().
-alpn_extension(#{alpn := Protocol}) when byte_size(Protocol) > 0 ->
+-spec alpn_extension(binary()) -> iolist().
+alpn_extension(<<>>) ->
+    [];
+alpn_extension(Protocol) ->
     NameList = [<<(byte_size(Protocol)):8>>, Protocol],
-    encode_extension(?EXT_ALPN, [<<(iolist_size(NameList)):16>>, NameList]);
-alpn_extension(#{}) ->
-    [].
+    encode_extension(?EXT_ALPN, [<<(iolist_size(NameList)):16>>, NameList]).
 
 %% The EncryptedExtensions quic_transport_parameters extension (RFC 9001
-%% §8.2), or [] when no parameters were given (an empty map is absent).
--spec transport_params_extension(#{
-    transport_params => roadrunner_quic_transport_params:params(), _ => _
-}) ->
-    iolist().
-transport_params_extension(#{transport_params := Params}) when map_size(Params) > 0 ->
-    encode_extension(?EXT_QUIC_TRANSPORT_PARAMS, roadrunner_quic_transport_params:encode(Params));
-transport_params_extension(#{}) ->
-    [].
+%% §8.2), or [] when no parameters were given (an empty set is absent).
+-spec transport_params_extension(roadrunner_quic_transport_params:params()) -> iolist().
+transport_params_extension(Params) ->
+    case roadrunner_quic_transport_params:encode(Params) of
+        [] -> [];
+        Encoded -> encode_extension(?EXT_QUIC_TRANSPORT_PARAMS, Encoded)
+    end.
 
 %% =============================================================================
 %% Internal - wire helpers

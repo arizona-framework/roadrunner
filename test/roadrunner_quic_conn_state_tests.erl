@@ -1,6 +1,7 @@
 -module(roadrunner_quic_conn_state_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("../include/roadrunner_quic.hrl").
 
 -define(M, roadrunner_quic_conn_state).
 -define(TC, roadrunner_quic_test_client).
@@ -73,7 +74,7 @@ peername_answers_in_handshaking_test() ->
 reply_addressed_to_client_source_cid_test() ->
     #{effects1 := Effects1} = connect(),
     [InitialReply | _] = sends(Effects1),
-    {ok, #{dcid := ReplyDCID}} = roadrunner_quic_packet:long_header_info(InitialReply),
+    {ok, _Version, ReplyDCID, _SCID} = roadrunner_quic_packet:long_header_info(InitialReply),
     ?assertEqual(?CLIENT_SCID, ReplyDCID),
     ?assertNotEqual(?DCID, ReplyDCID).
 
@@ -323,7 +324,9 @@ undecryptable_packet_dropped_test() ->
     %% A packet sealed with the wrong keys is silently dropped (RFC 9001
     %% §5.4.2); the connection neither advances nor replies.
     {State0, _Ctx} = new_conn([~"leaf-cert-der"]),
-    WrongKeys = #{key => {aes_128_gcm, <<0:128>>}, iv => <<0:96>>, hp => {aes_128_ecb, <<0:128>>}},
+    WrongKeys = #quic_keys{
+        key = {aes_128_gcm, <<0:128>>}, iv = <<0:96>>, hp = {aes_128_ecb, <<0:128>>}
+    },
     Datagram = ?TC:seal(initial, 0, WrongKeys, [{crypto, 0, ~"hello"}], ?DCID, ?SCID),
     {State1, Effects} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State0),
     ?assertEqual(handshaking, ?M:phase(State1)),
@@ -731,7 +734,7 @@ issued_up_to_client_limit_test() ->
     %% A client accepting three ids gets two spares (sequence numbers 1 and
     %% 2), each a different id with its own token.
     #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(
-        #{}, #{transport_params => #{active_connection_id_limit => 3}}
+        #{}, #{transport_params => [{active_connection_id_limit, 3}]}
     ),
     [{new_connection_id, 1, 0, CID1, Token1}, {new_connection_id, 2, 0, CID2, Token2}] =
         lists:sort(new_cids(Effects, ServerApSecret)),
@@ -742,7 +745,7 @@ issued_ids_capped_test() ->
     %% However many ids the client accepts, the server keeps at most four
     %% active (RFC 9000 §5.1.1 lets it limit them): three spares.
     #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(
-        #{}, #{transport_params => #{active_connection_id_limit => 10}}
+        #{}, #{transport_params => [{active_connection_id_limit, 10}]}
     ),
     ?assertEqual(
         [1, 2, 3],
@@ -1600,7 +1603,7 @@ path_validation_interval_takes_the_peer_max_ack_delay_test() ->
     %% keeps the current path's own probe timeout (1030 ms) below it, so a
     %% default padding would challenge again by 1100 ms.
     {State, ClientApSecret, ServerApSecret, CID1} =
-        connected_with_client_spare(#{transport_params => #{max_ack_delay => 1000}}),
+        connected_with_client_spare(#{transport_params => [{max_ack_delay, 1000}]}),
     {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"a", false, ?NOW, State),
     Ack = [{ack, largest_app_pn(Sent, ServerApSecret), 0, 0, [], undefined}],
     {State2, _} = ?M:handle_datagram(
@@ -2193,7 +2196,9 @@ idle_timeout_waits_three_ptos_test() ->
     %% (RFC 9000 §10.1): the timer firing at the short deadline re-arms it at
     %% the third PTO instead of closing, and the connection closes there.
     {State, _Ctx} = new_conn([], #{
-        transport_params => maps:put(max_idle_timeout, 1, transport_params())
+        transport_params => roadrunner_quic_transport_params:set(
+            max_idle_timeout, 1, transport_params()
+        )
     }),
     {State1, Effects} = ?M:handle_timeout(?NOW + 1, idle, State),
     ?assertNotEqual(closed, ?M:phase(State1)),
@@ -2223,7 +2228,7 @@ peer_max_ack_delay_pads_the_probe_timeout_test() ->
     %% The application space pads its probe timeout with the peer's
     %% advertised max_ack_delay (RFC 9002 §6.2.1), not the 25 ms default.
     Default = pto_after_samples(#{}, 0),
-    Padded = pto_after_samples(#{transport_params => #{max_ack_delay => 1000}}, 0),
+    Padded = pto_after_samples(#{transport_params => [{max_ack_delay, 1000}]}, 0),
     ?assertEqual(975, Padded - Default).
 
 peer_ack_delay_exponent_decodes_ack_delays_test() ->
@@ -2232,7 +2237,7 @@ peer_ack_delay_exponent_decodes_ack_delays_test() ->
     %% sample (192: smoothed RTT 111, variance 60, PTO 376); at exponent 20
     %% it is capped at max_ack_delay's 25 ms (175: 109 and 56, PTO 358).
     Scaled = pto_after_samples(#{}, 1000),
-    Huge = pto_after_samples(#{transport_params => #{ack_delay_exponent => 20}}, 1000),
+    Huge = pto_after_samples(#{transport_params => [{ack_delay_exponent, 20}]}, 1000),
     ?assertEqual(18, Scaled - Huge).
 
 %% The probe timeout armed after two 1-RTT RTT samples, of 100 ms and then
@@ -2331,13 +2336,13 @@ negotiated_idle_timeout_test() ->
     %% RFC 9000 §10.1: the effective idle timeout is the minimum of the two
     %% advertised values, or the only non-zero one; with neither side advertising
     %% one it falls back to the ?IDLE_TIMEOUT default.
-    ?assertEqual(?IDLE_TIMEOUT, ?M:negotiated_idle_timeout(#{}, #{})),
-    ?assertEqual(5000, ?M:negotiated_idle_timeout(#{}, #{max_idle_timeout => 5000})),
-    ?assertEqual(8000, ?M:negotiated_idle_timeout(#{max_idle_timeout => 8000}, #{})),
+    ?assertEqual(?IDLE_TIMEOUT, ?M:negotiated_idle_timeout(tp([]), tp([]))),
+    ?assertEqual(5000, ?M:negotiated_idle_timeout(tp([]), tp([{max_idle_timeout, 5000}]))),
+    ?assertEqual(8000, ?M:negotiated_idle_timeout(tp([{max_idle_timeout, 8000}]), tp([]))),
     ?assertEqual(
         5000,
         ?M:negotiated_idle_timeout(
-            #{max_idle_timeout => 8000}, #{max_idle_timeout => 5000}
+            tp([{max_idle_timeout, 8000}]), tp([{max_idle_timeout, 5000}])
         )
     ).
 
@@ -2694,7 +2699,7 @@ open_uni_allocates_server_uni_ids_test() ->
 %% (§19.14).
 open_uni_refused_past_peer_limit_test() ->
     {State, _ClientApSecret, ServerApSecret} = connect_owned(
-        #{}, #{transport_params => #{initial_max_streams_uni => 1}}
+        #{}, #{transport_params => [{initial_max_streams_uni, 1}]}
     ),
     {State1, _} = ?M:handle_call(self(), make_ref(), open_uni, ?NOW, State),
     Ref = make_ref(),
@@ -2709,7 +2714,7 @@ open_uni_refused_past_peer_limit_test() ->
 %% 0, RFC 9000 §18.2), so even the first open is refused.
 open_uni_refused_without_peer_param_test() ->
     {State, _ClientApSecret, _ServerApSecret} = connect_owned(
-        #{}, #{transport_params => #{initial_max_streams_uni => 0}}
+        #{}, #{transport_params => [{initial_max_streams_uni, 0}]}
     ),
     Ref = make_ref(),
     {_State1, Effects} = ?M:handle_call(self(), Ref, open_uni, ?NOW, State),
@@ -2720,7 +2725,7 @@ open_uni_refused_without_peer_param_test() ->
 %% raised limit still holds.
 max_streams_uni_raises_server_limit_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(
-        #{}, #{transport_params => #{initial_max_streams_uni => 0}}
+        #{}, #{transport_params => [{initial_max_streams_uni, 0}]}
     ),
     Frames = [{max_streams, uni, 2}, {max_streams, uni, 1}],
     {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram(Frames, 0, ClientApSecret), State),
@@ -2738,7 +2743,7 @@ max_streams_uni_raises_server_limit_test() ->
 %% bidirectional streams (RFC 9114 §6.1), and it does not touch the uni limit.
 max_streams_bidi_ignored_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(
-        #{}, #{transport_params => #{initial_max_streams_uni => 0}}
+        #{}, #{transport_params => [{initial_max_streams_uni, 0}]}
     ),
     Datagram = app_datagram([{max_streams, bidi, 10}], 0, ClientApSecret),
     {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State),
@@ -3886,7 +3891,7 @@ peer_key_update_switches_both_directions_test() ->
     ?assertEqual([], sends(Effects1)),
     {_State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{ack, 0, _, 0, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{ack, 0, _, 0, [], undefined} | _]}}],
         app_packets(Effects2, generation_keys(ServerApSecret, 1))
     ),
     ?assertEqual(
@@ -3909,7 +3914,7 @@ forged_key_phase_changes_nothing_test() ->
     {_State2, Effects2} = ?M:handle_datagram(?NOW, ?PEER, Data, State1),
     ?assert(lists:member({emit, self(), {stream_data, 0, ~"hello", true}}, emits(Effects2))),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 0, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 1, _, 0, [], undefined} | _]}}],
         app_packets(Effects2, generation_keys(ServerApSecret, 0))
     ).
 
@@ -3980,7 +3985,11 @@ second_update_before_ack_closes_test() ->
     ?assertEqual(draining, ?M:phase(State2)),
     ?assertEqual([{emit, self(), {closed, {local, key_update_error}}}], emits(Effects)),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{connection_close, transport, 16#0e, 0, <<>>}]}}],
+        [
+            {ok, #quic_decoded{
+                key_phase = 1, frames = [{connection_close, transport, 16#0e, 0, <<>>}]
+            }}
+        ],
         app_packets(Effects, generation_keys(ServerApSecret, 1))
     ).
 
@@ -3996,7 +4005,7 @@ second_update_after_ack_commits_test() ->
     ?assertEqual(connected, ?M:phase(State3)),
     {_State4, Effects} = ?M:handle_timeout(?NOW + 50, ack, State3),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 1, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 1, _, 1, [], undefined} | _]}}],
         app_packets(Effects, generation_keys(ServerApSecret, 2))
     ).
 
@@ -4017,7 +4026,7 @@ chacha20_peer_key_update_test() ->
     ?assertEqual(connected, ?M:phase(State1)),
     {State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{ack, 0, _, 0, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{ack, 0, _, 0, [], undefined} | _]}}],
         app_packets(Effects2, generation_keys(chacha20_poly1305, ServerApSecret, 1))
     ),
     ?assertEqual(
@@ -4030,7 +4039,7 @@ chacha20_peer_key_update_test() ->
     ?assertEqual(connected, ?M:phase(State3)),
     {_State4, Effects4} = ?M:handle_timeout(?NOW + 50, ack, State3),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 1, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 1, _, 1, [], undefined} | _]}}],
         app_packets(Effects4, generation_keys(chacha20_poly1305, ServerApSecret, 2))
     ).
 
@@ -4047,7 +4056,7 @@ aes_256_gcm_peer_key_update_test() ->
     ?assertEqual(connected, ?M:phase(State1)),
     {State2, Effects2} = ?M:handle_timeout(?NOW + 20, ack, State1),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{ack, 0, _, 0, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{ack, 0, _, 0, [], undefined} | _]}}],
         app_packets(Effects2, generation_keys(aes_256_gcm, ServerApSecret, 1))
     ),
     ?assertEqual(
@@ -4058,7 +4067,7 @@ aes_256_gcm_peer_key_update_test() ->
     ?assertEqual(connected, ?M:phase(State3)),
     {_State4, Effects4} = ?M:handle_timeout(?NOW + 50, ack, State3),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 1, _, 1, [], undefined} | _]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 1, _, 1, [], undefined} | _]}}],
         app_packets(Effects4, generation_keys(aes_256_gcm, ServerApSecret, 2))
     ).
 
@@ -4219,7 +4228,7 @@ own_key_update_then_peer_update_test() ->
     State1 = ?M:key_limit(1 bsl 22, Later, send_phase_acked(State, ClientApSecret)),
     {State2, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"hello", true, Later, State1),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{stream, 0, 0, ~"hello", true}]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{stream, 0, 0, ~"hello", true}]}}],
         app_packets(Effects2, generation_keys(ServerApSecret, 1))
     ),
     Response = phase_datagram([ping], 1, generation_keys(ClientApSecret, 1), 1),
@@ -4227,7 +4236,7 @@ own_key_update_then_peer_update_test() ->
     ?assertEqual(connected, ?M:phase(State3)),
     {State4, Effects4} = ?M:handle_timeout(Later + 20, ack, State3),
     ?assertMatch(
-        [{ok, #{key_phase := 1, frames := [{ack, 1, _, 1, [], undefined}]}}],
+        [{ok, #quic_decoded{key_phase = 1, frames = [{ack, 1, _, 1, [], undefined}]}}],
         app_packets(Effects4, generation_keys(ServerApSecret, 1))
     ),
     Again = phase_datagram([ping], 2, generation_keys(ClientApSecret, 2), 0),
@@ -4235,7 +4244,7 @@ own_key_update_then_peer_update_test() ->
     ?assertEqual(connected, ?M:phase(State5)),
     {_State6, Effects6} = ?M:handle_timeout(Later + 50, ack, State5),
     ?assertMatch(
-        [{ok, #{key_phase := 0, frames := [{ack, 2, _, 2, [], undefined}]}}],
+        [{ok, #quic_decoded{key_phase = 0, frames = [{ack, 2, _, 2, [], undefined}]}}],
         app_packets(Effects6, generation_keys(ServerApSecret, 2))
     ).
 
@@ -4256,7 +4265,7 @@ own_key_update_waits_for_peer_response_test() ->
     Much = Later + 60000,
     State4 = ?M:key_limit(1 bsl 22, Much, State3),
     {_State5, Effects5} = ?M:handle_send(self(), make_ref(), 0, ~"b", true, Much, State4),
-    [{ok, #{key_phase := 1, frames := Frames}}] =
+    [{ok, #quic_decoded{key_phase = 1, frames = Frames}}] =
         app_packets(Effects5, generation_keys(ServerApSecret, 1)),
     ?assert(lists:member({stream, 0, 1, ~"b", true}, Frames)).
 
@@ -4269,12 +4278,14 @@ own_key_update_needs_acknowledged_phase_test() ->
     Unacked = ?M:key_limit(1 bsl 22, ?NOW + 60000, State),
     {_, Effects1} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, ?NOW + 60000, Unacked),
     ?assertMatch(
-        [{ok, #{key_phase := 0}}], app_packets(Effects1, generation_keys(ServerApSecret, 0))
+        [{ok, #quic_decoded{key_phase = 0}}],
+        app_packets(Effects1, generation_keys(ServerApSecret, 0))
     ),
     TooSoon = ?M:key_limit(1 bsl 22, ?NOW + 1, send_phase_acked(State, ClientApSecret)),
     {_, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, ?NOW + 1, TooSoon),
     ?assertMatch(
-        [{ok, #{key_phase := 0}}], app_packets(Effects2, generation_keys(ServerApSecret, 0))
+        [{ok, #quic_decoded{key_phase = 0}}],
+        app_packets(Effects2, generation_keys(ServerApSecret, 0))
     ),
     #{state1 := Handshaking} = connect(),
     ?assertEqual(
@@ -4293,8 +4304,8 @@ confidentiality_limit_closes_without_update_test() ->
     ?assertEqual(draining, ?M:phase(Closed)),
     ?assertMatch(
         [
-            {ok, #{frames := [{stream, 0, 0, ~"last", true}]}},
-            {ok, #{frames := [{connection_close, transport, 16#0f, 0, <<>>}]}}
+            {ok, #quic_decoded{frames = [{stream, 0, 0, ~"last", true}]}},
+            {ok, #quic_decoded{frames = [{connection_close, transport, 16#0f, 0, <<>>}]}}
         ],
         app_packets(Effects, generation_keys(ServerApSecret, 0))
     ),
@@ -4315,13 +4326,13 @@ chacha20_confidentiality_limit_test() ->
     Gcm = ?M:key_limit(1 bsl 23, Later, Acked),
     {_, Effects1} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, Later, Gcm),
     ?assertMatch(
-        [{ok, #{key_phase := 0}}],
+        [{ok, #quic_decoded{key_phase = 0}}],
         app_packets(Effects1, generation_keys(chacha20_poly1305, ServerApSecret, 0))
     ),
     Half = ?M:key_limit(1 bsl 61, Later, Acked),
     {_, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, Later, Half),
     ?assertMatch(
-        [{ok, #{key_phase := 1}}],
+        [{ok, #quic_decoded{key_phase = 1}}],
         app_packets(Effects2, generation_keys(chacha20_poly1305, ServerApSecret, 1))
     ).
 
@@ -4338,7 +4349,7 @@ aes_256_gcm_confidentiality_limit_test() ->
     Half = ?M:key_limit(1 bsl 22, Later, Acked),
     {_, Effects2} = ?M:handle_send(self(), make_ref(), 0, ~"a", true, Later, Half),
     ?assertMatch(
-        [{ok, #{key_phase := 1}}],
+        [{ok, #quic_decoded{key_phase = 1}}],
         app_packets(Effects2, generation_keys(aes_256_gcm, ServerApSecret, 1))
     ).
 
@@ -4469,24 +4480,22 @@ new_conn(CertChain) ->
 new_conn(CertChain, Extra) ->
     {Scheme, PrivKey} = ?TC:key_material(),
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
-    TransportParams = transport_params(),
+    Settings = ?M:settings(
+        CertChain,
+        PrivKey,
+        ~"h3",
+        maps:get(transport_params, Extra, transport_params()),
+        ?RESET_KEY,
+        ?TOKEN_KEY,
+        maps:get(stream_credit, Extra, on_receipt)
+    ),
     State = ?M:new(
-        maps:merge(
-            #{
-                dcid => ?DCID,
-                scid => ?SCID,
-                peer_scid => ?CLIENT_SCID,
-                peer => ?PEER,
-                reset_key => ?RESET_KEY,
-                token_key => ?TOKEN_KEY,
-                cert_chain => CertChain,
-                priv_key => PrivKey,
-                alpn => ~"h3",
-                transport_params => TransportParams,
-                server_random => crypto:strong_rand_bytes(32)
-            },
-            Extra
-        ),
+        Settings,
+        ?DCID,
+        ?SCID,
+        maps:get(peer_scid, Extra, ?CLIENT_SCID),
+        ?PEER,
+        maps:get(address_validated, Extra, false),
         ?NOW
     ),
     {State, #{
@@ -4532,19 +4541,22 @@ is_ack({ack, _Largest, _Delay, _First, _Ranges, _Ecn}) -> true;
 is_ack(_Frame) -> false.
 
 transport_params() ->
-    #{
-        original_destination_connection_id => ?DCID,
-        initial_source_connection_id => ?SCID,
-        initial_max_data => ?CONN_RECV_WINDOW,
-        initial_max_stream_data_bidi_remote => ?STREAM_RECV_WINDOW,
-        initial_max_stream_data_uni => ?STREAM_RECV_WINDOW,
-        initial_max_streams_bidi => ?MAX_STREAMS_BIDI,
-        initial_max_streams_uni => ?MAX_STREAMS_UNI
-    }.
+    tp([
+        {original_destination_connection_id, ?DCID},
+        {initial_source_connection_id, ?SCID},
+        {initial_max_data, ?CONN_RECV_WINDOW},
+        {initial_max_stream_data_bidi_remote, ?STREAM_RECV_WINDOW},
+        {initial_max_stream_data_uni, ?STREAM_RECV_WINDOW},
+        {initial_max_streams_bidi, ?MAX_STREAMS_BIDI},
+        {initial_max_streams_uni, ?MAX_STREAMS_UNI}
+    ]).
 
-%% The connected payload conn_state caches at new/1 (alpn + advertised params).
+tp(Params) ->
+    roadrunner_quic_transport_params:new(Params).
+
+%% The connected payload: the negotiated ALPN.
 expected_info() ->
-    #{alpn => ~"h3", transport_params => transport_params()}.
+    ~"h3".
 
 %% Install this process as the owner (no emit while handshaking) so a later
 %% close surfaces {closed, _} here.
@@ -4738,7 +4750,7 @@ validated_move(Peer, State, ClientApSecret, ServerApSecret) ->
 
 %% Seal a peer 1-RTT datagram with the given keys and Key Phase bit.
 phase_datagram(Frames, PN, Keys, KeyPhase) ->
-    Entry = #{frames => Frames, keys => Keys, pn => PN, key_phase => KeyPhase},
+    Entry = #quic_entry{frames = Frames, keys = Keys, pn = PN, key_phase = KeyPhase},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(#{application => Entry}, ?DCID, ?SCID),
     Datagram.
 
@@ -4750,10 +4762,11 @@ generation_keys(Secret, N) ->
     generation_keys(aes_128_gcm, Secret, N).
 
 generation_keys(Aead, Secret, N) ->
-    maps:merge(roadrunner_quic_keys:traffic_keys(Aead, Secret), packet_keys(Aead, Secret, N)).
+    #quic_keys{key = Key, iv = IV} = packet_keys(Aead, Secret, N),
+    (roadrunner_quic_keys:traffic_keys(Aead, Secret))#quic_keys{key = Key, iv = IV}.
 
 packet_keys(Aead, Secret, 0) ->
-    maps:with([key, iv], roadrunner_quic_keys:traffic_keys(Aead, Secret));
+    (roadrunner_quic_keys:traffic_keys(Aead, Secret))#quic_keys{hp = undefined};
 packet_keys(Aead, Secret, N) ->
     {Updated, _PacketKeys} = roadrunner_quic_keys:update(Aead, Secret),
     packet_keys(Aead, Updated, N - 1).
@@ -4771,7 +4784,7 @@ updated_at(PN, ClientApSecret, State) ->
 %% HANDSHAKE_DONE) at `?NOW`, from its own first 1-RTT packet: a packet of the
 %% server's current key phase is acknowledged (RFC 9001 §6.1). `Keys` seal it,
 %% the client's AES-128-GCM first generation unless given.
-send_phase_acked(State, #{} = Keys) ->
+send_phase_acked(State, #quic_keys{} = Keys) ->
     Ack = phase_datagram([{ack, 0, 0, 0, [], undefined}], 0, Keys, 0),
     {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Ack, State),
     State1;
@@ -4782,7 +4795,9 @@ send_phase_acked(State, ClientApSecret) ->
 app_acks(Effects, ServerApSecret) ->
     [
         Frame
-     || {ok, #{frames := Frames}} <- app_packets(Effects, generation_keys(ServerApSecret, 0)),
+     || {ok, #quic_decoded{frames = Frames}} <- app_packets(
+            Effects, generation_keys(ServerApSecret, 0)
+        ),
         Frame <- Frames,
         is_ack(Frame)
     ].
@@ -4869,7 +4884,7 @@ largest_app_pn(Effects, ServerApSecret) ->
     PNs = [
         PN
      || Datagram <- sends(Effects),
-        {ok, #{level := application, pn := PN}} <-
+        {ok, #quic_decoded{level = application, pn = PN}} <-
             roadrunner_quic_recv:datagram(Datagram, byte_size(?DCID), Keys, #{})
     ],
     lists:max(PNs).

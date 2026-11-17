@@ -29,10 +29,11 @@ prop_encode_decode_round_trips() ->
         end
     ).
 
-%% A map of a random subset of client parameters with in-range values.
-%% maps:from_list dedupes keys, so the set never has a duplicate.
+%% A set of a random subset of client parameters with in-range values (a
+%% later value for a parameter replaces an earlier one, so the set never has
+%% a duplicate).
 params_gen() ->
-    ?LET(Pairs, list(param_gen()), maps:from_list(Pairs)).
+    ?LET(Pairs, list(param_gen()), roadrunner_quic_transport_params:new(Pairs)).
 
 param_gen() ->
     oneof([

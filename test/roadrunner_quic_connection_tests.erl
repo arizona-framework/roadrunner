@@ -39,8 +39,8 @@ setup() ->
     {ok, ClientSocket} = roadrunner_quic_socket:open(0),
     {ok, {_Ip, ClientPort}} = roadrunner_quic_socket:sockname(ClientSocket),
     Peer = {{127, 0, 0, 1}, ClientPort},
-    {#{registry := Registry} = Config, Ctx} = config(Peer),
-    {ok, Shell} = ?CONN:start(ServerSocket, Config),
+    {Registry, Settings, Ctx} = config(),
+    {ok, Shell} = ?CONN:start(ServerSocket, Registry, Settings, Peer, ?DCID, ?SCID, ?SCID, false),
     #{
         shell => Shell,
         peer => Peer,
@@ -272,7 +272,7 @@ set_owner_emits_connected(#{shell := Shell, peer := Peer, client := ClientSocket
             erlang:error(no_reply)
         end,
         receive
-            {quic, Shell, {connected, Info}} -> ?assertMatch(#{alpn := _}, Info)
+            {quic, Shell, {connected, Alpn}} -> ?assertEqual(~"h3", Alpn)
         after 1000 ->
             erlang:error(no_connected_event)
         end
@@ -393,32 +393,25 @@ loss_timer_fires(#{shell := Shell, peer := Peer, client := ClientSocket, ctx := 
 %% Helpers
 %% =============================================================================
 
-config(Peer) ->
+config() ->
     {Scheme, PrivKey} = ?TC:key_material(),
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
-    Config = #{
-        dcid => ?DCID,
-        scid => ?SCID,
-        peer_scid => ?SCID,
-        peer => Peer,
-        registry => roadrunner_quic_cid_registry:new(),
-        reset_key => crypto:strong_rand_bytes(32),
-        token_key => crypto:strong_rand_bytes(32),
-        cert_chain => [~"leaf-cert-der"],
-        priv_key => PrivKey,
-        alpn => ~"h3",
-        transport_params => #{
-            original_destination_connection_id => ?DCID,
-            initial_source_connection_id => ?SCID,
-            initial_max_data => 1048576,
-            initial_max_stream_data_bidi_remote => 262144,
-            initial_max_stream_data_uni => 262144,
-            initial_max_streams_bidi => 100,
-            initial_max_streams_uni => 100
-        },
-        server_random => crypto:strong_rand_bytes(32)
-    },
-    {Config, #{
+    Settings = roadrunner_quic_conn_state:settings(
+        [~"leaf-cert-der"],
+        PrivKey,
+        ~"h3",
+        roadrunner_quic_transport_params:new([
+            {initial_max_data, 1048576},
+            {initial_max_stream_data_bidi_remote, 262144},
+            {initial_max_stream_data_uni, 262144},
+            {initial_max_streams_bidi, 100},
+            {initial_max_streams_uni, 100}
+        ]),
+        crypto:strong_rand_bytes(32),
+        crypto:strong_rand_bytes(32),
+        on_receipt
+    ),
+    {roadrunner_quic_cid_registry:new(), Settings, #{
         scheme => Scheme,
         client_pub => ClientPub,
         client_priv => ClientPriv

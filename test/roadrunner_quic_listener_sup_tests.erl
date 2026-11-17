@@ -34,17 +34,19 @@ listener_opts_maps_pool_opts_test() ->
     ?assertEqual(true, maps:get(reuseport, Opts)),
     ?assertEqual(Registry, maps:get(registry, Opts)),
     TP = maps:get(transport_params, Opts),
-    ?assertEqual(50, maps:get(initial_max_streams_bidi, TP)),
+    ?assertEqual(50, roadrunner_quic_transport_params:initial_max_streams_bidi(TP)),
     %% The fixed defaults (pending the flow-control opt wiring).
-    ?assertEqual(1048576, maps:get(initial_max_data, TP)),
-    ?assertEqual(262144, maps:get(initial_max_stream_data_bidi_local, TP)),
-    ?assertEqual(262144, maps:get(initial_max_stream_data_bidi_remote, TP)),
-    ?assertEqual(262144, maps:get(initial_max_stream_data_uni, TP)),
-    ?assertEqual(100, maps:get(initial_max_streams_uni, TP)),
-    ?assertEqual(30000, maps:get(max_idle_timeout, TP)),
+    ?assertEqual(1048576, roadrunner_quic_transport_params:initial_max_data(TP)),
+    ?assertEqual(262144, roadrunner_quic_transport_params:initial_max_stream_data_bidi_local(TP)),
+    ?assertEqual(262144, roadrunner_quic_transport_params:initial_max_stream_data_bidi_remote(TP)),
+    ?assertEqual(262144, roadrunner_quic_transport_params:initial_max_stream_data_uni(TP)),
+    ?assertEqual(100, roadrunner_quic_transport_params:initial_max_streams_uni(TP)),
+    ?assertEqual(30000, roadrunner_quic_transport_params:max_idle_timeout(TP)),
     %% The base transport params carry no per-connection ids (filled at spawn).
-    ?assertNot(maps:is_key(original_destination_connection_id, TP)),
-    ?assertNot(maps:is_key(initial_source_connection_id, TP)).
+    ?assertEqual(
+        undefined, roadrunner_quic_transport_params:original_destination_connection_id(TP)
+    ),
+    ?assertEqual(undefined, roadrunner_quic_transport_params:initial_source_connection_id(TP)).
 
 %% A single-listener pool passes reuseport => false, and an empty intermediate
 %% chain yields a one-element (leaf-only) chain.

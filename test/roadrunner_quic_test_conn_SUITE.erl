@@ -146,36 +146,38 @@ pump_loop(Socket, Conns) ->
 
 start_shell(Socket, Peer, FirstDatagram) ->
     {ok, ClientDCID} = roadrunner_quic_packet:dcid(FirstDatagram, 8),
-    {ok, #{scid := ClientSCID}} = roadrunner_quic_packet:long_header_info(FirstDatagram),
+    {ok, _Version, _DCID, ClientSCID} = roadrunner_quic_packet:long_header_info(FirstDatagram),
     ServerSCID = crypto:strong_rand_bytes(8),
     {CertChain, PrivKey} = cert_key(),
-    Config = #{
-        dcid => ClientDCID,
-        scid => ServerSCID,
-        peer_scid => ClientSCID,
-        peer => Peer,
-        %% The pump routes by peer address, so the ids the connection issues
-        %% are registered in a table nothing reads.
-        registry => roadrunner_quic_cid_registry:new(),
-        reset_key => crypto:strong_rand_bytes(32),
-        token_key => crypto:strong_rand_bytes(32),
-        cert_chain => CertChain,
-        priv_key => PrivKey,
-        alpn => ~"h3",
-        transport_params => #{
-            original_destination_connection_id => ClientDCID,
-            initial_source_connection_id => ServerSCID,
-            initial_max_data => 1048576,
-            initial_max_stream_data_bidi_local => 262144,
-            initial_max_stream_data_bidi_remote => 262144,
-            initial_max_stream_data_uni => 262144,
-            initial_max_streams_bidi => 100,
-            initial_max_streams_uni => 100,
-            max_idle_timeout => 30000
-        },
-        server_random => crypto:strong_rand_bytes(32)
-    },
-    {ok, Shell} = roadrunner_quic_connection:start(Socket, Config),
+    Settings = roadrunner_quic_conn_state:settings(
+        CertChain,
+        PrivKey,
+        ~"h3",
+        roadrunner_quic_transport_params:new([
+            {initial_max_data, 1048576},
+            {initial_max_stream_data_bidi_local, 262144},
+            {initial_max_stream_data_bidi_remote, 262144},
+            {initial_max_stream_data_uni, 262144},
+            {initial_max_streams_bidi, 100},
+            {initial_max_streams_uni, 100},
+            {max_idle_timeout, 30000}
+        ]),
+        crypto:strong_rand_bytes(32),
+        crypto:strong_rand_bytes(32),
+        on_receipt
+    ),
+    %% The pump routes by peer address, so the ids the connection issues are
+    %% registered in a table nothing reads.
+    {ok, Shell} = roadrunner_quic_connection:start(
+        Socket,
+        roadrunner_quic_cid_registry:new(),
+        Settings,
+        Peer,
+        ClientDCID,
+        ServerSCID,
+        ClientSCID,
+        false
+    ),
     true = link(Shell),
     Shell.
 

@@ -1,6 +1,7 @@
 -module(roadrunner_quic_recv_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("../include/roadrunner_quic.hrl").
 
 -define(M, roadrunner_quic_recv).
 
@@ -17,10 +18,10 @@
 
 rfc9001_a3_server_initial_test() ->
     Keys = #{
-        initial => #{
-            key => {aes_128_gcm, hex(~"cf3a5331653c364c88f0f379b6067e37")},
-            iv => hex(~"0ac1493ca1905853b0bba03e"),
-            hp => {aes_128_ecb, hex(~"c206b8d9b9f0f37644430b490eeaa314")}
+        initial => #quic_keys{
+            key = {aes_128_gcm, hex(~"cf3a5331653c364c88f0f379b6067e37")},
+            iv = hex(~"0ac1493ca1905853b0bba03e"),
+            hp = {aes_128_ecb, hex(~"c206b8d9b9f0f37644430b490eeaa314")}
         }
     },
     Packet = hex(
@@ -31,7 +32,7 @@ rfc9001_a3_server_initial_test() ->
     ),
     {ok, Frames} = roadrunner_quic_frame:decode_all(Plaintext),
     ?assertEqual(
-        [{ok, #{level => initial, pn => 1, frames => Frames}}],
+        [{ok, #quic_decoded{level = initial, pn = 1, frames = Frames}}],
         ?M:datagram(Packet, ?DCID_LEN, Keys, #{})
     ).
 
@@ -45,7 +46,7 @@ handshake_round_trip_test() ->
     {Plaintext, Frames} = frames_for([{crypto, 0, <<"handshake-crypto-data">>}]),
     Wire = seal_long(handshake, 5, handshake_keys(), Plaintext),
     ?assertEqual(
-        [{ok, #{level => handshake, pn => 5, frames => Frames}}],
+        [{ok, #quic_decoded{level = handshake, pn = 5, frames = Frames}}],
         ?M:datagram(Wire, ?DCID_LEN, #{handshake => handshake_keys()}, #{handshake => 4})
     ).
 
@@ -56,12 +57,12 @@ application_round_trip_test() ->
     Wire = seal_short(7, application_keys(), 1, Plaintext),
     ?assertEqual(
         [
-            {ok, #{
-                level => application,
-                pn => 7,
-                frames => Frames,
-                key_phase => 1,
-                generation => current
+            {ok, #quic_decoded{
+                level = application,
+                pn = 7,
+                frames = Frames,
+                key_phase = 1,
+                generation = current
             }}
         ],
         ?M:datagram(Wire, ?DCID_LEN, #{application => application_keys()}, #{})
@@ -77,12 +78,12 @@ reconstructed_pn_round_trip_test() ->
     Wire = seal_short_pn(FullPN, 1, application_keys(), 0, Plaintext),
     ?assertEqual(
         [
-            {ok, #{
-                level => application,
-                pn => FullPN,
-                frames => Frames,
-                key_phase => 0,
-                generation => current
+            {ok, #quic_decoded{
+                level = application,
+                pn = FullPN,
+                frames = Frames,
+                key_phase = 0,
+                generation = current
             }}
         ],
         ?M:datagram(Wire, ?DCID_LEN, #{application => application_keys()}, #{
@@ -101,8 +102,8 @@ coalesced_datagram_test() ->
     >>,
     ?assertEqual(
         [
-            {ok, #{level => initial, pn => 0, frames => InitialFrames}},
-            {ok, #{level => handshake, pn => 0, frames => HandshakeFrames}}
+            {ok, #quic_decoded{level = initial, pn = 0, frames = InitialFrames}},
+            {ok, #quic_decoded{level = handshake, pn = 0, frames = HandshakeFrames}}
         ],
         ?M:datagram(
             Wire, ?DCID_LEN, #{initial => initial_keys(), handshake => handshake_keys()}, #{}
@@ -115,7 +116,7 @@ trailing_padding_test() ->
     {Plaintext, Frames} = frames_for([{crypto, 0, <<"handshake-crypto-data">>}]),
     Wire = <<(seal_long(handshake, 1, handshake_keys(), Plaintext))/binary, 0, 0, 0, 0>>,
     ?assertEqual(
-        [{ok, #{level => handshake, pn => 1, frames => Frames}}],
+        [{ok, #quic_decoded{level = handshake, pn = 1, frames = Frames}}],
         ?M:datagram(Wire, ?DCID_LEN, #{handshake => handshake_keys()}, #{})
     ).
 
@@ -161,7 +162,7 @@ current_phase_opens_with_current_keys_test() ->
     {Plaintext, Frames} = frames_for([{stream, 0, 0, ~"key-update-body", false}]),
     Wire = seal_short(12, application_keys(), 0, Plaintext),
     ?assertMatch(
-        [{ok, #{pn := 12, frames := Frames, key_phase := 0, generation := current}}],
+        [{ok, #quic_decoded{pn = 12, frames = Frames, key_phase = 0, generation = current}}],
         ?M:datagram(Wire, ?DCID_LEN, #{application => update_keys()}, #{application => 11})
     ).
 
@@ -171,7 +172,7 @@ flipped_phase_opens_with_next_keys_test() ->
     {Plaintext, Frames} = frames_for([{stream, 0, 0, ~"key-update-body", false}]),
     Wire = seal_short(12, generation(next_packet_keys()), 1, Plaintext),
     ?assertMatch(
-        [{ok, #{pn := 12, frames := Frames, key_phase := 1, generation := next}}],
+        [{ok, #quic_decoded{pn = 12, frames = Frames, key_phase = 1, generation = next}}],
         ?M:datagram(Wire, ?DCID_LEN, #{application => update_keys()}, #{application => 11})
     ).
 
@@ -181,7 +182,7 @@ flipped_phase_below_current_opens_with_previous_keys_test() ->
     {Plaintext, Frames} = frames_for([{stream, 0, 0, ~"key-update-body", false}]),
     Wire = seal_short(9, generation(prev_packet_keys()), 1, Plaintext),
     ?assertMatch(
-        [{ok, #{pn := 9, frames := Frames, key_phase := 1, generation := previous}}],
+        [{ok, #quic_decoded{pn = 9, frames = Frames, key_phase = 1, generation = previous}}],
         ?M:datagram(Wire, ?DCID_LEN, #{application => update_keys()}, #{application => 11})
     ).
 
@@ -216,7 +217,7 @@ sample_too_short_dropped_test() ->
 unsupported_packet_dropped_test() ->
     Wire = enc(
         roadrunner_quic_packet:encode_long(
-            zero_rtt, 1, ?DCID, ?SCID, #{payload => binary:copy(<<0>>, 24)}
+            zero_rtt, 1, ?DCID, ?SCID, <<>>, 0, binary:copy(<<0>>, 24)
         )
     ),
     ?assertEqual([{drop, unsupported_packet}], ?M:datagram(Wire, ?DCID_LEN, #{}, #{})).
@@ -288,29 +289,33 @@ hex(H) -> binary:decode_hex(string:uppercase(H)).
 
 %% Distinct per-level keys; any valid AES-128 material round-trips.
 initial_keys() ->
-    #{key => {aes_128_gcm, <<31:128>>}, iv => <<32:96>>, hp => {aes_128_ecb, <<33:128>>}}.
+    #quic_keys{key = {aes_128_gcm, <<31:128>>}, iv = <<32:96>>, hp = {aes_128_ecb, <<33:128>>}}.
 handshake_keys() ->
-    #{key => {aes_128_gcm, <<11:128>>}, iv => <<12:96>>, hp => {aes_128_ecb, <<13:128>>}}.
+    #quic_keys{key = {aes_128_gcm, <<11:128>>}, iv = <<12:96>>, hp = {aes_128_ecb, <<13:128>>}}.
 application_keys() ->
-    #{key => {aes_128_gcm, <<21:128>>}, iv => <<22:96>>, hp => {aes_128_ecb, <<23:128>>}}.
+    #quic_keys{key = {aes_128_gcm, <<21:128>>}, iv = <<22:96>>, hp = {aes_128_ecb, <<23:128>>}}.
 
 %% Key update generations around `application_keys/0`, all sharing its
 %% header-protection key.
-next_packet_keys() -> #{key => {aes_128_gcm, <<41:128>>}, iv => <<42:96>>}.
-prev_packet_keys() -> #{key => {aes_128_gcm, <<51:128>>}, iv => <<52:96>>}.
+next_packet_keys() -> #quic_keys{key = {aes_128_gcm, <<41:128>>}, iv = <<42:96>>}.
+prev_packet_keys() -> #quic_keys{key = {aes_128_gcm, <<51:128>>}, iv = <<52:96>>}.
 
 update_keys() ->
-    (application_keys())#{
-        phase => 0,
-        next => next_packet_keys(),
-        prev => prev_packet_keys(),
-        prev_below => 10
+    #quic_keys{key = Key, iv = IV, hp = HP} = application_keys(),
+    #quic_phased_keys{
+        key = Key,
+        iv = IV,
+        hp = HP,
+        phase = 0,
+        next = next_packet_keys(),
+        prev = prev_packet_keys(),
+        prev_below = 10
     }.
 
 %% A generation's full keys: its AEAD key and IV with the shared
 %% header-protection key.
 generation(PacketKeys) ->
-    maps:merge(application_keys(), PacketKeys).
+    PacketKeys#quic_keys{hp = (application_keys())#quic_keys.hp}.
 
 %% Encode a frame list to a payload and the frames it decodes back to.
 frames_for(FrameList) ->
@@ -321,17 +326,17 @@ frames_for(FrameList) ->
 %% Build a protected long-header wire packet from level keys + plaintext,
 %% mirroring the send path: size the header for the sealed payload, seal
 %% with the header as AAD, then apply header protection.
-seal_long(Type, PN, #{key := Key, iv := IV, hp := HP}, Plaintext) ->
+seal_long(Type, PN, #quic_keys{key = Key, iv = IV, hp = HP}, Plaintext) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     SealedSize = byte_size(Plaintext) + 16,
-    [Header, _] = roadrunner_quic_packet:encode_long(
-        Type, 1, ?DCID, ?SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
-    ),
+    [Header, _] = roadrunner_quic_packet:encode_long(Type, 1, ?DCID, ?SCID, <<>>, PN, <<
+        0:(SealedSize * 8)
+    >>),
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
     Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
     <<Protected/binary, Sealed/binary>>.
 
-seal_short(PN, #{key := Key, iv := IV, hp := HP}, KeyPhase, Plaintext) ->
+seal_short(PN, #quic_keys{key = Key, iv = IV, hp = HP}, KeyPhase, Plaintext) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     [Header, _] = roadrunner_quic_packet:encode_short(?DCID, PN, <<>>, false, KeyPhase),
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
@@ -342,7 +347,7 @@ seal_short(PN, #{key := Key, iv := IV, hp := HP}, KeyPhase, Plaintext) ->
 %% `WirePNLen` bytes (the low bytes of `FullPN`), while the AEAD nonce uses
 %% the full number, the way a real sender truncates the PN against the
 %% largest acknowledged.
-seal_short_pn(FullPN, WirePNLen, #{key := Key, iv := IV, hp := HP}, KeyPhase, Plaintext) ->
+seal_short_pn(FullPN, WirePNLen, #quic_keys{key = Key, iv = IV, hp = HP}, KeyPhase, Plaintext) ->
     FirstByte = 2#01000000 bor ((KeyPhase band 1) bsl 2) bor (WirePNLen - 1),
     Header =
         <<FirstByte, ?DCID/binary, (roadrunner_quic_packet:encode_pn(FullPN, WirePNLen))/binary>>,
@@ -354,7 +359,7 @@ seal_short_pn(FullPN, WirePNLen, #{key := Key, iv := IV, hp := HP}, KeyPhase, Pl
 
 %% A short-header packet with the reserved bits (mask 0x18) set; a
 %% conformant 1-RTT packet leaves them 0 (RFC 9000 §17.3.1).
-seal_short_reserved(PN, #{key := Key, iv := IV, hp := HP}, Plaintext) ->
+seal_short_reserved(PN, #quic_keys{key = Key, iv = IV, hp = HP}, Plaintext) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     FirstByte = 2#01000000 bor 16#18 bor (PNLen - 1),
     Header = <<FirstByte, ?DCID/binary, (roadrunner_quic_packet:encode_pn(PN, PNLen))/binary>>,

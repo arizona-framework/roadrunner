@@ -11,6 +11,7 @@
 %% server-reply decoding so neither is duplicated.
 
 -include_lib("public_key/include/public_key.hrl").
+-include("../include/roadrunner_quic.hrl").
 
 -export([key_material/0, gen_keypair/0]).
 -export([client_hello_framed/1, client_hello_framed/3, client_hello_framed/4]).
@@ -83,11 +84,11 @@ are both the CRYPTO-frame payload and the first transcript element.
     Scheme :: non_neg_integer(), ClientPub :: binary(), ClientSCID :: binary() | none
 ) -> binary().
 client_hello_framed(Scheme, ClientPub, ClientSCID) ->
-    client_hello_framed(Scheme, ClientPub, ClientSCID, #{}).
+    client_hello_framed(Scheme, ClientPub, ClientSCID, []).
 
 -doc """
-As `client_hello_framed/3` but with `Overrides` merged over the default
-transport parameters, so a test can pin a small per-stream send window
+As `client_hello_framed/3` but with the `{Key, Value}` `Overrides` set over
+the default transport parameters, so a test can pin a small per-stream send window
 (`initial_max_stream_data_*`) to exercise stream-level backpressure, or a
 small `initial_max_streams_uni` to limit the server's own streams.
 """.
@@ -95,7 +96,12 @@ small `initial_max_streams_uni` to limit the server's own streams.
     Scheme :: non_neg_integer(),
     ClientPub :: binary(),
     ClientSCID :: binary() | none,
-    Overrides :: roadrunner_quic_transport_params:params()
+    Overrides :: [
+        {
+            roadrunner_quic_transport_params:param_key(),
+            roadrunner_quic_transport_params:param_value()
+        }
+    ]
 ) -> binary().
 client_hello_framed(Scheme, ClientPub, ClientSCID, Overrides) ->
     client_hello_framed(#{
@@ -123,7 +129,12 @@ steer the server's version, cipher suite and group negotiation. `none` for
     client_scid := binary() | none,
     groups => [non_neg_integer()] | none,
     signature_algorithms => [non_neg_integer()],
-    transport_params => roadrunner_quic_transport_params:params(),
+    transport_params => [
+        {
+            roadrunner_quic_transport_params:param_key(),
+            roadrunner_quic_transport_params:param_value()
+        }
+    ],
     cipher_suites => [non_neg_integer()],
     versions => [non_neg_integer()]
 }) -> binary().
@@ -135,7 +146,7 @@ client_hello_framed(#{scheme := Scheme, key_shares := KeyShares, client_scid := 
         signature_algorithms_ext(maps:get(signature_algorithms, Opts, [Scheme])),
         alpn_ext(~"h3"),
         key_share_ext(KeyShares),
-        transport_params_ext(ClientSCID, maps:get(transport_params, Opts, #{}))
+        transport_params_ext(ClientSCID, maps:get(transport_params, Opts, []))
     ]),
     CipherSuites = <<<<C:16>> || C <- maps:get(cipher_suites, Opts, [?CIPHER_AES_128_GCM_SHA256])>>,
     Body =
@@ -182,15 +193,17 @@ key_share_ext(KeyShares) ->
 transport_params_ext(none, _Overrides) ->
     <<>>;
 transport_params_ext(ClientSCID, Overrides) ->
-    Defaults = #{
-        initial_source_connection_id => ClientSCID,
-        initial_max_data => 800000,
-        initial_max_stream_data_bidi_local => 800000,
-        initial_max_stream_data_uni => 800000,
-        initial_max_streams_uni => 3
-    },
+    Defaults = [
+        {initial_source_connection_id, ClientSCID},
+        {initial_max_data, 800000},
+        {initial_max_stream_data_bidi_local, 800000},
+        {initial_max_stream_data_uni, 800000},
+        {initial_max_streams_uni, 3}
+    ],
     Body = iolist_to_binary(
-        roadrunner_quic_transport_params:encode(maps:merge(Defaults, Overrides))
+        roadrunner_quic_transport_params:encode(
+            roadrunner_quic_transport_params:new(Defaults ++ Overrides)
+        )
     ),
     extension(?EXT_QUIC_TRANSPORT_PARAMS, Body).
 
@@ -214,7 +227,7 @@ padded to 1200, satisfying the server's anti-amplification budget.
     binary()
 ) -> binary().
 seal(Level, PN, Keys, Frames, DCID, SCID) ->
-    Entries = #{Level => #{frames => Frames, keys => Keys, pn => PN}},
+    Entries = #{Level => #quic_entry{frames = Frames, keys = Keys, pn = PN}},
     {Datagram, _Sent} = roadrunner_quic_send:datagram(Entries, DCID, SCID),
     Datagram.
 
@@ -231,19 +244,19 @@ with PADDING frames to the 1200-byte floor (§14.1).
     binary(),
     binary()
 ) -> binary().
-seal_initial(PN, #{key := Key, iv := IV, hp := HP}, Frames, DCID, SCID, Token) ->
+seal_initial(PN, #quic_keys{key = Key, iv = IV, hp = HP}, Frames, DCID, SCID, Token) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     Encoded = iolist_to_binary([roadrunner_quic_frame:encode(F) || F <- Frames]),
     %% The header with a 2-byte Length field (every size up to 16383), so
     %% the plaintext that fills the datagram to 1200 bytes is known first.
-    [Probe, _] = roadrunner_quic_packet:encode_long(
-        initial, 1, DCID, SCID, #{pn => PN, payload => <<0:(1000 * 8)>>, token => Token}
-    ),
+    [Probe, _] = roadrunner_quic_packet:encode_long(initial, 1, DCID, SCID, Token, PN, <<
+        0:(1000 * 8)
+    >>),
     Fill = max(byte_size(Encoded), 1200 - byte_size(Probe) - 16),
     Plaintext = <<Encoded/binary, 0:((Fill - byte_size(Encoded)) * 8)>>,
-    [Header, _] = roadrunner_quic_packet:encode_long(
-        initial, 1, DCID, SCID, #{pn => PN, payload => <<0:((Fill + 16) * 8)>>, token => Token}
-    ),
+    [Header, _] = roadrunner_quic_packet:encode_long(initial, 1, DCID, SCID, Token, PN, <<
+        0:((Fill + 16) * 8)
+    >>),
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
     Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
     <<Protected/binary, Sealed/binary>>.
@@ -260,12 +273,12 @@ deliberately malformed frame, mirroring the send path's header sizing.
     binary(),
     binary()
 ) -> binary().
-seal_raw(Level, PN, #{key := Key, iv := IV, hp := HP}, Plaintext, DCID, SCID) ->
+seal_raw(Level, PN, #quic_keys{key = Key, iv = IV, hp = HP}, Plaintext, DCID, SCID) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     SealedSize = byte_size(Plaintext) + 16,
-    [Header, _Payload] = roadrunner_quic_packet:encode_long(
-        Level, 1, DCID, SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
-    ),
+    [Header, _Payload] = roadrunner_quic_packet:encode_long(Level, 1, DCID, SCID, <<>>, PN, <<
+        0:(SealedSize * 8)
+    >>),
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
     Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
     <<Protected/binary, Sealed/binary>>.
@@ -283,11 +296,11 @@ PROTOCOL_VIOLATION once it authenticates (RFC 9000 §17.2).
     binary(),
     binary()
 ) -> binary().
-seal_raw_reserved(Level, PN, #{key := Key, iv := IV, hp := HP}, Plaintext, DCID, SCID) ->
+seal_raw_reserved(Level, PN, #quic_keys{key = Key, iv = IV, hp = HP}, Plaintext, DCID, SCID) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     SealedSize = byte_size(Plaintext) + 16,
     [<<FirstByte, HeaderRest/binary>>, _Payload] = roadrunner_quic_packet:encode_long(
-        Level, 1, DCID, SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
+        Level, 1, DCID, SCID, <<>>, PN, <<0:(SealedSize * 8)>>
     ),
     Header = <<(FirstByte bor 16#0c), HeaderRest/binary>>,
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
@@ -307,7 +320,7 @@ concat reassembles the flight.
 -spec crypto_bytes(
     [binary()],
     roadrunner_quic_recv:level(),
-    #{roadrunner_quic_recv:level() => map()},
+    #{roadrunner_quic_recv:level() => roadrunner_quic_recv:keys()},
     non_neg_integer()
 ) -> binary().
 crypto_bytes(Datagrams, Level, Keys, DCIDLen) ->
@@ -318,7 +331,7 @@ crypto_bytes(Datagrams, Level, Keys, DCIDLen) ->
 -spec frames(
     [binary()],
     roadrunner_quic_recv:level(),
-    #{roadrunner_quic_recv:level() => map()},
+    #{roadrunner_quic_recv:level() => roadrunner_quic_recv:keys()},
     non_neg_integer()
 ) -> [roadrunner_quic_frame:frame()].
 frames(Datagrams, Level, Keys, DCIDLen) ->
@@ -326,7 +339,7 @@ frames(Datagrams, Level, Keys, DCIDLen) ->
 
 level_frames(Datagram, Level, Keys, DCIDLen) ->
     Outcomes = roadrunner_quic_recv:datagram(Datagram, DCIDLen, Keys, #{}),
-    lists:append([Fs || {ok, #{level := L, frames := Fs}} <- Outcomes, L =:= Level]).
+    lists:append([Fs || {ok, #quic_decoded{level = L, frames = Fs}} <- Outcomes, L =:= Level]).
 
 %% =============================================================================
 %% Handshake-message decoding
