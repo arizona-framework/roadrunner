@@ -81,7 +81,9 @@ protocol(Case) ->
 listener_opts(http2) ->
     #{
         port => 0,
-        protocols => [{http2, #{max_concurrent_streams => ?MAX_STREAMS}}],
+        %% The client syncs on PINGs (`ping_sync/1`) after frames that
+        %% bring no HEADERS or DATA back, so many would be strikes.
+        protocols => [{http2, #{max_concurrent_streams => ?MAX_STREAMS, ping_policy => false}}],
         routes => [
             {~"/", roadrunner_h2_slot_handler},
             {~"/answered", roadrunner_answer_then_hold_handler}

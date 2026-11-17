@@ -103,6 +103,16 @@ dynamic table, responses use the static table). Remaining work:
   the separate `MDA2AV/HttpArena` repo)
 - WebTransport / Extended CONNECT (RFC 9220) and HTTP datagrams
   (RFC 9297)
+- `connection_age` on h3 (small to medium): HTTP/2 connections can close
+  at an age (`{http2, #{connection_age => ...}}`), HTTP/3 ones live as
+  long as they are used. The h3 drain (GOAWAY on the control stream)
+  already does the close; what is left is the per-connection timer with
+  its jitter, the grace that resets the requests still open, an
+  `{http3, #{connection_age => ...}}` opt and its tests. The rest of the
+  HTTP/2 keepalive policy needs nothing on h3: the QUIC idle timeout
+  (`keep_alive_timeout`) closes idle connections and a QUIC PING costs
+  the server only an ACK it sends anyway, so there is no PING policy to
+  enforce
 
 ## Native QUIC transport follow-ups
 
@@ -220,6 +230,24 @@ piece of its own:
 
 **Why deferred:** the client was built for roadrunner's own tests and
 tools; these matter only once it carries production traffic.
+
+### HTTP/2 control-frame flood guard — medium
+
+**What:** `ping_policy` bounds PINGs, and the idle timeout no longer
+lets frames without a request keep a connection open, but the other
+frames that make the server work without serving anything have no
+budget of their own (RFC 9113 §10.5): SETTINGS (each one answered),
+WINDOW_UPDATE, PRIORITY, empty DATA and CONTINUATION frames, frames of
+unknown types. A general guard would count those frames per connection
+over a window, as nghttp2, h2o and Go's `x/net/http2` do, and close the
+connection with `GOAWAY(ENHANCE_YOUR_CALM)` past a limit, with no timer
+per frame. The work is in deciding what counts (a WINDOW_UPDATE is
+useful while the server sends; an empty DATA frame can end a stream),
+a default no real client meets, and the tests.
+
+**Why deferred:** the cost of such a flood is CPU on one connection,
+bounded by the client's own sending rate and by `max_clients`, and none
+of these frames holds memory or keeps an idle connection open now.
 
 ### CI bench-vs-baseline comparison
 

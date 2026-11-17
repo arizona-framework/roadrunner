@@ -105,6 +105,19 @@
 %% Opaque data of the PING a conn still serving sends when its idle timeout
 %% passes with nothing heard (`recv_idle_expired/1`).
 -define(LIVENESS_PING, ~"rr-alive").
+%% Opaque data of the PING that follows a graceful close's first GOAWAY
+%% (`announce_goaway/2`): its ACK says the client has seen that GOAWAY.
+-define(GOAWAY_PING, ~"rr-drain").
+%% The largest stream id (RFC 9113 §5.1.1), which the first GOAWAY of a
+%% graceful close names so that no stream the client opened is refused.
+-define(MAX_STREAM_ID, 16#7FFFFFFF).
+%% The least time between two client PINGs with no stream open when the
+%% `ping_policy` does not permit PINGs without one: gRPC's (grpc-go's
+%% `defaultPingTimeout`, gRPC core's no-call ping interval), 2 hours.
+-define(PING_IDLE_MIN_TIME, 7_200_000).
+%% Debug data of the GOAWAY that closes a conn for its PINGs: what gRPC
+%% servers send, and gRPC clients look for to ping less.
+-define(TOO_MANY_PINGS, ~"too_many_pings").
 %% How many of the streams it reset a conn remembers, to ignore what the
 %% peer still sends on them (`remember_reset/2`).
 -define(RESET_MEMORY, 128).
@@ -385,6 +398,22 @@
     %% hook) is captured at `enter/6`, so it must be set before connect.
     handshake_timeout = ?HANDSHAKE_TIMEOUT_DEFAULT :: non_neg_integer(),
     idle_timeout = ?IDLE_TIMEOUT_DEFAULT :: non_neg_integer(),
+    %% When (`erlang:monotonic_time(millisecond)`) the conn closes for
+    %% being idle: set once it has no stream and no worker left (from the
+    %% start, and as its last stream goes, `idle_deadline/3`), cleared by
+    %% the next stream it opens, and moved by nothing else, so no frame a
+    %% client sends without a request (PING, SETTINGS, WINDOW_UPDATE...)
+    %% keeps an unused conn open. `undefined` while it serves.
+    idle_deadline = undefined :: integer() | undefined,
+    %% The client PING policy (`http2_ping_*` proto_opts, `ping_policy/1`):
+    %% `off`, or the least time between two PINGs with a stream open and
+    %% with none, and the PINGs closer than that a client may send before
+    %% the next one closes the conn.
+    ping_policy = off :: off | {pos_integer(), pos_integer(), non_neg_integer()},
+    %% When the client last pinged, in milliseconds, and its strikes
+    %% since; `undefined` while its next PING is free: none came yet, or
+    %% HEADERS or DATA went out since (`ping_strike/1`).
+    ping_clock = undefined :: undefined | {integer(), non_neg_integer()},
     %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
     %% Prepended to every response by `roadrunner_http:auto_headers/2`.
     %% Read from proto_opts at `enter/6`.
@@ -442,12 +471,21 @@
     heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor(),
     %% The `Deadline` of the first `{roadrunner_drain, Deadline}`
     %% message, `undefined` until one arrives. In drain mode we've
-    %% already sent GOAWAY(NO_ERROR) and passed the message on to every
-    %% stream worker, refuse fresh streams with
-    %% RST_STREAM(REFUSED_STREAM), hand the same message to each worker
-    %% started from then on, and exit as soon as the streams map empties.
-    drain_deadline = undefined :: integer() | undefined
+    %% passed the message on to every stream worker and hand the same
+    %% message to each worker started from then on.
+    drain_deadline = undefined :: integer() | undefined,
+    %% Where the connection is in a graceful close (RFC 9113 §6.8):
+    %% `open` until one starts; `{announced, TRef, Reason}` once a
+    %% GOAWAY naming the largest stream id and a PING are out, while new
+    %% streams are still served, until the PING's ACK (or `TRef`, an
+    %% idle timeout later) says the client has seen it; `{final, Reason}`
+    %% once the GOAWAY naming the last stream served is out: new streams
+    %% are refused with RST_STREAM(REFUSED_STREAM) and the conn exits
+    %% with `Reason` as soon as the streams map empties.
+    goaway = open :: open | {announced, reference(), close_reason()} | {final, close_reason()}
 }).
+
+-type close_reason() :: roadrunner_event_handler:close_reason().
 
 -doc """
 Top-level entry from the HTTP/1.1 dispatch fork. Owns the socket
@@ -529,9 +567,48 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
         real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
         handshake_timeout = HandshakeTimeout,
-        idle_timeout = IdleTimeout
+        idle_timeout = IdleTimeout,
+        idle_deadline = erlang:monotonic_time(millisecond) + IdleTimeout,
+        ping_policy = ping_policy(ProtoOpts)
     },
+    ok = start_connection_age(ProtoOpts),
     handshake(State).
+
+%% The listener's `connection_age`: one timer for the conn's whole life,
+%% at its age, carrying the grace that follows (`handle_timer/3`).
+-spec start_connection_age(roadrunner_conn:proto_opts()) -> ok.
+start_connection_age(#{http2_connection_age_max := Max, http2_connection_age_grace := Grace}) ->
+    _ = erlang:start_timer(jittered(Max), self(), {?MODULE, {connection_age, Grace}}),
+    ok;
+start_connection_age(#{}) ->
+    ok.
+
+%% `Max` give or take up to a tenth of it, as grpc-go jitters its
+%% `MaxConnectionAge`: the conns a client opened together (or a restart
+%% saw reconnect together) then close spread over time, not all at once.
+-spec jittered(pos_integer()) -> pos_integer().
+jittered(Max) ->
+    Spread = Max div 10,
+    Max - Spread + rand:uniform(2 * Spread + 1) - 1.
+
+%% The listener's `ping_policy`, flattened onto `http2_ping_*` keys, none
+%% of them when it is off. Without stream, a PING must wait `MinTime`
+%% when PINGs are permitted then, and at least 2 hours otherwise.
+-spec ping_policy(roadrunner_conn:proto_opts()) ->
+    off | {pos_integer(), pos_integer(), non_neg_integer()}.
+ping_policy(#{
+    http2_ping_min_time := MinTime,
+    http2_ping_permit_without_stream := Permit,
+    http2_ping_max_strikes := MaxStrikes
+}) ->
+    IdleMinTime =
+        case Permit of
+            true -> MinTime;
+            false -> max(MinTime, ?PING_IDLE_MIN_TIME)
+        end,
+    {MinTime, IdleMinTime, MaxStrikes};
+ping_policy(#{}) ->
+    off.
 
 %% The connection and stream refill thresholds: the configured
 %% `window_refill_threshold` for both, else half of each window's peak
@@ -672,12 +749,12 @@ handshake_recv(
 %% =============================================================================
 
 -spec frame_loop(#loop{}) -> no_return().
-frame_loop(#loop{drain_deadline = Deadline, streams = Streams} = State) when
-    is_integer(Deadline), map_size(Streams) =:= 0
+frame_loop(#loop{goaway = {final, Reason}, streams = Streams} = State) when
+    map_size(Streams) =:= 0
 ->
     %% Drain done — the last in-flight stream finished or peer
     %% RST'd it, nothing more to do.
-    exit_clean(State, drained);
+    exit_clean(State, Reason);
 frame_loop(#loop{buffer = Buf} = State) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
         {ok, Frame, Rest} ->
@@ -749,28 +826,27 @@ recv_more(
             %% a draining conn was waiting on.
             recv_more(maybe_exit_when_drained(handle_slot(State, StreamId, Outcome)));
         {roadrunner_drain, Deadline} ->
-            recv_more(maybe_exit_when_drained(start_drain(State, Deadline)))
+            recv_more(start_drain(State, Deadline));
+        {timeout, TRef, {?MODULE, Timer}} ->
+            recv_more(handle_timer(State, TRef, Timer))
     after recv_timeout(State) ->
         recv_idle_expired(State)
     end.
 
-%% Idle-wait timeout selection. When no streams are in flight, no worker
-%% runs (one whose stream was reset may), AND the listener opted into a
-%% `hibernate_after` shorter than the idle
-%% timeout, park for that window so `recv_idle_expired/1` can
-%% hibernate. Otherwise the GOAWAY idle timeout applies: whenever
-%% streams are active, where worker messages are imminent and
-%% hibernating would be pointless, and when the idle timeout comes
-%% first anyway.
+%% Idle-wait timeout selection. A conn still serving waits the idle
+%% timeout from its last message: worker messages are imminent, and the
+%% quiet wire only brings the liveness PING (`recv_idle_expired/1`). An
+%% idle one waits what is left until its `idle_deadline`, or, when the
+%% listener opted into a `hibernate_after` shorter than that, parks for
+%% that window so `recv_idle_expired/1` can hibernate.
 -spec recv_timeout(#loop{}) -> non_neg_integer().
-recv_timeout(#loop{
-    streams = Streams, worker_refs = Refs, hibernate_after = Ms, idle_timeout = T
-}) when
-    map_size(Streams) =:= 0, map_size(Refs) =:= 0, Ms > 0, Ms < T
-->
-    Ms;
-recv_timeout(#loop{idle_timeout = T}) ->
-    T.
+recv_timeout(#loop{idle_deadline = undefined, idle_timeout = T}) ->
+    T;
+recv_timeout(#loop{idle_deadline = Deadline, hibernate_after = Ms}) ->
+    case max(0, Deadline - erlang:monotonic_time(millisecond)) of
+        Left when Ms > 0, Ms < Left -> Ms;
+        Left -> Left
+    end.
 
 %% Fired when `recv_more/1` sees no traffic for `recv_timeout/1`. With
 %% no stream and no worker and `hibernate_after` the shorter wait, collapse
@@ -788,13 +864,15 @@ recv_timeout(#loop{idle_timeout = T}) ->
 %% idle timeout pass, which closes the conn. Otherwise emit the idle
 %% GOAWAY now.
 -spec recv_idle_expired(#loop{}) -> no_return().
-recv_idle_expired(
-    #loop{streams = Streams, worker_refs = Refs, hibernate_after = Ms, idle_timeout = T} = State
-) when
-    map_size(Streams) =:= 0, map_size(Refs) =:= 0, Ms > 0, Ms < T
-->
-    TRef = erlang:start_timer(T - Ms, self(), ?MODULE),
-    erlang:hibernate(?MODULE, recv_more_hib, [State, TRef]);
+recv_idle_expired(#loop{idle_deadline = Deadline} = State) when is_integer(Deadline) ->
+    %% Idle: time left means the `hibernate_after` wait ran out first.
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Left when Left > 0 ->
+            TRef = erlang:start_timer(Left, self(), ?MODULE),
+            erlang:hibernate(?MODULE, recv_more_hib, [State, TRef]);
+        _Passed ->
+            idle_goaway(State)
+    end;
 recv_idle_expired(#loop{liveness_ping = false} = State) ->
     case serving(State) of
         true ->
@@ -844,6 +922,64 @@ idle_goaway(State, Reason) ->
     _ = send_goaway(State, no_error),
     exit_clean(State, Reason).
 
+%% The `idle_deadline` once `Streams` and `Refs` are what the conn holds:
+%% the idle timeout from now when they leave it with no stream and no
+%% worker, the deadline it already has otherwise. Set as the last stream
+%% or worker goes, in the update that drops it: every path that drops a
+%% stream (`remove_stream/3`, `drop_reset_stream/2`, `abort_stream/3`) or
+%% a worker whose stream is gone (`handle_worker_down/3`) asks it.
+-spec idle_deadline(#{stream_id() => stream_entry()}, #{reference() => stream_id()}, #loop{}) ->
+    integer() | undefined.
+idle_deadline(Streams, Refs, #loop{idle_deadline = undefined, idle_timeout = T}) when
+    map_size(Streams) =:= 0, map_size(Refs) =:= 0
+->
+    erlang:monotonic_time(millisecond) + T;
+idle_deadline(_Streams, _Refs, #loop{idle_deadline = Deadline}) ->
+    Deadline.
+
+%% Judge a client PING against the `ping_policy`, as gRPC servers do
+%% (grpc-go's `handlePing`, gRPC core's ping policy): one that comes less
+%% than the policy's least time after the client's last PING (with a
+%% stream open, or with none) is a strike, and the strike past
+%% `max_strikes` closes the conn (`too_many_pings/2`). Strikes do not wear
+%% off; HEADERS or DATA the conn sends clears them and makes the next PING
+%% free (`ping_clock`), so a client pinging as it reads a response (to
+%% measure its bandwidth) is never struck.
+-spec ping_strike(#loop{}) -> {ok, #loop{}} | too_many_pings.
+ping_strike(#loop{ping_policy = off} = State) ->
+    {ok, State};
+ping_strike(#loop{ping_clock = undefined} = State) ->
+    {ok, State#loop{ping_clock = {erlang:monotonic_time(millisecond), 0}}};
+ping_strike(
+    #loop{
+        ping_policy = {MinTime, IdleMinTime, MaxStrikes},
+        ping_clock = {Last, Strikes},
+        live_streams = Live
+    } = State
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    Least =
+        case Live of
+            0 -> IdleMinTime;
+            _ -> MinTime
+        end,
+    case Now - Last >= Least of
+        true -> {ok, State#loop{ping_clock = {Now, Strikes}}};
+        false when Strikes >= MaxStrikes -> too_many_pings;
+        false -> {ok, State#loop{ping_clock = {Now, Strikes + 1}}}
+    end.
+
+%% A client past its PING strikes: answer the PING (RFC 9113 §6.7), then
+%% close with GOAWAY(ENHANCE_YOUR_CALM) and `too_many_pings` (gRPC's
+%% keepalive enforcement), which tells a gRPC client to ping less.
+-spec too_many_pings(#loop{}, iodata()) -> no_return().
+too_many_pings(#loop{last_stream_id = LastId} = State, Ack) ->
+    _ = send(State, [
+        Ack,
+        roadrunner_http2_frame:encode({goaway, LastId, enhance_your_calm, ?TOO_MANY_PINGS})
+    ]),
+    exit_clean(State, too_many_pings).
+
 %% Hibernate re-entry (see `recv_idle_expired/1`). Drops the idle
 %% timer and resumes the unified mailbox loop after an idle conn wakes
 %% from `erlang:hibernate/3`. If the timer already fired, the conn sat
@@ -861,8 +997,9 @@ recv_more_hib(State, TRef) ->
             recv_more(State)
     end.
 
-%% Begin a graceful drain: emit GOAWAY(NO_ERROR) once, refuse new
-%% streams henceforth. In-flight workers continue to completion, and
+%% Begin a graceful drain: start the graceful close (`announce_goaway/2`)
+%% unless one is under way, and refuse new streams once it is done.
+%% In-flight workers continue to completion, and
 %% each gets the same `{roadrunner_drain, Deadline}` the conn did: the
 %% handler runs in the worker, not here, so this is how a `{loop, ...}`
 %% response (an SSE stream, say) learns of the drain and can wind down,
@@ -875,7 +1012,6 @@ recv_more_hib(State, TRef) ->
 start_drain(#loop{drain_deadline = Deadline} = State, _Deadline) when is_integer(Deadline) ->
     State;
 start_drain(#loop{streams = Streams} = State, Deadline) ->
-    _ = send_goaway(State, no_error),
     ok = maps:foreach(
         fun
             (_StreamId, #{worker_pid := Pid, worker_ref := MonRef}) when is_reference(MonRef) ->
@@ -886,7 +1022,82 @@ start_drain(#loop{streams = Streams} = State, Deadline) ->
         end,
         Streams
     ),
-    State#loop{drain_deadline = Deadline}.
+    announce_goaway(State#loop{drain_deadline = Deadline}, drained).
+
+%% The first step of a graceful close (RFC 9113 §6.8): a GOAWAY(NO_ERROR)
+%% naming the largest stream id, so a request the client sends before it
+%% sees the GOAWAY is still served rather than refused, then a PING. Its
+%% ACK comes after the client has read the GOAWAY, so every stream it
+%% opened before then has reached us by then: `final_goaway/2` names
+%% the last of them. A client that never answers gets the final GOAWAY
+%% an idle timeout later. A close already under way is left as it is.
+-spec announce_goaway(#loop{}, close_reason()) -> #loop{}.
+announce_goaway(#loop{goaway = open, idle_timeout = Timeout} = State, Reason) ->
+    _ = send(State, [
+        ?GOAWAY(?MAX_STREAM_ID, no_error),
+        roadrunner_http2_frame:encode({ping, 0, ?GOAWAY_PING})
+    ]),
+    TRef = erlang:start_timer(Timeout, self(), {?MODULE, goaway_ping}),
+    State#loop{goaway = {announced, TRef, Reason}};
+announce_goaway(State, _Reason) ->
+    State.
+
+%% The second step of a graceful close: the GOAWAY(NO_ERROR) naming the
+%% last stream this conn opened. Every stream up to it is served to its
+%% end, and every later one refused.
+-spec final_goaway(#loop{}, close_reason()) -> #loop{}.
+final_goaway(State, Reason) ->
+    _ = send_goaway(State, no_error),
+    maybe_exit_when_drained(State#loop{goaway = {final, Reason}}).
+
+%% A timer this conn started went off. One no longer wanted (its step
+%% already happened another way) is ignored. The conn reaching its
+%% `connection_age` starts the graceful close (which a drain may have
+%% started already) and the grace it has to finish in.
+-spec handle_timer(
+    #loop{},
+    reference(),
+    goaway_ping | {connection_age, non_neg_integer() | infinity} | connection_age_grace
+) -> #loop{}.
+handle_timer(#loop{goaway = {announced, TRef, Reason}} = State, TRef, goaway_ping) ->
+    final_goaway(State, Reason);
+handle_timer(State, _TRef, {connection_age, Grace}) ->
+    ok = start_grace(Grace),
+    announce_goaway(State, connection_age);
+handle_timer(State, _TRef, connection_age_grace) ->
+    grace_expired(State);
+handle_timer(State, _TRef, goaway_ping) ->
+    State.
+
+-spec start_grace(non_neg_integer() | infinity) -> ok.
+start_grace(infinity) ->
+    ok;
+start_grace(Grace) ->
+    _ = erlang:start_timer(Grace, self(), {?MODULE, connection_age_grace}),
+    ok.
+
+%% The `connection_age` grace ran out with requests still open: reset each
+%% stream not yet closed with CANCEL (RFC 9113 §8.4, the request is no
+%% longer wanted) and close the conn. A client that has only seen the
+%% first GOAWAY (a grace shorter than its answer to the PING) gets the
+%% final one first, naming the last stream this conn took: any stream it
+%% opened after that was not processed and is safe to retry (§6.8).
+-spec grace_expired(#loop{}) -> no_return().
+grace_expired(#loop{streams = Streams} = State) ->
+    _ = send(State, [
+        final_goaway_frame(State)
+        | [
+            roadrunner_http2_frame:encode({rst_stream, StreamId, cancel})
+         || StreamId := #{state := StreamState} <- Streams, StreamState =/= closed
+        ]
+    ]),
+    exit_clean(State, connection_age_grace).
+
+-spec final_goaway_frame(#loop{}) -> iodata().
+final_goaway_frame(#loop{goaway = {final, _}}) ->
+    [];
+final_goaway_frame(#loop{last_stream_id = LastId}) ->
+    ?GOAWAY(LastId, no_error).
 
 %% Spawn the worker for `StreamId`. A worker started once the drain has
 %% begun (a stream below the GOAWAY whose body was still arriving, or a
@@ -926,10 +1137,10 @@ start_worker(
 %% `recv_more/1` is dead — typed as `#loop{}` rather than
 %% `no_return()` so the type-checker sees the live path.
 -spec maybe_exit_when_drained(#loop{}) -> #loop{}.
-maybe_exit_when_drained(#loop{drain_deadline = Deadline, streams = Streams} = State) when
-    is_integer(Deadline), map_size(Streams) =:= 0
+maybe_exit_when_drained(#loop{goaway = {final, Reason}, streams = Streams} = State) when
+    map_size(Streams) =:= 0
 ->
-    exit_clean(State, drained);
+    exit_clean(State, Reason);
 maybe_exit_when_drained(State) ->
     State.
 
@@ -975,11 +1186,20 @@ handle_frame({settings, 0, Params}, State) ->
     end;
 handle_frame({ping, 1, ?LIVENESS_PING}, State) ->
     frame_loop(State#loop{liveness_ping = false});
+handle_frame({ping, 1, ?GOAWAY_PING}, #loop{goaway = {announced, TRef, Reason}} = State) ->
+    _ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+    frame_loop(final_goaway(State, Reason));
 handle_frame({ping, 1, _Data}, State) ->
     frame_loop(State);
 handle_frame({ping, 0, Opaque}, State) ->
-    _ = send(State, roadrunner_http2_frame:encode({ping, 1, Opaque})),
-    frame_loop(State);
+    Ack = roadrunner_http2_frame:encode({ping, 1, Opaque}),
+    case ping_strike(State) of
+        {ok, State1} ->
+            _ = send(State1, Ack),
+            frame_loop(State1);
+        too_many_pings ->
+            too_many_pings(State, Ack)
+    end;
 handle_frame({window_update, 0, Inc}, State) ->
     case State#loop.conn_send_window + Inc of
         New when New > ?MAX_WINDOW ->
@@ -1156,12 +1376,10 @@ on_headers(StreamId, Flags, #{stream_dependency := StreamId}, Fragment, State) -
     %% RFC 9113 §5.3.1: a stream cannot depend on itself —
     %% stream-error PROTOCOL_ERROR.
     refuse_new_stream(StreamId, Flags, Fragment, protocol_error, State);
-on_headers(StreamId, Flags, _Priority, Fragment, #loop{drain_deadline = Deadline} = State) when
-    is_integer(Deadline)
-->
-    %% In drain mode — refuse all new streams. The peer already
-    %% saw GOAWAY(NO_ERROR); it knows new requests on this conn
-    %% won't be served.
+on_headers(StreamId, Flags, _Priority, Fragment, #loop{goaway = {final, _}} = State) ->
+    %% Past the final GOAWAY(NO_ERROR) of a graceful close: refuse all
+    %% new streams. The peer already saw it; it knows new requests on
+    %% this conn won't be served, and may retry them elsewhere.
     refuse_new_stream(StreamId, Flags, Fragment, refused_stream, State);
 on_headers(
     StreamId,
@@ -1187,6 +1405,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     State1 = State#loop{
         streams = (State#loop.streams)#{StreamId => Stream},
         live_streams = State#loop.live_streams + 1,
+        idle_deadline = undefined,
         last_stream_id = StreamId,
         peer_stream_id = StreamId,
         awaiting_continuation =
@@ -1498,7 +1717,7 @@ body_follows(StreamId, State) ->
 send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
     {Block, Enc1} = roadrunner_http2_hpack:encode([{~":status", ~"100"}], Enc),
     _ = send(State, roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block})),
-    State#loop{hpack_enc = Enc1}.
+    State#loop{hpack_enc = Enc1, ping_clock = undefined}.
 
 %% RFC 9113 §8.1: the request body is over its cap. Answer 413
 %% before the full request, then RST_STREAM(NO_ERROR) to ask the client to
@@ -2170,7 +2389,13 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
                     %% still arriving (`forget_stream/3`): nothing is left
                     %% to answer, and the stream it held toward
                     %% `max_concurrent_streams` is free.
-                    reset_worker_ended(State#loop{worker_refs = Refs1}, MonRef)
+                    reset_worker_ended(
+                        State#loop{
+                            worker_refs = Refs1,
+                            idle_deadline = idle_deadline(State#loop.streams, Refs1, State)
+                        },
+                        MonRef
+                    )
             end;
         #{} ->
             State
@@ -2298,10 +2523,13 @@ encode_and_send_headers(
             #loop{streams = #{StreamId := Stream} = Streams, live_streams = Live0} = State,
             {Closed, Live} = close_send(Stream, Live0),
             State#loop{
-                hpack_enc = Enc1, streams = Streams#{StreamId := Closed}, live_streams = Live
+                hpack_enc = Enc1,
+                streams = Streams#{StreamId := Closed},
+                live_streams = Live,
+                ping_clock = undefined
             };
         false ->
-            State#loop{hpack_enc = Enc1}
+            State#loop{hpack_enc = Enc1, ping_clock = undefined}
     end.
 
 %% HEADERS + DATA (END_STREAM) packed into ONE `ssl:send/2`. Body
@@ -2339,7 +2567,8 @@ encode_and_send_response_atomic(
         hpack_enc = Enc1,
         conn_send_window = ConnW - BodyLen,
         streams = Streams#{StreamId := Closed},
-        live_streams = Live
+        live_streams = Live,
+        ping_clock = undefined
     }.
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
@@ -2367,7 +2596,9 @@ encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
 close_stream_send_side(#loop{streams = Streams, live_streams = Live0} = State, StreamId) ->
     #{StreamId := Stream} = Streams,
     {Closed, Live} = close_send(Stream, Live0),
-    State#loop{streams = Streams#{StreamId := Closed}, live_streams = Live}.
+    %% The frame that ended the stream (trailers, or an empty DATA) went
+    %% out: the client's next PING is free (`ping_strike/1`).
+    State#loop{streams = Streams#{StreamId := Closed}, live_streams = Live, ping_clock = undefined}.
 
 %% A stream entry with its send side closed, and the live-stream count
 %% after it: a stream the peer already ended is closed both ways and
@@ -2496,6 +2727,8 @@ data_frames(StreamId, Bin, Fin) ->
 window_budget(#loop{conn_send_window = ConnW}, #{send_window := StreamW}) ->
     max(0, min(ConnW, StreamW)).
 
+%% DATA went out: spend the windows, and make the client's next PING free
+%% (`ping_strike/1`), as HEADERS do.
 consume_send_window(
     #loop{conn_send_window = ConnW, streams = Streams} = State, StreamId, Stream, N
 ) ->
@@ -2503,7 +2736,8 @@ consume_send_window(
     Stream1 = Stream#{send_window := SW - N},
     State#loop{
         conn_send_window = ConnW - N,
-        streams = Streams#{StreamId := Stream1}
+        streams = Streams#{StreamId := Stream1},
+        ping_clock = undefined
     }.
 
 enqueue_pending(#{pending_sends := Pending} = Stream, Entry) ->
@@ -2667,8 +2901,13 @@ drop_reset_stream(#loop{streams = Streams0} = State0, StreamId) ->
                 WorkerPid ! {h2_stream_reset, StreamId},
                 hold_reset_slot(State#loop.reset_workers, MonRef, Counted)
         end,
+    Streams1 = forget_stream(State, StreamId, Streams),
     withdraw_parked(
-        State#loop{streams = forget_stream(State, StreamId, Streams), reset_workers = Reset},
+        State#loop{
+            streams = Streams1,
+            reset_workers = Reset,
+            idle_deadline = idle_deadline(Streams1, State#loop.worker_refs, State)
+        },
         StreamId
     ).
 
@@ -2687,8 +2926,15 @@ abort_stream(State0, StreamId, ErrorCode) ->
     #{StreamId := #{pending_sends := Pending}} = Streams,
     notify_pending_reset(StreamId, Pending),
     _ = send_rst_stream(State, StreamId, ErrorCode),
+    Streams1 = forget_stream(State, StreamId, Streams),
     withdraw_parked(
-        remember_reset(State#loop{streams = forget_stream(State, StreamId, Streams)}, StreamId),
+        remember_reset(
+            State#loop{
+                streams = Streams1,
+                idle_deadline = idle_deadline(Streams1, State#loop.worker_refs, State)
+            },
+            StreamId
+        ),
         StreamId
     ).
 
@@ -2726,7 +2972,12 @@ remove_reset_stream(State, StreamId) ->
 -spec remove_stream(#loop{}, stream_id(), #{reference() => stream_id()}) -> #loop{}.
 remove_stream(State0, StreamId, Refs) ->
     #loop{streams = Streams} = State = withdraw_parked(uncount_stream(State0, StreamId), StreamId),
-    State#loop{streams = forget_stream(State, StreamId, Streams), worker_refs = Refs}.
+    Streams1 = forget_stream(State, StreamId, Streams),
+    State#loop{
+        streams = Streams1,
+        worker_refs = Refs,
+        idle_deadline = idle_deadline(Streams1, Refs, State)
+    }.
 
 %% Drop a stream's entry, unless its header block (trailers) is still
 %% arriving in CONTINUATION frames: then the entry stays, as a closed

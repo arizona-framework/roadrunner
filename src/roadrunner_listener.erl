@@ -78,6 +78,9 @@ to the handler.
 -define(DEFAULT_MAX_KEEP_ALIVE, 1000).
 -define(DEFAULT_MAX_CLIENTS, 16384).
 -define(DEFAULT_MAX_CONCURRENT_REQUESTS, infinity).
+%% The HTTP/2 `ping_policy` a listener takes unless set: a PING flood
+%% guard (see `t:http2_opts/0`).
+-define(DEFAULT_PING_POLICY, #{min_time => 1000, permit_without_stream => true, max_strikes => 2}).
 %% `Retry-After` seconds on a request shed at the in-flight ceiling.
 -define(DEFAULT_SHED_RETRY_AFTER, 1).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
@@ -211,11 +214,13 @@ Optional middleware and timing knobs (durations in milliseconds):
   precedes the handshake. Default 5 s, at most `16#FFFFFFFF` ms.
 - `keep_alive_timeout` — idle timeout between requests on a
   keep-alive conn: on HTTP/1.1 between one request and the next, on
-  HTTP/2 how long the connection may stay quiet before it is closed with
-  a GOAWAY, or, while a handler is still at work, checked with a PING
-  (at least 1 s, so a client has time to send its first request and to
-  answer the PING), and on HTTP/3 the QUIC idle timeout the server
-  offers (at least 1 s; the connection uses the smaller of it and the
+  HTTP/2 how long after its last request ended (or after it opened) a
+  connection with no request open is closed with a GOAWAY, whatever
+  else the client sends meanwhile (gRPC's `max_connection_idle`), and
+  how long one with a handler still at work may stay quiet before it is
+  checked with a PING (at least 1 s, so a client has time to send its
+  first request and to answer the PING), and on HTTP/3 the QUIC idle
+  timeout the server offers (at least 1 s; the connection uses the smaller of it and the
   client's, and closes once it passes with nothing received; a client
   waiting on a response keeps it open, as RFC 9114 §5.1 expects of it,
   while the server does not). Default 60 s, at most `16#FFFFFFFF` ms.
@@ -816,6 +821,37 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   reads in its mailbox (each up to `recv_buffer` bytes on plain TCP),
   so a lower `N` bounds that memory more tightly. Default `16`. Change
   it only if you measure a reason to.
+- `ping_policy`: how often a client may send PING, as gRPC servers
+  enforce it (grpc-go's `EnforcementPolicy`), or `false` to answer every
+  PING. A PING that comes less than `min_time` milliseconds after the
+  client's last one is a strike, as is, unless `permit_without_stream`
+  is `true`, one less than two hours after it with no request open.
+  After `max_strikes` strikes the next one closes the connection with
+  `GOAWAY(ENHANCE_YOUR_CALM)` and the debug data `too_many_pings`, which
+  gRPC clients take as a sign to ping less. A PING that follows a
+  response's HEADERS or DATA is never a strike, so a client that pings
+  as it reads (to size its windows) is not closed for it. Keys left out
+  take their default: `min_time` `1000` (1 s), `permit_without_stream`
+  `true`, `max_strikes` `2`. The default is a PING flood guard that no
+  usual client meets: HTTP/2 clients ping on network changes, to check a
+  connection before they reuse it, or every few seconds at most. gRPC's
+  own servers default to `#{min_time => 300000, permit_without_stream =>
+  false}`; see [gRPC keepalive](grpc.md#keepalive).
+- `connection_age`: how long a connection may live, as gRPC servers
+  bound it (`MaxConnectionAge`), so long-lived clients spread over new
+  servers as they come (behind a load balancer, say), or `false` (the
+  default) to let it live as long as it is used. `max` is the age in
+  milliseconds, drawn for each connection within 10% of it either way
+  so the connections opened together do not all close together. At
+  that age the connection closes gracefully, as on a drain: a GOAWAY that
+  refuses nothing and a PING, then, once the client answers, the GOAWAY
+  naming the last request served, after which new requests are refused
+  and the connection closes once its requests are done. `grace` bounds
+  that wait (`MaxConnectionAgeGrace`): the requests still open then are
+  reset with `CANCEL` and the connection closes. It is `infinity` unless
+  set, or milliseconds. `max` is required. The connection closes with
+  the reason `connection_age`, or `connection_age_grace` when the grace
+  ran out.
 """.
 -type http2_opts() :: #{
     conn_window => 1..16#7FFFFFFF,
@@ -824,7 +860,16 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
     max_concurrent_streams => 1..16#7FFFFFFF,
     max_header_block => 1..16#7FFFFFFF,
     max_header_list_size => 1..16#7FFFFFFF,
-    active => once | 1..32767
+    active => once | 1..32767,
+    ping_policy =>
+        false
+        | #{
+            min_time => 1..16#FFFFFFFF,
+            permit_without_stream => boolean(),
+            max_strikes => 0..16#7FFFFFFF
+        },
+    connection_age =>
+        false | #{max := 1..16#FFFFFFFF, grace => 0..16#FFFFFFFF | infinity}
 }.
 
 -doc """
@@ -1053,7 +1098,12 @@ a handler that traps exits (a WebSocket session does, if its handler
 turns `trap_exit` on) cannot turn into a message and outlive.
 
 An idle HTTP/1.1 conn closes, and an HTTP/2 or HTTP/3 conn sends GOAWAY,
-refuses new requests and closes once its in-flight requests finish. The
+refuses new requests and closes once its in-flight requests finish. On
+HTTP/2 the close takes two steps (RFC 9113 §6.8): a first GOAWAY that
+refuses nothing and a PING, then, once the client answers the PING (or
+after `keep_alive_timeout` if it never does), the GOAWAY that names the
+last request served, so a request the client sent before it saw the
+first GOAWAY is served rather than refused. The
 handler of every in-flight request gets the same message on every
 protocol: on HTTP/1.1 it runs in the conn process itself, and an HTTP/2
 or HTTP/3 conn passes the message on to each of its stream workers, so
@@ -2303,7 +2353,9 @@ http2_defaults() ->
         %% Placeholder: resolved to `2 * max_header_block` when not set
         %% explicitly (see `resolve_max_header_list_size/2`).
         max_header_list_size => 32768,
-        active => 16
+        active => 16,
+        ping_policy => ?DEFAULT_PING_POLICY,
+        connection_age => false
     }.
 
 -spec validate_http2_opts(map(), term()) -> http2_opts().
@@ -2316,6 +2368,8 @@ validate_http2_opts(Opts, Raw) ->
             case K =:= window_refill_threshold orelse is_map_key(K, Defaults) of
                 false -> error({invalid_listener_opt, protocols, Raw});
                 true when K =:= active -> Acc#{K => validate_http2_active(V, Raw)};
+                true when K =:= ping_policy -> Acc#{K => validate_ping_policy(V, Raw)};
+                true when K =:= connection_age -> Acc#{K => validate_connection_age(V, Raw)};
                 true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
             end
@@ -2324,6 +2378,50 @@ validate_http2_opts(Opts, Raw) ->
         Opts
     ),
     resolve_max_header_list_size(Merged, Opts).
+
+%% `false`, or a map whose keys left out take the default's.
+-spec validate_ping_policy(term(), term()) -> false | map().
+validate_ping_policy(false, _Raw) ->
+    false;
+validate_ping_policy(Policy, Raw) when is_map(Policy) ->
+    maps:fold(
+        fun(K, V, Acc) ->
+            case valid_ping_policy_opt(K, V) of
+                true -> Acc#{K => V};
+                false -> error({invalid_listener_opt, protocols, Raw})
+            end
+        end,
+        ?DEFAULT_PING_POLICY,
+        Policy
+    );
+validate_ping_policy(_Policy, Raw) ->
+    error({invalid_listener_opt, protocols, Raw}).
+
+%% `false`, or a map with `max` and maybe `grace` (`infinity` unless set).
+-spec validate_connection_age(term(), term()) -> false | map().
+validate_connection_age(false, _Raw) ->
+    false;
+validate_connection_age(#{max := Max} = Age, Raw) when
+    is_integer(Max), Max >= 1, Max =< 16#FFFFFFFF
+->
+    case maps:merge(#{grace => infinity}, Age) of
+        #{grace := Grace} = Age1 when
+            map_size(Age1) =:= 2,
+            (Grace =:= infinity orelse
+                (is_integer(Grace) andalso Grace >= 0 andalso Grace =< 16#FFFFFFFF))
+        ->
+            Age1;
+        #{} ->
+            error({invalid_listener_opt, protocols, Raw})
+    end;
+validate_connection_age(_Age, Raw) ->
+    error({invalid_listener_opt, protocols, Raw}).
+
+-spec valid_ping_policy_opt(term(), term()) -> boolean().
+valid_ping_policy_opt(min_time, V) -> is_integer(V) andalso V >= 1 andalso V =< 16#FFFFFFFF;
+valid_ping_policy_opt(permit_without_stream, V) -> is_boolean(V);
+valid_ping_policy_opt(max_strikes, V) -> is_integer(V) andalso V >= 0 andalso V =< 16#7FFFFFFF;
+valid_ping_policy_opt(_Key, _V) -> false.
 
 %% `true` is rejected: an always-active socket has no bound on unread
 %% data, so a fast peer could fill the mailbox. `32767` is the largest
@@ -2361,16 +2459,21 @@ flatten_http2_opts(Entries) ->
                 max_concurrent_streams := MaxStreams,
                 max_header_block := MaxHeaderBlock,
                 max_header_list_size := MaxHeaderListSize,
-                active := Active
+                active := Active,
+                ping_policy := PingPolicy,
+                connection_age := Age
             } = Http2} ->
-            Flat = #{
-                http2_conn_window => Conn,
-                http2_stream_window => Stream,
-                http2_max_concurrent_streams => MaxStreams,
-                http2_max_header_block => MaxHeaderBlock,
-                http2_max_header_list_size => MaxHeaderListSize,
-                http2_active => Active
-            },
+            Flat = maps:merge(
+                #{
+                    http2_conn_window => Conn,
+                    http2_stream_window => Stream,
+                    http2_max_concurrent_streams => MaxStreams,
+                    http2_max_header_block => MaxHeaderBlock,
+                    http2_max_header_list_size => MaxHeaderListSize,
+                    http2_active => Active
+                },
+                maps:merge(flatten_ping_policy(PingPolicy), flatten_connection_age(Age))
+            ),
             case Http2 of
                 #{window_refill_threshold := Threshold} ->
                     Flat#{http2_window_refill_threshold => Threshold};
@@ -2378,6 +2481,26 @@ flatten_http2_opts(Entries) ->
                     Flat
             end
     end.
+
+%% One `http2_connection_age_*` key per setting, none when it is off.
+-spec flatten_connection_age(false | map()) -> #{atom() => term()}.
+flatten_connection_age(false) ->
+    #{};
+flatten_connection_age(#{max := Max, grace := Grace}) ->
+    #{http2_connection_age_max => Max, http2_connection_age_grace => Grace}.
+
+%% One `http2_ping_*` key per setting, none when the policy is off.
+-spec flatten_ping_policy(false | map()) -> #{atom() => term()}.
+flatten_ping_policy(false) ->
+    #{};
+flatten_ping_policy(#{
+    min_time := MinTime, permit_without_stream := Permit, max_strikes := MaxStrikes
+}) ->
+    #{
+        http2_ping_min_time => MinTime,
+        http2_ping_permit_without_stream => Permit,
+        http2_ping_max_strikes => MaxStrikes
+    }.
 
 -spec http3_defaults() -> http3_opts().
 http3_defaults() ->

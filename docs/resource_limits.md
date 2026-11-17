@@ -138,6 +138,8 @@ are advertised to the peer in the initial `SETTINGS` frame.
 | Connection receive window (`conn_window`) | 2^31-1 (the largest allowed) | yes |
 | Stream receive window (`stream_window`) | 16 MB | yes |
 | Unread socket reads per connection (`active`) | 16 | yes |
+| Client PINGs (`ping_policy`) | 1 s apart, 2 closer ones forgiven | yes (`false` disables) |
+| Connection lifetime (`connection_age`) | none | opt-in |
 
 A frame whose declared length exceeds the negotiated max frame size is
 rejected on its 9-byte header, before the body is buffered. Streams over
@@ -161,6 +163,30 @@ those handlers ends, and a client that still has streams of its own open
 is only refused, so a client that resets its requests now and then is
 not closed for it.
 
+A client may ping no more than `ping_policy` allows, the keepalive
+enforcement gRPC servers apply: a PING less than `min_time` after the
+client's last one is a strike (with no request open and
+`permit_without_stream => false`, one less than two hours after it), and
+the strike past `max_strikes` closes the connection with
+`GOAWAY(ENHANCE_YOUR_CALM)` and the debug data `too_many_pings`. A PING
+right after a response's HEADERS or DATA is never a strike, so a client
+that pings as it reads is not closed for it. The default (1 s, 2
+strikes) stops a PING flood (each PING costs the server an answer) and
+no usual client meets it; gRPC's own servers enforce 5 minutes and no
+PINGs without a call, which a listener for gRPC alone can match (see
+[gRPC keepalive](grpc.md#keepalive)). The connection closes with the
+reason `too_many_pings` in `listener_conn_close`.
+
+A connection lives as long as it is used unless `connection_age` sets
+how long it may: at that age (drawn within 10% of `max` for each
+connection, so connections opened together do not close together) it
+closes gracefully, as on a drain, and the requests open then may finish
+within `grace` (`infinity` unless set), after which they are reset with
+`CANCEL`. Behind a load balancer this moves long-lived clients onto
+servers added since they connected. `listener_conn_close` carries the
+reason `connection_age`, or `connection_age_grace` when the grace ran
+out.
+
 A request whose header block (HEADERS plus its CONTINUATION frames) is
 over `max_header_block`, or whose decoded headers are over the
 advertised `SETTINGS_MAX_HEADER_LIST_SIZE` (name + value + 32 per field,
@@ -177,7 +203,8 @@ are, so a block of those can pass it, which the advisory list size
 (RFC 9113 §6.5.2) allows. The
 concurrency and header caps are tuned under `{http2, #{...}}` in the
 `protocols` list, with the keys `max_concurrent_streams`,
-`max_header_block` and `max_header_list_size`.
+`max_header_block`, `max_header_list_size`, `ping_policy` and
+`connection_age`.
 
 `active` sets how many socket reads a connection takes before it asks
 the socket for more (`once` asks after every read). On TLS each ask is a
@@ -276,7 +303,7 @@ table.
 | `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3, every protocol in `shed` mode) |
 | `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |
 | `request_timeout` | 30 s | yes | header-read timeout on a fresh connection; in `manual` body mode, also how long the body may take to read (on HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the request's read deadline, which is `keep_alive_timeout` for a connection's later requests), which `roadrunner_req:set_body_timeout/2` changes per request; at most `16#FFFFFFFF` ms, as `keep_alive_timeout` and `tls_handshake_timeout` |
-| `keep_alive_timeout` | 60 s | yes | idle timeout between requests (on HTTP/2 and HTTP/3, of the whole connection, at least 1 s; an HTTP/2 connection with a handler still at work gets a PING instead, while on HTTP/3 the client waiting on a response keeps the connection open, as RFC 9114 §5.1 expects of it) |
+| `keep_alive_timeout` | 60 s | yes | idle timeout between requests (on HTTP/2 and HTTP/3, of the whole connection, at least 1 s; on HTTP/2 counted from the end of the last request, whatever else the client sends; an HTTP/2 connection with a handler still at work gets a PING instead, while on HTTP/3 the client waiting on a response keeps the connection open, as RFC 9114 §5.1 expects of it) |
 | `max_keep_alive_requests` | 1000 | yes | requests served per connection before close |
 | `min_bytes_per_second` | 100 | yes (0 disables) | slow-loris guard on the request-read phase |
 | `rate_limit` | off | opt-in | per-peer request-rate cap (`429` + `Retry-After`) |

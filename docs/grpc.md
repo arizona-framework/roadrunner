@@ -329,8 +329,11 @@ all read already, so each one arrives in the mailbox at once.
 
 When the listener drains (`roadrunner_listener:drain/2`), new calls are
 refused and the calls running are left to finish until the drain's
-timeout. A long streaming call should end early instead, so its client
-can call again on another server: `info/2` returns `drain` for the
+timeout. On HTTP/2 a call the client started before it saw the server's
+GOAWAY is still served: the server sends a GOAWAY that refuses nothing and
+a PING first, and refuses new calls only once the client has answered.
+A long streaming call should end early instead, so its client can call
+again on another server: `info/2` returns `drain` for the
 message the call's process gets. End the call with
 `{error, unavailable, ~"server shutting down", Stream}`; gRPC clients
 treat `UNAVAILABLE` as safe to retry. A method that never waits on its
@@ -687,6 +690,62 @@ method runs, so a route left at `infinity` keeps the listener's
 `413`.
 
 See [Resource limits](resource_limits.md) for the defaults.
+
+## Keepalive
+
+gRPC servers let you bound how long a connection lives and how often a
+client may ping it. These are HTTP/2 listener settings in roadrunner,
+the same for every HTTP/2 client, gRPC or not:
+
+| gRPC (grpc-go) | roadrunner |
+|---|---|
+| `MaxConnectionIdle` | `keep_alive_timeout`: a connection with no call open closes with `GOAWAY(NO_ERROR)` this long after its last call ended (or after it opened), whatever the client sends meanwhile, PINGs included |
+| `MaxConnectionAge` | `connection_age`'s `max`, off by default |
+| `MaxConnectionAgeGrace` | `connection_age`'s `grace`, `infinity` unless set |
+| `Time` and `Timeout` | `keep_alive_timeout`: a connection with a call running and nothing heard for this long gets a PING, and closes if the client does not answer within another `keep_alive_timeout` |
+| `EnforcementPolicy.MinTime` | `ping_policy`'s `min_time` |
+| `EnforcementPolicy.PermitWithoutStream` | `ping_policy`'s `permit_without_stream` |
+| the 2 ping strikes grpc-go allows | `ping_policy`'s `max_strikes` |
+
+`keep_alive_timeout` defaults to 60 s, where gRPC servers keep an idle
+connection open for good: a channel with no call for a minute is closed,
+and the client opens a new connection for its next call. Raise it for
+clients that call rarely and mind the new connection.
+
+A client that pings more often than `ping_policy` allows is closed with
+`GOAWAY(ENHANCE_YOUR_CALM)` and `too_many_pings`, which gRPC clients take
+as a sign to ping less (grpc-go doubles its keepalive time). The default,
+1 s with 2 strikes, only stops PING floods. To enforce what gRPC servers
+do by default:
+
+```erlang
+{ok, _} = roadrunner:start_listener(grpc, #{
+    port => 50051,
+    protocols => [{http2, #{ping_policy => #{min_time => 300_000, permit_without_stream => false}}}],
+    body_buffering => manual,
+    routes => roadrunner_grpc:routes(#{services => [greeter]})
+}).
+```
+
+A client's keepalive time must then be 5 minutes or more, and it must
+not ping without a call open. A PING right after the server sent a
+response's headers or a message is never held against the client, so
+the PINGs gRPC clients send to size their flow-control windows as they
+read are fine.
+
+A gRPC client keeps its connection for as long as it can, so behind a
+load balancer it stays on the server it first reached. `connection_age`
+closes each connection after about `max` milliseconds (within a tenth of
+it either way, so connections opened together close apart), gracefully:
+the client is told to open a new connection, the calls already running
+go on, and those still running after `grace` are cancelled:
+
+```erlang
+protocols => [{http2, #{connection_age => #{max => 1_800_000, grace => 60_000}}}]
+```
+
+Only the calls the grace cuts short fail, reset with `CANCEL`; new calls
+go to the new connection.
 
 ## Telemetry
 

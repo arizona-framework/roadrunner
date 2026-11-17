@@ -175,10 +175,24 @@ queue_mode_draining_conn_exits_after_its_park_is_refused_test_() ->
             end
         end}}.
 
+%% Read until the server closes, answering its PINGs (RFC 9113 §6.7): a
+%% draining connection sends its final GOAWAY on the ACK of the PING that
+%% follows its first one (§6.8).
 read_until_closed(Sock, Timeout) ->
-    case gen_tcp:recv(Sock, 0, Timeout) of
-        {ok, _} -> read_until_closed(Sock, Timeout);
-        {error, Reason} -> Reason
+    read_until_closed(Sock, Timeout, <<>>).
+
+read_until_closed(Sock, Timeout, Buf) ->
+    case roadrunner_http2_frame:parse(Buf, 16384) of
+        {ok, {ping, 0, Opaque}, Rest} ->
+            ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
+            read_until_closed(Sock, Timeout, Rest);
+        {ok, _Frame, Rest} ->
+            read_until_closed(Sock, Timeout, Rest);
+        {more, _} ->
+            case gen_tcp:recv(Sock, 0, Timeout) of
+                {ok, Data} -> read_until_closed(Sock, Timeout, <<Buf/binary, Data/binary>>);
+                {error, Reason} -> Reason
+            end
     end.
 
 await_ping_ack(Sock) ->

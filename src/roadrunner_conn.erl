@@ -279,6 +279,14 @@ deadline in milliseconds. The shed form answers it `503` with the
     http2_max_concurrent_streams => 1..16#7FFFFFFF,
     http2_max_header_block => 1..16#7FFFFFFF,
     http2_active => once | 1..32767,
+    %% The HTTP/2 `ping_policy`, one key per setting, none of them when it
+    %% is `false` (`roadrunner_conn_loop_http2:ping_policy/1`).
+    http2_ping_min_time => 1..16#FFFFFFFF,
+    http2_ping_permit_without_stream => boolean(),
+    http2_ping_max_strikes => 0..16#7FFFFFFF,
+    %% The HTTP/2 `connection_age`, both keys or neither (`false`).
+    http2_connection_age_max => 1..16#FFFFFFFF,
+    http2_connection_age_grace => 0..16#FFFFFFFF | infinity,
     %% HTTP/3 tuning, flattened from `{http3, #{...}}` when http3 is enabled.
     http3_listeners => 1..1024,
     http3_max_header_block => 1..16#7FFFFFFF,

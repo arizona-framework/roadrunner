@@ -234,6 +234,11 @@ flow({settings, 0, Params}, #{sock := Sock, transport := T} = C) ->
     %% RFC 9113 §6.5.3: every SETTINGS frame is acknowledged.
     ok = T:send(Sock, roadrunner_http2_frame:encode({settings, 1, []})),
     lists:foldl(fun apply_setting/2, C, Params);
+flow({ping, 0, Opaque}, #{sock := Sock, transport := T} = C) ->
+    %% RFC 9113 §6.7: a PING is answered with its ACK, which a server
+    %% closing gracefully waits for (§6.8).
+    ok = T:send(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
+    C;
 flow({window_update, 0, Increment}, #{conn_window := ConnWindow} = C) ->
     C#{conn_window := ConnWindow + Increment};
 flow({window_update, StreamId, Increment}, #{windows := Windows} = C) ->
