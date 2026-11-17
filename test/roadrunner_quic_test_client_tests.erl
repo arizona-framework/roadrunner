@@ -44,7 +44,7 @@ hello_retry_request_round_trip_test() ->
     ).
 
 encrypted_extensions_round_trip_test() ->
-    Params = #{initial_max_data => 65536},
+    Params = roadrunner_quic_transport_params:new([{initial_max_data, 65536}]),
     Framed = roadrunner_quic_tls_hello:build_encrypted_extensions(#{
         alpn => ~"h3", transport_params => Params
     }),

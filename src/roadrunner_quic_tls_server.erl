@@ -487,17 +487,16 @@ check_transport_params(#{}) -> {error, missing_transport_params}.
 
 %% RFC 9000 §7.3: the client's initial_source_connection_id transport parameter
 %% MUST equal the Source Connection ID of its first Initial packet (the value
-%% the loop captured as peer_scid). The first clause binds PeerSCID twice (the
-%% function argument and the map value), so it matches ONLY when they are equal;
-%% a mismatch, a missing initial_source_connection_id, or (after
-%% check_transport_params) an absent extension all fall to the second clause as
-%% a transport_parameter_error.
+%% the loop captured as peer_scid); a mismatch or a missing
+%% initial_source_connection_id is a transport_parameter_error. The extension
+%% itself is present (check_transport_params/1 ran first).
 -spec check_initial_scid(roadrunner_quic_tls_hello:client_hello(), binary()) ->
     ok | {error, transport_parameter_error}.
-check_initial_scid(#{transport_params := #{initial_source_connection_id := PeerSCID}}, PeerSCID) ->
-    ok;
-check_initial_scid(#{}, _PeerSCID) ->
-    {error, transport_parameter_error}.
+check_initial_scid(#{transport_params := Params}, PeerSCID) ->
+    case roadrunner_quic_transport_params:initial_source_connection_id(Params) of
+        PeerSCID -> ok;
+        _ -> {error, transport_parameter_error}
+    end.
 
 %% The CertificateVerify scheme for the cert key, if the client offered it
 %% in its signature_algorithms. The scheme is fixed by the key type (v1

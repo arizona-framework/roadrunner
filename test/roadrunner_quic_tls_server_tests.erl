@@ -506,7 +506,9 @@ missing_transport_params_rejected_test() ->
 missing_initial_scid_rejected_test() ->
     ?assertEqual(
         {error, transport_parameter_error},
-        process_offering(#{transport_params => #{initial_max_data => 4096}})
+        process_offering(#{
+            transport_params => roadrunner_quic_transport_params:new([{initial_max_data, 4096}])
+        })
     ).
 
 %% RFC 9000 §7.3: the client's advertised initial_source_connection_id does not
@@ -514,7 +516,11 @@ missing_initial_scid_rejected_test() ->
 initial_scid_mismatch_rejected_test() ->
     ?assertEqual(
         {error, transport_parameter_error},
-        process_offering(#{transport_params => #{initial_source_connection_id => <<9, 9, 9, 9>>}})
+        process_offering(#{
+            transport_params => roadrunner_quic_transport_params:new([
+                {initial_source_connection_id, <<9, 9, 9, 9>>}
+            ])
+        })
     ).
 
 %% RFC 9000 §7.4 / §18.2: a transport parameter the codec rejects (here an
@@ -524,9 +530,9 @@ invalid_transport_param_rejected_test() ->
     ?assertEqual(
         {error, transport_parameter_error},
         process_offering(#{
-            transport_params => #{
-                initial_source_connection_id => ?CLIENT_SCID, max_ack_delay => 16384
-            }
+            transport_params => roadrunner_quic_transport_params:new([
+                {initial_source_connection_id, ?CLIENT_SCID}, {max_ack_delay, 16384}
+            ])
         })
     ).
 
@@ -534,10 +540,10 @@ server_only_transport_param_rejected_test() ->
     ?assertEqual(
         {error, transport_parameter_error},
         process_offering(#{
-            transport_params => #{
-                initial_source_connection_id => ?CLIENT_SCID,
-                original_destination_connection_id => <<5, 6, 7, 8>>
-            }
+            transport_params => roadrunner_quic_transport_params:new([
+                {initial_source_connection_id, ?CLIENT_SCID},
+                {original_destination_connection_id, <<5, 6, 7, 8>>}
+            ])
         })
     ).
 
@@ -557,10 +563,10 @@ server_state(PrivKey) ->
     }).
 
 server_transport_params() ->
-    #{
-        original_destination_connection_id => <<5, 6, 7, 8>>,
-        initial_source_connection_id => <<1, 2, 3, 4>>
-    }.
+    roadrunner_quic_transport_params:new([
+        {original_destination_connection_id, <<5, 6, 7, 8>>},
+        {initial_source_connection_id, <<1, 2, 3, 4>>}
+    ]).
 
 server_random() ->
     binary:copy(<<16#5A>>, 32).
@@ -610,7 +616,9 @@ client_hello_for(#{scheme := Scheme}, Opts) ->
         maps:merge(
             #{
                 sig_algs => [Scheme],
-                transport_params => #{initial_source_connection_id => ?CLIENT_SCID}
+                transport_params => roadrunner_quic_transport_params:new([
+                    {initial_source_connection_id, ?CLIENT_SCID}
+                ])
             },
             Opts
         )

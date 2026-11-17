@@ -193,12 +193,12 @@ listener_opts(Port, PoolOpts, Registry, ReusePort) ->
 -spec transport_params(non_neg_integer(), pos_integer()) ->
     roadrunner_quic_transport_params:params().
 transport_params(MaxStreamsBidi, MaxIdleTimeout) ->
-    #{
-        initial_max_data => ?DEFAULT_INITIAL_MAX_DATA,
-        initial_max_stream_data_bidi_local => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_bidi_remote => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_uni => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_streams_bidi => MaxStreamsBidi,
-        initial_max_streams_uni => ?DEFAULT_INITIAL_MAX_STREAMS_UNI,
-        max_idle_timeout => MaxIdleTimeout
-    }.
+    roadrunner_quic_transport_params:new([
+        {initial_max_data, ?DEFAULT_INITIAL_MAX_DATA},
+        {initial_max_stream_data_bidi_local, ?DEFAULT_INITIAL_MAX_STREAM_DATA},
+        {initial_max_stream_data_bidi_remote, ?DEFAULT_INITIAL_MAX_STREAM_DATA},
+        {initial_max_stream_data_uni, ?DEFAULT_INITIAL_MAX_STREAM_DATA},
+        {initial_max_streams_bidi, MaxStreamsBidi},
+        {initial_max_streams_uni, ?DEFAULT_INITIAL_MAX_STREAMS_UNI},
+        {max_idle_timeout, MaxIdleTimeout}
+    ]).

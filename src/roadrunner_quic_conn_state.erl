@@ -139,9 +139,6 @@
 
 %% RFC 9000 §17.2: the server uses a fixed-length SCID so short headers demux.
 -define(SCID_LEN, 8).
-%% RFC 9000 §18.2: the active_connection_id_limit when a side does not send
-%% one (and the smallest value it may send).
--define(DEFAULT_ACTIVE_CID_LIMIT, 2).
 %% The most connection ids the server keeps active per connection, however
 %% many the client accepts (RFC 9000 §5.1.1 lets an endpoint limit them):
 %% enough for the client to migrate and probe a path more, while every one is
@@ -442,9 +439,10 @@
     probes = 0 :: non_neg_integer(),
     %% The client's advertised transport parameters, captured from the
     %% ClientHello. The send windows (connection and per-stream) are seeded from
-    %% these so the server never sends past what the peer granted (RFC 9000 §4.1);
-    %% empty until the handshake delivers them.
-    peer_params = #{} :: roadrunner_quic_transport_params:params(),
+    %% these so the server never sends past what the peer granted (RFC 9000 §4.1).
+    %% Until the handshake delivers the peer's, an empty set that reads as the
+    %% RFC 9000 §18.2 defaults.
+    peer_params :: roadrunner_quic_transport_params:params(),
     %% Owner events and connection-id routing changes accumulated while
     %% folding a datagram's frames, drained in order at the end of
     %% handle_datagram (newest-first, reversed on drain), ahead of the sends.
@@ -581,14 +579,13 @@ new(
     %% Seed the connection receive window and the stream-count limits from the
     %% values we advertise, so what is enforced (RFC 9000 §4.1 / §4.6) is exactly
     %% what the peer was told it may use, never a hardcoded default.
-    #{
-        initial_max_data := ConnMaxData,
-        initial_max_streams_bidi := MaxStreamsBidi,
-        initial_max_streams_uni := MaxStreamsUni
-    } = TransportParams,
+    ConnMaxData = roadrunner_quic_transport_params:initial_max_data(TransportParams),
+    MaxStreamsBidi = roadrunner_quic_transport_params:initial_max_streams_bidi(TransportParams),
+    MaxStreamsUni = roadrunner_quic_transport_params:initial_max_streams_uni(TransportParams),
     %% Until the ClientHello delivers the peer's value, the idle timeout is our
     %% own advertised one (RFC 9000 §10.1).
-    IdleTimeout = negotiated_idle_timeout(TransportParams, #{}),
+    PeerParams = roadrunner_quic_transport_params:new([]),
+    IdleTimeout = negotiated_idle_timeout(TransportParams, PeerParams),
     #state{
         dcid = DCID,
         scid = SCID,
@@ -615,6 +612,7 @@ new(
         amp = initial_amp(Config),
         owner = undefined,
         info = #{alpn => Alpn, transport_params => TransportParams},
+        peer_params = PeerParams,
         max_streams_bidi = MaxStreamsBidi,
         max_streams_uni = MaxStreamsUni,
         conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ConnMaxData}),
@@ -1768,7 +1766,7 @@ on_max_stream_data(Sid, Max, #state{streams = Streams} = State) ->
 %% 9001 §5.7).
 -spec issue_cids(t()) -> t().
 issue_cids(#state{cids = Cids, peer_params = PeerParams} = State) ->
-    Limit = maps:get(active_connection_id_limit, PeerParams, ?DEFAULT_ACTIVE_CID_LIMIT),
+    Limit = roadrunner_quic_transport_params:active_connection_id_limit(PeerParams),
     issue_cids(min(Limit, ?ACTIVE_CID_LIMIT) - map_size(Cids), State).
 
 -spec issue_cids(integer(), t()) -> t().
@@ -1860,7 +1858,7 @@ add_peer_cid(
     }),
     State1 = retire_prior(Prior, Added),
     #state{peer_cids = Active, info = #{transport_params := OurParams}} = State1,
-    case maps:get(active_connection_id_limit, OurParams, ?DEFAULT_ACTIVE_CID_LIMIT) of
+    case roadrunner_quic_transport_params:active_connection_id_limit(OurParams) of
         Limit when map_size(Active) > Limit ->
             connection_fatal(application, connection_id_limit_error, State1);
         _Limit ->
@@ -2469,8 +2467,7 @@ deframe(Buffer) ->
 process_handshake(
     initial,
     {?CLIENT_HELLO, Body},
-    #state{tls = Tls, info = #{transport_params := #{initial_max_data := OurMaxData} = OurParams}} =
-        State
+    #state{tls = Tls, info = #{transport_params := OurParams}} = State
 ) ->
     case roadrunner_quic_tls_server:process_client_hello(Body, Tls) of
         {ok, #{initial := InitialFlight, handshake := HandshakeFlight}, Installs, PeerParams, Tls1} ->
@@ -2479,8 +2476,10 @@ process_handshake(
             %% to re-create conn_flow here: no 1-RTT data flows before the
             %% handshake completes.
             ConnFlow = roadrunner_quic_flow:new(#{
-                initial_max_data => OurMaxData,
-                peer_initial_max_data => maps:get(initial_max_data, PeerParams, 0)
+                initial_max_data => roadrunner_quic_transport_params:initial_max_data(OurParams),
+                peer_initial_max_data => roadrunner_quic_transport_params:initial_max_data(
+                    PeerParams
+                )
             }),
             %% Lower the idle timeout to the negotiated minimum (RFC 9000 §10.1)
             %% now that the peer's advertised value is known.
@@ -2492,7 +2491,8 @@ process_handshake(
                     peer_params = PeerParams,
                     %% The limit on the server's own unidirectional streams
                     %% (absent -> 0, RFC 9000 §18.2).
-                    peer_max_streams_uni = maps:get(initial_max_streams_uni, PeerParams, 0),
+                    peer_max_streams_uni =
+                        roadrunner_quic_transport_params:initial_max_streams_uni(PeerParams),
                     conn_flow = ConnFlow,
                     idle_timeout = IdleTimeout,
                     idle_deadline = State#state.idle_since + IdleTimeout
@@ -3045,9 +3045,9 @@ request_flow(_Sid, _Credit, Flow) ->
 -spec peer_stream_send_window(non_neg_integer(), roadrunner_quic_transport_params:params()) ->
     non_neg_integer().
 peer_stream_send_window(Sid, PeerParams) when Sid rem 4 =:= 0 ->
-    maps:get(initial_max_stream_data_bidi_local, PeerParams, 0);
+    roadrunner_quic_transport_params:initial_max_stream_data_bidi_local(PeerParams);
 peer_stream_send_window(Sid, PeerParams) when Sid rem 4 =:= 3 ->
-    maps:get(initial_max_stream_data_uni, PeerParams, 0);
+    roadrunner_quic_transport_params:initial_max_stream_data_uni(PeerParams);
 peer_stream_send_window(_Sid, _PeerParams) ->
     0.
 
@@ -3059,8 +3059,8 @@ peer_stream_send_window(_Sid, _PeerParams) ->
     roadrunner_quic_transport_params:params(), roadrunner_quic_transport_params:params()
 ) -> non_neg_integer().
 negotiated_idle_timeout(OurParams, PeerParams) ->
-    Ours = maps:get(max_idle_timeout, OurParams, 0),
-    Peer = maps:get(max_idle_timeout, PeerParams, 0),
+    Ours = roadrunner_quic_transport_params:max_idle_timeout(OurParams),
+    Peer = roadrunner_quic_transport_params:max_idle_timeout(PeerParams),
     case {Ours, Peer} of
         {0, 0} -> ?IDLE_TIMEOUT;
         {0, P} -> P;
@@ -3103,10 +3103,10 @@ grant_max_streams_bidi(
         bidi_opened = Opened,
         bidi_closed = Closed,
         max_streams_bidi = Max,
-        info = #{transport_params := #{initial_max_streams_bidi := Window}}
+        info = #{transport_params := OurParams}
     } = State
 ) ->
-    NewMax = Closed + Window,
+    NewMax = Closed + roadrunner_quic_transport_params:initial_max_streams_bidi(OurParams),
     case NewMax > Max andalso 2 * (Max - Opened) =< NewMax - Opened of
         true ->
             queue_frame(
@@ -3128,10 +3128,10 @@ grant_max_streams_bidi(State) ->
 %% receive window is moot since the server never receives there.
 -spec stream_recv_window(non_neg_integer(), roadrunner_quic_transport_params:params()) ->
     non_neg_integer().
-stream_recv_window(Sid, #{initial_max_stream_data_bidi_remote := Bidi}) when Sid rem 4 =:= 0 ->
-    Bidi;
-stream_recv_window(_Sid, #{initial_max_stream_data_uni := Uni}) ->
-    Uni.
+stream_recv_window(Sid, OurParams) when Sid rem 4 =:= 0 ->
+    roadrunner_quic_transport_params:initial_max_stream_data_bidi_remote(OurParams);
+stream_recv_window(_Sid, OurParams) ->
+    roadrunner_quic_transport_params:initial_max_stream_data_uni(OurParams).
 
 -spec put_stream(non_neg_integer(), roadrunner_quic_stream:t(), roadrunner_quic_flow:t(), t()) ->
     t().

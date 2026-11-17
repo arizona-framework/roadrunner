@@ -162,17 +162,17 @@ start_shell(Socket, Peer, FirstDatagram) ->
         cert_chain => CertChain,
         priv_key => PrivKey,
         alpn => ~"h3",
-        transport_params => #{
-            original_destination_connection_id => ClientDCID,
-            initial_source_connection_id => ServerSCID,
-            initial_max_data => 1048576,
-            initial_max_stream_data_bidi_local => 262144,
-            initial_max_stream_data_bidi_remote => 262144,
-            initial_max_stream_data_uni => 262144,
-            initial_max_streams_bidi => 100,
-            initial_max_streams_uni => 100,
-            max_idle_timeout => 30000
-        },
+        transport_params => roadrunner_quic_transport_params:new([
+            {original_destination_connection_id, ClientDCID},
+            {initial_source_connection_id, ServerSCID},
+            {initial_max_data, 1048576},
+            {initial_max_stream_data_bidi_local, 262144},
+            {initial_max_stream_data_bidi_remote, 262144},
+            {initial_max_stream_data_uni, 262144},
+            {initial_max_streams_bidi, 100},
+            {initial_max_streams_uni, 100},
+            {max_idle_timeout, 30000}
+        ]),
         server_random => crypto:strong_rand_bytes(32)
     },
     {ok, Shell} = roadrunner_quic_connection:start(Socket, Config),

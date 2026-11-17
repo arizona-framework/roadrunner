@@ -734,7 +734,7 @@ issued_up_to_client_limit_test() ->
     %% A client accepting three ids gets two spares (sequence numbers 1 and
     %% 2), each a different id with its own token.
     #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(
-        #{}, #{transport_params => #{active_connection_id_limit => 3}}
+        #{}, #{transport_params => [{active_connection_id_limit, 3}]}
     ),
     [{new_connection_id, 1, 0, CID1, Token1}, {new_connection_id, 2, 0, CID2, Token2}] =
         lists:sort(new_cids(Effects, ServerApSecret)),
@@ -745,7 +745,7 @@ issued_ids_capped_test() ->
     %% However many ids the client accepts, the server keeps at most four
     %% active (RFC 9000 §5.1.1 lets it limit them): three spares.
     #{effects2 := Effects, server_ap_secret := ServerApSecret} = connect(
-        #{}, #{transport_params => #{active_connection_id_limit => 10}}
+        #{}, #{transport_params => [{active_connection_id_limit, 10}]}
     ),
     ?assertEqual(
         [1, 2, 3],
@@ -1603,7 +1603,7 @@ path_validation_interval_takes_the_peer_max_ack_delay_test() ->
     %% keeps the current path's own probe timeout (1030 ms) below it, so a
     %% default padding would challenge again by 1100 ms.
     {State, ClientApSecret, ServerApSecret, CID1} =
-        connected_with_client_spare(#{transport_params => #{max_ack_delay => 1000}}),
+        connected_with_client_spare(#{transport_params => [{max_ack_delay, 1000}]}),
     {State1, Sent} = ?M:handle_send(self(), make_ref(), 0, ~"a", false, ?NOW, State),
     Ack = [{ack, largest_app_pn(Sent, ServerApSecret), 0, 0, [], undefined}],
     {State2, _} = ?M:handle_datagram(
@@ -2196,7 +2196,9 @@ idle_timeout_waits_three_ptos_test() ->
     %% (RFC 9000 §10.1): the timer firing at the short deadline re-arms it at
     %% the third PTO instead of closing, and the connection closes there.
     {State, _Ctx} = new_conn([], #{
-        transport_params => maps:put(max_idle_timeout, 1, transport_params())
+        transport_params => roadrunner_quic_transport_params:set(
+            max_idle_timeout, 1, transport_params()
+        )
     }),
     {State1, Effects} = ?M:handle_timeout(?NOW + 1, idle, State),
     ?assertNotEqual(closed, ?M:phase(State1)),
@@ -2226,7 +2228,7 @@ peer_max_ack_delay_pads_the_probe_timeout_test() ->
     %% The application space pads its probe timeout with the peer's
     %% advertised max_ack_delay (RFC 9002 §6.2.1), not the 25 ms default.
     Default = pto_after_samples(#{}, 0),
-    Padded = pto_after_samples(#{transport_params => #{max_ack_delay => 1000}}, 0),
+    Padded = pto_after_samples(#{transport_params => [{max_ack_delay, 1000}]}, 0),
     ?assertEqual(975, Padded - Default).
 
 peer_ack_delay_exponent_decodes_ack_delays_test() ->
@@ -2235,7 +2237,7 @@ peer_ack_delay_exponent_decodes_ack_delays_test() ->
     %% sample (192: smoothed RTT 111, variance 60, PTO 376); at exponent 20
     %% it is capped at max_ack_delay's 25 ms (175: 109 and 56, PTO 358).
     Scaled = pto_after_samples(#{}, 1000),
-    Huge = pto_after_samples(#{transport_params => #{ack_delay_exponent => 20}}, 1000),
+    Huge = pto_after_samples(#{transport_params => [{ack_delay_exponent, 20}]}, 1000),
     ?assertEqual(18, Scaled - Huge).
 
 %% The probe timeout armed after two 1-RTT RTT samples, of 100 ms and then
@@ -2334,13 +2336,13 @@ negotiated_idle_timeout_test() ->
     %% RFC 9000 §10.1: the effective idle timeout is the minimum of the two
     %% advertised values, or the only non-zero one; with neither side advertising
     %% one it falls back to the ?IDLE_TIMEOUT default.
-    ?assertEqual(?IDLE_TIMEOUT, ?M:negotiated_idle_timeout(#{}, #{})),
-    ?assertEqual(5000, ?M:negotiated_idle_timeout(#{}, #{max_idle_timeout => 5000})),
-    ?assertEqual(8000, ?M:negotiated_idle_timeout(#{max_idle_timeout => 8000}, #{})),
+    ?assertEqual(?IDLE_TIMEOUT, ?M:negotiated_idle_timeout(tp([]), tp([]))),
+    ?assertEqual(5000, ?M:negotiated_idle_timeout(tp([]), tp([{max_idle_timeout, 5000}]))),
+    ?assertEqual(8000, ?M:negotiated_idle_timeout(tp([{max_idle_timeout, 8000}]), tp([]))),
     ?assertEqual(
         5000,
         ?M:negotiated_idle_timeout(
-            #{max_idle_timeout => 8000}, #{max_idle_timeout => 5000}
+            tp([{max_idle_timeout, 8000}]), tp([{max_idle_timeout, 5000}])
         )
     ).
 
@@ -2697,7 +2699,7 @@ open_uni_allocates_server_uni_ids_test() ->
 %% (§19.14).
 open_uni_refused_past_peer_limit_test() ->
     {State, _ClientApSecret, ServerApSecret} = connect_owned(
-        #{}, #{transport_params => #{initial_max_streams_uni => 1}}
+        #{}, #{transport_params => [{initial_max_streams_uni, 1}]}
     ),
     {State1, _} = ?M:handle_call(self(), make_ref(), open_uni, ?NOW, State),
     Ref = make_ref(),
@@ -2712,7 +2714,7 @@ open_uni_refused_past_peer_limit_test() ->
 %% 0, RFC 9000 §18.2), so even the first open is refused.
 open_uni_refused_without_peer_param_test() ->
     {State, _ClientApSecret, _ServerApSecret} = connect_owned(
-        #{}, #{transport_params => #{initial_max_streams_uni => 0}}
+        #{}, #{transport_params => [{initial_max_streams_uni, 0}]}
     ),
     Ref = make_ref(),
     {_State1, Effects} = ?M:handle_call(self(), Ref, open_uni, ?NOW, State),
@@ -2723,7 +2725,7 @@ open_uni_refused_without_peer_param_test() ->
 %% raised limit still holds.
 max_streams_uni_raises_server_limit_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(
-        #{}, #{transport_params => #{initial_max_streams_uni => 0}}
+        #{}, #{transport_params => [{initial_max_streams_uni, 0}]}
     ),
     Frames = [{max_streams, uni, 2}, {max_streams, uni, 1}],
     {State1, _} = ?M:handle_datagram(?NOW, ?PEER, app_datagram(Frames, 0, ClientApSecret), State),
@@ -2741,7 +2743,7 @@ max_streams_uni_raises_server_limit_test() ->
 %% bidirectional streams (RFC 9114 §6.1), and it does not touch the uni limit.
 max_streams_bidi_ignored_test() ->
     {State, ClientApSecret, _ServerApSecret} = connect_owned(
-        #{}, #{transport_params => #{initial_max_streams_uni => 0}}
+        #{}, #{transport_params => [{initial_max_streams_uni, 0}]}
     ),
     Datagram = app_datagram([{max_streams, bidi, 10}], 0, ClientApSecret),
     {State1, _} = ?M:handle_datagram(?NOW, ?PEER, Datagram, State),
@@ -4541,15 +4543,18 @@ is_ack({ack, _Largest, _Delay, _First, _Ranges, _Ecn}) -> true;
 is_ack(_Frame) -> false.
 
 transport_params() ->
-    #{
-        original_destination_connection_id => ?DCID,
-        initial_source_connection_id => ?SCID,
-        initial_max_data => ?CONN_RECV_WINDOW,
-        initial_max_stream_data_bidi_remote => ?STREAM_RECV_WINDOW,
-        initial_max_stream_data_uni => ?STREAM_RECV_WINDOW,
-        initial_max_streams_bidi => ?MAX_STREAMS_BIDI,
-        initial_max_streams_uni => ?MAX_STREAMS_UNI
-    }.
+    tp([
+        {original_destination_connection_id, ?DCID},
+        {initial_source_connection_id, ?SCID},
+        {initial_max_data, ?CONN_RECV_WINDOW},
+        {initial_max_stream_data_bidi_remote, ?STREAM_RECV_WINDOW},
+        {initial_max_stream_data_uni, ?STREAM_RECV_WINDOW},
+        {initial_max_streams_bidi, ?MAX_STREAMS_BIDI},
+        {initial_max_streams_uni, ?MAX_STREAMS_UNI}
+    ]).
+
+tp(Params) ->
+    roadrunner_quic_transport_params:new(Params).
 
 %% The connected payload conn_state caches at new/1 (alpn + advertised params).
 expected_info() ->

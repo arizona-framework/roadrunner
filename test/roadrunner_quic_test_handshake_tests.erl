@@ -21,7 +21,9 @@ full_handshake_round_trip_test() ->
     ClientSCID = <<1, 2, 3, 4>>,
     %% Server transport params the production decoder accepts as peer params
     %% (no server-only parameters, which the server-side decoder rejects).
-    ServerParams = #{initial_source_connection_id => <<9, 9, 9, 9>>, initial_max_data => 65536},
+    ServerParams = roadrunner_quic_transport_params:new([
+        {initial_source_connection_id, <<9, 9, 9, 9>>}, {initial_max_data, 65536}
+    ]),
     ServerState = ?SERVER:new(#{
         cert_chain => [~"leaf-der"],
         priv_key => PrivKey,
@@ -71,7 +73,9 @@ rejects_bad_certificate_verify_test() ->
         cert_chain => [~"leaf-der"],
         priv_key => PrivKey,
         alpn => ~"h3",
-        transport_params => #{initial_source_connection_id => <<9, 9, 9, 9>>},
+        transport_params => roadrunner_quic_transport_params:new([
+            {initial_source_connection_id, <<9, 9, 9, 9>>}
+        ]),
         server_random => crypto:strong_rand_bytes(32),
         peer_scid => ClientSCID
     }),

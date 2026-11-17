@@ -596,13 +596,20 @@ conn_config(ClientDCID, ClientSCID, ServerSCID, Peer, #listener{
         cert_chain => CertChain,
         priv_key => PrivKey,
         alpn => Alpn,
-        transport_params => TransportParams#{
-            original_destination_connection_id => ClientDCID,
-            initial_source_connection_id => ServerSCID,
-            %% The handshake id's token (RFC 9000 §10.3, §18.2); the ids
-            %% issued later carry theirs in NEW_CONNECTION_ID.
-            stateless_reset_token => roadrunner_quic_cid_registry:reset_token(ResetKey, ServerSCID)
-        },
+        transport_params => lists:foldl(
+            fun({Key, Value}, Params) ->
+                roadrunner_quic_transport_params:set(Key, Value, Params)
+            end,
+            TransportParams,
+            [
+                {original_destination_connection_id, ClientDCID},
+                {initial_source_connection_id, ServerSCID},
+                %% The handshake id's token (RFC 9000 §10.3, §18.2); the ids
+                %% issued later carry theirs in NEW_CONNECTION_ID.
+                {stateless_reset_token,
+                    roadrunner_quic_cid_registry:reset_token(ResetKey, ServerSCID)}
+            ]
+        ),
         server_random => crypto:strong_rand_bytes(32),
         stream_credit => StreamCredit
     }.

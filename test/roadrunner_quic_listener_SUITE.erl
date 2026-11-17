@@ -569,15 +569,15 @@ listener_opts(Port, Handler) ->
         cert_chain => CertChain,
         priv_key => PrivKey,
         alpn => ~"h3",
-        transport_params => #{
-            initial_max_data => 1048576,
-            initial_max_stream_data_bidi_local => 262144,
-            initial_max_stream_data_bidi_remote => 262144,
-            initial_max_stream_data_uni => 262144,
-            initial_max_streams_bidi => 100,
-            initial_max_streams_uni => 100,
-            max_idle_timeout => 30000
-        },
+        transport_params => roadrunner_quic_transport_params:new([
+            {initial_max_data, 1048576},
+            {initial_max_stream_data_bidi_local, 262144},
+            {initial_max_stream_data_bidi_remote, 262144},
+            {initial_max_stream_data_uni, 262144},
+            {initial_max_streams_bidi, 100},
+            {initial_max_streams_uni, 100},
+            {max_idle_timeout, 30000}
+        ]),
         connection_handler => Handler
     }.
 

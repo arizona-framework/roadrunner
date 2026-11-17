@@ -134,7 +134,9 @@ hello_retry_request_echoes_session_id_test() ->
 %% =============================================================================
 
 encrypted_extensions_build_test() ->
-    Params = #{initial_max_data => 1048576, initial_max_streams_bidi => 16},
+    Params = roadrunner_quic_transport_params:new([
+        {initial_max_data, 1048576}, {initial_max_streams_bidi, 16}
+    ]),
     EE = iolist_to_binary(
         ?M:build_encrypted_extensions(#{alpn => ~"h3", transport_params => Params})
     ),
@@ -158,7 +160,11 @@ encrypted_extensions_omits_absent_test() ->
 encrypted_extensions_omits_empty_test() ->
     %% A present-but-empty protocol or params map is treated as absent
     %% (a zero-length ALPN ProtocolName would be invalid per RFC 7301).
-    EE = iolist_to_binary(?M:build_encrypted_extensions(#{alpn => <<>>, transport_params => #{}})),
+    EE = iolist_to_binary(
+        ?M:build_encrypted_extensions(#{
+            alpn => <<>>, transport_params => roadrunner_quic_transport_params:new([])
+        })
+    ),
     {ok, {8, Body}, <<>>} = ?FRAME:decode(EE),
     ?assertEqual(<<0:16>>, Body).
 
@@ -167,7 +173,7 @@ encrypted_extensions_omits_empty_test() ->
 %% =============================================================================
 
 parse_extracts_alpn_and_transport_params_test() ->
-    Params = #{initial_max_data => 4096},
+    Params = roadrunner_quic_transport_params:new([{initial_max_data, 4096}]),
     TPData = iolist_to_binary(roadrunner_quic_transport_params:encode(Params)),
     Exts = [
         ext(16#0010, <<3:16, 2:8, "h3">>),

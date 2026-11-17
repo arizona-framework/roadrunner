@@ -396,11 +396,11 @@ init(Parent, Ref, Host, Port, Opts) ->
                 signature_algorithms => ?SIG_SCHEMES,
                 key_shares => [{group_codepoint(Curve), EphPub}],
                 client_scid => Scid,
-                transport_params => #{
-                    initial_max_stream_data_bidi_local => StreamWindow,
-                    initial_max_stream_data_uni => StreamWindow,
-                    initial_max_streams_uni => maps:get(max_streams_uni, Opts, 3)
-                }
+                transport_params => [
+                    {initial_max_stream_data_bidi_local, StreamWindow},
+                    {initial_max_stream_data_uni, StreamWindow},
+                    {initial_max_streams_uni, maps:get(max_streams_uni, Opts, 3)}
+                ]
             },
             maps:with([cipher_suites], Opts)
         )

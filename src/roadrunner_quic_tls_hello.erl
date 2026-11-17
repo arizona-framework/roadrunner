@@ -366,13 +366,16 @@ alpn_extension(#{}) ->
     [].
 
 %% The EncryptedExtensions quic_transport_parameters extension (RFC 9001
-%% §8.2), or [] when no parameters were given (an empty map is absent).
+%% §8.2), or [] when no parameters were given (an empty set is absent).
 -spec transport_params_extension(#{
     transport_params => roadrunner_quic_transport_params:params(), _ => _
 }) ->
     iolist().
-transport_params_extension(#{transport_params := Params}) when map_size(Params) > 0 ->
-    encode_extension(?EXT_QUIC_TRANSPORT_PARAMS, roadrunner_quic_transport_params:encode(Params));
+transport_params_extension(#{transport_params := Params}) ->
+    case roadrunner_quic_transport_params:encode(Params) of
+        [] -> [];
+        Encoded -> encode_extension(?EXT_QUIC_TRANSPORT_PARAMS, Encoded)
+    end;
 transport_params_extension(#{}) ->
     [].
 

@@ -84,11 +84,11 @@ are both the CRYPTO-frame payload and the first transcript element.
     Scheme :: non_neg_integer(), ClientPub :: binary(), ClientSCID :: binary() | none
 ) -> binary().
 client_hello_framed(Scheme, ClientPub, ClientSCID) ->
-    client_hello_framed(Scheme, ClientPub, ClientSCID, #{}).
+    client_hello_framed(Scheme, ClientPub, ClientSCID, []).
 
 -doc """
-As `client_hello_framed/3` but with `Overrides` merged over the default
-transport parameters, so a test can pin a small per-stream send window
+As `client_hello_framed/3` but with the `{Key, Value}` `Overrides` set over
+the default transport parameters, so a test can pin a small per-stream send window
 (`initial_max_stream_data_*`) to exercise stream-level backpressure, or a
 small `initial_max_streams_uni` to limit the server's own streams.
 """.
@@ -96,7 +96,12 @@ small `initial_max_streams_uni` to limit the server's own streams.
     Scheme :: non_neg_integer(),
     ClientPub :: binary(),
     ClientSCID :: binary() | none,
-    Overrides :: roadrunner_quic_transport_params:params()
+    Overrides :: [
+        {
+            roadrunner_quic_transport_params:param_key(),
+            roadrunner_quic_transport_params:param_value()
+        }
+    ]
 ) -> binary().
 client_hello_framed(Scheme, ClientPub, ClientSCID, Overrides) ->
     client_hello_framed(#{
@@ -124,7 +129,12 @@ steer the server's version, cipher suite and group negotiation. `none` for
     client_scid := binary() | none,
     groups => [non_neg_integer()] | none,
     signature_algorithms => [non_neg_integer()],
-    transport_params => roadrunner_quic_transport_params:params(),
+    transport_params => [
+        {
+            roadrunner_quic_transport_params:param_key(),
+            roadrunner_quic_transport_params:param_value()
+        }
+    ],
     cipher_suites => [non_neg_integer()],
     versions => [non_neg_integer()]
 }) -> binary().
@@ -136,7 +146,7 @@ client_hello_framed(#{scheme := Scheme, key_shares := KeyShares, client_scid := 
         signature_algorithms_ext(maps:get(signature_algorithms, Opts, [Scheme])),
         alpn_ext(~"h3"),
         key_share_ext(KeyShares),
-        transport_params_ext(ClientSCID, maps:get(transport_params, Opts, #{}))
+        transport_params_ext(ClientSCID, maps:get(transport_params, Opts, []))
     ]),
     CipherSuites = <<<<C:16>> || C <- maps:get(cipher_suites, Opts, [?CIPHER_AES_128_GCM_SHA256])>>,
     Body =
@@ -183,15 +193,17 @@ key_share_ext(KeyShares) ->
 transport_params_ext(none, _Overrides) ->
     <<>>;
 transport_params_ext(ClientSCID, Overrides) ->
-    Defaults = #{
-        initial_source_connection_id => ClientSCID,
-        initial_max_data => 800000,
-        initial_max_stream_data_bidi_local => 800000,
-        initial_max_stream_data_uni => 800000,
-        initial_max_streams_uni => 3
-    },
+    Defaults = [
+        {initial_source_connection_id, ClientSCID},
+        {initial_max_data, 800000},
+        {initial_max_stream_data_bidi_local, 800000},
+        {initial_max_stream_data_uni, 800000},
+        {initial_max_streams_uni, 3}
+    ],
     Body = iolist_to_binary(
-        roadrunner_quic_transport_params:encode(maps:merge(Defaults, Overrides))
+        roadrunner_quic_transport_params:encode(
+            roadrunner_quic_transport_params:new(Defaults ++ Overrides)
+        )
     ),
     extension(?EXT_QUIC_TRANSPORT_PARAMS, Body).
 
