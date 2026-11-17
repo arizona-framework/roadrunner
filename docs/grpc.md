@@ -329,8 +329,11 @@ all read already, so each one arrives in the mailbox at once.
 
 When the listener drains (`roadrunner_listener:drain/2`), new calls are
 refused and the calls running are left to finish until the drain's
-timeout. A long streaming call should end early instead, so its client
-can call again on another server: `info/2` returns `drain` for the
+timeout. On HTTP/2 a call the client started before it saw the server's
+GOAWAY is still served: the server sends a GOAWAY that refuses nothing and
+a PING first, and refuses new calls only once the client has answered.
+A long streaming call should end early instead, so its client can call
+again on another server: `info/2` returns `drain` for the
 message the call's process gets. End the call with
 `{error, unavailable, ~"server shutting down", Stream}`; gRPC clients
 treat `UNAVAILABLE` as safe to retry. A method that never waits on its

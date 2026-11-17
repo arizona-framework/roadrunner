@@ -105,6 +105,12 @@
 %% Opaque data of the PING a conn still serving sends when its idle timeout
 %% passes with nothing heard (`recv_idle_expired/1`).
 -define(LIVENESS_PING, ~"rr-alive").
+%% Opaque data of the PING that follows a graceful close's first GOAWAY
+%% (`announce_goaway/2`): its ACK says the client has seen that GOAWAY.
+-define(GOAWAY_PING, ~"rr-drain").
+%% The largest stream id (RFC 9113 §5.1.1), which the first GOAWAY of a
+%% graceful close names so that no stream the client opened is refused.
+-define(MAX_STREAM_ID, 16#7FFFFFFF).
 %% How many of the streams it reset a conn remembers, to ignore what the
 %% peer still sends on them (`remember_reset/2`).
 -define(RESET_MEMORY, 128).
@@ -442,12 +448,21 @@
     heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor(),
     %% The `Deadline` of the first `{roadrunner_drain, Deadline}`
     %% message, `undefined` until one arrives. In drain mode we've
-    %% already sent GOAWAY(NO_ERROR) and passed the message on to every
-    %% stream worker, refuse fresh streams with
-    %% RST_STREAM(REFUSED_STREAM), hand the same message to each worker
-    %% started from then on, and exit as soon as the streams map empties.
-    drain_deadline = undefined :: integer() | undefined
+    %% passed the message on to every stream worker and hand the same
+    %% message to each worker started from then on.
+    drain_deadline = undefined :: integer() | undefined,
+    %% Where the connection is in a graceful close (RFC 9113 §6.8):
+    %% `open` until one starts; `{announced, TRef, Reason}` once a
+    %% GOAWAY naming the largest stream id and a PING are out, while new
+    %% streams are still served, until the PING's ACK (or `TRef`, an
+    %% idle timeout later) says the client has seen it; `{final, Reason}`
+    %% once the GOAWAY naming the last stream served is out: new streams
+    %% are refused with RST_STREAM(REFUSED_STREAM) and the conn exits
+    %% with `Reason` as soon as the streams map empties.
+    goaway = open :: open | {announced, reference(), close_reason()} | {final, close_reason()}
 }).
+
+-type close_reason() :: roadrunner_event_handler:close_reason().
 
 -doc """
 Top-level entry from the HTTP/1.1 dispatch fork. Owns the socket
@@ -672,12 +687,12 @@ handshake_recv(
 %% =============================================================================
 
 -spec frame_loop(#loop{}) -> no_return().
-frame_loop(#loop{drain_deadline = Deadline, streams = Streams} = State) when
-    is_integer(Deadline), map_size(Streams) =:= 0
+frame_loop(#loop{goaway = {final, Reason}, streams = Streams} = State) when
+    map_size(Streams) =:= 0
 ->
     %% Drain done — the last in-flight stream finished or peer
     %% RST'd it, nothing more to do.
-    exit_clean(State, drained);
+    exit_clean(State, Reason);
 frame_loop(#loop{buffer = Buf} = State) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
         {ok, Frame, Rest} ->
@@ -749,7 +764,9 @@ recv_more(
             %% a draining conn was waiting on.
             recv_more(maybe_exit_when_drained(handle_slot(State, StreamId, Outcome)));
         {roadrunner_drain, Deadline} ->
-            recv_more(maybe_exit_when_drained(start_drain(State, Deadline)))
+            recv_more(start_drain(State, Deadline));
+        {timeout, TRef, {?MODULE, Timer}} ->
+            recv_more(handle_timer(State, TRef, Timer))
     after recv_timeout(State) ->
         recv_idle_expired(State)
     end.
@@ -861,8 +878,9 @@ recv_more_hib(State, TRef) ->
             recv_more(State)
     end.
 
-%% Begin a graceful drain: emit GOAWAY(NO_ERROR) once, refuse new
-%% streams henceforth. In-flight workers continue to completion, and
+%% Begin a graceful drain: start the graceful close (`announce_goaway/2`)
+%% unless one is under way, and refuse new streams once it is done.
+%% In-flight workers continue to completion, and
 %% each gets the same `{roadrunner_drain, Deadline}` the conn did: the
 %% handler runs in the worker, not here, so this is how a `{loop, ...}`
 %% response (an SSE stream, say) learns of the drain and can wind down,
@@ -875,7 +893,6 @@ recv_more_hib(State, TRef) ->
 start_drain(#loop{drain_deadline = Deadline} = State, _Deadline) when is_integer(Deadline) ->
     State;
 start_drain(#loop{streams = Streams} = State, Deadline) ->
-    _ = send_goaway(State, no_error),
     ok = maps:foreach(
         fun
             (_StreamId, #{worker_pid := Pid, worker_ref := MonRef}) when is_reference(MonRef) ->
@@ -886,7 +903,41 @@ start_drain(#loop{streams = Streams} = State, Deadline) ->
         end,
         Streams
     ),
-    State#loop{drain_deadline = Deadline}.
+    announce_goaway(State#loop{drain_deadline = Deadline}, drained).
+
+%% The first step of a graceful close (RFC 9113 §6.8): a GOAWAY(NO_ERROR)
+%% naming the largest stream id, so a request the client sends before it
+%% sees the GOAWAY is still served rather than refused, then a PING. Its
+%% ACK comes after the client has read the GOAWAY, so every stream it
+%% opened before then has reached us by then: `final_goaway/2` names
+%% the last of them. A client that never answers gets the final GOAWAY
+%% an idle timeout later. A close already under way is left as it is.
+-spec announce_goaway(#loop{}, close_reason()) -> #loop{}.
+announce_goaway(#loop{goaway = open, idle_timeout = Timeout} = State, Reason) ->
+    _ = send(State, [
+        ?GOAWAY(?MAX_STREAM_ID, no_error),
+        roadrunner_http2_frame:encode({ping, 0, ?GOAWAY_PING})
+    ]),
+    TRef = erlang:start_timer(Timeout, self(), {?MODULE, goaway_ping}),
+    State#loop{goaway = {announced, TRef, Reason}};
+announce_goaway(State, _Reason) ->
+    State.
+
+%% The second step of a graceful close: the GOAWAY(NO_ERROR) naming the
+%% last stream this conn opened. Every stream up to it is served to its
+%% end, and every later one refused.
+-spec final_goaway(#loop{}, close_reason()) -> #loop{}.
+final_goaway(State, Reason) ->
+    _ = send_goaway(State, no_error),
+    maybe_exit_when_drained(State#loop{goaway = {final, Reason}}).
+
+%% A timer this conn started went off. One no longer wanted (its step
+%% already happened another way) is ignored.
+-spec handle_timer(#loop{}, reference(), goaway_ping) -> #loop{}.
+handle_timer(#loop{goaway = {announced, TRef, Reason}} = State, TRef, goaway_ping) ->
+    final_goaway(State, Reason);
+handle_timer(State, _TRef, _Timer) ->
+    State.
 
 %% Spawn the worker for `StreamId`. A worker started once the drain has
 %% begun (a stream below the GOAWAY whose body was still arriving, or a
@@ -926,10 +977,10 @@ start_worker(
 %% `recv_more/1` is dead — typed as `#loop{}` rather than
 %% `no_return()` so the type-checker sees the live path.
 -spec maybe_exit_when_drained(#loop{}) -> #loop{}.
-maybe_exit_when_drained(#loop{drain_deadline = Deadline, streams = Streams} = State) when
-    is_integer(Deadline), map_size(Streams) =:= 0
+maybe_exit_when_drained(#loop{goaway = {final, Reason}, streams = Streams} = State) when
+    map_size(Streams) =:= 0
 ->
-    exit_clean(State, drained);
+    exit_clean(State, Reason);
 maybe_exit_when_drained(State) ->
     State.
 
@@ -975,6 +1026,9 @@ handle_frame({settings, 0, Params}, State) ->
     end;
 handle_frame({ping, 1, ?LIVENESS_PING}, State) ->
     frame_loop(State#loop{liveness_ping = false});
+handle_frame({ping, 1, ?GOAWAY_PING}, #loop{goaway = {announced, TRef, Reason}} = State) ->
+    _ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+    frame_loop(final_goaway(State, Reason));
 handle_frame({ping, 1, _Data}, State) ->
     frame_loop(State);
 handle_frame({ping, 0, Opaque}, State) ->
@@ -1156,12 +1210,10 @@ on_headers(StreamId, Flags, #{stream_dependency := StreamId}, Fragment, State) -
     %% RFC 9113 §5.3.1: a stream cannot depend on itself —
     %% stream-error PROTOCOL_ERROR.
     refuse_new_stream(StreamId, Flags, Fragment, protocol_error, State);
-on_headers(StreamId, Flags, _Priority, Fragment, #loop{drain_deadline = Deadline} = State) when
-    is_integer(Deadline)
-->
-    %% In drain mode — refuse all new streams. The peer already
-    %% saw GOAWAY(NO_ERROR); it knows new requests on this conn
-    %% won't be served.
+on_headers(StreamId, Flags, _Priority, Fragment, #loop{goaway = {final, _}} = State) ->
+    %% Past the final GOAWAY(NO_ERROR) of a graceful close: refuse all
+    %% new streams. The peer already saw it; it knows new requests on
+    %% this conn won't be served, and may retry them elsewhere.
     refuse_new_stream(StreamId, Flags, Fragment, refused_stream, State);
 on_headers(
     StreamId,

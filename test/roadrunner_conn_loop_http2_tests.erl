@@ -164,6 +164,9 @@ all_test_() ->
         fun priority_self_dependency_rst_stream/0,
         fun refused_stream_keeps_hpack_in_sync/0,
         fun drain_refused_stream_keeps_hpack_in_sync/0,
+        fun drain_serves_a_stream_opened_before_the_ping_ack/0,
+        fun drain_without_a_ping_ack_ends_an_idle_timeout_later/0,
+        fun stale_goaway_timer_is_ignored/0,
         fun self_dependent_headers_across_continuation_keep_hpack_in_sync/0,
         fun priority_self_dependency_resets_a_live_stream/0,
         fun self_dependent_trailers_reset_the_stream/0,
@@ -3638,9 +3641,10 @@ drain_with_no_streams_exits_immediately() ->
     serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
     _ = expect_send(),
     ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
-    Goaway = expect_send(),
-    %% Frame type 7 = GOAWAY, error code 0 = NO_ERROR.
-    ?assertMatch(<<0, 0, 8, 7, 0, _/binary>>, Goaway),
+    ?assertMatch([{other, 7, 0, false}, {other, 6, 0, false}], ack_goaway_ping(ConnPid)),
+    ?assertMatch(
+        {ok, {goaway, 0, no_error, _}, <<>>}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
     expect_close(),
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
@@ -3698,8 +3702,10 @@ drain_refuses_new_streams() ->
     %% Drain — server emits GOAWAY(NO_ERROR) but stays alive
     %% because stream 1 is still in-flight.
     Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
-    Goaway = expect_send(),
-    ?assertMatch(<<0, 0, 8, 7, 0, _/binary>>, Goaway),
+    _ = ack_goaway_ping(Pid),
+    ?assertMatch(
+        {ok, {goaway, 1, no_error, _}, <<>>}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
     %% Now HEADERS for a new stream — refused.
     H3 = iolist_to_binary(
         roadrunner_http2_frame:encode({headers, 3, 16#04 bor 16#01, undefined, HpackBin})
@@ -3773,8 +3779,8 @@ drain_with_in_flight_stream_waits() ->
     _ = drain_send(50),
     _ = drain_send(50),
     Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
-    %% Conn alive while drain pending — eventually emits GOAWAY,
-    %% finishes the stream, then exits.
+    _ = ack_goaway_ping(Pid),
+    %% Conn alive while drain pending: finishes the stream, then exits.
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 1000 -> error(drain_did_not_complete)
@@ -3888,8 +3894,10 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     ),
     serve_recv(Pid, H),
     Pid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
-    Goaway = expect_send(),
-    ?assertMatch(<<0, 0, 8, 7, 0, _/binary>>, Goaway),
+    _ = ack_goaway_ping(Pid),
+    ?assertMatch(
+        {ok, {goaway, 1, no_error, _}, <<>>}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
     Rst = iolist_to_binary(roadrunner_http2_frame:encode({rst_stream, 1, cancel})),
     serve_recv(Pid, Rst),
     expect_close(),
@@ -3912,7 +3920,14 @@ drain_reaches_loop_handler() ->
         [{headers, 1, false}, {data, 1, false, ~"started"}], collect_response_frames()
     ),
     ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
-    ?assertMatch([{other, 7, 0, false}, {data, 1, true, ~""}], collect_response_frames()),
+    ?assertMatch(
+        [{other, 7, 0, false}, {other, 6, 0, false}, {data, 1, true, ~""}],
+        collect_response_frames()
+    ),
+    %% The stream is done, but the conn waits for the client to have seen
+    %% the first GOAWAY before it names stream 1 the last and exits.
+    serve_recv(ConnPid, roadrunner_http2_frame:encode({ping, 1, ~"rr-drain"})),
+    ?assertMatch([{other, 7, 0, false}], collect_response_frames()),
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 1000 -> error(drain_did_not_complete)
@@ -3941,6 +3956,7 @@ drain_reaches_loop_worker_once() ->
         [F || {data, _, _, _} = F <- Frames]
     ),
     ?assertEqual(1, length([G || {other, 7, _, _} = G <- Frames])),
+    serve_recv(Pid, roadrunner_http2_frame:encode({ping, 1, ~"rr-drain"})),
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 1000 -> error(drain_did_not_complete)
@@ -3959,6 +3975,7 @@ drain_reaches_workers_started_after_it() ->
     serve_recv(ConnPid, open_get_headers(1, ~"/loop")),
     serve_recv(ConnPid, open_get_headers(3, ~"/")),
     ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    _ = ack_goaway_ping(ConnPid),
     ?assertMatch(
         {ok, {goaway, 3, no_error, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
     ),
@@ -3991,6 +4008,22 @@ drain_reaches_workers_started_after_it() ->
 
 %% Read the conn's sends up to and including its PING ACK, returning the
 %% frames, so the test knows the conn handled what it was sent before.
+%% Answer the PING that follows a graceful close's first GOAWAY (RFC 9113
+%% §6.8), once the conn has sent it, and return what the conn sent up to
+%% it, as `parse_frames/1` tags.
+ack_goaway_ping(ConnPid) ->
+    ack_goaway_ping(ConnPid, <<>>).
+
+ack_goaway_ping(ConnPid, Acc0) ->
+    Acc = <<Acc0/binary, (expect_send())/binary>>,
+    case binary:match(Acc, ~"rr-drain") of
+        nomatch ->
+            ack_goaway_ping(ConnPid, Acc);
+        _ ->
+            serve_recv(ConnPid, roadrunner_http2_frame:encode({ping, 1, ~"rr-drain"})),
+            parse_frames(Acc)
+    end.
+
 frames_until_ping_ack(Acc) ->
     Frames = Acc ++ parse_frames(expect_send()),
     case [P || {other, 6, 0, true} = P <- Frames] of
@@ -4459,6 +4492,79 @@ refused_stream_keeps_hpack_in_sync() ->
     ok = expect_response_headers(5, <<>>),
     cleanup(Pid, Ref).
 
+drain_serves_a_stream_opened_before_the_ping_ack() ->
+    %% RFC 9113 §6.8: the first GOAWAY names the largest stream id, so a
+    %% request the client sent before it saw that GOAWAY is served, not
+    %% refused; the final GOAWAY, sent on the PING's ACK, names it.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    ?assertMatch(
+        {ok, {goaway, 16#7FFFFFFF, no_error, _}, _},
+        roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    serve_recv(ConnPid, complete_get_headers(1, ~"/")),
+    ?assertMatch([{headers, 1, false}, {data, 1, true, _}], collect_response_frames()),
+    serve_recv(ConnPid, roadrunner_http2_frame:encode({ping, 1, ~"rr-drain"})),
+    ?assertMatch(
+        {ok, {goaway, 1, no_error, _}, <<>>}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    expect_close(),
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 1000 -> error(drain_did_not_complete)
+    end.
+
+drain_without_a_ping_ack_ends_an_idle_timeout_later() ->
+    %% A client that never answers the PING gets the final GOAWAY an idle
+    %% timeout after the first. A loop handler keeps the conn serving, so
+    %% the quiet wire only brings a liveness PING, which would close it a
+    %% whole idle timeout later.
+    persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 200),
+    try
+        {Pid, Ref, ConnPid} = post_handshake_conn(#{dispatch => h2_test_dispatch()}),
+        serve_recv(ConnPid, complete_get_headers(1, ~"/loop")),
+        _ = wait_for_register(roadrunner_h2_loop_test, 1000),
+        ?assertMatch([{headers, 1, false}], parse_frames(expect_send())),
+        ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+        Frames = frames_until_goaways(2, []),
+        %% The first GOAWAY and its PING, the liveness PING the quiet wire
+        %% may bring, then the final GOAWAY, naming stream 1.
+        [{goaway, 16#7FFFFFFF, no_error, _}, {goaway, 1, no_error, _}] =
+            [G || {goaway, _, _, _} = G <- Frames],
+        roadrunner_h2_loop_test ! stop,
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> ok
+        after 1000 -> error(drain_did_not_complete)
+        end
+    after
+        persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
+    end.
+
+stale_goaway_timer_is_ignored() ->
+    %% A timer the conn no longer waits on (one cancelled as it went off)
+    %% changes nothing: the next PING is answered as usual.
+    {Pid, Ref, ConnPid} = post_handshake_conn(),
+    ConnPid ! {timeout, make_ref(), {roadrunner_conn_loop_http2, goaway_ping}},
+    serve_recv(ConnPid, roadrunner_http2_frame:encode({ping, 0, <<7:64>>})),
+    ?assertMatch(
+        {ok, {ping, 1, <<7:64>>}, <<>>}, roadrunner_http2_frame:parse(expect_send(), 16384)
+    ),
+    cleanup(Pid, Ref).
+
+%% The frames the conn sends until it has sent `N` GOAWAYs, decoded.
+frames_until_goaways(N, Acc) ->
+    Frames = Acc ++ decode_frames(expect_send()),
+    case length([G || {goaway, _, _, _} = G <- Frames]) of
+        Count when Count >= N -> Frames;
+        _ -> frames_until_goaways(N, Frames)
+    end.
+
+decode_frames(<<>>) ->
+    [];
+decode_frames(Bin) ->
+    {ok, Frame, Rest} = roadrunner_http2_frame:parse(Bin, 16384),
+    [Frame | decode_frames(Rest)].
+
 drain_refused_stream_keeps_hpack_in_sync() ->
     %% RFC 9113 §6.8: HEADERS after our GOAWAY are refused but still
     %% decoded. Stream 1's trailers reference the two entries the refused
@@ -4470,6 +4576,7 @@ drain_refused_stream_keeps_hpack_in_sync() ->
     {H1, Enc1} = indexed_get_headers(1, [], 16#04, Enc0),
     serve_recv(ConnPid, H1),
     ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    _ = ack_goaway_ping(ConnPid),
     ?assertMatch(
         {ok, {goaway, 1, no_error, _}, _}, roadrunner_http2_frame:parse(expect_send(), 16384)
     ),

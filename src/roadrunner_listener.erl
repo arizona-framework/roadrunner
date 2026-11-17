@@ -1053,7 +1053,12 @@ a handler that traps exits (a WebSocket session does, if its handler
 turns `trap_exit` on) cannot turn into a message and outlive.
 
 An idle HTTP/1.1 conn closes, and an HTTP/2 or HTTP/3 conn sends GOAWAY,
-refuses new requests and closes once its in-flight requests finish. The
+refuses new requests and closes once its in-flight requests finish. On
+HTTP/2 the close takes two steps (RFC 9113 §6.8): a first GOAWAY that
+refuses nothing and a PING, then, once the client answers the PING (or
+after `keep_alive_timeout` if it never does), the GOAWAY that names the
+last request served, so a request the client sent before it saw the
+first GOAWAY is served rather than refused. The
 handler of every in-flight request gets the same message on every
 protocol: on HTTP/1.1 it runs in the conn process itself, and an HTTP/2
 or HTTP/3 conn passes the message on to each of its stream workers, so

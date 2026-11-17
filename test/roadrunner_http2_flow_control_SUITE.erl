@@ -450,6 +450,10 @@ buffered_body_outlives_worker_and_drains(_Config) ->
     %% remaining 34465 bytes belong to the conn alone.
     ok = wait_inflight(Inflight, 0),
     ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+    %% The first GOAWAY (with its PING), then, on the PING's ACK, the final
+    %% one (RFC 9113 §6.8).
+    expect_send_type(7),
+    serve_recv(ConnPid, encode_frame({ping, 1, ~"rr-drain"})),
     expect_send_type(7),
     %% Opening only the conn window moves nothing (the stream window is
     %% still 0): the next send is the PING ACK.
