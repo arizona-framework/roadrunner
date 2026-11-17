@@ -568,14 +568,9 @@ new(
     } = Config,
     Now
 ) ->
-    Tls = roadrunner_quic_tls_server:new(#{
-        cert_chain => CertChain,
-        priv_key => PrivKey,
-        alpn => Alpn,
-        transport_params => TransportParams,
-        server_random => ServerRandom,
-        peer_scid => PeerSCID
-    }),
+    Tls = roadrunner_quic_tls_server:new(
+        CertChain, PrivKey, Alpn, TransportParams, ServerRandom, PeerSCID
+    ),
     %% Seed the connection receive window and the stream-count limits from the
     %% values we advertise, so what is enforced (RFC 9000 §4.1 / §4.6) is exactly
     %% what the peer was told it may use, never a hardcoded default.
@@ -2470,7 +2465,7 @@ process_handshake(
     #state{tls = Tls, info = #{transport_params := OurParams}} = State
 ) ->
     case roadrunner_quic_tls_server:process_client_hello(Body, Tls) of
-        {ok, #{initial := InitialFlight, handshake := HandshakeFlight}, Installs, PeerParams, Tls1} ->
+        {ok, InitialFlight, HandshakeFlight, Installs, PeerParams, Tls1} ->
             %% Seed the connection send window from the client's advertised
             %% initial_max_data (absent -> 0, RFC 9000 §18.2), not a default. Safe
             %% to re-create conn_flow here: no 1-RTT data flows before the

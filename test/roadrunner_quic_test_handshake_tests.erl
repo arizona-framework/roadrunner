@@ -24,19 +24,20 @@ full_handshake_round_trip_test() ->
     ServerParams = roadrunner_quic_transport_params:new([
         {initial_source_connection_id, <<9, 9, 9, 9>>}, {initial_max_data, 65536}
     ]),
-    ServerState = ?SERVER:new(#{
-        cert_chain => [~"leaf-der"],
-        priv_key => PrivKey,
-        alpn => ~"h3",
-        transport_params => ServerParams,
-        server_random => crypto:strong_rand_bytes(32),
-        peer_scid => ClientSCID
-    }),
+    ServerState = ?SERVER:new(
+        [~"leaf-der"],
+        PrivKey,
+        ~"h3",
+        ServerParams,
+        crypto:strong_rand_bytes(32),
+        ClientSCID
+    ),
 
     ClientHelloFramed = ?TC:client_hello_framed(Scheme, ClientPub, ClientSCID),
     [{1, ClientHelloBody}] = ?TC:deframe_all(ClientHelloFramed),
-    {ok, Flight, ServerInstalls, _PeerParams, ServerState1} =
+    {ok, InitialFlight, HandshakeFlight, ServerInstalls, _PeerParams, ServerState1} =
         ?SERVER:process_client_hello(ClientHelloBody, ServerState),
+    Flight = #{initial => InitialFlight, handshake => HandshakeFlight},
 
     {ok, Result} = ?CLIENT:process_server_flight(
         #{
@@ -69,19 +70,19 @@ rejects_bad_certificate_verify_test() ->
     WrongPub = #'RSAPublicKey'{modulus = N, publicExponent = E},
     {ClientPub, ClientPriv} = crypto:generate_key(ecdh, x25519),
     ClientSCID = <<1, 2, 3, 4>>,
-    ServerState = ?SERVER:new(#{
-        cert_chain => [~"leaf-der"],
-        priv_key => PrivKey,
-        alpn => ~"h3",
-        transport_params => roadrunner_quic_transport_params:new([
-            {initial_source_connection_id, <<9, 9, 9, 9>>}
-        ]),
-        server_random => crypto:strong_rand_bytes(32),
-        peer_scid => ClientSCID
-    }),
+    ServerState = ?SERVER:new(
+        [~"leaf-der"],
+        PrivKey,
+        ~"h3",
+        roadrunner_quic_transport_params:new([{initial_source_connection_id, <<9, 9, 9, 9>>}]),
+        crypto:strong_rand_bytes(32),
+        ClientSCID
+    ),
     ClientHelloFramed = ?TC:client_hello_framed(Scheme, ClientPub, ClientSCID),
     [{1, ClientHelloBody}] = ?TC:deframe_all(ClientHelloFramed),
-    {ok, Flight, _, _, _} = ?SERVER:process_client_hello(ClientHelloBody, ServerState),
+    {ok, InitialFlight, HandshakeFlight, _, _, _} =
+        ?SERVER:process_client_hello(ClientHelloBody, ServerState),
+    Flight = #{initial => InitialFlight, handshake => HandshakeFlight},
     %% Verify the signature against a public key that did not sign it.
     ?assertEqual(
         {error, handshake_verification_failed},
