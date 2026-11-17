@@ -432,7 +432,7 @@ init(Parent, Ref, Host, Port, Opts) ->
         initial = Initial,
         owner = Parent,
         server_initial_keys = roadrunner_quic_keys:initial_server(Dcid0),
-        conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ?CONN_MAX_DATA}),
+        conn_flow = roadrunner_quic_flow:new(?CONN_MAX_DATA, 786432),
         ack = roadrunner_quic_ack:new(),
         cid_events = maps:get(cid_events, Opts, false),
         max_streams_events = maps:get(max_streams_events, Opts, false)
@@ -503,7 +503,7 @@ send_initial(Socket, Host, Port, Initial, Copies) ->
 -spec learn_server_scid(#conn{}) -> #conn{}.
 learn_server_scid(#conn{server_scid = undefined, datagrams = [First | _]} = Conn) ->
     case roadrunner_quic_packet:long_header_info(First) of
-        {ok, #{scid := ServerScid}} -> Conn#conn{server_scid = ServerScid};
+        {ok, _Version, _DCID, ServerScid} -> Conn#conn{server_scid = ServerScid};
         _ -> Conn
     end;
 learn_server_scid(Conn) ->

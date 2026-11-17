@@ -146,7 +146,7 @@ pump_loop(Socket, Conns) ->
 
 start_shell(Socket, Peer, FirstDatagram) ->
     {ok, ClientDCID} = roadrunner_quic_packet:dcid(FirstDatagram, 8),
-    {ok, #{scid := ClientSCID}} = roadrunner_quic_packet:long_header_info(FirstDatagram),
+    {ok, _Version, _DCID, ClientSCID} = roadrunner_quic_packet:long_header_info(FirstDatagram),
     ServerSCID = crypto:strong_rand_bytes(8),
     {CertChain, PrivKey} = cert_key(),
     Config = #{

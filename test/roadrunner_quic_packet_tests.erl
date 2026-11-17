@@ -51,7 +51,17 @@ encode_short_spin_bit_set_test() ->
 roundtrip_long_test() ->
     [
         begin
-            Bin = enc(?M:encode_long(Type, ?V1, ?DCID, ?SCID, Opts)),
+            Bin = enc(
+                ?M:encode_long(
+                    Type,
+                    ?V1,
+                    ?DCID,
+                    ?SCID,
+                    maps:get(token, Opts, <<>>),
+                    maps:get(pn, Opts),
+                    maps:get(payload, Opts)
+                )
+            ),
             #{pn := PN, payload := Payload} = Opts1 = expected_long(Type, Opts),
             ?assertEqual({ok, Opts1, <<>>}, ?M:decode(Bin, byte_size(?DCID))),
             %% pn_offset points exactly at the encoded packet number.
@@ -101,7 +111,7 @@ roundtrip_short_test() ->
 %% A coalesced datagram (Initial followed by a short-header packet): the
 %% Initial decodes and leaves the short-header bytes as the remainder.
 decode_coalesced_test() ->
-    First = enc(?M:encode_long(initial, ?V1, ?DCID, ?SCID, #{pn => 1, payload => <<"a">>})),
+    First = enc(?M:encode_long(initial, ?V1, ?DCID, ?SCID, <<>>, 1, <<"a">>)),
     Second = enc(?M:encode_short(?DCID, 2, <<"b">>, false)),
     {ok, #{type := initial}, Rest} = ?M:decode(<<First/binary, Second/binary>>, byte_size(?DCID)),
     ?assertEqual(Second, Rest).
@@ -113,7 +123,7 @@ decode_coalesced_test() ->
 %% A long-header packet is bounded by its Length field, leaving the
 %% following coalesced packet as the remainder.
 coalesced_split_long_test() ->
-    First = enc(?M:encode_long(initial, ?V1, ?DCID, ?SCID, #{pn => 1, payload => <<"abc">>})),
+    First = enc(?M:encode_long(initial, ?V1, ?DCID, ?SCID, <<>>, 1, <<"abc">>)),
     Second = enc(?M:encode_short(?DCID, 2, <<"d">>, false)),
     ?assertEqual(
         {ok, First, Second}, ?M:coalesced_split(<<First/binary, Second/binary>>)
@@ -137,7 +147,7 @@ coalesced_split_truncated_test() ->
 %% A long header whose Length field claims more bytes than the datagram
 %% holds cannot be sliced.
 coalesced_split_length_exceeds_test() ->
-    Full = enc(?M:encode_long(initial, ?V1, ?DCID, ?SCID, #{pn => 1, payload => <<"abcdefgh">>})),
+    Full = enc(?M:encode_long(initial, ?V1, ?DCID, ?SCID, <<>>, 1, <<"abcdefgh">>)),
     Truncated = binary:part(Full, 0, byte_size(Full) - 4),
     ?assertEqual({error, truncated}, ?M:coalesced_split(Truncated)).
 
@@ -152,7 +162,7 @@ coalesced_split_invalid_cid_test() ->
 %% =============================================================================
 
 dcid_test() ->
-    Long = enc(?M:encode_long(handshake, ?V1, ?DCID, ?SCID, #{pn => 0, payload => <<>>})),
+    Long = enc(?M:encode_long(handshake, ?V1, ?DCID, ?SCID, <<>>, 0, <<>>)),
     ?assertEqual({ok, ?DCID}, ?M:dcid(Long, 0)),
     Short = enc(?M:encode_short(?DCID, 0, <<>>, false)),
     ?assertEqual({ok, ?DCID}, ?M:dcid(Short, byte_size(?DCID))).
@@ -262,7 +272,7 @@ long_header_info_test() ->
         <<16#C0, 16#FF000001:32, (byte_size(DCID)), DCID/binary, (byte_size(SCID)), SCID/binary,
             "payload">>,
     ?assertEqual(
-        {ok, #{version => 16#FF000001, dcid => DCID, scid => SCID}},
+        {ok, 16#FF000001, DCID, SCID},
         ?M:long_header_info(Bin)
     ).
 
@@ -274,7 +284,7 @@ long_header_info_allows_oversized_cids_test() ->
     SCID = binary:copy(<<8>>, 25),
     Bin = <<16#C0, 16#FF000001:32, (byte_size(DCID)), DCID/binary, (byte_size(SCID)), SCID/binary>>,
     ?assertEqual(
-        {ok, #{version => 16#FF000001, dcid => DCID, scid => SCID}},
+        {ok, 16#FF000001, DCID, SCID},
         ?M:long_header_info(Bin)
     ).
 

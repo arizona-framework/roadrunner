@@ -249,14 +249,14 @@ seal_initial(PN, #quic_keys{key = Key, iv = IV, hp = HP}, Frames, DCID, SCID, To
     Encoded = iolist_to_binary([roadrunner_quic_frame:encode(F) || F <- Frames]),
     %% The header with a 2-byte Length field (every size up to 16383), so
     %% the plaintext that fills the datagram to 1200 bytes is known first.
-    [Probe, _] = roadrunner_quic_packet:encode_long(
-        initial, 1, DCID, SCID, #{pn => PN, payload => <<0:(1000 * 8)>>, token => Token}
-    ),
+    [Probe, _] = roadrunner_quic_packet:encode_long(initial, 1, DCID, SCID, Token, PN, <<
+        0:(1000 * 8)
+    >>),
     Fill = max(byte_size(Encoded), 1200 - byte_size(Probe) - 16),
     Plaintext = <<Encoded/binary, 0:((Fill - byte_size(Encoded)) * 8)>>,
-    [Header, _] = roadrunner_quic_packet:encode_long(
-        initial, 1, DCID, SCID, #{pn => PN, payload => <<0:((Fill + 16) * 8)>>, token => Token}
-    ),
+    [Header, _] = roadrunner_quic_packet:encode_long(initial, 1, DCID, SCID, Token, PN, <<
+        0:((Fill + 16) * 8)
+    >>),
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
     Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
     <<Protected/binary, Sealed/binary>>.
@@ -276,9 +276,9 @@ deliberately malformed frame, mirroring the send path's header sizing.
 seal_raw(Level, PN, #quic_keys{key = Key, iv = IV, hp = HP}, Plaintext, DCID, SCID) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     SealedSize = byte_size(Plaintext) + 16,
-    [Header, _Payload] = roadrunner_quic_packet:encode_long(
-        Level, 1, DCID, SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
-    ),
+    [Header, _Payload] = roadrunner_quic_packet:encode_long(Level, 1, DCID, SCID, <<>>, PN, <<
+        0:(SealedSize * 8)
+    >>),
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
     Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
     <<Protected/binary, Sealed/binary>>.
@@ -300,7 +300,7 @@ seal_raw_reserved(Level, PN, #quic_keys{key = Key, iv = IV, hp = HP}, Plaintext,
     PNLen = roadrunner_quic_packet:pn_length(PN),
     SealedSize = byte_size(Plaintext) + 16,
     [<<FirstByte, HeaderRest/binary>>, _Payload] = roadrunner_quic_packet:encode_long(
-        Level, 1, DCID, SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
+        Level, 1, DCID, SCID, <<>>, PN, <<0:(SealedSize * 8)>>
     ),
     Header = <<(FirstByte bor 16#0c), HeaderRest/binary>>,
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),

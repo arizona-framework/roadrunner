@@ -610,7 +610,8 @@ new(
         peer_params = PeerParams,
         max_streams_bidi = MaxStreamsBidi,
         max_streams_uni = MaxStreamsUni,
-        conn_flow = roadrunner_quic_flow:new(#{initial_max_data => ConnMaxData}),
+        %% No send credit until the ClientHello brings the peer's limit.
+        conn_flow = roadrunner_quic_flow:new(ConnMaxData, 0),
         stream_credit = maps:get(stream_credit, Config, on_receipt),
         cc = roadrunner_quic_cc_newreno:new(),
         idle_timeout = IdleTimeout,
@@ -1296,10 +1297,9 @@ stream_for_send(
             %% A server-first stream (response on a client request stream, or a
             %% server control / QPACK stream): seed its send window from what the
             %% client granted for that stream type, like the receive path does.
-            Flow = roadrunner_quic_flow:new(#{
-                initial_max_data => stream_recv_window(Sid, TP),
-                peer_initial_max_data => peer_stream_send_window(Sid, PeerParams)
-            }),
+            Flow = roadrunner_quic_flow:new(
+                stream_recv_window(Sid, TP), peer_stream_send_window(Sid, PeerParams)
+            ),
             {roadrunner_quic_stream:new(), Flow, State}
     end.
 
@@ -2470,12 +2470,10 @@ process_handshake(
             %% initial_max_data (absent -> 0, RFC 9000 §18.2), not a default. Safe
             %% to re-create conn_flow here: no 1-RTT data flows before the
             %% handshake completes.
-            ConnFlow = roadrunner_quic_flow:new(#{
-                initial_max_data => roadrunner_quic_transport_params:initial_max_data(OurParams),
-                peer_initial_max_data => roadrunner_quic_transport_params:initial_max_data(
-                    PeerParams
-                )
-            }),
+            ConnFlow = roadrunner_quic_flow:new(
+                roadrunner_quic_transport_params:initial_max_data(OurParams),
+                roadrunner_quic_transport_params:initial_max_data(PeerParams)
+            ),
             %% Lower the idle timeout to the negotiated minimum (RFC 9000 §10.1)
             %% now that the peer's advertised value is known.
             IdleTimeout = negotiated_idle_timeout(OurParams, PeerParams),
@@ -3015,10 +3013,9 @@ open_stream(
         State
 ) ->
     Stream = roadrunner_quic_stream:new(),
-    Flow = roadrunner_quic_flow:new(#{
-        initial_max_data => stream_recv_window(Sid, TP),
-        peer_initial_max_data => peer_stream_send_window(Sid, PeerParams)
-    }),
+    Flow = roadrunner_quic_flow:new(
+        stream_recv_window(Sid, TP), peer_stream_send_window(Sid, PeerParams)
+    ),
     {ok, Stream, request_flow(Sid, Credit, Flow),
         emit({stream_opened, Sid}, bump_opened(Sid, State))}.
 

@@ -151,9 +151,9 @@ header(application, DCID, _SCID, PN, _SealedSize, KeyPhase) ->
     [Header, _] = roadrunner_quic_packet:encode_short(DCID, PN, <<>>, false, KeyPhase),
     Header;
 header(Level, DCID, SCID, PN, SealedSize, _KeyPhase) ->
-    [Header, _] = roadrunner_quic_packet:encode_long(Level, ?QUIC_V1, DCID, SCID, #{
-        pn => PN, payload => <<0:(SealedSize * 8)>>
-    }),
+    [Header, _] = roadrunner_quic_packet:encode_long(
+        Level, ?QUIC_V1, DCID, SCID, <<>>, PN, <<0:(SealedSize * 8)>>
+    ),
     Header.
 
 %% The plaintext size a packet must reach: the header-protection-sample

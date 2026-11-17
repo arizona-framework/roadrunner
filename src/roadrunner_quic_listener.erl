@@ -435,7 +435,7 @@ classify_unrouted(<<0:1, _:7, _/binary>> = Datagram, DCID, Registry) ->
 classify_unrouted(Datagram, DCID, _Registry) ->
     case is_v1_initial(Datagram) andalso byte_size(Datagram) >= ?MIN_INITIAL_DATAGRAM of
         true ->
-            {ok, #{scid := SCID}} = roadrunner_quic_packet:long_header_info(Datagram),
+            {ok, _Version, _DCID, SCID} = roadrunner_quic_packet:long_header_info(Datagram),
             {spawn, DCID, SCID};
         false ->
             maybe_version_negotiation(Datagram)
@@ -467,7 +467,7 @@ classify_short(_Datagram, _DCID, _Registry) ->
 -spec maybe_version_negotiation(binary()) -> {version_negotiation, binary(), binary()} | drop.
 maybe_version_negotiation(Datagram) when byte_size(Datagram) >= ?MIN_INITIAL_DATAGRAM ->
     case roadrunner_quic_packet:long_header_info(Datagram) of
-        {ok, #{version := Version, dcid := DCID, scid := SCID}} when
+        {ok, Version, DCID, SCID} when
             Version =/= 0, Version =/= ?QUIC_V1
         ->
             {version_negotiation, DCID, SCID};

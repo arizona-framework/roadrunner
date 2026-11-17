@@ -74,7 +74,7 @@ peername_answers_in_handshaking_test() ->
 reply_addressed_to_client_source_cid_test() ->
     #{effects1 := Effects1} = connect(),
     [InitialReply | _] = sends(Effects1),
-    {ok, #{dcid := ReplyDCID}} = roadrunner_quic_packet:long_header_info(InitialReply),
+    {ok, _Version, ReplyDCID, _SCID} = roadrunner_quic_packet:long_header_info(InitialReply),
     ?assertEqual(?CLIENT_SCID, ReplyDCID),
     ?assertNotEqual(?DCID, ReplyDCID).
 

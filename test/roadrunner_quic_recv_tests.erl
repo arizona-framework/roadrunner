@@ -217,7 +217,7 @@ sample_too_short_dropped_test() ->
 unsupported_packet_dropped_test() ->
     Wire = enc(
         roadrunner_quic_packet:encode_long(
-            zero_rtt, 1, ?DCID, ?SCID, #{payload => binary:copy(<<0>>, 24)}
+            zero_rtt, 1, ?DCID, ?SCID, <<>>, 0, binary:copy(<<0>>, 24)
         )
     ),
     ?assertEqual([{drop, unsupported_packet}], ?M:datagram(Wire, ?DCID_LEN, #{}, #{})).
@@ -329,9 +329,9 @@ frames_for(FrameList) ->
 seal_long(Type, PN, #quic_keys{key = Key, iv = IV, hp = HP}, Plaintext) ->
     PNLen = roadrunner_quic_packet:pn_length(PN),
     SealedSize = byte_size(Plaintext) + 16,
-    [Header, _] = roadrunner_quic_packet:encode_long(
-        Type, 1, ?DCID, ?SCID, #{pn => PN, payload => <<0:(SealedSize * 8)>>}
-    ),
+    [Header, _] = roadrunner_quic_packet:encode_long(Type, 1, ?DCID, ?SCID, <<>>, PN, <<
+        0:(SealedSize * 8)
+    >>),
     Sealed = roadrunner_quic_aead:seal(Key, IV, PN, Header, Plaintext),
     Protected = roadrunner_quic_aead:protect_header(HP, Header, Sealed, byte_size(Header) - PNLen),
     <<Protected/binary, Sealed/binary>>.
