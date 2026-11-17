@@ -138,6 +138,7 @@ are advertised to the peer in the initial `SETTINGS` frame.
 | Connection receive window (`conn_window`) | 2^31-1 (the largest allowed) | yes |
 | Stream receive window (`stream_window`) | 16 MB | yes |
 | Unread socket reads per connection (`active`) | 16 | yes |
+| Client PINGs (`ping_policy`) | 1 s apart, 2 closer ones forgiven | yes (`false` disables) |
 
 A frame whose declared length exceeds the negotiated max frame size is
 rejected on its 9-byte header, before the body is buffered. Streams over
@@ -161,6 +162,20 @@ those handlers ends, and a client that still has streams of its own open
 is only refused, so a client that resets its requests now and then is
 not closed for it.
 
+A client may ping no more than `ping_policy` allows, the keepalive
+enforcement gRPC servers apply: a PING less than `min_time` after the
+client's last one is a strike (with no request open and
+`permit_without_stream => false`, one less than two hours after it), and
+the strike past `max_strikes` closes the connection with
+`GOAWAY(ENHANCE_YOUR_CALM)` and the debug data `too_many_pings`. A PING
+right after a response's HEADERS or DATA is never a strike, so a client
+that pings as it reads is not closed for it. The default (1 s, 2
+strikes) stops a PING flood (each PING costs the server an answer) and
+no usual client meets it; gRPC's own servers enforce 5 minutes and no
+PINGs without a call, which a listener for gRPC alone can match (see
+[gRPC keepalive](grpc.md#keepalive)). The connection closes with the
+reason `too_many_pings` in `listener_conn_close`.
+
 A request whose header block (HEADERS plus its CONTINUATION frames) is
 over `max_header_block`, or whose decoded headers are over the
 advertised `SETTINGS_MAX_HEADER_LIST_SIZE` (name + value + 32 per field,
@@ -177,7 +192,7 @@ are, so a block of those can pass it, which the advisory list size
 (RFC 9113 §6.5.2) allows. The
 concurrency and header caps are tuned under `{http2, #{...}}` in the
 `protocols` list, with the keys `max_concurrent_streams`,
-`max_header_block` and `max_header_list_size`.
+`max_header_block`, `max_header_list_size` and `ping_policy`.
 
 `active` sets how many socket reads a connection takes before it asks
 the socket for more (`once` asks after every read). On TLS each ask is a

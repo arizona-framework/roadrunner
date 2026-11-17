@@ -111,6 +111,13 @@
 %% The largest stream id (RFC 9113 §5.1.1), which the first GOAWAY of a
 %% graceful close names so that no stream the client opened is refused.
 -define(MAX_STREAM_ID, 16#7FFFFFFF).
+%% The least time between two client PINGs with no stream open when the
+%% `ping_policy` does not permit PINGs without one: gRPC's (grpc-go's
+%% `defaultPingTimeout`, gRPC core's no-call ping interval), 2 hours.
+-define(PING_IDLE_MIN_TIME, 7_200_000).
+%% Debug data of the GOAWAY that closes a conn for its PINGs: what gRPC
+%% servers send, and gRPC clients look for to ping less.
+-define(TOO_MANY_PINGS, ~"too_many_pings").
 %% How many of the streams it reset a conn remembers, to ignore what the
 %% peer still sends on them (`remember_reset/2`).
 -define(RESET_MEMORY, 128).
@@ -398,6 +405,15 @@
     %% client sends without a request (PING, SETTINGS, WINDOW_UPDATE...)
     %% keeps an unused conn open. `undefined` while it serves.
     idle_deadline = undefined :: integer() | undefined,
+    %% The client PING policy (`http2_ping_*` proto_opts, `ping_policy/1`):
+    %% `off`, or the least time between two PINGs with a stream open and
+    %% with none, and the PINGs closer than that a client may send before
+    %% the next one closes the conn.
+    ping_policy = off :: off | {pos_integer(), pos_integer(), non_neg_integer()},
+    %% When the client last pinged, in milliseconds, and its strikes
+    %% since; `undefined` while its next PING is free: none came yet, or
+    %% HEADERS or DATA went out since (`ping_strike/1`).
+    ping_clock = undefined :: undefined | {integer(), non_neg_integer()},
     %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
     %% Prepended to every response by `roadrunner_http:auto_headers/2`.
     %% Read from proto_opts at `enter/6`.
@@ -552,9 +568,29 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout,
-        idle_deadline = erlang:monotonic_time(millisecond) + IdleTimeout
+        idle_deadline = erlang:monotonic_time(millisecond) + IdleTimeout,
+        ping_policy = ping_policy(ProtoOpts)
     },
     handshake(State).
+
+%% The listener's `ping_policy`, flattened onto `http2_ping_*` keys, none
+%% of them when it is off. Without stream, a PING must wait `MinTime`
+%% when PINGs are permitted then, and at least 2 hours otherwise.
+-spec ping_policy(roadrunner_conn:proto_opts()) ->
+    off | {pos_integer(), pos_integer(), non_neg_integer()}.
+ping_policy(#{
+    http2_ping_min_time := MinTime,
+    http2_ping_permit_without_stream := Permit,
+    http2_ping_max_strikes := MaxStrikes
+}) ->
+    IdleMinTime =
+        case Permit of
+            true -> MinTime;
+            false -> max(MinTime, ?PING_IDLE_MIN_TIME)
+        end,
+    {MinTime, IdleMinTime, MaxStrikes};
+ping_policy(#{}) ->
+    off.
 
 %% The connection and stream refill thresholds: the configured
 %% `window_refill_threshold` for both, else half of each window's peak
@@ -883,6 +919,49 @@ idle_deadline(Streams, Refs, #loop{idle_deadline = undefined, idle_timeout = T})
 idle_deadline(_Streams, _Refs, #loop{idle_deadline = Deadline}) ->
     Deadline.
 
+%% Judge a client PING against the `ping_policy`, as gRPC servers do
+%% (grpc-go's `handlePing`, gRPC core's ping policy): one that comes less
+%% than the policy's least time after the client's last PING (with a
+%% stream open, or with none) is a strike, and the strike past
+%% `max_strikes` closes the conn (`too_many_pings/2`). Strikes do not wear
+%% off; HEADERS or DATA the conn sends clears them and makes the next PING
+%% free (`ping_clock`), so a client pinging as it reads a response (to
+%% measure its bandwidth) is never struck.
+-spec ping_strike(#loop{}) -> {ok, #loop{}} | too_many_pings.
+ping_strike(#loop{ping_policy = off} = State) ->
+    {ok, State};
+ping_strike(#loop{ping_clock = undefined} = State) ->
+    {ok, State#loop{ping_clock = {erlang:monotonic_time(millisecond), 0}}};
+ping_strike(
+    #loop{
+        ping_policy = {MinTime, IdleMinTime, MaxStrikes},
+        ping_clock = {Last, Strikes},
+        live_streams = Live
+    } = State
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    Least =
+        case Live of
+            0 -> IdleMinTime;
+            _ -> MinTime
+        end,
+    case Now - Last >= Least of
+        true -> {ok, State#loop{ping_clock = {Now, Strikes}}};
+        false when Strikes >= MaxStrikes -> too_many_pings;
+        false -> {ok, State#loop{ping_clock = {Now, Strikes + 1}}}
+    end.
+
+%% A client past its PING strikes: answer the PING (RFC 9113 §6.7), then
+%% close with GOAWAY(ENHANCE_YOUR_CALM) and `too_many_pings` (gRPC's
+%% keepalive enforcement), which tells a gRPC client to ping less.
+-spec too_many_pings(#loop{}, iodata()) -> no_return().
+too_many_pings(#loop{last_stream_id = LastId} = State, Ack) ->
+    _ = send(State, [
+        Ack,
+        roadrunner_http2_frame:encode({goaway, LastId, enhance_your_calm, ?TOO_MANY_PINGS})
+    ]),
+    exit_clean(State, too_many_pings).
+
 %% Hibernate re-entry (see `recv_idle_expired/1`). Drops the idle
 %% timer and resumes the unified mailbox loop after an idle conn wakes
 %% from `erlang:hibernate/3`. If the timer already fired, the conn sat
@@ -1054,8 +1133,14 @@ handle_frame({ping, 1, ?GOAWAY_PING}, #loop{goaway = {announced, TRef, Reason}} 
 handle_frame({ping, 1, _Data}, State) ->
     frame_loop(State);
 handle_frame({ping, 0, Opaque}, State) ->
-    _ = send(State, roadrunner_http2_frame:encode({ping, 1, Opaque})),
-    frame_loop(State);
+    Ack = roadrunner_http2_frame:encode({ping, 1, Opaque}),
+    case ping_strike(State) of
+        {ok, State1} ->
+            _ = send(State1, Ack),
+            frame_loop(State1);
+        too_many_pings ->
+            too_many_pings(State, Ack)
+    end;
 handle_frame({window_update, 0, Inc}, State) ->
     case State#loop.conn_send_window + Inc of
         New when New > ?MAX_WINDOW ->
@@ -1573,7 +1658,7 @@ body_follows(StreamId, State) ->
 send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
     {Block, Enc1} = roadrunner_http2_hpack:encode([{~":status", ~"100"}], Enc),
     _ = send(State, roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block})),
-    State#loop{hpack_enc = Enc1}.
+    State#loop{hpack_enc = Enc1, ping_clock = undefined}.
 
 %% RFC 9113 §8.1: the request body is over its cap. Answer 413
 %% before the full request, then RST_STREAM(NO_ERROR) to ask the client to
@@ -2379,10 +2464,13 @@ encode_and_send_headers(
             #loop{streams = #{StreamId := Stream} = Streams, live_streams = Live0} = State,
             {Closed, Live} = close_send(Stream, Live0),
             State#loop{
-                hpack_enc = Enc1, streams = Streams#{StreamId := Closed}, live_streams = Live
+                hpack_enc = Enc1,
+                streams = Streams#{StreamId := Closed},
+                live_streams = Live,
+                ping_clock = undefined
             };
         false ->
-            State#loop{hpack_enc = Enc1}
+            State#loop{hpack_enc = Enc1, ping_clock = undefined}
     end.
 
 %% HEADERS + DATA (END_STREAM) packed into ONE `ssl:send/2`. Body
@@ -2420,7 +2508,8 @@ encode_and_send_response_atomic(
         hpack_enc = Enc1,
         conn_send_window = ConnW - BodyLen,
         streams = Streams#{StreamId := Closed},
-        live_streams = Live
+        live_streams = Live,
+        ping_clock = undefined
     }.
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
@@ -2448,7 +2537,9 @@ encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
 close_stream_send_side(#loop{streams = Streams, live_streams = Live0} = State, StreamId) ->
     #{StreamId := Stream} = Streams,
     {Closed, Live} = close_send(Stream, Live0),
-    State#loop{streams = Streams#{StreamId := Closed}, live_streams = Live}.
+    %% The frame that ended the stream (trailers, or an empty DATA) went
+    %% out: the client's next PING is free (`ping_strike/1`).
+    State#loop{streams = Streams#{StreamId := Closed}, live_streams = Live, ping_clock = undefined}.
 
 %% A stream entry with its send side closed, and the live-stream count
 %% after it: a stream the peer already ended is closed both ways and
@@ -2577,6 +2668,8 @@ data_frames(StreamId, Bin, Fin) ->
 window_budget(#loop{conn_send_window = ConnW}, #{send_window := StreamW}) ->
     max(0, min(ConnW, StreamW)).
 
+%% DATA went out: spend the windows, and make the client's next PING free
+%% (`ping_strike/1`), as HEADERS do.
 consume_send_window(
     #loop{conn_send_window = ConnW, streams = Streams} = State, StreamId, Stream, N
 ) ->
@@ -2584,7 +2677,8 @@ consume_send_window(
     Stream1 = Stream#{send_window := SW - N},
     State#loop{
         conn_send_window = ConnW - N,
-        streams = Streams#{StreamId := Stream1}
+        streams = Streams#{StreamId := Stream1},
+        ping_clock = undefined
     }.
 
 enqueue_pending(#{pending_sends := Pending} = Stream, Entry) ->

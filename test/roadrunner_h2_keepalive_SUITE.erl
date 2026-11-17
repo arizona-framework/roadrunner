@@ -1,7 +1,8 @@
 -module(roadrunner_h2_keepalive_SUITE).
 -moduledoc """
 The HTTP/2 connection keepalive policy, driven by a hand-written client
-over plain TCP: what an idle connection does when the client pings it.
+over plain TCP: how often a client may ping (`ping_policy`), and what an
+idle connection does when the client pings it.
 """.
 
 -behaviour(ct_suite).
@@ -12,6 +13,13 @@ over plain TCP: what an idle connection does when the client pings it.
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
 -export([init_per_testcase/2, end_per_testcase/2]).
 -export([
+    default_policy_closes_a_ping_flood/1,
+    no_policy_answers_every_ping/1,
+    pings_past_the_least_time_are_no_strikes/1,
+    pings_without_a_stream_strike_unless_permitted/1,
+    pings_with_a_stream_open_wait_the_least_time/1,
+    data_sent_frees_the_next_ping/1,
+    interim_response_frees_the_next_ping/1,
     pings_do_not_keep_an_idle_conn_open/1,
     other_frames_do_not_keep_an_idle_conn_open/1,
     a_request_restarts_the_idle_timeout/1,
@@ -20,15 +28,28 @@ over plain TCP: what an idle connection does when the client pings it.
     a_conn_left_idle_by_a_reset_hibernates/1
 ]).
 
-%% The idle timeout the cases run with (`keep_alive_timeout`, shortened
-%% through the conn's test hook).
+-define(COLLECTOR, roadrunner_h2_slot_collector).
+
+%% The idle timeout the idle cases run with (`keep_alive_timeout`,
+%% shortened through the conn's test hook); the others keep the
+%% listener's, far longer than any of them takes.
 -define(IDLE_TIMEOUT, 300).
+%% The `min_time` the spaced-PING cases run with: long enough that a PING
+%% sent right after the last one's ACK comes well within it.
+-define(MIN_TIME, 300).
 
 suite() ->
     [{timetrap, {seconds, 30}}].
 
 all() ->
     [
+        default_policy_closes_a_ping_flood,
+        no_policy_answers_every_ping,
+        pings_past_the_least_time_are_no_strikes,
+        pings_without_a_stream_strike_unless_permitted,
+        pings_with_a_stream_open_wait_the_least_time,
+        data_sent_frees_the_next_ping,
+        interim_response_frees_the_next_ping,
         pings_do_not_keep_an_idle_conn_open,
         other_frames_do_not_keep_an_idle_conn_open,
         a_request_restarts_the_idle_timeout,
@@ -45,15 +66,21 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_testcase(Case, Config) ->
-    ok = persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, ?IDLE_TIMEOUT),
+    _ =
+        case idle_case(Case) of
+            true -> persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, ?IDLE_TIMEOUT);
+            false -> ok
+        end,
+    true = register(?COLLECTOR, self()),
     {ok, _} = roadrunner_listener:start_link(
         ?MODULE,
         listener_opts(Case, #{
             port => 0,
-            protocols => [{http2, #{}}],
+            protocols => [{http2, http2_opts(Case)}],
             routes => [
                 {~"/", roadrunner_h2_test_handler},
-                {~"/stream/bad-trailers", roadrunner_h2_test_handler}
+                {~"/stream/bad-trailers", roadrunner_h2_test_handler},
+                {~"/hold", roadrunner_h2_slot_handler}
             ]
         })
     ),
@@ -61,6 +88,7 @@ init_per_testcase(Case, Config) ->
 
 end_per_testcase(_Case, _Config) ->
     ok = roadrunner_listener:stop(?MODULE),
+    true = unregister(?COLLECTOR),
     _ = persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout}),
     ok.
 
@@ -69,9 +97,97 @@ listener_opts(a_conn_left_idle_by_a_reset_hibernates, Opts) ->
 listener_opts(_Case, Opts) ->
     Opts.
 
+idle_case(Case) ->
+    lists:member(Case, [
+        pings_do_not_keep_an_idle_conn_open,
+        other_frames_do_not_keep_an_idle_conn_open,
+        a_request_restarts_the_idle_timeout,
+        a_reset_of_the_last_stream_leaves_the_conn_idle,
+        a_crash_of_the_last_handler_leaves_the_conn_idle,
+        a_conn_left_idle_by_a_reset_hibernates
+    ]).
+
+http2_opts(default_policy_closes_a_ping_flood) ->
+    #{};
+http2_opts(pings_past_the_least_time_are_no_strikes) ->
+    #{ping_policy => #{min_time => ?MIN_TIME, max_strikes => 0}};
+http2_opts(pings_without_a_stream_strike_unless_permitted) ->
+    #{ping_policy => #{min_time => ?MIN_TIME, permit_without_stream => false, max_strikes => 0}};
+http2_opts(pings_with_a_stream_open_wait_the_least_time) ->
+    #{ping_policy => #{min_time => ?MIN_TIME, permit_without_stream => false, max_strikes => 0}};
+http2_opts(data_sent_frees_the_next_ping) ->
+    #{ping_policy => #{min_time => 60_000, max_strikes => 0}};
+http2_opts(interim_response_frees_the_next_ping) ->
+    #{ping_policy => #{min_time => 60_000, max_strikes => 0}};
+http2_opts(_Case) ->
+    %% The idle cases ping as fast as the server answers.
+    #{ping_policy => false}.
+
 %% =============================================================================
 %% Cases
 %% =============================================================================
+
+default_policy_closes_a_ping_flood(Config) ->
+    %% By default a client may ping once a second, two PINGs closer than
+    %% that forgiven: the fourth PING in a row is answered, then the
+    %% connection is closed as gRPC servers close it (RFC 9113 §5.4.1).
+    Ref = attach_conn_close(),
+    C0 = open(Config),
+    C1 = acked_pings(C0, 3),
+    {Frames, C2} = until(send_ping(C1, 4), fun is_goaway/1),
+    ?assertEqual(
+        [{ping, 1, <<4:64>>}, {goaway, 0, enhance_your_calm, ~"too_many_pings"}],
+        [F || F <- Frames, element(1, F) =/= window_update]
+    ),
+    ?assertEqual(too_many_pings, conn_closed(Ref)),
+    closed(C2).
+
+no_policy_answers_every_ping(Config) ->
+    %% `ping_policy => false`: every PING is answered, however fast.
+    C = acked_pings(open(Config), 20),
+    {200, _, _} = response(send_headers(C, 1), 1).
+
+pings_past_the_least_time_are_no_strikes(Config) ->
+    %% PINGs `min_time` apart are fine; the first one closer than that is a
+    %% strike, and with `max_strikes => 0` it closes the connection.
+    C0 = open(Config),
+    C1 = spaced_pings(C0, 3, ?MIN_TIME),
+    too_many_pings(send_ping(C1, 4)).
+
+pings_without_a_stream_strike_unless_permitted(Config) ->
+    %% Without `permit_without_stream`, a client with no request open must
+    %% not ping again for two hours: `min_time` apart is not enough.
+    C0 = open(Config),
+    C1 = spaced_pings(C0, 1, ?MIN_TIME),
+    ok = wait(?MIN_TIME),
+    too_many_pings(send_ping(C1, 2)).
+
+pings_with_a_stream_open_wait_the_least_time(Config) ->
+    %% With a request open (its handler holding its response back), PINGs
+    %% `min_time` apart are fine even without `permit_without_stream`.
+    C0 = send_headers(open(Config), 1, ~"/hold"),
+    Handler = handler_started(),
+    C1 = spaced_pings(C0, 3, ?MIN_TIME),
+    Handler ! release,
+    {200, ~"ok", _} = response(C1, 1).
+
+data_sent_frees_the_next_ping(Config) ->
+    %% A PING right after a response is no strike, however soon it comes:
+    %% a client measuring its bandwidth pings as it reads.
+    C0 = acked_pings(open(Config), 1),
+    {200, _, C1} = response(send_headers(C0, 1), 1),
+    C2 = acked_pings(C1, 1),
+    %% With nothing sent since, the next one is a strike.
+    too_many_pings(send_ping(C2, 3)).
+
+interim_response_frees_the_next_ping(Config) ->
+    %% So is a PING right after an interim `100 (Continue)`, HEADERS with
+    %% no END_STREAM: every HEADERS and DATA the server sends frees it.
+    C0 = acked_pings(open(Config), 1),
+    C1 = send_expect_continue(C0, 1),
+    {[{headers, 1, 16#04, [{~":status", ~"100"}]}], C2} = until(C1, fun is_headers/1),
+    C3 = acked_pings(C2, 1),
+    too_many_pings(send_ping(C3, 3)).
 
 pings_do_not_keep_an_idle_conn_open(Config) ->
     %% A client that pings a conn with no request on it does not keep it
@@ -233,8 +349,7 @@ conn_closed(Ref) ->
 %% Send frames that carry no request, each round once the server
 %% answered the last round's SETTINGS, until it sends a GOAWAY.
 chatter_until_goaway(#{sock := Sock} = C0) ->
-    %% The server may have closed already: its GOAWAY is still there to read.
-    _ = gen_tcp:send(Sock, [
+    _ = send_tolerant(Sock, [
         roadrunner_http2_frame:encode({window_update, 0, 1}),
         %% PRIORITY on idle stream 1 (RFC 9113 §6.3 allows it).
         <<5:24, 2, 0, 0:1, 1:31, 0:1, 0:31, 15>>,
@@ -258,6 +373,70 @@ next_frame_until(C0, Pred) ->
     case Frame =:= closed orelse Pred(Frame) of
         true -> {Frame, C1};
         false -> next_frame_until(C1, Pred)
+    end.
+
+%% `N` PINGs, each sent once the last one is answered, and none answered
+%% with a GOAWAY.
+acked_pings(C, 0) ->
+    C;
+acked_pings(C0, N) ->
+    {Frames, C1} = until(send_ping(C0, N), fun(F) -> is_ping_ack(F) orelse is_goaway(F) end),
+    ?assertEqual({ping, 1, <<N:64>>}, lists:last(Frames)),
+    acked_pings(C1, N - 1).
+
+%% The PING just sent was the strike too many: it is answered, then the
+%% connection closes with GOAWAY(ENHANCE_YOUR_CALM, too_many_pings).
+too_many_pings(C0) ->
+    {Frames, C1} = until(C0, fun is_goaway/1),
+    ?assertMatch([{ping, 1, _}, {goaway, _, enhance_your_calm, ~"too_many_pings"}], [
+        F
+     || F <- Frames, element(1, F) =/= window_update
+    ]),
+    closed(C1).
+
+handler_started() ->
+    receive
+        {handler_started, Pid} -> Pid
+    after 5000 -> ct:fail(handler_not_started)
+    end.
+
+is_headers({headers, _, _, _}) -> true;
+is_headers(_Frame) -> false.
+
+%% A POST expecting `100-continue`, its body still to come.
+send_expect_continue(#{sock := Sock, enc := Enc} = C, StreamId) ->
+    Fields = [
+        {~":method", ~"POST"},
+        {~":scheme", ~"http"},
+        {~":authority", ~"x"},
+        {~":path", ~"/"},
+        {~"content-length", ~"3"},
+        {~"expect", ~"100-continue"}
+    ],
+    {Block, Enc1} = roadrunner_http2_hpack:encode(Fields, Enc),
+    ok = gen_tcp:send(
+        Sock, roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block})
+    ),
+    C#{enc := Enc1}.
+
+%% `N` PINGs, each but the first sent `Ms` after the last one's ACK. The
+%% server took the last one before it answered it, so it sees at least
+%% `Ms` between them. The case is about time passing, and nothing the server sends
+%% marks it, so it is waited out: the wait only has to be long enough,
+%% never short, so load cannot break it.
+spaced_pings(C0, N, Ms) ->
+    C1 = acked_pings(C0, 1),
+    case N of
+        1 ->
+            C1;
+        _ ->
+            ok = wait(Ms),
+            spaced_pings(C1, N - 1, Ms)
+    end.
+
+wait(Ms) ->
+    receive
+    after Ms -> ok
     end.
 
 %% Ping, each PING after the last one's ACK, until the server sends a
@@ -316,8 +495,16 @@ open(Config) ->
     }.
 
 send_ping(#{sock := Sock} = C, N) ->
-    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({ping, 0, <<N:64>>})),
+    ok = send_tolerant(Sock, roadrunner_http2_frame:encode({ping, 0, <<N:64>>})),
     C.
+
+%% Send, unless the server closed the connection already: what it sent
+%% before it closed (its GOAWAY) is still there to read.
+send_tolerant(Sock, Data) ->
+    case gen_tcp:send(Sock, Data) of
+        ok -> ok;
+        {error, closed} -> ok
+    end.
 
 %% A GET with END_STREAM.
 send_headers(C, StreamId) ->

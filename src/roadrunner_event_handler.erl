@@ -275,6 +275,9 @@ Why a connection ended, as carried by `listener_conn_close`.
 - `liveness_timeout`: an HTTP/2 connection with a handler still at work
   went quiet, and the client did not answer the PING sent to check it is
   still there
+- `too_many_pings`: an HTTP/2 client pinged more often than the
+  listener's `ping_policy` allows, and the connection closed with
+  `GOAWAY(ENHANCE_YOUR_CALM)`
 - `slow_client`: the client sent slower than `min_bytes_per_second`
 - `drained`: closed by `roadrunner_listener:drain/2`
 - `rejected`: an HTTP/1.1 request was refused before its handler ran
@@ -292,6 +295,7 @@ Why a connection ended, as carried by `listener_conn_close`.
     | request_timeout
     | keep_alive_timeout
     | liveness_timeout
+    | too_many_pings
     | slow_client
     | drained
     | rejected
