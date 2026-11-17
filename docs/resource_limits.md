@@ -305,7 +305,7 @@ table.
 | `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |
 | `request_timeout` | 30 s | yes | header-read timeout on a fresh connection; in `manual` body mode, also how long the body may take to read (on HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the request's read deadline, which is `keep_alive_timeout` for a connection's later requests), which `roadrunner_req:set_body_timeout/2` changes per request; at most `16#FFFFFFFF` ms, as `keep_alive_timeout` and `tls_handshake_timeout` |
 | `keep_alive_timeout` | 60 s | yes | idle timeout between requests (on HTTP/2 and HTTP/3, of the whole connection, at least 1 s; on HTTP/2 counted from the end of the last request, whatever else the client sends; an HTTP/2 connection with a handler still at work gets a PING instead, while on HTTP/3 the client waiting on a response keeps the connection open, as RFC 9114 §5.1 expects of it) |
-| `max_keep_alive_requests` | 1000 | yes | requests served per connection before close |
+| `max_keep_alive_requests` | `infinity` | yes | requests an HTTP/1.1 connection serves before it closes |
 | `min_bytes_per_second` | 100 | yes (0 disables) | slow-loris guard on the request-read phase |
 | `rate_limit` | off | opt-in | per-peer request-rate cap (`429` + `Retry-After`) |
 
@@ -315,6 +315,16 @@ acceptors hit `emfile` at the descriptor ceiling — each emits
 `listener_accept_error` and keeps accepting after a short
 back-off rather than going silent — so raise `ulimit -n` (and the systemd
 `LimitNOFILE`) for high concurrency.
+
+`max_keep_alive_requests` is off by default, as in Bandit, Go's
+`net/http`, Node.js and Envoy. Closing a connection after a fixed number
+of requests frees the memory it gathered in servers that keep it until the
+connection ends; a roadrunner connection is a process whose garbage
+collector does that while it lives. A fixed count also makes every client
+open a new connection (and redo its TLS handshake) each time it reaches the
+count, and connections a load generator or a proxy opens together reach it
+together, so they all reconnect at once. Set it when you want clients to move between servers,
+for example behind a load balancer that only places new connections.
 
 A plain-TCP connection waiting to read holds a read buffer of
 `idle_recv_buffer` (4 KB), so idle memory scales as `max_clients` times

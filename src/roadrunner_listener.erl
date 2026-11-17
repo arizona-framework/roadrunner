@@ -75,7 +75,7 @@ to the handler.
 %% The most acceptors spawned by default; fewer when there are fewer
 %% online schedulers (`default_num_acceptors/0`).
 -define(MAX_DEFAULT_NUM_ACCEPTORS, 10).
--define(DEFAULT_MAX_KEEP_ALIVE, 1000).
+-define(DEFAULT_MAX_KEEP_ALIVE, infinity).
 -define(DEFAULT_MAX_CLIENTS, 16384).
 -define(DEFAULT_MAX_CONCURRENT_REQUESTS, infinity).
 %% The HTTP/2 `ping_policy` a listener takes unless set: a PING flood
@@ -238,8 +238,15 @@ Optional middleware and timing knobs (durations in milliseconds):
   times. Only TCP listeners have acceptors; HTTP/3 is not affected, and
   on TLS listeners the gain is smaller. See "Accepting connections" in
   [Resource limits](resource_limits.md).
-- `max_keep_alive_requests`: requests served per conn before
-  forced close. Default 1000.
+- `max_keep_alive_requests`: the most requests an HTTP/1.1 connection
+  serves before roadrunner closes it, or `infinity`. Default `infinity`:
+  a connection stays open as long as the client keeps using it, and its
+  memory is reclaimed by garbage collection while it lives. Set a number
+  to move clients to other servers now and then, for example behind a
+  load balancer that only balances new connections. The response that
+  reaches it carries `Connection: close`, and requests pipelined after
+  it are not served. HTTP/2 and HTTP/3 connections have no request
+  count limit.
 - `max_clients`: concurrent connection cap. Default 16384 (the modern
   Erlang/Elixir HTTP-server norm). A connection counts from the moment
   it is accepted, so on a TLS listener one still in its handshake holds
@@ -520,7 +527,7 @@ ops-tuning rationale.
     keep_alive_timeout => 0..16#FFFFFFFF,
     num_acceptors => pos_integer(),
     accept_priority => high | normal,
-    max_keep_alive_requests => pos_integer(),
+    max_keep_alive_requests => infinity | pos_integer(),
     max_clients => pos_integer(),
     max_concurrent_requests => infinity | pos_integer(),
     overload_mode =>
@@ -1919,6 +1926,15 @@ timeout_opt(Key, Opts, Default, Min) ->
         Other -> error({invalid_listener_opt, Key, Other})
     end.
 
+%% Validate `max_keep_alive_requests`: a count of requests, or `infinity`.
+-spec max_keep_alive_requests(map()) -> infinity | pos_integer().
+max_keep_alive_requests(Opts) ->
+    case maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE) of
+        infinity -> infinity;
+        N when is_integer(N), N >= 1 -> N;
+        Bad -> error({invalid_listener_opt, max_keep_alive_requests, Bad})
+    end.
+
 %% Validate the opt-in `proxy_protocol` listener opt. It is a TCP-stream
 %% feature (an L4 balancer prepends the header before the first byte), so it
 %% conflicts with an HTTP/3-only (UDP) listener; on a mixed `[http1, http3]`
@@ -2048,8 +2064,7 @@ build_proto_opts(Opts, ListenerName) ->
                 timeout_opt(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT, 1),
             keep_alive_timeout =>
                 timeout_opt(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT, 0),
-            max_keep_alive_requests =>
-                maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
+            max_keep_alive_requests => max_keep_alive_requests(Opts),
             max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
             accept_priority => validate_accept_priority(maps:get(accept_priority, Opts, high)),
             max_concurrent_requests => MaxConcurrentRequests,

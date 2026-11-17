@@ -1027,6 +1027,34 @@ listener_rejects_invalid_recv_buffer_test() ->
         [0, -1, bad, 16#80000000]
     ).
 
+listener_max_keep_alive_requests_test() ->
+    %% `infinity` (the default) and any count start; anything else does not.
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Ok) ->
+            {ok, _} = roadrunner_listener:start_link(listener_test_keep_alive_requests, #{
+                port => 0,
+                max_keep_alive_requests => Ok,
+                routes => roadrunner_hello_handler
+            }),
+            ok = roadrunner_listener:stop(listener_test_keep_alive_requests)
+        end,
+        [infinity, 1, 1000]
+    ),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_keep_alive_requests, #{
+                port => 0,
+                max_keep_alive_requests => Bad,
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch(
+                {error, {{invalid_listener_opt, max_keep_alive_requests, _}, _Stack}}, R
+            )
+        end,
+        [0, -1, bad]
+    ).
+
 listener_rejects_invalid_idle_recv_buffer_test() ->
     %% `idle_recv_buffer` is an inet buffer size like `recv_buffer`.
     process_flag(trap_exit, true),

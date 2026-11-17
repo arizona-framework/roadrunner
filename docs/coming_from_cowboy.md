@@ -99,6 +99,8 @@ Notable differences:
 - `max_clients` closes a connection over the cap right away, where Ranch's
   `max_connections` leaves it waiting in the backlog; its default is 16384,
   not 1024
+- `max_keep_alive_requests` is `infinity` by default, where Cowboy's
+  `max_keepalive` is 1000
 - HTTP/3 needs `tls` and runs over UDP on the same port number
 - Without `tls`, `protocols => [http1, http2]` serves HTTP/1.1 and
   HTTP/2 (prior knowledge) on the same port, told apart by HTTP/2's

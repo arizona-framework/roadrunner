@@ -199,7 +199,7 @@ deadline in milliseconds. The shed form answers it `503` with the
     %% `tls_handshake_timeout` listener opt.
     tls_handshake_timeout := pos_integer(),
     keep_alive_timeout := non_neg_integer(),
-    max_keep_alive_requests := pos_integer(),
+    max_keep_alive_requests := infinity | pos_integer(),
     max_clients := pos_integer(),
     client_counter := counters:counters_ref(),
     %% Per-listener drain registry (`{Pid}` rows). Optional so hand-built

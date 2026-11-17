@@ -118,7 +118,7 @@
     dispatch :: roadrunner_conn:dispatch() | undefined,
     middlewares = [] :: roadrunner_middleware:middlewares(),
     max_content_length = 0 :: non_neg_integer(),
-    max_keep_alive_requests = 1 :: pos_integer(),
+    max_keep_alive_requests = infinity :: infinity | pos_integer(),
     %% Read-phase deadlines: `request_timeout` for the first request on a
     %% fresh conn, `keep_alive_timeout` for keep-alive loop-backs. Picked
     %% by `phase_timeout/1` per `phase`.
@@ -1788,7 +1788,8 @@ with_close_if_closing(S, Req, Headers) ->
     close_at_ceiling(S, Req, Headers).
 
 %% The response that reaches `max_keep_alive_requests` is the
-%% connection's last.
+%% connection's last. An integer sorts below every atom, so `infinity` is
+%% never reached.
 -spec close_at_ceiling(#loop_state{}, roadrunner_req:request(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
 close_at_ceiling(
