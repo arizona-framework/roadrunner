@@ -837,6 +837,21 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   connection before they reuse it, or every few seconds at most. gRPC's
   own servers default to `#{min_time => 300000, permit_without_stream =>
   false}`; see [gRPC keepalive](grpc.md#keepalive).
+- `connection_age`: how long a connection may live, as gRPC servers
+  bound it (`MaxConnectionAge`), so long-lived clients spread over new
+  servers as they come (behind a load balancer, say), or `false` (the
+  default) to let it live as long as it is used. `max` is the age in
+  milliseconds, drawn for each connection within 10% of it either way
+  so the connections opened together do not all close together. At
+  that age the connection closes gracefully, as on a drain: a GOAWAY that
+  refuses nothing and a PING, then, once the client answers, the GOAWAY
+  naming the last request served, after which new requests are refused
+  and the connection closes once its requests are done. `grace` bounds
+  that wait (`MaxConnectionAgeGrace`): the requests still open then are
+  reset with `CANCEL` and the connection closes. It is `infinity` unless
+  set, or milliseconds. `max` is required. The connection closes with
+  the reason `connection_age`, or `connection_age_grace` when the grace
+  ran out.
 """.
 -type http2_opts() :: #{
     conn_window => 1..16#7FFFFFFF,
@@ -852,7 +867,9 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
             min_time => 1..16#FFFFFFFF,
             permit_without_stream => boolean(),
             max_strikes => 0..16#7FFFFFFF
-        }
+        },
+    connection_age =>
+        false | #{max := 1..16#FFFFFFFF, grace => 0..16#FFFFFFFF | infinity}
 }.
 
 -doc """
@@ -2337,7 +2354,8 @@ http2_defaults() ->
         %% explicitly (see `resolve_max_header_list_size/2`).
         max_header_list_size => 32768,
         active => 16,
-        ping_policy => ?DEFAULT_PING_POLICY
+        ping_policy => ?DEFAULT_PING_POLICY,
+        connection_age => false
     }.
 
 -spec validate_http2_opts(map(), term()) -> http2_opts().
@@ -2351,6 +2369,7 @@ validate_http2_opts(Opts, Raw) ->
                 false -> error({invalid_listener_opt, protocols, Raw});
                 true when K =:= active -> Acc#{K => validate_http2_active(V, Raw)};
                 true when K =:= ping_policy -> Acc#{K => validate_ping_policy(V, Raw)};
+                true when K =:= connection_age -> Acc#{K => validate_connection_age(V, Raw)};
                 true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
             end
@@ -2376,6 +2395,26 @@ validate_ping_policy(Policy, Raw) when is_map(Policy) ->
         Policy
     );
 validate_ping_policy(_Policy, Raw) ->
+    error({invalid_listener_opt, protocols, Raw}).
+
+%% `false`, or a map with `max` and maybe `grace` (`infinity` unless set).
+-spec validate_connection_age(term(), term()) -> false | map().
+validate_connection_age(false, _Raw) ->
+    false;
+validate_connection_age(#{max := Max} = Age, Raw) when
+    is_integer(Max), Max >= 1, Max =< 16#FFFFFFFF
+->
+    case maps:merge(#{grace => infinity}, Age) of
+        #{grace := Grace} = Age1 when
+            map_size(Age1) =:= 2,
+            (Grace =:= infinity orelse
+                (is_integer(Grace) andalso Grace >= 0 andalso Grace =< 16#FFFFFFFF))
+        ->
+            Age1;
+        #{} ->
+            error({invalid_listener_opt, protocols, Raw})
+    end;
+validate_connection_age(_Age, Raw) ->
     error({invalid_listener_opt, protocols, Raw}).
 
 -spec valid_ping_policy_opt(term(), term()) -> boolean().
@@ -2421,7 +2460,8 @@ flatten_http2_opts(Entries) ->
                 max_header_block := MaxHeaderBlock,
                 max_header_list_size := MaxHeaderListSize,
                 active := Active,
-                ping_policy := PingPolicy
+                ping_policy := PingPolicy,
+                connection_age := Age
             } = Http2} ->
             Flat = maps:merge(
                 #{
@@ -2432,7 +2472,7 @@ flatten_http2_opts(Entries) ->
                     http2_max_header_list_size => MaxHeaderListSize,
                     http2_active => Active
                 },
-                flatten_ping_policy(PingPolicy)
+                maps:merge(flatten_ping_policy(PingPolicy), flatten_connection_age(Age))
             ),
             case Http2 of
                 #{window_refill_threshold := Threshold} ->
@@ -2441,6 +2481,13 @@ flatten_http2_opts(Entries) ->
                     Flat
             end
     end.
+
+%% One `http2_connection_age_*` key per setting, none when it is off.
+-spec flatten_connection_age(false | map()) -> #{atom() => term()}.
+flatten_connection_age(false) ->
+    #{};
+flatten_connection_age(#{max := Max, grace := Grace}) ->
+    #{http2_connection_age_max => Max, http2_connection_age_grace => Grace}.
 
 %% One `http2_ping_*` key per setting, none when the policy is off.
 -spec flatten_ping_policy(false | map()) -> #{atom() => term()}.

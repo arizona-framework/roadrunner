@@ -103,6 +103,16 @@ dynamic table, responses use the static table). Remaining work:
   the separate `MDA2AV/HttpArena` repo)
 - WebTransport / Extended CONNECT (RFC 9220) and HTTP datagrams
   (RFC 9297)
+- `connection_age` on h3 (small to medium): HTTP/2 connections can close
+  at an age (`{http2, #{connection_age => ...}}`), HTTP/3 ones live as
+  long as they are used. The h3 drain (GOAWAY on the control stream)
+  already does the close; what is left is the per-connection timer with
+  its jitter, the grace that resets the requests still open, an
+  `{http3, #{connection_age => ...}}` opt and its tests. The rest of the
+  HTTP/2 keepalive policy needs nothing on h3: the QUIC idle timeout
+  (`keep_alive_timeout`) closes idle connections and a QUIC PING costs
+  the server only an ACK it sends anyway, so there is no PING policy to
+  enforce
 
 ## Native QUIC transport follow-ups
 

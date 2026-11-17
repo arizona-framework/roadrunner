@@ -700,6 +700,8 @@ the same for every HTTP/2 client, gRPC or not:
 | gRPC (grpc-go) | roadrunner |
 |---|---|
 | `MaxConnectionIdle` | `keep_alive_timeout`: a connection with no call open closes with `GOAWAY(NO_ERROR)` this long after its last call ended (or after it opened), whatever the client sends meanwhile, PINGs included |
+| `MaxConnectionAge` | `connection_age`'s `max`, off by default |
+| `MaxConnectionAgeGrace` | `connection_age`'s `grace`, `infinity` unless set |
 | `Time` and `Timeout` | `keep_alive_timeout`: a connection with a call running and nothing heard for this long gets a PING, and closes if the client does not answer within another `keep_alive_timeout` |
 | `EnforcementPolicy.MinTime` | `ping_policy`'s `min_time` |
 | `EnforcementPolicy.PermitWithoutStream` | `ping_policy`'s `permit_without_stream` |
@@ -730,6 +732,20 @@ not ping without a call open. A PING right after the server sent a
 response's headers or a message is never held against the client, so
 the PINGs gRPC clients send to size their flow-control windows as they
 read are fine.
+
+A gRPC client keeps its connection for as long as it can, so behind a
+load balancer it stays on the server it first reached. `connection_age`
+closes each connection after about `max` milliseconds (within a tenth of
+it either way, so connections opened together close apart), gracefully:
+the client is told to open a new connection, the calls already running
+go on, and those still running after `grace` are cancelled:
+
+```erlang
+protocols => [{http2, #{connection_age => #{max => 1_800_000, grace => 60_000}}}]
+```
+
+Only the calls the grace cuts short fail, reset with `CANCEL`; new calls
+go to the new connection.
 
 ## Telemetry
 

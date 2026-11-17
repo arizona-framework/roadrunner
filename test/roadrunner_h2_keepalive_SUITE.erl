@@ -1,8 +1,9 @@
 -module(roadrunner_h2_keepalive_SUITE).
 -moduledoc """
 The HTTP/2 connection keepalive policy, driven by a hand-written client
-over plain TCP: how often a client may ping (`ping_policy`), and what an
-idle connection does when the client pings it.
+over plain TCP: how often a client may ping (`ping_policy`), what an
+idle connection does when the client sends frames without a request, and
+how a connection ends at its `connection_age`.
 """.
 
 -behaviour(ct_suite).
@@ -25,7 +26,13 @@ idle connection does when the client pings it.
     a_request_restarts_the_idle_timeout/1,
     a_reset_of_the_last_stream_leaves_the_conn_idle/1,
     a_crash_of_the_last_handler_leaves_the_conn_idle/1,
-    a_conn_left_idle_by_a_reset_hibernates/1
+    a_conn_left_idle_by_a_reset_hibernates/1,
+    age_closes_an_idle_conn/1,
+    age_lets_open_requests_finish/1,
+    age_grace_resets_open_requests/1,
+    age_with_no_grace_names_the_last_stream/1,
+    age_grace_after_the_final_goaway_only_resets/1,
+    age_during_a_drain_keeps_its_grace/1
 ]).
 
 -define(COLLECTOR, roadrunner_h2_slot_collector).
@@ -37,6 +44,9 @@ idle connection does when the client pings it.
 %% The `min_time` the spaced-PING cases run with: long enough that a PING
 %% sent right after the last one's ACK comes well within it.
 -define(MIN_TIME, 300).
+%% The `connection_age` the age cases run with: each conn's is within a
+%% tenth of it.
+-define(AGE, 200).
 
 suite() ->
     [{timetrap, {seconds, 30}}].
@@ -55,7 +65,13 @@ all() ->
         a_request_restarts_the_idle_timeout,
         a_reset_of_the_last_stream_leaves_the_conn_idle,
         a_crash_of_the_last_handler_leaves_the_conn_idle,
-        a_conn_left_idle_by_a_reset_hibernates
+        a_conn_left_idle_by_a_reset_hibernates,
+        age_closes_an_idle_conn,
+        age_lets_open_requests_finish,
+        age_grace_resets_open_requests,
+        age_with_no_grace_names_the_last_stream,
+        age_grace_after_the_final_goaway_only_resets,
+        age_during_a_drain_keeps_its_grace
     ].
 
 init_per_suite(Config) ->
@@ -119,6 +135,18 @@ http2_opts(data_sent_frees_the_next_ping) ->
     #{ping_policy => #{min_time => 60_000, max_strikes => 0}};
 http2_opts(interim_response_frees_the_next_ping) ->
     #{ping_policy => #{min_time => 60_000, max_strikes => 0}};
+http2_opts(age_closes_an_idle_conn) ->
+    #{connection_age => #{max => ?AGE}};
+http2_opts(age_lets_open_requests_finish) ->
+    #{connection_age => #{max => ?AGE}};
+http2_opts(age_grace_resets_open_requests) ->
+    #{connection_age => #{max => ?AGE, grace => 100}};
+http2_opts(age_with_no_grace_names_the_last_stream) ->
+    #{connection_age => #{max => ?AGE, grace => 0}};
+http2_opts(age_grace_after_the_final_goaway_only_resets) ->
+    #{connection_age => #{max => ?AGE, grace => 1000}};
+http2_opts(age_during_a_drain_keeps_its_grace) ->
+    #{connection_age => #{max => ?AGE, grace => 100}};
 http2_opts(_Case) ->
     %% The idle cases ping as fast as the server answers.
     #{ping_policy => false}.
@@ -273,6 +301,102 @@ a_conn_left_idle_by_a_reset_hibernates(Config) ->
     ok = await_hibernating_conn(erlang:monotonic_time(millisecond) + 5000),
     ok = gen_tcp:close(Sock).
 
+age_closes_an_idle_conn(Config) ->
+    %% At its age a conn closes as a drained one does (RFC 9113 §6.8): a
+    %% GOAWAY that refuses nothing and a PING, then, on the PING's ACK, the
+    %% GOAWAY naming the last stream, and with no request open, the close.
+    Ref = attach_conn_close(),
+    Opened = erlang:monotonic_time(millisecond),
+    C0 = open(Config),
+    C1 = graceful_close(C0, 0),
+    ?assert(erlang:monotonic_time(millisecond) - Opened >= ?AGE - ?AGE div 10),
+    ?assertEqual(connection_age, conn_closed(Ref)),
+    closed(C1).
+
+age_lets_open_requests_finish(Config) ->
+    %% A request open at the conn's age is served to its end; one sent
+    %% after the final GOAWAY is refused (retry-safe, RFC 9113 §8.7).
+    Ref = attach_conn_close(),
+    C0 = send_headers(open(Config), 1, ~"/hold"),
+    Handler = handler_started(),
+    C1 = graceful_close(C0, 1),
+    {Frames, C2} = until(send_headers(C1, 3), fun is_rst_stream/1),
+    ?assertEqual({rst_stream, 3, refused_stream}, lists:last(Frames)),
+    Handler ! release,
+    {200, ~"ok", C3} = response(C2, 1),
+    ?assertEqual(connection_age, conn_closed(Ref)),
+    closed(C3).
+
+age_grace_resets_open_requests(Config) ->
+    %% A request still open when the grace runs out is reset with CANCEL
+    %% and the conn closes. However far the client got answering the PING,
+    %% the GOAWAY naming the last stream comes before the reset.
+    Ref = attach_conn_close(),
+    C0 = send_headers(open(Config), 1, ~"/hold"),
+    Handler = handler_started(),
+    ?assertEqual(
+        [
+            {goaway, 16#7FFFFFFF, no_error, <<>>},
+            {ping, 0, ~"rr-drain"},
+            {goaway, 1, no_error, <<>>},
+            {rst_stream, 1, cancel}
+        ],
+        frames_until_closed(C0)
+    ),
+    ?assertEqual(connection_age_grace, conn_closed(Ref)),
+    Handler ! release.
+
+age_with_no_grace_names_the_last_stream(Config) ->
+    %% With `grace => 0` the requests open at the conn's age are reset at
+    %% once, the client not having answered the PING (here, it never
+    %% does): the final GOAWAY still goes out first, so the client knows
+    %% no stream it opened after stream 1 was processed.
+    Ref = attach_conn_close(),
+    C0 = send_headers(open(Config), 1, ~"/hold"),
+    Handler = handler_started(),
+    ?assertEqual(
+        [
+            {goaway, 16#7FFFFFFF, no_error, <<>>},
+            {ping, 0, ~"rr-drain"},
+            {goaway, 1, no_error, <<>>},
+            {rst_stream, 1, cancel}
+        ],
+        frames_until_closed(C0, false)
+    ),
+    ?assertEqual(connection_age_grace, conn_closed(Ref)),
+    Handler ! release.
+
+age_grace_after_the_final_goaway_only_resets(Config) ->
+    %% A client that answered the PING has the final GOAWAY already: when
+    %% the grace runs out, the requests still open are only reset.
+    Ref = attach_conn_close(),
+    C0 = send_headers(open(Config), 1, ~"/hold"),
+    Handler = handler_started(),
+    C1 = graceful_close(C0, 1),
+    ?assertEqual([{rst_stream, 1, cancel}], frames_until_closed(C1)),
+    ?assertEqual(connection_age_grace, conn_closed(Ref)),
+    Handler ! release.
+
+age_during_a_drain_keeps_its_grace(Config) ->
+    %% A conn the listener drains before its age is closing already: its
+    %% age starts no second close, but its grace still bounds the requests
+    %% left open.
+    Ref = attach_conn_close(),
+    C0 = send_headers(open(Config), 1, ~"/hold"),
+    Handler = handler_started(),
+    ok = roadrunner_listener:notify_drain(?MODULE, erlang:monotonic_time(millisecond) + 30_000),
+    ?assertEqual(
+        [
+            {goaway, 16#7FFFFFFF, no_error, <<>>},
+            {ping, 0, ~"rr-drain"},
+            {goaway, 1, no_error, <<>>},
+            {rst_stream, 1, cancel}
+        ],
+        frames_until_closed(C0)
+    ),
+    ?assertEqual(connection_age_grace, conn_closed(Ref)),
+    Handler ! release.
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -324,6 +448,58 @@ send_post_headers(#{sock := Sock, enc := Enc} = C, StreamId) ->
 send_rst(#{sock := Sock} = C, StreamId) ->
     ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({rst_stream, StreamId, cancel})),
     C.
+
+%% Walk a graceful close: the first GOAWAY (naming the largest stream id)
+%% and its PING, which is answered, then the final GOAWAY, which names
+%% `LastStreamId`.
+graceful_close(C0, LastStreamId) ->
+    {Frames, #{sock := Sock} = C1} = until(C0, fun
+        ({ping, 0, _}) -> true;
+        (_) -> false
+    end),
+    [{goaway, 16#7FFFFFFF, no_error, <<>>}, {ping, 0, Opaque}] =
+        [F || F <- Frames, element(1, F) =/= window_update],
+    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
+    {Final, C2} = until(C1, fun is_goaway/1),
+    ?assertEqual([{goaway, LastStreamId, no_error, <<>>}], Final),
+    C2.
+
+%% Every frame up to the close (leaving out SETTINGS and WINDOW_UPDATE),
+%% each PING answered as it comes, if the connection is still open.
+frames_until_closed(C) ->
+    frames_until_closed(C, true).
+
+%% The same, answering PINGs only when `Ack` is `true`.
+frames_until_closed(#{sock := Sock, buf := Buf, dec := Dec} = C, Ack) ->
+    case roadrunner_http2_frame:parse(Buf, 16384) of
+        {ok, {headers, StreamId, Flags, _Priority, Block}, Rest} ->
+            {ok, Headers, Dec1} = roadrunner_http2_hpack:decode(Block, Dec),
+            [
+                {headers, StreamId, Flags, Headers}
+                | frames_until_closed(C#{buf := Rest, dec := Dec1}, Ack)
+            ];
+        {ok, {ping, 0, Opaque} = Ping, Rest} ->
+            ok =
+                case Ack of
+                    true -> send_tolerant(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque}));
+                    false -> ok
+                end,
+            [Ping | frames_until_closed(C#{buf := Rest}, Ack)];
+        {ok, Frame, Rest} when
+            element(1, Frame) =:= settings; element(1, Frame) =:= window_update
+        ->
+            frames_until_closed(C#{buf := Rest}, Ack);
+        {ok, Frame, Rest} ->
+            [Frame | frames_until_closed(C#{buf := Rest}, Ack)];
+        {more, _} ->
+            case gen_tcp:recv(Sock, 0, 5000) of
+                {ok, Data} -> frames_until_closed(C#{buf := <<Buf/binary, Data/binary>>}, Ack);
+                {error, closed} -> []
+            end
+    end.
+
+is_rst_stream({rst_stream, _, _}) -> true;
+is_rst_stream(_Frame) -> false.
 
 attach_conn_close() ->
     Self = self(),

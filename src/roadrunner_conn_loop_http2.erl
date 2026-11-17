@@ -571,7 +571,25 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         idle_deadline = erlang:monotonic_time(millisecond) + IdleTimeout,
         ping_policy = ping_policy(ProtoOpts)
     },
+    ok = start_connection_age(ProtoOpts),
     handshake(State).
+
+%% The listener's `connection_age`: one timer for the conn's whole life,
+%% at its age, carrying the grace that follows (`handle_timer/3`).
+-spec start_connection_age(roadrunner_conn:proto_opts()) -> ok.
+start_connection_age(#{http2_connection_age_max := Max, http2_connection_age_grace := Grace}) ->
+    _ = erlang:start_timer(jittered(Max), self(), {?MODULE, {connection_age, Grace}}),
+    ok;
+start_connection_age(#{}) ->
+    ok.
+
+%% `Max` give or take up to a tenth of it, as grpc-go jitters its
+%% `MaxConnectionAge`: the conns a client opened together (or a restart
+%% saw reconnect together) then close spread over time, not all at once.
+-spec jittered(pos_integer()) -> pos_integer().
+jittered(Max) ->
+    Spread = Max div 10,
+    Max - Spread + rand:uniform(2 * Spread + 1) - 1.
 
 %% The listener's `ping_policy`, flattened onto `http2_ping_*` keys, none
 %% of them when it is off. Without stream, a PING must wait `MinTime`
@@ -1033,12 +1051,53 @@ final_goaway(State, Reason) ->
     maybe_exit_when_drained(State#loop{goaway = {final, Reason}}).
 
 %% A timer this conn started went off. One no longer wanted (its step
-%% already happened another way) is ignored.
--spec handle_timer(#loop{}, reference(), goaway_ping) -> #loop{}.
+%% already happened another way) is ignored. The conn reaching its
+%% `connection_age` starts the graceful close (which a drain may have
+%% started already) and the grace it has to finish in.
+-spec handle_timer(
+    #loop{},
+    reference(),
+    goaway_ping | {connection_age, non_neg_integer() | infinity} | connection_age_grace
+) -> #loop{}.
 handle_timer(#loop{goaway = {announced, TRef, Reason}} = State, TRef, goaway_ping) ->
     final_goaway(State, Reason);
-handle_timer(State, _TRef, _Timer) ->
+handle_timer(State, _TRef, {connection_age, Grace}) ->
+    ok = start_grace(Grace),
+    announce_goaway(State, connection_age);
+handle_timer(State, _TRef, connection_age_grace) ->
+    grace_expired(State);
+handle_timer(State, _TRef, goaway_ping) ->
     State.
+
+-spec start_grace(non_neg_integer() | infinity) -> ok.
+start_grace(infinity) ->
+    ok;
+start_grace(Grace) ->
+    _ = erlang:start_timer(Grace, self(), {?MODULE, connection_age_grace}),
+    ok.
+
+%% The `connection_age` grace ran out with requests still open: reset each
+%% stream not yet closed with CANCEL (RFC 9113 §8.4, the request is no
+%% longer wanted) and close the conn. A client that has only seen the
+%% first GOAWAY (a grace shorter than its answer to the PING) gets the
+%% final one first, naming the last stream this conn took: any stream it
+%% opened after that was not processed and is safe to retry (§6.8).
+-spec grace_expired(#loop{}) -> no_return().
+grace_expired(#loop{streams = Streams} = State) ->
+    _ = send(State, [
+        final_goaway_frame(State)
+        | [
+            roadrunner_http2_frame:encode({rst_stream, StreamId, cancel})
+         || StreamId := #{state := StreamState} <- Streams, StreamState =/= closed
+        ]
+    ]),
+    exit_clean(State, connection_age_grace).
+
+-spec final_goaway_frame(#loop{}) -> iodata().
+final_goaway_frame(#loop{goaway = {final, _}}) ->
+    [];
+final_goaway_frame(#loop{last_stream_id = LastId}) ->
+    ?GOAWAY(LastId, no_error).
 
 %% Spawn the worker for `StreamId`. A worker started once the drain has
 %% begun (a stream below the GOAWAY whose body was still arriving, or a

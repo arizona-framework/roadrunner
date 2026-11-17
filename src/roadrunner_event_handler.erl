@@ -278,6 +278,10 @@ Why a connection ended, as carried by `listener_conn_close`.
 - `too_many_pings`: an HTTP/2 client pinged more often than the
   listener's `ping_policy` allows, and the connection closed with
   `GOAWAY(ENHANCE_YOUR_CALM)`
+- `connection_age`: an HTTP/2 connection reached the listener's
+  `connection_age` and closed gracefully once its requests were done
+- `connection_age_grace`: as `connection_age`, but the grace ran out
+  first, and the requests still open were reset
 - `slow_client`: the client sent slower than `min_bytes_per_second`
 - `drained`: closed by `roadrunner_listener:drain/2`
 - `rejected`: an HTTP/1.1 request was refused before its handler ran
@@ -296,6 +300,8 @@ Why a connection ended, as carried by `listener_conn_close`.
     | keep_alive_timeout
     | liveness_timeout
     | too_many_pings
+    | connection_age
+    | connection_age_grace
     | slow_client
     | drained
     | rejected

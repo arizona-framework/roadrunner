@@ -636,6 +636,62 @@ listener_http2_ping_policy_threads_into_proto_opts_test() ->
         ]
     ).
 
+listener_http2_connection_age_threads_into_proto_opts_test() ->
+    %% Off by default (no `http2_connection_age_*` keys); `grace` is
+    %% `infinity` unless set.
+    lists:foreach(
+        fun({Http2, Expected}) ->
+            Name = listener_test_h2_connection_age,
+            {ok, Pid} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                protocols => [Http2],
+                routes => roadrunner_hello_handler
+            }),
+            ProtoOpts = element(4, sys:get_state(Pid)),
+            ?assertEqual(
+                Expected,
+                maps:with([http2_connection_age_max, http2_connection_age_grace], ProtoOpts)
+            ),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        [
+            {http2, #{}},
+            {{http2, #{connection_age => false}}, #{}},
+            {{http2, #{connection_age => #{max => 60_000}}}, #{
+                http2_connection_age_max => 60_000, http2_connection_age_grace => infinity
+            }},
+            {{http2, #{connection_age => #{max => 60_000, grace => 0}}}, #{
+                http2_connection_age_max => 60_000, http2_connection_age_grace => 0
+            }}
+        ]
+    ).
+
+listener_rejects_invalid_http2_connection_age_test() ->
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_h2_connection_age_invalid, #{
+                port => 0,
+                protocols => [{http2, #{connection_age => Bad}}],
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
+        end,
+        [
+            true,
+            60_000,
+            #{},
+            #{grace => 1000},
+            #{max => 0},
+            #{max => 16#100000000},
+            #{max => infinity},
+            #{max => 1000, grace => -1},
+            #{max => 1000, grace => 16#100000000},
+            #{max => 1000, grace => forever},
+            #{max => 1000, jitter => 0}
+        ]
+    ).
+
 listener_rejects_invalid_http2_ping_policy_test() ->
     process_flag(trap_exit, true),
     lists:foreach(
