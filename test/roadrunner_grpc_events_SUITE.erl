@@ -326,11 +326,13 @@ active_read_drained(Config) ->
         #{status := unavailable, message := ~"server shutting down", reason := error}, Md
     ).
 
-%% The client resets the call while the method reads.
+%% The client resets the call while the method reads, once it has read
+%% a message.
 client_cancels_a_read(Config) ->
-    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "Sum">>, []),
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "ReadSum">>, []),
     C1 = roadrunner_grpc_test_client:send(C0, 1, frame(~"a")),
-    {Pid, _Start} = started(),
+    Pid = read(),
     _ = roadrunner_grpc_test_client:reset(C1, 1),
     {stop, M, Md} = ending(Pid),
     ?assertMatch(#{status := cancelled, reason := cancelled}, Md),
@@ -407,21 +409,23 @@ gone_before_trailers_only(Config) ->
 %% A method that learns of the reset from `cancelled/2` and returns `ok`
 %% had its call cancelled, not ended OK.
 cancelled_told_to_the_method(Config) ->
-    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "Watch">>, []),
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "ReadWatch">>, []),
     C1 = roadrunner_grpc_test_client:finish(
         roadrunner_grpc_test_client:send(C0, 1, frame(~"x")), 1
     ),
-    {Pid, _Start} = started(),
+    Pid = read(),
     _ = roadrunner_grpc_test_client:reset(C1, 1),
     {stop, _, Md} = ending(Pid),
     ?assertMatch(#{status := cancelled, reason := cancelled}, Md).
 
 gone_told_to_the_method(Config) ->
-    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "Watch">>, []),
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "ReadWatch">>, []),
     #{sock := Sock} = roadrunner_grpc_test_client:finish(
         roadrunner_grpc_test_client:send(C0, 1, frame(~"x")), 1
     ),
-    {Pid, _Start} = started(),
+    Pid = read(),
     ok = gen_tcp:close(Sock),
     {stop, _, Md} = ending(Pid),
     ?assertMatch(#{status := cancelled, reason := cancelled}, Md).
@@ -457,13 +461,14 @@ reset_before_the_deadline(Config, Before) ->
 %% A method told by `cancelled/2` long before the deadline, that returns
 %% only at it: the call was cancelled when it was told.
 cancelled_long_before_a_late_return(Config) ->
-    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "WatchLate">>, [
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "ReadWatchLate">>, [
         {~"grpc-timeout", ~"1S"}
     ]),
     C1 = roadrunner_grpc_test_client:finish(
         roadrunner_grpc_test_client:send(C0, 1, frame(~"x")), 1
     ),
-    {Pid, _Start} = started(),
+    Pid = read(),
     _ = roadrunner_grpc_test_client:reset(C1, 1),
     {stop, _, Md} = ending(Pid),
     ?assertMatch(#{status := cancelled, reason := cancelled}, Md).
@@ -727,6 +732,15 @@ held() ->
             {Pid, _Start} = started(),
             true = unregister(roadrunner_grpc_held),
             1 = erlang:trace(Pid, true, ['receive']),
+            Pid
+    end.
+
+%% The method's process once it has read the call's request.
+read() ->
+    receive
+        {read, Pid} ->
+            {Pid, _Start} = started(),
+            true = unregister(roadrunner_grpc_held),
             Pid
     end.
 
