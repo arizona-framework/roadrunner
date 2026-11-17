@@ -752,7 +752,9 @@ cookies / tracing metadata); lower them to tighten the attack surface.
 - `linger_timeout` — after a response that closes the connection before
   the request was read to its end (a 413 over the body cap, a 431, a
   handler answering without reading its body, the response that reaches
-  `max_keep_alive_requests` while the client may have pipelined more),
+  `max_keep_alive_requests` while the client may have pipelined more, a
+  handler's `Connection: close` with a pipelined request already
+  received),
   how long in milliseconds
   the connection keeps reading and dropping what the client still sends
   before it closes. Closing with unread input makes the kernel reset the
