@@ -255,7 +255,7 @@
     %% In-flight-request slot accounting (cross-listener cap). `infinity`
     %% (default) disables it; `inflight_counter` is the shared gauge. Read
     %% from proto_opts at `init/2` so the per-stream acquire/release passes
-    %% them to `roadrunner_conn` directly. See `dispatch_decoded/3`.
+    %% them to `roadrunner_conn` directly. See `dispatch_decoded/5`.
     max_concurrent_requests = infinity :: infinity | pos_integer(),
     inflight_counter :: counters:counters_ref() | undefined,
     %% What happens to a request that arrives over the ceiling: refuse it
@@ -268,7 +268,7 @@
     %% something only it can deliver.
     awaiting_slot = #{} :: #{non_neg_integer() => roadrunner_req:request()},
     %% Per-peer rate-limit guard resolved from proto_opts + peer at conn start
-    %% (`undefined` when off). Checked in `dispatch_decoded/4`.
+    %% (`undefined` when off). Checked in `dispatch_decoded/5`.
     rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
@@ -852,7 +852,10 @@ await_body(
     case decode_section(State, StreamId, Block) of
         {ok, Headers, State1} ->
             Streams = State1#h3.streams,
-            State2 = State1#h3{streams = Streams#{StreamId := Stream1#{headers := Headers}}},
+            Decoded = Stream1#{
+                headers := Headers, headers_at => erlang:monotonic_time(millisecond)
+            },
+            State2 = State1#h3{streams = Streams#{StreamId := Decoded}},
             answer_expectation(State2, StreamId, Stream0, Headers);
         {conn_error, _, _} = ConnError ->
             ConnError
@@ -1690,7 +1693,8 @@ raise_body_cap(
 ) ->
     case roadrunner_qpack:decode(Block, Qpack) of
         {ok, Headers, 0} ->
-            route_body_cap(Stream#{headers := Headers}, Headers, Payload, NewLen, ProtoOpts);
+            Decoded = Stream#{headers := Headers, headers_at => erlang:monotonic_time(millisecond)},
+            route_body_cap(Decoded, Headers, Payload, NewLen, ProtoOpts);
         {ok, Headers, _Ric} ->
             route_body_cap(Stream, Headers, Payload, NewLen, ProtoOpts);
         {error, _} ->
@@ -1965,8 +1969,15 @@ dispatch_headers(State, StreamId, Stream, Headers) ->
             %% desync — answer 431 and drop the stream.
             respond_field_section_too_large(State, StreamId);
         false ->
-            dispatch_decoded(State, StreamId, Headers, request_body(Stream))
+            dispatch_decoded(State, StreamId, Headers, request_body(Stream), headers_at(Stream))
     end.
+
+%% When the request's field section was decoded: as its HEADERS frame
+%% arrived with a body still to come (`await_body/4`, `raise_body_cap/5`),
+%% else now, at dispatch.
+-spec headers_at(map()) -> integer().
+headers_at(#{headers_at := At}) -> At;
+headers_at(#{}) -> erlang:monotonic_time(millisecond).
 
 %% The body a request is dispatched with: the one buffered, or, for a
 %% manual-mode stream still receiving it, `reading` (a body reader).
@@ -1989,16 +2000,19 @@ respond_field_section_too_large(#h3{conn = Conn} = State, StreamId) ->
     ),
     drop_stream(State, StreamId).
 
--spec dispatch_decoded(#h3{}, non_neg_integer(), roadrunner_http:headers(), iodata() | reading) ->
+-spec dispatch_decoded(
+    #h3{}, non_neg_integer(), roadrunner_http:headers(), iodata() | reading, integer()
+) ->
     handle_result().
-dispatch_decoded(State, StreamId, Headers, Body) ->
+dispatch_decoded(State, StreamId, Headers, Body, HeadersAt) ->
     {ReqId, NewBuf} = roadrunner_conn:generate_request_id(State#h3.req_id_buffer),
     RequestContext = #{
         peer => State#h3.peer,
         conn_info => State#h3.conn_info,
         scheme => https,
         listener_name => State#h3.listener_name,
-        request_id => ReqId
+        request_id => ReqId,
+        headers_at => HeadersAt
     },
     State1 = State#h3{req_id_buffer = NewBuf},
     case build_request(Headers, Body, RequestContext) of

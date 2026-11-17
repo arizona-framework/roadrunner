@@ -80,7 +80,13 @@ fixture, under both body buffering modes.
     active_drain_is_unavailable/1,
     active_body_over_the_cap/1,
     server_stream_learns_of_a_drain/1,
-    http3_active_reads/1
+    http3_active_reads/1,
+    deadline_counts_from_the_headers/1,
+    http3_deadline_counts_from_the_headers/1,
+    zero_timeout_is_deadline_exceeded/1,
+    queued_wait_counts_toward_the_deadline/1,
+    queued_read_ends_at_the_deadline/1,
+    http3_single_chunk_deadline/1
 ]).
 
 -define(RUNTIME, ~"/test.Runtime/").
@@ -91,7 +97,17 @@ suite() ->
     [{timetrap, {seconds, 30}}].
 
 all() ->
-    [{group, auto}, {group, manual}, http1_is_505, http3_calls, http3_active_reads].
+    [
+        {group, auto},
+        {group, manual},
+        http1_is_505,
+        http3_calls,
+        http3_active_reads,
+        http3_deadline_counts_from_the_headers,
+        queued_wait_counts_toward_the_deadline,
+        queued_read_ends_at_the_deadline,
+        http3_single_chunk_deadline
+    ].
 
 groups() ->
     Common = [
@@ -115,6 +131,7 @@ groups() ->
         message_cut_short_is_internal,
         malformed_timeout_is_internal,
         timeout_sets_the_deadline,
+        zero_timeout_is_deadline_exceeded,
         metadata_round_trips,
         content_type_parameters,
         shutdown_exit_stops_the_call,
@@ -147,7 +164,7 @@ groups() ->
         recv_after_recv_async
     ],
     [
-        {auto, [], Common},
+        {auto, [], Common ++ [deadline_counts_from_the_headers]},
         {manual, [],
             Common ++
                 [
@@ -181,11 +198,25 @@ init_per_testcase(http3_calls, Config) ->
     start(Config, [http3], manual);
 init_per_testcase(http3_active_reads, Config) ->
     start(Config, [http3], manual);
+init_per_testcase(http3_deadline_counts_from_the_headers, Config) ->
+    start(Config, [http3], auto);
+init_per_testcase(http3_single_chunk_deadline, Config) ->
+    start(Config, [http3], auto);
+init_per_testcase(Case, Config) when
+    Case =:= queued_wait_counts_toward_the_deadline; Case =:= queued_read_ends_at_the_deadline
+->
+    start(Config, [http2], manual, #{
+        max_concurrent_requests => 1,
+        overload_mode => {queue, #{max_queued => 4, timeout => 5000}}
+    });
 init_per_testcase(_Case, Config) ->
     start(Config, [http2], ?config(mode, Config)).
 
 start(Config, Protocols, Mode) ->
-    {ok, _} = roadrunner_listener:start_link(?MODULE, (tls(Protocols))#{
+    start(Config, Protocols, Mode, #{}).
+
+start(Config, Protocols, Mode, Extra) ->
+    {ok, _} = roadrunner_listener:start_link(?MODULE, (maps:merge(tls(Protocols), Extra))#{
         port => 0,
         protocols => Protocols,
         body_buffering => Mode,
@@ -424,6 +455,159 @@ http3_calls(Config) ->
     ),
     _ = roadrunner_quic_test_h3:close(Conn),
     ok.
+
+%% With `auto` buffering the deadline counts from when the headers arrived:
+%% a call whose body comes in after it ends `DEADLINE_EXCEEDED` without
+%% running the method (`Deadline` would answer OK). The interim 100 says
+%% the headers arrived.
+deadline_counts_from_the_headers(Config) ->
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "Deadline">>, [
+        {~"grpc-timeout", ~"1m"}, {~"expect", ~"100-continue"}
+    ]),
+    C1 = continued(C0),
+    ok = past_the_deadline(),
+    C2 = roadrunner_grpc_test_client:finish(
+        roadrunner_grpc_test_client:send(C1, 1, frame(~"x")), 1
+    ),
+    {Headers, [], trailers_only, _} = roadrunner_grpc_test_client:response(C2, 1),
+    ?assertEqual(~"4", header(~"grpc-status", Headers)),
+    ?assertEqual(~"deadline exceeded", header(~"grpc-message", Headers)).
+
+http3_deadline_counts_from_the_headers(Config) ->
+    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, ?config(port, Config)),
+    Fields = h3_fields(~"Deadline", [{~"grpc-timeout", ~"1m"}, {~"expect", ~"100-continue"}]),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, Fields, false),
+    receive
+        {quic_test_stream, Conn, StreamId, Continue, false} ->
+            {ok, {headers, Block}, <<>>} = roadrunner_quic_h3_frame:decode(Continue),
+            ?assertEqual({ok, [{~":status", ~"100"}]}, roadrunner_qpack:decode(Block))
+    after 5000 -> ct:fail(no_continue)
+    end,
+    ok = past_the_deadline(),
+    ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, frame(~"x"), true),
+    {[Only], <<>>} = roadrunner_quic_test_h3:collect_all(Conn, StreamId),
+    ?assertEqual(~"4", header(~"grpc-status", Only)),
+    _ = roadrunner_quic_test_h3:close(Conn),
+    ok.
+
+%% A `grpc-timeout` of 0 has passed by the time the method would start.
+zero_timeout_is_deadline_exceeded(Config) ->
+    {Headers, [], trailers_only, _} = call(Config, ~"Deadline", [{~"grpc-timeout", ~"0m"}], [~"x"]),
+    ?assertEqual(~"4", header(~"grpc-status", Headers)).
+
+%% The time a call waits for an in-flight slot counts toward its deadline:
+%% one whose deadline passed while it was parked ends `DEADLINE_EXCEEDED`
+%% without running (`Deadline` would answer OK). A PING round trip says
+%% the server has decoded its headers.
+queued_wait_counts_toward_the_deadline(Config) ->
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "Hold">>, []),
+    C1 = roadrunner_grpc_test_client:finish(
+        roadrunner_grpc_test_client:send(C0, 1, frame(~"x")), 1
+    ),
+    Holder =
+        receive
+            {held, Pid} -> Pid
+        after 5000 -> ct:fail(not_held)
+        end,
+    C2 = roadrunner_grpc_test_client:start(C1, 3, <<?SVC/binary, "Deadline">>, [
+        {~"grpc-timeout", ~"1m"}
+    ]),
+    C3 = pinged(
+        roadrunner_grpc_test_client:finish(roadrunner_grpc_test_client:send(C2, 3, frame(~"x")), 3)
+    ),
+    ok = past_the_deadline(),
+    Holder ! go,
+    {Held, [], trailers_only, C4} = roadrunner_grpc_test_client:response(C3, 1),
+    ?assertEqual(~"5", header(~"grpc-status", Held)),
+    {Headers, [], trailers_only, _} = roadrunner_grpc_test_client:response(C4, 3),
+    ?assertEqual(~"4", header(~"grpc-status", Headers)).
+
+%% A read waits until the deadline counted from the headers, not from when
+%% the method started: parked for longer than the cancel's grace (1 s),
+%% a call whose client sends nothing still ends `DEADLINE_EXCEEDED` rather
+%% than being reset.
+queued_read_ends_at_the_deadline(Config) ->
+    true = register(roadrunner_grpc_held, self()),
+    C0 = roadrunner_grpc_test_client:start(open(Config), 1, <<?SVC/binary, "Hold">>, []),
+    C1 = roadrunner_grpc_test_client:finish(
+        roadrunner_grpc_test_client:send(C0, 1, frame(~"x")), 1
+    ),
+    Holder =
+        receive
+            {held, Pid} -> Pid
+        after 5000 -> ct:fail(not_held)
+        end,
+    C2 = pinged(
+        roadrunner_grpc_test_client:start(C1, 3, <<?SVC/binary, "Unary">>, [
+            {~"grpc-timeout", ~"1500m"}
+        ])
+    ),
+    Until = erlang:monotonic_time(millisecond) + 1100,
+    receive
+    after max(0, Until - erlang:monotonic_time(millisecond)) -> ok
+    end,
+    Holder ! go,
+    {_, [], trailers_only, C3} = roadrunner_grpc_test_client:response(C2, 1),
+    {Headers, [], Trailers, _} = roadrunner_grpc_test_client:response(C3, 3),
+    ?assertEqual(trailers_only, Trailers),
+    ?assertEqual(~"4", header(~"grpc-status", Headers)).
+
+%% An HTTP/3 request whose HEADERS, DATA and FIN come in one chunk has its
+%% field section decoded at dispatch, its deadline counted from then.
+http3_single_chunk_deadline(Config) ->
+    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, ?config(port, Config)),
+    Before = erlang:monotonic_time(millisecond),
+    Fields = h3_fields(~"Deadline", [{~"grpc-timeout", ~"10S"}]),
+    StreamId = roadrunner_quic_test_conn:open_bidi(Conn),
+    ok = roadrunner_quic_test_conn:send(
+        Conn,
+        StreamId,
+        iolist_to_binary([
+            roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(Fields)),
+            roadrunner_quic_h3_frame:encode_data(frame(~"x"))
+        ]),
+        true
+    ),
+    {[_Headers, Trailers], Body} = roadrunner_quic_test_h3:collect_all(Conn, StreamId),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)),
+    [With] = roadrunner_grpc_test_client:messages(Body),
+    Deadline = binary_to_term(With),
+    ?assert(
+        Deadline >= Before + 10000 andalso Deadline =< erlang:monotonic_time(millisecond) + 10000
+    ),
+    _ = roadrunner_quic_test_h3:close(Conn),
+    ok.
+
+%% Send a PING and read up to the server's ACK: every frame sent before
+%% has been processed.
+pinged(#{sock := Sock, transport := T} = C) ->
+    ok = T:send(Sock, roadrunner_http2_frame:encode({ping, 0, ~"deadline"})),
+    acked(C, []).
+
+%% Frames read before the ACK are kept, in order, for `response/2`.
+acked(C, Kept) ->
+    case roadrunner_grpc_test_client:next_frame(C) of
+        {{ping, 1, ~"deadline"}, #{pending := Pending} = C1} ->
+            C1#{pending := queue:join(queue:from_list(lists:reverse(Kept)), Pending)};
+        {Other, C1} ->
+            acked(C1, [Other | Kept])
+    end.
+
+%% The interim 100 the server sent as the call's headers arrived.
+continued(C) ->
+    case roadrunner_grpc_test_client:next_frame(C) of
+        {{headers, 1, _Flags, [{~":status", ~"100"}]}, C1} -> C1;
+        {_Other, C1} -> continued(C1)
+    end.
+
+%% A call's headers arrived before now: 2 ms on, a 1 ms deadline counted
+%% from them has passed.
+past_the_deadline() ->
+    Until = erlang:monotonic_time(millisecond) + 2,
+    receive
+    after max(0, Until - erlang:monotonic_time(millisecond)) -> ok
+    end.
 
 h3_call(Conn, Method, Messages) ->
     h3_call(Conn, Method, [], Messages).

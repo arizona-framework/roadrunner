@@ -7,7 +7,8 @@ ctx() ->
         conn_info => fun(_Query) -> {error, unavailable} end,
         scheme => https,
         request_id => ~"abc123",
-        listener_name => test_listener
+        listener_name => test_listener,
+        headers_at => 0
     }.
 
 from(Headers) ->

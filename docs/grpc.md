@@ -586,8 +586,12 @@ lookup(Request, Stream) ->
     end.
 ```
 
-With `body_buffering => auto`, the deadline counts from when the body was
-read, a little after the client started its clock.
+The deadline counts from when the request's headers arrived, so the time
+spent before the method starts counts too: waiting for the body with
+`body_buffering => auto`, for an in-flight slot on a listener whose
+`overload_mode` queues, or in middlewares. A call whose
+deadline has passed by then, or whose `grpc-timeout` is 0, ends with
+`DEADLINE_EXCEEDED` without running the method.
 
 ### Learning that the client cancelled
 
@@ -777,10 +781,8 @@ How a call ended is one of:
   `roadrunner_grpc:cancelled/2` said so, or else at its next read or
   write or as its status went out, which can be long after the client
   cancelled if the method keeps working without either.
-  The deadline counts from when the call starts (with `auto` buffering,
-  after the body was read), so a client that cancels at its own deadline
-  is reported `cancelled` when its body took more than about 50 ms to
-  arrive
+  The deadline counts from when the request's headers arrived, so a
+  client that cancels at its own deadline is reported `deadline`
 - `stopped`: it ended with no gRPC status (an `exit({shutdown, _})`, or
   response headers too large for the client); the status is the one a
   client reads then, `unknown` before any response and `internal` after

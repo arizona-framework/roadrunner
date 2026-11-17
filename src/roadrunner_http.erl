@@ -78,7 +78,10 @@ accessors that operate on it.
     conn_info := roadrunner_req:conn_info(),
     scheme := http | https,
     request_id := binary(),
-    listener_name := atom()
+    listener_name := atom(),
+    %% When the request's header block was decoded, in
+    %% `erlang:monotonic_time(millisecond)`.
+    headers_at := integer()
 }.
 %% Why `request_pseudo_headers/1` rejects an HTTP/2 or HTTP/3 request's
 %% pseudo-header section.
@@ -873,7 +876,8 @@ build_request(Version, Method, Path, Authority, Regular, Body, RequestContext) -
         conn_info := ConnInfo,
         scheme := Scheme,
         request_id := RequestId,
-        listener_name := ListenerName
+        listener_name := ListenerName,
+        headers_at := HeadersAt
     } = RequestContext,
     #{
         method => Method,
@@ -887,5 +891,6 @@ build_request(Version, Method, Path, Authority, Regular, Body, RequestContext) -
         conn_info => ConnInfo,
         scheme => Scheme,
         request_id => RequestId,
-        listener_name => ListenerName
+        listener_name => ListenerName,
+        headers_at => HeadersAt
     }.
