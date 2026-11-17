@@ -4480,24 +4480,22 @@ new_conn(CertChain) ->
 new_conn(CertChain, Extra) ->
     {Scheme, PrivKey} = ?TC:key_material(),
     {ClientPub, ClientPriv} = ?TC:gen_keypair(),
-    TransportParams = transport_params(),
+    Settings = ?M:settings(
+        CertChain,
+        PrivKey,
+        ~"h3",
+        maps:get(transport_params, Extra, transport_params()),
+        ?RESET_KEY,
+        ?TOKEN_KEY,
+        maps:get(stream_credit, Extra, on_receipt)
+    ),
     State = ?M:new(
-        maps:merge(
-            #{
-                dcid => ?DCID,
-                scid => ?SCID,
-                peer_scid => ?CLIENT_SCID,
-                peer => ?PEER,
-                reset_key => ?RESET_KEY,
-                token_key => ?TOKEN_KEY,
-                cert_chain => CertChain,
-                priv_key => PrivKey,
-                alpn => ~"h3",
-                transport_params => TransportParams,
-                server_random => crypto:strong_rand_bytes(32)
-            },
-            Extra
-        ),
+        Settings,
+        ?DCID,
+        ?SCID,
+        maps:get(peer_scid, Extra, ?CLIENT_SCID),
+        ?PEER,
+        maps:get(address_validated, Extra, false),
         ?NOW
     ),
     {State, #{
@@ -4556,9 +4554,9 @@ transport_params() ->
 tp(Params) ->
     roadrunner_quic_transport_params:new(Params).
 
-%% The connected payload conn_state caches at new/1 (alpn + advertised params).
+%% The connected payload: the negotiated ALPN.
 expected_info() ->
-    #{alpn => ~"h3", transport_params => transport_params()}.
+    ~"h3".
 
 %% Install this process as the owner (no emit while handshaking) so a later
 %% close surfaces {closed, _} here.
