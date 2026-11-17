@@ -604,8 +604,8 @@ body_cap_test() ->
     %% A route's own cap replaces the listener's, larger or smaller; a
     %% route without one, a 404 / 405 and a single handler keep the
     %% listener's.
-    ?assertEqual(64, roadrunner_conn:body_cap({ok, m, #{}, p, s, #{max_content_length => 64}}, 8)),
-    ?assertEqual(2, roadrunner_conn:body_cap({ok, m, #{}, p, s, #{max_content_length => 2}}, 8)),
+    ?assertEqual(64, roadrunner_conn:body_cap({ok, m, #{}, p, s, 64}, 8)),
+    ?assertEqual(2, roadrunner_conn:body_cap({ok, m, #{}, p, s, 2}, 8)),
     ?assertEqual(8, roadrunner_conn:body_cap({ok, m, #{}, p, s, undefined}, 8)),
     ?assertEqual(8, roadrunner_conn:body_cap(not_found, 8)),
     ?assertEqual(8, roadrunner_conn:body_cap({method_not_allowed, [~"GET"]}, 8)).

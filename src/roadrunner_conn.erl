@@ -1095,7 +1095,9 @@ resolve_handler({router, ListenerName}, Req) ->
 %% the route sets one, else the listener's `Default`.
 -doc false.
 -spec body_cap(resolved(), non_neg_integer()) -> roadrunner_router:body_limit().
-body_cap({ok, _Handler, _Bindings, _Pipeline, _State, #{max_content_length := Max}}, _Default) ->
+body_cap({ok, _Handler, _Bindings, _Pipeline, _State, undefined}, Default) ->
+    Default;
+body_cap({ok, _Handler, _Bindings, _Pipeline, _State, Max}, _Default) ->
     Max;
 body_cap(_Resolved, Default) ->
     Default.

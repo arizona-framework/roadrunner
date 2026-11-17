@@ -307,15 +307,15 @@ raise_heap_floor(Cell, Floor, Heap, Cap) ->
 %% body read in manual mode is held to the route's cap as it is read.
 -spec route_body(roadrunner_router:limits(), roadrunner_req:request()) ->
     roadrunner_req:request() | too_large.
-route_body(#{max_content_length := Max}, #{body := Body} = Req) ->
+route_body(undefined, Req) ->
+    Req;
+route_body(Max, #{body := Body} = Req) ->
     case iolist_size(Body) > Max of
         true -> too_large;
         false -> Req
     end;
-route_body(#{max_content_length := Max}, #{body_reader := Reader} = Req) ->
-    Req#{body_reader := Reader#{max := Max}};
-route_body(_Limits, Req) ->
-    Req.
+route_body(Max, #{body_reader := Reader} = Req) ->
+    Req#{body_reader := Reader#{max := Max}}.
 
 -spec invoke(
     module(),
