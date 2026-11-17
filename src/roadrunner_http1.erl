@@ -20,7 +20,10 @@
     parse_chunk_part/4,
     response/3,
     response/4,
-    compute_cached_decisions/1
+    compute_cached_decisions/1,
+    framing/1,
+    expectation/1,
+    connection_lower/1
 ]).
 
 -on_load(init_patterns/0).
@@ -73,6 +76,25 @@
     | {more, undefined}
     | {error, bad_header | header_too_long | header_block_too_long | too_many_headers}.
 -type status() :: roadrunner_http:status().
+
+%% What the conn layer needs from the request's case-insensitive
+%% headers, worked out once in `compute_cached_decisions/1`'s header
+%% walk. `has_host` and `has_content_type` only feed `parse_request/2`'s
+%% checks; the rest is read through `framing/1`, `expectation/1` and
+%% `connection_lower/1`.
+-record(cached_decisions, {
+    framing ::
+        none
+        | chunked
+        | {content_length, non_neg_integer()}
+        | {error, bad_content_length | bad_transfer_encoding},
+    expectation :: none | continue | unsupported,
+    connection_lower :: binary(),
+    has_host :: boolean() | multiple | invalid,
+    has_content_type :: boolean() | multiple
+}).
+-opaque cached_decisions() :: #cached_decisions{}.
+-export_type([cached_decisions/0]).
 
 -doc """
 Parse the HTTP/1.1 request line.
@@ -882,7 +904,8 @@ check_cls_consistent(_, _) -> error.
 %%
 %% Internal hot-path helper — not part of the public handler API. The
 %% result is stashed on the request map's `cached_decisions` field
-%% for `roadrunner_conn` to read; handlers should ignore it.
+%% for `roadrunner_conn` to read through `framing/1`, `expectation/1`
+%% and `connection_lower/1`; handlers should ignore it.
 %%
 %% Header names are already lowercased by `parse_headers/1`; this pass
 %% also lowercases the value of `Connection` (whose tokens are
@@ -892,12 +915,12 @@ check_cls_consistent(_, _) -> error.
 %% Reusing the cached values avoids ~3 lowercase scans per request on
 %% the hot path measured via `scripts/stress.escript --profile`.
 -doc false.
--spec compute_cached_decisions(headers()) -> roadrunner_req:cached_decisions().
+-spec compute_cached_decisions(headers()) -> cached_decisions().
 compute_cached_decisions(Headers) ->
     compute_cached_decisions_loop(Headers, false, false, none, ~"", none, false, false).
 
-%% The seven decisions travel as arguments and become the map once, at the
-%% end: updating a 7-key map per relevant header copies it each time, which
+%% The decisions travel as arguments and become the record once, at the
+%% end: updating a 7-key map per relevant header copied it each time, which
 %% cost a POST with Host, Content-Type, Content-Length and Connection about
 %% 50 ns more.
 -spec compute_cached_decisions_loop(
@@ -909,16 +932,14 @@ compute_cached_decisions(Headers) ->
     ContentLength :: none | {ok, non_neg_integer()} | {error, bad_content_length},
     HasHost :: boolean() | multiple | invalid,
     HasContentType :: boolean() | multiple
-) -> roadrunner_req:cached_decisions().
+) -> cached_decisions().
 compute_cached_decisions_loop([], Chunked, TE, Expect, Conn, CL, Host, CT) ->
-    #{
-        is_chunked => Chunked,
-        has_transfer_encoding => TE,
-        expectation => Expect,
-        connection_lower => Conn,
-        content_length => CL,
-        has_host => Host,
-        has_content_type => CT
+    #cached_decisions{
+        framing = framing(Chunked, TE, CL),
+        expectation = Expect,
+        connection_lower = Conn,
+        has_host = Host,
+        has_content_type = CT
     };
 %% Each field's canonical lowercase value gets a literal clause ahead
 %% of that field's general clause. The literal is its own lowercase, so
@@ -987,6 +1008,43 @@ compute_cached_decisions_loop([{~"host", _} | Rest], Chunked, TE, Expect, Conn, 
     compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, multiple, CT);
 compute_cached_decisions_loop([_ | Rest], Chunked, TE, Expect, Conn, CL, Host, CT) ->
     compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, CT).
+
+%% The body's framing: a chunked Transfer-Encoding wins, any other
+%% coding is rejected (RFC 9112 §6.1: only identity and chunked are
+%% supported), and with no Transfer-Encoding the Content-Length decides.
+%% `parse_headers/2`'s `check_framing/1` has already rejected TE+CL
+%% combos and inconsistent repeated Content-Length lines.
+-spec framing(
+    IsChunked :: boolean(),
+    HasTransferEncoding :: boolean(),
+    none | {ok, non_neg_integer()} | {error, bad_content_length}
+) ->
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding}.
+framing(true, _TE, _CL) -> chunked;
+framing(false, true, _CL) -> {error, bad_transfer_encoding};
+framing(false, false, none) -> none;
+framing(false, false, {ok, N}) -> {content_length, N};
+framing(false, false, {error, _} = Err) -> Err.
+
+-doc false.
+-spec framing(cached_decisions()) ->
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding}.
+framing(#cached_decisions{framing = Framing}) -> Framing.
+
+-doc false.
+-spec expectation(cached_decisions()) -> none | continue | unsupported.
+expectation(#cached_decisions{expectation = Expectation}) -> Expectation.
+
+%% The request's `Connection` value, lowercased (empty when absent).
+-doc false.
+-spec connection_lower(cached_decisions()) -> binary().
+connection_lower(#cached_decisions{connection_lower = ConnectionLower}) -> ConnectionLower.
 
 -spec parse_content_length(binary()) ->
     {ok, non_neg_integer()} | {error, bad_content_length}.
@@ -1099,18 +1157,22 @@ origin_form(Target, _Path, Headers) ->
 %% More than one Content-Type field line is a 400: the field is a
 %% singleton (RFC 9110 §5.3, §8.3), and two values, equal or not, leave
 %% the body's media type to whichever line a reader picks.
--spec validate_content_type(roadrunner_req:cached_decisions()) ->
+-spec validate_content_type(cached_decisions()) ->
     ok | {error, duplicate_content_type}.
-validate_content_type(#{has_content_type := multiple}) -> {error, duplicate_content_type};
-validate_content_type(_Decisions) -> ok.
+validate_content_type(#cached_decisions{has_content_type = multiple}) ->
+    {error, duplicate_content_type};
+validate_content_type(_Decisions) ->
+    ok.
 
 %% An `Expect` asking for anything but `100-continue` is a 417 (RFC 9110
 %% §10.1.1): the server can't meet it, and going on would leave the client
 %% thinking it was met.
--spec validate_expectation(roadrunner_req:cached_decisions()) ->
+-spec validate_expectation(cached_decisions()) ->
     ok | {error, unsupported_expectation}.
-validate_expectation(#{expectation := unsupported}) -> {error, unsupported_expectation};
-validate_expectation(_Decisions) -> ok.
+validate_expectation(#cached_decisions{expectation = unsupported}) ->
+    {error, unsupported_expectation};
+validate_expectation(_Decisions) ->
+    ok.
 
 %% RFC 9112 §3.2 / 7230 §5.4: HTTP/1.1 requests MUST include a Host
 %% header. Absence is a 400 Bad Request, also a request-smuggling
@@ -1119,12 +1181,12 @@ validate_expectation(_Decisions) -> ok.
 %% that is present must be a valid `uri-host [":" port]` with a non-empty
 %% host (`roadrunner_http:valid_host/1`, the check HTTP/2 and HTTP/3 apply
 %% to the authority): RFC 9112 §3.2 answers an invalid one with 400 too.
--spec validate_host(version(), roadrunner_req:cached_decisions()) ->
+-spec validate_host(version(), cached_decisions()) ->
     ok | {error, missing_host | duplicate_host | bad_host}.
-validate_host(_Version, #{has_host := multiple}) -> {error, duplicate_host};
-validate_host(_Version, #{has_host := invalid}) -> {error, bad_host};
-validate_host({1, 1}, #{has_host := true}) -> ok;
-validate_host({1, 1}, #{has_host := false}) -> {error, missing_host};
+validate_host(_Version, #cached_decisions{has_host = multiple}) -> {error, duplicate_host};
+validate_host(_Version, #cached_decisions{has_host = invalid}) -> {error, bad_host};
+validate_host({1, 1}, #cached_decisions{has_host = true}) -> ok;
+validate_host({1, 1}, #cached_decisions{has_host = false}) -> {error, missing_host};
 validate_host({1, 0}, _Decisions) -> ok.
 
 -doc """

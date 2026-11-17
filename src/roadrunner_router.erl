@@ -187,10 +187,11 @@ A cap on a request body in bytes, or `infinity` for none.
 -doc """
 A route's request limits the connection reads before dispatch, carried in its
 compiled entry so the one dispatch match yields them: `undefined` for a route
-that sets none, else the overrides it declares. A route's `rate_limit` is not
-here: it is a stage of the route's pipeline (`roadrunner_route_rate_limit`).
+that sets none, else the body cap its `max_content_length` declares. A route's
+`rate_limit` is not here: it is a stage of the route's pipeline
+(`roadrunner_route_rate_limit`).
 """.
--type limits() :: undefined | #{max_content_length => body_limit()}.
+-type limits() :: undefined | body_limit().
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
@@ -444,7 +445,7 @@ has_init_route(Handler) ->
 %% arrive; one the listener reads whole first keeps the listener's cap.
 -spec route_limits(map(), roadrunner_listener:body_buffering()) -> limits().
 route_limits(#{max_content_length := infinity}, auto) -> undefined;
-route_limits(#{max_content_length := Max}, _BodyBuffering) -> #{max_content_length => Max};
+route_limits(#{max_content_length := Max}, _BodyBuffering) -> Max;
 route_limits(_Route, _BodyBuffering) -> undefined.
 
 %% A route's own middlewares, led by its `rate_limit` stage when it sets one:

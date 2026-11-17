@@ -50,11 +50,11 @@ care which protocol delivered the bytes.
     path => binary(),
     version := version(),
     headers := headers(),
-    %% H1-parser internal optimization — handlers should ignore.
-    %% Hot-path conn helpers (`body_framing/1`,
-    %% `keep_alive_decision/2`, `expects_continue/1`) read
-    %% this directly to skip per-request header re-lowercasing.
-    %% Absent on h2 requests and on manually-built request maps.
+    %% H1-parser internal optimization, an opaque term handlers must
+    %% ignore. Hot-path conn helpers (`body_framing/1`,
+    %% `keep_alive_decision/2`, `expects_continue/1`) read it to skip
+    %% per-request header re-lowercasing. Absent on h2 and h3 requests
+    %% and on manually-built request maps.
     cached_decisions => cached_decisions(),
     %% Body is set by `roadrunner_conn` before the handler is
     %% invoked. Auto mode delivers the full body as `iodata()` (an
@@ -152,21 +152,13 @@ The framework/middleware scratchpad map carried on the request's
 
 -doc """
 Framework-internal h1-parser hot-path optimization carried on the
-request map's `cached_decisions` field. Handlers should ignore both
-the field and this type — they're absent on h2 requests and on
-manually-built request maps. Populated by the h1 parser at
-request-read time and consumed by framework code to skip
-per-request header re-lowercasing on the dispatch hot path.
+request map's `cached_decisions` field. An opaque term: handlers must
+ignore both the field and this type. It is absent on h2 and h3
+requests and on manually-built request maps. The h1 parser fills it
+at request-read time so framework code can skip re-reading and
+re-lowercasing headers on the dispatch hot path.
 """.
--type cached_decisions() :: #{
-    is_chunked := boolean(),
-    has_transfer_encoding := boolean(),
-    expectation := none | continue | unsupported,
-    connection_lower := binary(),
-    content_length := none | {ok, non_neg_integer()} | {error, bad_content_length},
-    has_host := boolean() | multiple | invalid,
-    has_content_type := boolean() | multiple
-}.
+-type cached_decisions() :: term().
 
 -doc """
 Body-read envelope attached to the request in `body_buffering =>

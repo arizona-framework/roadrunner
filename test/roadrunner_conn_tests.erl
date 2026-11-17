@@ -387,14 +387,17 @@ expects_continue_ignores_http10_test() ->
     Req = req_v10([{~"expect", ~"100-continue"}]),
     ?assertNot(roadrunner_conn:expects_continue(Req)),
     ?assertNot(
-        roadrunner_conn:expects_continue(Req#{cached_decisions => #{expectation => continue}})
+        roadrunner_conn:expects_continue(Req#{cached_decisions => continue_decisions()})
     ).
 
 expects_continue_from_cached_decisions_test() ->
     Req = req_with_headers([]),
     ?assert(
-        roadrunner_conn:expects_continue(Req#{cached_decisions => #{expectation => continue}})
+        roadrunner_conn:expects_continue(Req#{cached_decisions => continue_decisions()})
     ).
+
+continue_decisions() ->
+    roadrunner_http1:compute_cached_decisions([{~"expect", ~"100-continue"}]).
 
 send_continue_writes_interim_response_test() ->
     %% A fake socket that records send calls.
@@ -601,8 +604,8 @@ body_cap_test() ->
     %% A route's own cap replaces the listener's, larger or smaller; a
     %% route without one, a 404 / 405 and a single handler keep the
     %% listener's.
-    ?assertEqual(64, roadrunner_conn:body_cap({ok, m, #{}, p, s, #{max_content_length => 64}}, 8)),
-    ?assertEqual(2, roadrunner_conn:body_cap({ok, m, #{}, p, s, #{max_content_length => 2}}, 8)),
+    ?assertEqual(64, roadrunner_conn:body_cap({ok, m, #{}, p, s, 64}, 8)),
+    ?assertEqual(2, roadrunner_conn:body_cap({ok, m, #{}, p, s, 2}, 8)),
     ?assertEqual(8, roadrunner_conn:body_cap({ok, m, #{}, p, s, undefined}, 8)),
     ?assertEqual(8, roadrunner_conn:body_cap(not_found, 8)),
     ?assertEqual(8, roadrunner_conn:body_cap({method_not_allowed, [~"GET"]}, 8)).

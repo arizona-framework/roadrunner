@@ -640,7 +640,7 @@ compile_rejects_invalid_max_content_length_test_() ->
 infinity_max_content_length_needs_manual_buffering_test() ->
     Routes = [#{path => ~"/x", handler => h, max_content_length => infinity}],
     ?assertMatch(
-        {ok, h, _, _, _, #{max_content_length := infinity}},
+        {ok, h, _, _, _, infinity},
         roadrunner_router:resolve(~"POST", ~"/x", roadrunner_router:compile(Routes, [], manual))
     ),
     ?assertMatch(
@@ -706,7 +706,7 @@ rate_limit_is_a_pipeline_stage_test() ->
     try
         {ok, _, _, Pipeline, _, undefined} = roadrunner_router:resolve(~"GET", ~"/login", Compiled),
         ?assertMatch(
-            {ok, _, _, _, _, #{max_content_length := 64}},
+            {ok, _, _, _, _, 64},
             roadrunner_router:resolve(~"POST", ~"/upload", Compiled)
         ),
         {{200, Served, _}, _} = Pipeline(Req),
@@ -744,7 +744,7 @@ resolve_carries_the_route_limits_test() ->
         []
     ),
     ?assertMatch(
-        {ok, up, #{}, _, _, #{max_content_length := 0}},
+        {ok, up, #{}, _, _, 0},
         roadrunner_router:resolve(~"POST", ~"/upload", Compiled)
     ),
     ?assertMatch(
