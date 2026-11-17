@@ -1232,8 +1232,8 @@ send_continue(Socket) ->
 -spec expects_continue(roadrunner_req:request()) -> boolean().
 expects_continue(#{version := {1, 0}}) ->
     false;
-expects_continue(#{cached_decisions := #{expectation := Expectation}}) ->
-    Expectation =:= continue;
+expects_continue(#{cached_decisions := Decisions}) ->
+    roadrunner_http1:expectation(Decisions) =:= continue;
 expects_continue(Req) ->
     %% Manually-built request maps (tests, middleware) skip the parse-time
     %% precompute — fall back to parsing the header.
@@ -1532,21 +1532,8 @@ drop_delivered(StreamId) ->
     | chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding}.
-body_framing(#{cached_decisions := #{is_chunked := true}}) ->
-    chunked;
-body_framing(#{cached_decisions := #{has_transfer_encoding := true}}) ->
-    %% Non-chunked Transfer-Encoding (e.g. `gzip`). Rejected per
-    %% RFC 9112 §6.1 — we only support identity and chunked.
-    {error, bad_transfer_encoding};
-body_framing(#{cached_decisions := #{content_length := CL}}) ->
-    %% No Transfer-Encoding header. `parse_request/1`'s `check_framing/1`
-    %% already rejected TE+CL combos and inconsistent multi-CL, so the
-    %% cached Content-Length is the body framing.
-    case CL of
-        none -> none;
-        {ok, N} -> {content_length, N};
-        {error, _} = Err -> Err
-    end;
+body_framing(#{cached_decisions := Decisions}) ->
+    roadrunner_http1:framing(Decisions);
 body_framing(Req) ->
     %% Manually-built request maps without cached_decisions — full path.
     case roadrunner_req:header_normalized(~"transfer-encoding", Req) of
@@ -2194,16 +2181,17 @@ head_response(Response, _Method) ->
 %% carries no `close` token, so it decides the same as empty), response
 %% has no `connection` header → `keep_alive` directly. Skips the
 %% lowercase + has_token dance (~120 ns for `keep-alive`) entirely.
-keep_alive_decision(
-    #{
-        version := {1, 1},
-        cached_decisions := #{connection_lower := ReqConn}
-    } = Req,
-    RespHeaders
-) when is_list(RespHeaders), (ReqConn =:= <<>> orelse ReqConn =:= ~"keep-alive") ->
-    case lists:keymember(~"connection", 1, RespHeaders) of
-        false -> keep_alive;
-        true -> keep_alive_decision_full(Req, RespHeaders)
+keep_alive_decision(#{version := {1, 1}, cached_decisions := Decisions} = Req, RespHeaders) when
+    is_list(RespHeaders)
+->
+    case roadrunner_http1:connection_lower(Decisions) of
+        ReqConn when ReqConn =:= <<>>; ReqConn =:= ~"keep-alive" ->
+            case lists:keymember(~"connection", 1, RespHeaders) of
+                false -> keep_alive;
+                true -> keep_alive_decision_full(Req, RespHeaders)
+            end;
+        _ ->
+            keep_alive_decision_full(Req, RespHeaders)
     end;
 keep_alive_decision(Req, RespHeaders) ->
     keep_alive_decision_full(Req, RespHeaders).
@@ -2242,8 +2230,8 @@ keep_alive_decision_full(Req, RespHeaders) ->
 %% `cached_decisions` when present (parser populates it once per request)
 %% and falls back to a per-call lowercase for manually-built request maps.
 -spec req_connection_lower(roadrunner_req:request()) -> binary().
-req_connection_lower(#{cached_decisions := #{connection_lower := V}}) ->
-    V;
+req_connection_lower(#{cached_decisions := Decisions}) ->
+    roadrunner_http1:connection_lower(Decisions);
 req_connection_lower(Req) ->
     case roadrunner_req:header_normalized(~"connection", Req) of
         undefined -> ~"";

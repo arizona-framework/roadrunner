@@ -656,15 +656,7 @@ request_full_test() ->
                 path => ~"/foo",
                 version => {1, 1},
                 headers => [{~"host", ~"x"}],
-                cached_decisions => #{
-                    is_chunked => false,
-                    has_transfer_encoding => false,
-                    expectation => none,
-                    connection_lower => ~"",
-                    content_length => none,
-                    has_host => true,
-                    has_content_type => false
-                }
+                cached_decisions => roadrunner_http1:compute_cached_decisions([{~"host", ~"x"}])
             },
             ~"body"},
         roadrunner_http1:parse_request(~"GET /foo HTTP/1.1\r\nHost: x\r\n\r\nbody")
@@ -690,15 +682,7 @@ request_http10_no_host_accepted_test() ->
                 path => ~"/",
                 version => {1, 0},
                 headers => [],
-                cached_decisions => #{
-                    is_chunked => false,
-                    has_transfer_encoding => false,
-                    expectation => none,
-                    connection_lower => ~"",
-                    content_length => none,
-                    has_host => false,
-                    has_content_type => false
-                }
+                cached_decisions => roadrunner_http1:compute_cached_decisions([])
             },
             ~""},
         roadrunner_http1:parse_request(~"GET / HTTP/1.0\r\n\r\n")
@@ -754,7 +738,7 @@ request_repeated_content_type_returns_error_test() ->
      || Second <- [~"text/plain", ~"application/json"]
     ],
     ?assertMatch(
-        {ok, #{cached_decisions := #{has_content_type := true}}, ~""},
+        {ok, #{headers := [_, {~"content-type", ~"text/plain"}]}, ~""},
         roadrunner_http1:parse_request(
             ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\n\r\n"
         )
@@ -835,108 +819,77 @@ control_char_in_query_rejected_test() ->
         roadrunner_http1:parse_request(~"GET /foo?a=\x{00} HTTP/1.1\r\nHost: x\r\n\r\n")
     ).
 
+%% What the conn layer reads off the decisions, as one map so a test can
+%% compare it whole.
+decisions(Headers) ->
+    D = roadrunner_http1:compute_cached_decisions(Headers),
+    #{
+        framing => roadrunner_http1:framing(D),
+        expectation => roadrunner_http1:expectation(D),
+        connection_lower => roadrunner_http1:connection_lower(D)
+    }.
+
 cached_decisions_empty_for_empty_headers_test() ->
     ?assertEqual(
-        #{
-            is_chunked => false,
-            has_transfer_encoding => false,
-            expectation => none,
-            connection_lower => ~"",
-            content_length => none,
-            has_host => false,
-            has_content_type => false
-        },
-        roadrunner_http1:compute_cached_decisions([])
+        #{framing => none, expectation => none, connection_lower => ~""},
+        decisions([])
     ).
 
 cached_decisions_chunked_lowercased_match_test() ->
     %% RFC 9110 §10.1.4: case-insensitive. Each casing must flip the flag.
     [
-        ?assertMatch(
-            #{is_chunked := true},
-            roadrunner_http1:compute_cached_decisions([{~"transfer-encoding", V}])
-        )
+        ?assertMatch(#{framing := chunked}, decisions([{~"transfer-encoding", V}]))
      || V <- [~"chunked", ~"Chunked", ~"CHUNKED", ~"ChUnKeD"]
     ].
 
-cached_decisions_chunked_unknown_te_does_not_set_flag_test() ->
-    %% Non-chunked TE values leave is_chunked false but flag the presence
-    %% of *some* Transfer-Encoding so `body_framing/1` can reject it
-    %% without re-reading the header.
+cached_decisions_unknown_te_is_bad_framing_test() ->
+    %% A non-chunked Transfer-Encoding is rejected without re-reading the
+    %% header, whatever the Content-Length says.
     ?assertMatch(
-        #{is_chunked := false, has_transfer_encoding := true},
-        roadrunner_http1:compute_cached_decisions([{~"transfer-encoding", ~"gzip"}])
+        #{framing := {error, bad_transfer_encoding}},
+        decisions([{~"transfer-encoding", ~"gzip"}])
+    ),
+    ?assertMatch(
+        #{framing := {error, bad_transfer_encoding}},
+        decisions([{~"transfer-encoding", ~"gzip"}, {~"content-length", ~"5"}])
     ).
 
-cached_decisions_chunked_te_sets_has_transfer_encoding_test() ->
-    %% `is_chunked := true` always implies `has_transfer_encoding := true`.
+cached_decisions_chunked_wins_over_content_length_test() ->
     ?assertMatch(
-        #{is_chunked := true, has_transfer_encoding := true},
-        roadrunner_http1:compute_cached_decisions([{~"transfer-encoding", ~"chunked"}])
+        #{framing := chunked},
+        decisions([{~"content-length", ~"5"}, {~"transfer-encoding", ~"chunked"}])
     ).
 
 cached_decisions_caches_valid_content_length_test() ->
-    ?assertMatch(
-        #{content_length := {ok, 256}},
-        roadrunner_http1:compute_cached_decisions([{~"content-length", ~"256"}])
-    ).
+    ?assertMatch(#{framing := {content_length, 256}}, decisions([{~"content-length", ~"256"}])).
 
 cached_decisions_caches_zero_content_length_test() ->
-    ?assertMatch(
-        #{content_length := {ok, 0}},
-        roadrunner_http1:compute_cached_decisions([{~"content-length", ~"0"}])
-    ).
+    ?assertMatch(#{framing := {content_length, 0}}, decisions([{~"content-length", ~"0"}])).
 
-cached_decisions_caches_bad_content_length_non_integer_test() ->
-    ?assertMatch(
-        #{content_length := {error, bad_content_length}},
-        roadrunner_http1:compute_cached_decisions([{~"content-length", ~"abc"}])
-    ).
-
-cached_decisions_caches_bad_content_length_negative_test() ->
-    ?assertMatch(
-        #{content_length := {error, bad_content_length}},
-        roadrunner_http1:compute_cached_decisions([{~"content-length", ~"-1"}])
-    ).
-
-cached_decisions_caches_bad_content_length_signed_test() ->
+cached_decisions_caches_bad_content_length_test() ->
     [
         ?assertMatch(
-            #{content_length := {error, bad_content_length}},
-            roadrunner_http1:compute_cached_decisions([{~"content-length", V}])
+            #{framing := {error, bad_content_length}}, decisions([{~"content-length", V}])
         )
-     || V <- [~"+5", ~"-0"]
+     || V <- [~"abc", ~"-1", ~"+5", ~"-0"]
     ].
-
-cached_decisions_content_length_default_none_test() ->
-    ?assertMatch(
-        #{content_length := none},
-        roadrunner_http1:compute_cached_decisions([])
-    ).
 
 cached_decisions_expect_continue_any_case_test() ->
     [
-        ?assertMatch(
-            #{expectation := continue},
-            roadrunner_http1:compute_cached_decisions([{~"expect", V}])
-        )
+        ?assertMatch(#{expectation := continue}, decisions([{~"expect", V}]))
      || V <- [~"100-continue", ~"100-Continue", ~"100-CONTINUE"]
     ].
 
 cached_decisions_unknown_expect_is_unsupported_test() ->
     ?assertMatch(
-        #{expectation := unsupported},
-        roadrunner_http1:compute_cached_decisions([{~"expect", ~"the-spanish-inquisition"}])
+        #{expectation := unsupported}, decisions([{~"expect", ~"the-spanish-inquisition"}])
     ).
 
 cached_decisions_expect_lines_combine_test_() ->
     %% Every `Expect` line counts: an unsupported member on any line makes
     %% the request's expectation unsupported, an empty line changes nothing.
     [
-        ?_assertMatch(
-            #{expectation := Want},
-            roadrunner_http1:compute_cached_decisions([{~"expect", V} || V <- Lines])
-        )
+        ?_assertMatch(#{expectation := Want}, decisions([{~"expect", V} || V <- Lines]))
      || {Lines, Want} <- [
             {[~"100-continue", ~""], continue},
             {[~"", ~"100-continue"], continue},
@@ -966,52 +919,34 @@ parse_request_unknown_expectation_rejected_test_() ->
 cached_decisions_connection_lowercased_test() ->
     ?assertMatch(
         #{connection_lower := ~"keep-alive, upgrade"},
-        roadrunner_http1:compute_cached_decisions(
-            [{~"connection", ~"Keep-Alive, Upgrade"}]
-        )
+        decisions([{~"connection", ~"Keep-Alive, Upgrade"}])
     ).
 
 cached_decisions_full_map_test_() ->
-    %% Every field and its repeats, checked against the whole decisions map so
-    %% each one lands in its own key and leaves the others at their defaults.
-    Default = #{
-        is_chunked => false,
-        has_transfer_encoding => false,
-        expectation => none,
-        connection_lower => ~"",
-        content_length => none,
-        has_host => false,
-        has_content_type => false
-    },
+    %% Every field and its repeats, checked against the whole decisions view
+    %% so each one lands in its own field and leaves the others at their
+    %% defaults. Host and Content-Type only feed `parse_request/2`'s checks,
+    %% covered by its own tests.
+    Default = #{framing => none, expectation => none, connection_lower => ~""},
     [
-        ?_assertEqual(
-            maps:merge(Default, Want), roadrunner_http1:compute_cached_decisions(Headers)
-        )
+        ?_assertEqual(maps:merge(Default, Want), decisions(Headers))
      || {Headers, Want} <- [
             {[], #{}},
             {[{~"x-other", ~"v"}], #{}},
-            {[{~"transfer-encoding", ~"chunked"}], #{
-                is_chunked => true, has_transfer_encoding => true
-            }},
-            {[{~"transfer-encoding", ~"Chunked"}], #{
-                is_chunked => true, has_transfer_encoding => true
-            }},
-            {[{~"transfer-encoding", ~"gzip"}], #{has_transfer_encoding => true}},
+            {[{~"host", ~"x"}, {~"content-type", ~"text/plain"}], #{}},
+            {[{~"transfer-encoding", ~"chunked"}], #{framing => chunked}},
+            {[{~"transfer-encoding", ~"Chunked"}], #{framing => chunked}},
+            {[{~"transfer-encoding", ~"gzip"}], #{framing => {error, bad_transfer_encoding}}},
             {[{~"transfer-encoding", ~"chunked"}, {~"transfer-encoding", ~"gzip"}], #{
-                is_chunked => true, has_transfer_encoding => true
+                framing => chunked
             }},
             {[{~"expect", ~"100-continue"}], #{expectation => continue}},
             {[{~"expect", ~"100-continue"}, {~"expect", ~"foo"}], #{expectation => unsupported}},
             {[{~"connection", ~"keep-alive"}], #{connection_lower => ~"keep-alive"}},
             {[{~"connection", ~"close"}], #{connection_lower => ~"close"}},
             {[{~"connection", ~"Upgrade"}], #{connection_lower => ~"upgrade"}},
-            {[{~"content-length", ~"42"}], #{content_length => {ok, 42}}},
-            {[{~"content-length", ~"x"}], #{content_length => {error, bad_content_length}}},
-            {[{~"content-type", ~"a/b"}], #{has_content_type => true}},
-            {[{~"content-type", ~"a/b"}, {~"content-type", ~"a/b"}], #{has_content_type => multiple}},
-            {[{~"host", ~"example.com"}], #{has_host => true}},
-            {[{~"host", ~"bad host"}], #{has_host => invalid}},
-            {[{~"host", ~"a"}, {~"host", ~"b"}], #{has_host => multiple}},
+            {[{~"content-length", ~"42"}], #{framing => {content_length, 42}}},
+            {[{~"content-length", ~"x"}], #{framing => {error, bad_content_length}}},
             {
                 [
                     {~"host", ~"x"},
@@ -1021,9 +956,7 @@ cached_decisions_full_map_test_() ->
                     {~"expect", ~"100-continue"}
                 ],
                 #{
-                    has_host => true,
-                    has_content_type => true,
-                    content_length => {ok, 5},
+                    framing => {content_length, 5},
                     connection_lower => ~"keep-alive",
                     expectation => continue
                 }
@@ -1031,43 +964,16 @@ cached_decisions_full_map_test_() ->
         ]
     ].
 
-cached_decisions_ignores_unrelated_headers_test() ->
-    %% Only cached headers feed the cache; everything else
-    %% (Content-Type, X-*, etc.) leaves defaults intact. `Host` is
-    %% cached too — flips `has_host` — so it stays in the input here
-    %% and the assertion expects `has_host => true`.
-    ?assertEqual(
-        #{
-            is_chunked => false,
-            has_transfer_encoding => false,
-            expectation => none,
-            connection_lower => ~"",
-            content_length => none,
-            has_host => true,
-            has_content_type => true
-        },
-        roadrunner_http1:compute_cached_decisions([
-            {~"host", ~"x"}, {~"content-type", ~"text/plain"}
-        ])
-    ).
-
 parse_request_attaches_cached_decisions_for_chunked_request_test() ->
     Bin = ~"POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: Chunked\r\n\r\n",
-    ?assertMatch(
-        {ok,
-            #{
-                cached_decisions := #{is_chunked := true, expectation := none}
-            },
-            _},
-        roadrunner_http1:parse_request(Bin)
-    ).
+    {ok, #{cached_decisions := D}, _} = roadrunner_http1:parse_request(Bin),
+    ?assertEqual(chunked, roadrunner_http1:framing(D)),
+    ?assertEqual(none, roadrunner_http1:expectation(D)).
 
 parse_request_attaches_cached_decisions_for_expect_continue_test() ->
     Bin = ~"PUT /u HTTP/1.1\r\nHost: x\r\nExpect: 100-Continue\r\nContent-Length: 0\r\n\r\n",
-    ?assertMatch(
-        {ok, #{cached_decisions := #{expectation := continue}}, _},
-        roadrunner_http1:parse_request(Bin)
-    ).
+    {ok, #{cached_decisions := D}, _} = roadrunner_http1:parse_request(Bin),
+    ?assertEqual(continue, roadrunner_http1:expectation(D)).
 
 request_http11_with_host_accepted_test() ->
     %% Sanity: Host present satisfies validation.
