@@ -1193,9 +1193,7 @@ allow_header_value(Allowed) ->
 %% answers it without coming here.
 -doc false.
 -spec read_body(
-    chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding},
+    roadrunner_http1:framing(),
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer(),
@@ -1246,7 +1244,7 @@ expects_continue(Req) ->
 
 -doc false.
 -spec make_body_reader(
-    none | chunked | {content_length, non_neg_integer()},
+    roadrunner_http1:body_framing(),
     binary(),
     fun((roadrunner_req:deadline()) -> {ok, binary()} | {error, term()}),
     roadrunner_router:body_limit(),
@@ -1530,30 +1528,35 @@ drop_delivered(StreamId) ->
 
 -doc false.
 -spec body_framing(roadrunner_req:request()) ->
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding}.
-body_framing(#{cached_decisions := Decisions}) ->
-    roadrunner_http1:framing(Decisions);
-body_framing(Req) ->
-    %% Manually-built request maps without cached_decisions — full path.
-    case roadrunner_req:header_normalized(~"transfer-encoding", Req) of
-        undefined ->
-            case content_length(Req) of
-                none -> none;
-                {ok, N} -> {content_length, N};
-                {error, _} = Err -> Err
-            end;
-        Value ->
-            %% RFC 9110 §10.1.4: transfer-coding names are
-            %% case-insensitive. Accept `chunked`, `Chunked`,
-            %% `CHUNKED` etc. (clients in the wild send all variants).
-            case roadrunner_bin:ascii_lowercase(Value) of
-                ~"chunked" -> chunked;
-                _ -> {error, bad_transfer_encoding}
-            end
-    end.
+    roadrunner_http1:framing().
+body_framing(#{cached_decisions := Decisions} = Req) ->
+    version_framing(roadrunner_http1:framing(Decisions), Req);
+body_framing(#{headers := Headers} = Req) ->
+    %% Manually-built request maps without cached_decisions: compute them
+    %% so both paths frame the body by the same rules.
+    version_framing(
+        roadrunner_http1:framing(roadrunner_http1:compute_cached_decisions(Headers)), Req
+    ).
+
+%% RFC 9112 §6.1: an HTTP/1.0 message with Transfer-Encoding MUST be
+%% treated as if its framing is faulty and the connection closed after it.
+%% An HTTP/1.0 peer may not know chunked at all, and a proxy on its path may
+%% frame the body by Content-Length or by close instead, so its length
+%% cannot be determined reliably: answer it as RFC 9112 §6.3 answers a
+%% request whose length is unreliable, 400 and close, rather than read a
+%% body the hops may disagree on. That includes a list ending in chunked
+%% after an unsupported coding, which HTTP/1.1 answers 501. Any other
+%% Transfer-Encoding is already a 400 on every version.
+-spec version_framing(
+    roadrunner_http1:framing(),
+    roadrunner_req:request()
+) ->
+    roadrunner_http1:framing().
+version_framing(chunked, #{version := {1, 1}}) -> chunked;
+version_framing({error, unsupported_transfer_coding} = Err, #{version := {1, 1}}) -> Err;
+version_framing(chunked, _Req) -> {error, bad_transfer_encoding};
+version_framing({error, unsupported_transfer_coding}, _Req) -> {error, bad_transfer_encoding};
+version_framing(Framing, _Req) -> Framing.
 
 -spec read_body_until(
     non_neg_integer(),
@@ -2061,19 +2064,6 @@ fill_iolist(Need, Recv) ->
             E
     end.
 
--spec content_length(roadrunner_req:request()) ->
-    none | {ok, non_neg_integer()} | {error, bad_content_length}.
-content_length(Req) ->
-    case roadrunner_req:header_normalized(~"content-length", Req) of
-        undefined ->
-            none;
-        Bin ->
-            case roadrunner_bin:digits_to_integer(Bin) of
-                {ok, _} = Ok -> Ok;
-                error -> {error, bad_content_length}
-            end
-    end.
-
 -doc false.
 -spec parse_loop(binary(), fun(() -> {ok, binary()} | {error, term()})) ->
     {ok, roadrunner_req:request(), binary()} | {error, term()}.
@@ -2310,6 +2300,7 @@ send_status(Socket, Status) ->
 -spec parse_error_status(atom()) -> roadrunner_http:status().
 parse_error_status(request_line_too_long) -> 414;
 parse_error_status(not_implemented) -> 501;
+parse_error_status(unsupported_transfer_coding) -> 501;
 parse_error_status(unsupported_expectation) -> 417;
 parse_error_status(header_too_long) -> 431;
 parse_error_status(header_block_too_long) -> 431;
