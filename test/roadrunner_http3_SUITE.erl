@@ -2124,27 +2124,29 @@ refuse_request_during_drain(Config) ->
     %% in-flight request still completes.
     Name = ?config(listener, Config),
     Conn = ll_connect(?config(port, Config)),
-    %% A slow request keeps a worker in flight across the drain.
-    SlowFrame = roadrunner_quic_h3_frame:encode_headers(
-        roadrunner_qpack:encode(headers(~"GET", ~"/slow"))
-    ),
-    SlowId = roadrunner_quic_test_conn:open_bidi(Conn),
-    ok = roadrunner_quic_test_conn:send(Conn, SlowId, SlowFrame, true),
-    timer:sleep(20),
-    %% Drive the conn loop's drain directly — the same message the
+    %% A request parked in its handler keeps a worker in flight across the
+    %% drain. Drain only once it has started: with nothing in flight the
+    %% drain closes the connection at once, and no reset ever comes.
+    true = register(roadrunner_h3_block_observer, self()),
+    BlockId = ll_send(Conn, request_frame(~"/block"), true),
+    Worker =
+        receive
+            {block_worker, Pid} -> Pid
+        after 5000 -> ct:fail(no_worker)
+        end,
+    true = unregister(roadrunner_h3_block_observer),
+    %% Drive the conn loop's drain directly, the same message the
     %% listener broadcasts (its synchronous `drain/2` would block here).
     [LoopPid] = drain_members(Name),
     LoopPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5000},
-    timer:sleep(20),
+    {goaway, GoawayId} = await_goaway(Conn),
+    ?assert(GoawayId > BlockId),
     %% A request opened after the GOAWAY is rejected.
-    NewFrame = roadrunner_quic_h3_frame:encode_headers(
-        roadrunner_qpack:encode(headers(~"GET", ~"/"))
-    ),
-    NewId = roadrunner_quic_test_conn:open_bidi(Conn),
-    ok = roadrunner_quic_test_conn:send(Conn, NewId, NewFrame, true),
-    ?assertEqual(16#10b, ll_await_reset(Conn, NewId)),
-    %% The in-flight slow request still completes.
-    ?assertEqual({200, ~"slow"}, ll_collect(Conn, SlowId, <<>>)),
+    Rejected = ll_send(Conn, request_frame(~"/"), true),
+    ?assertEqual(16#10b, ll_await_reset(Conn, Rejected)),
+    %% The in-flight request still completes.
+    Worker ! release,
+    ?assertEqual({200, ~"ok"}, ll_collect(Conn, BlockId, <<>>)),
     ll_close(Conn).
 
 drain_waits_for_a_response_flow_control_holds(Config) ->

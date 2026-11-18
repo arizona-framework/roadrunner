@@ -79,12 +79,18 @@ handle(#{target := ~"/big-observed"} = Req) ->
 handle(#{target := ~"/block"} = Req) ->
     %% Park the worker in the handler so a test can cancel the request
     %% while it is still computing its answer; `release` lets it answer.
+    %% A registered observer hears which worker parked.
     try
         unregister(roadrunner_h3_block_test)
     catch
         _:_ -> ok
     end,
     true = register(roadrunner_h3_block_test, self()),
+    _ =
+        case whereis(roadrunner_h3_block_observer) of
+            undefined -> ok;
+            Observer -> Observer ! {block_worker, self()}
+        end,
     receive
         release -> {{200, [], ~"ok"}, Req}
     end;
