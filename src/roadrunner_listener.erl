@@ -139,21 +139,21 @@ to the handler.
 Listener configuration map.
 
 Required:
-- `port` — TCP port to bind. `0` lets the kernel pick an ephemeral
+- `port`: TCP port to bind. `0` lets the kernel pick an ephemeral
   port; query it back with `port/1`.
 
 Routing (pick one):
-- `routes => module()` — single-handler dispatch. Every request
+- `routes => module()`: single-handler dispatch. Every request
   goes to `Module:handle/1` and `roadrunner_req:state/1`
   returns `undefined`.
-- `routes => {module(), term()}` — single-handler dispatch with
+- `routes => {module(), term()}`: single-handler dispatch with
   per-handler state. The opaque second element is reachable from
   the handler via `roadrunner_req:state/1`.
 - `routes => #{handler := module(), state => term(),
-   middlewares => [...]}` — map form for single-handler dispatch;
+   middlewares => [...]}`: map form for single-handler dispatch;
   use it to attach per-handler middlewares (or future per-handler
   framework knobs) alongside the state.
-- `routes => roadrunner_router:routes()` — list of route entries;
+- `routes => roadrunner_router:routes()`: list of route entries;
   each entry is either a `{Path, Handler}` / `{Path, Handler, State}`
   tuple or a `#{path := Path, handler := Handler, state => ...,
   middlewares => [...]}` map. First match wins, so the specific
@@ -170,17 +170,17 @@ an entry in a `middlewares` list that is not a middleware, with
 `{invalid_middleware, Entry, Reason}` (see `roadrunner_middleware`).
 
 Optional middleware and timing knobs (durations in milliseconds):
-- `middlewares` — listener-wide pipeline applied to every request.
-- `max_content_length` — request-body cap across HTTP/1.1, HTTP/2, and
+- `middlewares`: listener-wide pipeline applied to every request.
+- `max_content_length`: request-body cap across HTTP/1.1, HTTP/2, and
   HTTP/3; an over-cap body answers `413 Payload Too Large` (and resets
   the stream on h2/h3). Default 10 MB. A route can set its own, larger or
   smaller, or `infinity` for bodies its handler reads as they arrive with
   `body_buffering => manual` (`t:roadrunner_router:route/0`).
-- `ws` — WebSocket session tunables as a nested map (see
+- `ws`: WebSocket session tunables as a nested map (see
   `t:ws_opts/0`): `max_frame_size` (per-frame payload cap) and
   `max_message_size` (reassembled + decompressed message cap), both
   defaulting to 10 MB with over-cap closing the connection with code
-  1009, plus `recv_buffer` (per-session inet `buffer` — bounds
+  1009, plus `recv_buffer` (per-session inet `buffer`, which bounds
   per-connection memory at high WebSocket concurrency; adapts between
   the listener's `idle_recv_buffer` and `recv_buffer` when unset),
   `hibernate_after`
@@ -197,14 +197,14 @@ Optional middleware and timing knobs (durations in milliseconds):
   while small messages leave the floor; `0` lets every message raise
   it). An upgrade can set each for its own session
   (`t:roadrunner_ws_handler:upgrade_opts/0`).
-- `request_timeout` — header-read timeout on a fresh conn. With
+- `request_timeout`: header-read timeout on a fresh conn. With
   `body_buffering => manual` it also bounds reading the body: on
   HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the deadline the
   request's read started with (this timeout for a connection's first
   request, `keep_alive_timeout` after). `roadrunner_req:set_body_timeout/2`
   changes it per request. Default 30 s, at most `16#FFFFFFFF` ms (about
   49 days, the longest a `receive` waits).
-- `tls_handshake_timeout` — bound on the TLS handshake (TLS listeners
+- `tls_handshake_timeout`: bound on the TLS handshake (TLS listeners
   only). The handshake runs in the connection process, not the
   acceptor, so a slow or silent peer never blocks other connections
   from being accepted; one that exceeds the bound is closed and
@@ -212,7 +212,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   releasing its `max_clients` slot. On a TLS listener that also reads
   the PROXY protocol, the same bound covers the header read that
   precedes the handshake. Default 5 s, at most `16#FFFFFFFF` ms.
-- `keep_alive_timeout` — idle timeout between requests on a
+- `keep_alive_timeout`: idle timeout between requests on a
   keep-alive conn: on HTTP/1.1 between one request and the next, on
   HTTP/2 how long after its last request ended (or after it opened) a
   connection with no request open is closed with a GOAWAY, whatever
@@ -224,27 +224,28 @@ Optional middleware and timing knobs (durations in milliseconds):
   client's, and closes once it passes with nothing received; a client
   waiting on a response keeps it open, as RFC 9114 §5.1 expects of it,
   while the server does not). Default 60 s, at most `16#FFFFFFFF` ms.
-- `num_acceptors` — size of the acceptor pool. Default: one per online
+- `num_acceptors`: size of the acceptor pool. Default: one per online
   scheduler, at most 10. Every acceptor waits on the same listen socket, so
   more acceptors than schedulers only adds contention: on one or two
-  schedulers, matching them accepts 35-55% more connections a second than
-  10 does, at about a third of the tail latency.
-- `accept_priority` is `high` (the default) or `normal`. At `high` the
+  schedulers, matching them accepts more connections a second than 10
+  does, with lower tail latency.
+- `accept_priority`: `high` (the default) or `normal`. At `high` the
   acceptors run at high process priority, so a new connection is taken
   from the kernel queue promptly even when the server is busy. While
   the listener is turning connections away at `max_clients`, they drop
   to normal priority on their own and return to high once a connection
   is admitted again. `normal` keeps them at normal priority at all
-  times. Only TCP listeners have acceptors; HTTP/3 is not affected. See "Accepting connections" in
+  times. Only TCP listeners have acceptors; HTTP/3 is not affected, and
+  on TLS listeners the gain is smaller. See "Accepting connections" in
   [Resource limits](resource_limits.md).
-- `max_keep_alive_requests` — requests served per conn before
+- `max_keep_alive_requests`: requests served per conn before
   forced close. Default 1000.
-- `max_clients` — concurrent connection cap. Default 16384 (the modern
+- `max_clients`: concurrent connection cap. Default 16384 (the modern
   Erlang/Elixir HTTP-server norm). A connection counts from the moment
   it is accepted, so on a TLS listener one still in its handshake holds
   a slot too. Connections accepted while already at the cap are closed
   immediately without a response. The effective cap is
-  `min(max_clients, the OS file-descriptor limit)` — raise `ulimit -n`
+  `min(max_clients, the OS file-descriptor limit)`. Raise `ulimit -n`
   (and the systemd `LimitNOFILE`) for high concurrency, otherwise the
   acceptors hit `emfile` at the descriptor ceiling and emit
   `listener_accept_error`. Saturation memory scales as
@@ -256,7 +257,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   worst-case live-handler count is `max_clients × max_concurrent_streams`;
   bound it with `max_concurrent_requests` (default `infinity`) if heavy
   multiplexing memory is a concern.
-- `max_concurrent_requests` — cap on concurrent in-flight requests
+- `max_concurrent_requests`: cap on concurrent in-flight requests
   (live handler processes) across the whole listener, for the
   multiplexed protocols (HTTP/2 and HTTP/3). Default `infinity` (off).
   `max_clients` bounds connections and `max_concurrent_streams` bounds
@@ -264,7 +265,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   count) is otherwise unbounded; at the defaults that product
   (`16384 × 100` ≈ 1.6M) exceeds the BEAM process limit (`+P`, default
   262144), so under heavy multiplexing it can exhaust the VM-global
-  process table — failing spawns everywhere, not just this listener — on
+  process table (failing spawns everywhere, not just this listener) on
   top of unbounded handler memory. This caps the product directly; set it
   to a finite value when enabling HTTP/2 or HTTP/3 under a high
   `max_clients`. Over-limit streams
@@ -273,7 +274,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   `request_throttled` and increments the `throttled`
   count from `info/1`. HTTP/1 is unaffected (one request per connection,
   already bounded by `max_clients`), except in `shed` mode below.
-- `overload_mode` — what happens to a request that arrives over
+- `overload_mode`: what happens to a request that arrives over
   `max_concurrent_requests`. Default `refuse`, which is the behavior
   described above. `{queue, Opts}` instead
   parks it until a slot frees, so handler memory stays bounded without
@@ -281,7 +282,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   error rate. A request still waiting after `Ms` is refused exactly as
   `refuse` would, and one arriving when `N` are already parked is
   refused immediately, so overload still sheds rather than queueing
-  without bound. Requires a finite `max_concurrent_requests` — there is
+  without bound. Requires a finite `max_concurrent_requests`: there is
   nothing to queue behind otherwise, and asking for it without one is a
   configuration error.
 
@@ -327,17 +328,17 @@ Optional middleware and timing knobs (durations in milliseconds):
   `max_concurrent_requests` below what `max_clients` allows, and the
   ceiling becomes the soft limit that sheds while `max_clients` stays the
   hard one.
-- `socket_backlog` — TCP listen backlog (kernel SYN/accept queue
+- `socket_backlog`: TCP listen backlog (kernel SYN/accept queue
   depth). Default 1024. Raise it for connection bursts (load tests,
   health-check storms); Linux clamps the effective value at
   `net.core.somaxconn`.
-- `ip` — local interface to bind. Unset (the default) binds every IPv4
+- `ip`: local interface to bind. Unset (the default) binds every IPv4
   interface (`0.0.0.0`); set `{0,0,0,0,0,0,0,0}` (`::`) to bind every
   IPv6 interface, or a specific address such as `{127,0,0,1}` to
   restrict the listener to loopback, e.g. a dev/admin/metrics endpoint
   that must not be reachable from the LAN. Applies to every socket the
   listener binds: plain TCP, TLS, and the HTTP/3 UDP socket.
-- `ipv6_v6only` — with an IPv6 `ip`, `true` serves IPv6 clients only,
+- `ipv6_v6only`: with an IPv6 `ip`, `true` serves IPv6 clients only,
   and `false` serves IPv4 clients too, as IPv4-mapped addresses
   (`::ffff:a.b.c.d`). Unset, the operating system decides (on Linux,
   `net.ipv6.bindv6only`, `false` by default). Set it to `true` to run
@@ -345,13 +346,13 @@ Optional middleware and timing knobs (durations in milliseconds):
   IPv6 one also claims the port for IPv4 and fails to start with
   `eaddrinuse`. Applies to every socket the listener binds, like `ip`.
   Setting it without an IPv6 `ip` fails the listener's start.
-- `recv_buffer` — the most bytes one read takes, default 64 KB. A TLS
+- `recv_buffer`: the most bytes one read takes, default 64 KB. A TLS
   connection reads with a buffer of this size. A plain-TCP connection
   switches to it for good when a large request body comes in (HTTP/1.1)
   or its first request body does (HTTP/2), and a WebSocket session
   grows to it for a large frame. Larger values mean fewer reads for
   large bodies.
-- `idle_recv_buffer` — the read buffer a plain-TCP connection starts
+- `idle_recv_buffer`: the read buffer a plain-TCP connection starts
   with, default 4 KB: request heads and small bodies arrive in it,
   and it is what the connection holds while it waits for its next
   request or WebSocket message. A connection that receives a request
@@ -361,11 +362,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   Values above `recv_buffer` are lowered to it. An idle TLS connection
   holds no read buffer, so TLS listeners do not use it. See the
   `buffer` note in `base_listen_opts/2`.
-- `min_bytes_per_second` — slow-loris guard on the request-read
+- `min_bytes_per_second`: slow-loris guard on the request-read
   phase (0 disables). Default 100.
-- `rate_check_interval` — how often the rate guard re-checks
+- `rate_check_interval`: how often the rate guard re-checks
   (ms). Default 1000.
-- `body_buffering` — `auto` (default; framework reads the full
+- `body_buffering`: `auto` (default; framework reads the full
   body before invoking the handler) or `manual` (handler calls
   `roadrunner_req:read_body/1,2`; a client sending
   `Expect: 100-continue` is asked for its body only when the handler
@@ -376,21 +377,21 @@ Optional middleware and timing knobs (durations in milliseconds):
   stream credit, is given back only as the handler reads); a handler that
   answers without reading the body ends the client's upload
   (`RST_STREAM(NO_ERROR)` on HTTP/2, `STOP_SENDING` on HTTP/3).
-- `slot_reconciliation` — `#{interval := Ms}` (default 60000) for the
+- `slot_reconciliation`: `#{interval := Ms}` (default 60000) for the
   periodic reaper that releases slots orphaned by brutal-kill exits,
   and with them the killed conns' rows in the drain registry, or
   `disabled` to turn it off. A `graceful_drain => false` listener keeps
   no registry to compare against, so the reaper is off there; asking
   for both is a configuration conflict.
-- `graceful_drain` — opt out of the per-conn drain registry
+- `graceful_drain`: opt out of the per-conn drain registry
   (`true` default; `false` trades drain notification for a little
   less per-conn work on short-lived workloads).
-- `proxy_protocol` — `true` reads and strips the PROXY protocol header
+- `proxy_protocol`: `true` reads and strips the PROXY protocol header
   (HAProxy v1 / v2) an L4 balancer prepends, so `roadrunner_req:peer/1`
   is the real client. On TLS listeners the header is read before the
   handshake. TCP only. Default `false`. Enable it only behind a balancer
   that always sends the header, or a direct peer can spoof its address.
-- `real_ip` — the real client IP behind HTTP reverse proxies, read from
+- `real_ip`: the real client IP behind HTTP reverse proxies, read from
   `X-Forwarded-For` (default) or `Forwarded` (`header => forwarded`).
   Set exactly one trust mode: `trusted_proxies => [CIDR]` (for example
   `[~"10.0.0.0/8"]`; `/0` is refused) or `trusted_hops => N`. The
@@ -398,24 +399,24 @@ Optional middleware and timing knobs (durations in milliseconds):
   key, and `client_ip` in logger and telemetry metadata. Use
   `trusted_hops` only when clients can reach the listener through the
   proxies alone.
-- `rate_limit` — per-client request-rate guard:
+- `rate_limit`: per-client request-rate guard:
   `#{rate := N, period => Seconds, burst => N, sweep_interval => Ms}`
   (`period` default 1, `burst` default `rate`, `sweep_interval` default
   10000). A client over the rate gets `429 Too Many Requests` with
   `Retry-After` before the handler runs. Keyed on the real client IP;
   an IPv6 client is keyed by its /64. A route can add its own rate on
   top (`roadrunner_router:rate_limit()`).
-- `hibernate_after` — when set, idle conns hibernate after this
+- `hibernate_after`: when set, idle conns hibernate after this
   many milliseconds of main-loop idle time, which sweeps and shrinks
   the conn's heap. Pairs with `handler_spawn` below for a pool of
   mostly-idle connections; waking a hibernated conn is charged to the
   request that wakes it. It covers roadrunner's own processes only; on
   TLS, see `tls` for the processes `ssl` runs per connection.
-- `handler_spawn` — spawn config for every handler-running process (the
+- `handler_spawn`: spawn config for every handler-running process (the
   connection process and HTTP/2/3 stream workers) as a nested map with
   `opts` (`spawn_opt` / `proc_lib` options, default
   `[{fullsweep_after, 0}]`). `opts` merges over the defaults per option key, so
-  setting one option keeps the rest — asking for a heap hint does not
+  setting one option keeps the rest; asking for a heap hint does not
   silently change the GC policy.
 
   The default makes every collection a full sweep, so a connection that
@@ -465,11 +466,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   where a server push is built, relearns every 16 of them while raised
   and drops it before it hibernates; `ws.heap_floor` tunes it for
   sessions. Default `#{max => 46422}` (about 360 KB).
-- `protocols` — list of `t:protocol_entry/0`. Default `[http1]`.
+- `protocols`: list of `t:protocol_entry/0`. Default `[http1]`.
   On TLS this drives `alpn_preferred_protocols` automatically. On
   plain TCP, `[http1, http2]` serves HTTP/1.1 and prior-knowledge
   HTTP/2 on the one port.
-- `tls` — `[ssl:tls_server_option()]` for HTTPS. Absent for plain
+- `tls`: `[ssl:tls_server_option()]` for HTTPS. Absent for plain
   HTTP. The listener starts the `ssl` application when it is set, so
   a release that serves TLS must include `ssl`. Prefer an ECDSA P-256
   certificate: every new TLS or QUIC connection signs with the
