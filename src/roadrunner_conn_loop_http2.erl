@@ -57,6 +57,16 @@
 %% until it exits (`reset_workers`), so resetting streams cannot run more
 %% handlers at once than the limit (CVE-2023-44487, rapid reset).
 %%
+%% Until the client acknowledges our SETTINGS the limit is not yet in
+%% force (RFC 9113 §6.5.2: SETTINGS_MAX_CONCURRENT_STREAMS is initially
+%% unlimited; §6.5.3: only the ACK says our values apply), so a client
+%% that sends a burst of requests along with its preface, before it has
+%% read our SETTINGS, is not refused for it. The streams it opens then are
+%% held to `?PRE_SETTINGS_STREAMS`, or the advertised limit when that is
+%% higher, the same way, rapid reset guard included; once the ACK
+%% arrives, new streams are held to the advertised limit and the ones
+%% already open run to their end.
+%%
 %% Client header limit (RFC 9113 §6.5.2): a client that sent
 %% SETTINGS_MAX_HEADER_LIST_SIZE may treat a larger header section as
 %% malformed. The conn records the value and hands it to each worker it
@@ -196,6 +206,15 @@
 %% `max_concurrent_streams` http2 opt; clients exceeding the live cap get
 %% RST_STREAM(REFUSED_STREAM) on the over-limit HEADERS.
 -define(MAX_CONCURRENT_STREAMS, 100).
+
+%% The most streams a client may have open before it acknowledges our
+%% SETTINGS, when we advertise fewer (`stream_limit`). RFC 9113 §6.5.2
+%% recommends SETTINGS_MAX_CONCURRENT_STREAMS be no smaller than 100, so a
+%% client that starts sending before it has our SETTINGS typically allows
+%% itself 100 streams. A client that never acknowledges stays held to this
+%% many, and one that opens more is refused with the retry-safe
+%% REFUSED_STREAM (§8.7), so it bounds what a connection can hold.
+-define(PRE_SETTINGS_STREAMS, 100).
 
 -define(GOAWAY(LastStreamId, ErrorCode),
     roadrunner_http2_frame:encode({goaway, (LastStreamId), (ErrorCode), <<>>})
@@ -340,8 +359,15 @@
     recv_window_threshold = ?DEFAULT_CONN_RECV_WINDOW div 2 :: pos_integer(),
     stream_recv_window_threshold = ?DEFAULT_STREAM_RECV_WINDOW div 2 :: pos_integer(),
     %% Max concurrent client-initiated streams: advertised in our SETTINGS
-    %% and enforced in `on_headers/5`. Read from proto_opts at `enter/6`.
+    %% and enforced in `on_headers/5` (as `stream_limit`) once the client
+    %% acknowledges them. Read from proto_opts at `enter/6`.
     max_concurrent_streams = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
+    %% The stream limit in force: `max_concurrent_streams` once the client
+    %% has acknowledged our SETTINGS, and until then at least
+    %% `?PRE_SETTINGS_STREAMS` (RFC 9113 §6.5.2: the limit is initially
+    %% unlimited), so streams a client opened before it could know our
+    %% limit are not refused for it.
+    stream_limit = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
     %% Streams currently counting toward `max_concurrent_streams` — the
     %% entries whose `counted` flag is still set. Tracked separately from
     %% `map_size(streams)` because an entry outlives its RFC stream: it is
@@ -359,7 +385,7 @@
     %% attack, CVE-2023-44487), and run any number of handlers at once.
     reset_workers = #{} :: #{reference() => []},
     %% Streams refused while `reset_workers` alone held the whole limit, since
-    %% the last one of those workers ended. Past `max_concurrent_streams` the
+    %% the last one of those workers ended. Past `stream_limit` the
     %% client is resetting far beyond the limit and gets
     %% GOAWAY(ENHANCE_YOUR_CALM) (`refuse_over_limit/5`).
     reset_refusals = 0 :: non_neg_integer(),
@@ -553,6 +579,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         recv_window_threshold = ConnThreshold,
         stream_recv_window_threshold = StreamThreshold,
         max_concurrent_streams = MaxStreams,
+        stream_limit = max(MaxStreams, ?PRE_SETTINGS_STREAMS),
         max_header_block = MaxHeaderBlock,
         header_block_ceiling = max(MaxHeaderBlock, MaxHeaderListSize),
         max_header_list_size = MaxHeaderListSize,
@@ -1163,8 +1190,11 @@ handle_frame(Frame, #loop{awaiting_continuation = Awaiting} = State) when
         _ ->
             goaway_exit(State, protocol_error)
     end;
-handle_frame({settings, 1, _}, State) ->
-    frame_loop(State);
+handle_frame({settings, 1, _}, #loop{max_concurrent_streams = MaxStreams} = State) ->
+    %% The client applied our SETTINGS (RFC 9113 §6.5.3): we send one
+    %% SETTINGS frame, so this puts our stream limit in force. Streams
+    %% already open stay; new ones over the limit are refused.
+    frame_loop(State#loop{stream_limit = MaxStreams});
 handle_frame({settings, 0, Params}, State) ->
     case validate_settings(Params) of
         ok ->
@@ -1388,11 +1418,11 @@ on_headers(
     Flags,
     _Priority,
     Fragment,
-    #loop{live_streams = Live, reset_workers = Reset, max_concurrent_streams = MaxStreams} = State
+    #loop{live_streams = Live, reset_workers = Reset, stream_limit = Limit} = State
 ) when
-    Live + map_size(Reset) >= MaxStreams
+    Live + map_size(Reset) >= Limit
 ->
-    refuse_over_limit(StreamId, Flags, Fragment, map_size(Reset) >= MaxStreams, State);
+    refuse_over_limit(StreamId, Flags, Fragment, map_size(Reset) >= Limit, State);
 on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     EndHeaders = (Flags band 16#04) =/= 0,
     EndStream = (Flags band 16#01) =/= 0,
@@ -1425,17 +1455,18 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
 %% the client may retry (RFC 9113 §8.7). When the handlers of reset streams
 %% fill the whole limit on their own (the `true` clauses), the client has no stream
 %% left that it waits on and nothing it opens can be admitted until one of
-%% those handlers ends. `max_concurrent_streams` refusals in that state,
+%% those handlers ends. `stream_limit` refusals in that state,
 %% with none of the handlers ending in between, mean it keeps opening
 %% streams far beyond the limit: the connection ends with
 %% GOAWAY(ENHANCE_YOUR_CALM), the code for a peer exhausting resources
 %% (§5.4.1, §7). A client that still has streams of its own open is only
-%% refused, as it may have opened the new stream before it saw our SETTINGS,
-%% or while a stream it reset still had its handler running.
+%% refused, as it may have opened the new stream before it saw our limit
+%% come into force, or while a stream it reset still had its handler
+%% running.
 -spec refuse_over_limit(stream_id(), non_neg_integer(), binary(), boolean(), #loop{}) ->
     no_return().
 refuse_over_limit(_StreamId, _Flags, _Fragment, true, #loop{reset_refusals = Refusals} = State) when
-    Refusals >= State#loop.max_concurrent_streams
+    Refusals >= State#loop.stream_limit
 ->
     goaway_exit(State, enhance_your_calm);
 refuse_over_limit(StreamId, Flags, Fragment, true, #loop{reset_refusals = Refusals} = State) ->

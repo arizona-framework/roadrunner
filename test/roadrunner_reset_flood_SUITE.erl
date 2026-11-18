@@ -3,9 +3,11 @@
 A client that resets its requests while their handlers still run (the
 HTTP/2 rapid reset attack, CVE-2023-44487, and its HTTP/3 form) gets no
 more handlers running at once on a connection than the connection's stream
-limit. The handler (`roadrunner_h2_slot_handler`) announces itself and
-runs until released, ignoring the reset, so each one stands for work a
-client abandons.
+limit. Before an HTTP/2 client acknowledges our SETTINGS that limit is not
+in force yet (RFC 9113 §6.5.2), so the streams it opens with its preface
+are served, up to a fixed bound held the same way. The handler
+(`roadrunner_h2_slot_handler`) announces itself and runs until released,
+ignoring the reset, so each one stands for work a client abandons.
 """.
 
 -behaviour(ct_suite).
@@ -22,6 +24,10 @@ client abandons.
     h2_client_with_open_streams_is_only_refused/1,
     h2_reset_at_a_normal_rate_is_served/1,
     h2_reset_of_an_answered_stream_frees_it/1,
+    h2_burst_before_settings_ack_is_served/1,
+    h2_over_limit_after_settings_ack_is_refused/1,
+    h2_burst_past_the_pre_settings_bound_is_refused/1,
+    h2_reset_flood_before_settings_ack_gets_goaway/1,
     h3_reset_handlers_hold_the_stream_credit/1,
     h3_credit_frees_when_a_reset_handler_ends/1,
     h3_reset_at_a_normal_rate_is_served/1,
@@ -30,6 +36,10 @@ client abandons.
 ]).
 
 -define(MAX_STREAMS, 4).
+%% The streams a client may open before it acknowledges our SETTINGS when
+%% the advertised limit is lower (`?PRE_SETTINGS_STREAMS` in
+%% `roadrunner_conn_loop_http2`).
+-define(PRE_SETTINGS_STREAMS, 100).
 -define(COLLECTOR, roadrunner_h2_slot_collector).
 %% RFC 9114 §8.1 H3_REQUEST_CANCELLED.
 -define(H3_REQUEST_CANCELLED, 16#010C).
@@ -47,6 +57,10 @@ all() ->
         h2_client_with_open_streams_is_only_refused,
         h2_reset_at_a_normal_rate_is_served,
         h2_reset_of_an_answered_stream_frees_it,
+        h2_burst_before_settings_ack_is_served,
+        h2_over_limit_after_settings_ack_is_refused,
+        h2_burst_past_the_pre_settings_bound_is_refused,
+        h2_reset_flood_before_settings_ack_gets_goaway,
         h3_reset_handlers_hold_the_stream_credit,
         h3_credit_frees_when_a_reset_handler_ends,
         h3_reset_at_a_normal_rate_is_served,
@@ -222,6 +236,65 @@ h2_reset_of_an_answered_stream_frees_it(Config) ->
     lists:foreach(fun(H) -> ok = stop(H) end, Handlers),
     {_, _} = ping_sync(C2).
 
+h2_burst_before_settings_ack_is_served(Config) ->
+    %% The preface, SETTINGS and twice the limit's worth of requests in one
+    %% write, before the client could have read our SETTINGS: the limit is
+    %% not in force yet (RFC 9113 §6.5.2), so every request is served.
+    Ids = stream_ids(1, 2 * ?MAX_STREAMS),
+    C0 = burst(Config, Ids, false),
+    Handlers = handlers_started(2 * ?MAX_STREAMS),
+    {Frames, C1} = ping_sync(C0),
+    ?assertEqual([], [F || {rst_stream, _, _} = F <- Frames]),
+    release(Handlers),
+    ?assertEqual([{Id, 200} || Id <- Ids], lists:sort(responses(C1, length(Ids)))).
+
+h2_over_limit_after_settings_ack_is_refused(Config) ->
+    %% Once the client acknowledges our SETTINGS the limit is in force: the
+    %% streams it opened before stay and are served, and a new one over the
+    %% limit is refused.
+    Ids = stream_ids(1, 2 * ?MAX_STREAMS),
+    C0 = settings_ack(burst(Config, Ids, false)),
+    Handlers = handlers_started(2 * ?MAX_STREAMS),
+    Over = 4 * ?MAX_STREAMS + 1,
+    {Frames, C1} = ping_sync(send_headers(C0, Over)),
+    ?assertEqual([{rst_stream, Over, refused_stream}], [F || {rst_stream, _, _} = F <- Frames]),
+    release(Handlers),
+    ?assertEqual([{Id, 200} || Id <- Ids], lists:sort(responses(C1, length(Ids)))).
+
+h2_burst_past_the_pre_settings_bound_is_refused(Config) ->
+    %% Before the ACK the streams a client may open are still bounded: past
+    %% the bound, the next one is refused (retry-safe, RFC 9113 §8.7).
+    Ids = stream_ids(1, ?PRE_SETTINGS_STREAMS + 1),
+    C0 = burst(Config, Ids, false),
+    Handlers = handlers_started(?PRE_SETTINGS_STREAMS),
+    {Frames, _C1} = ping_sync(C0),
+    ?assertEqual(
+        [{rst_stream, lists:last(Ids), refused_stream}],
+        [F || {rst_stream, _, _} = F <- Frames]
+    ),
+    release(Handlers).
+
+h2_reset_flood_before_settings_ack_gets_goaway(Config) ->
+    %% A rapid reset sent with the preface: the handlers of the reset
+    %% streams hold the pre-SETTINGS bound, the streams after it are
+    %% refused, and a client that keeps opening them is told to calm down.
+    Reset = stream_ids(1, ?PRE_SETTINGS_STREAMS),
+    C0 = burst(Config, Reset, true),
+    Handlers = handlers_started(?PRE_SETTINGS_STREAMS),
+    Refused = stream_ids(2 * ?PRE_SETTINGS_STREAMS + 1, ?PRE_SETTINGS_STREAMS),
+    Over = 4 * ?PRE_SETTINGS_STREAMS + 1,
+    C1 = lists:foldl(fun(Id, C) -> send_headers(C, Id) end, C0, Refused ++ [Over]),
+    {Frames, _C2} = until(C1, fun
+        ({goaway, _, _, _}) -> true;
+        (_) -> false
+    end),
+    ?assertEqual(
+        [{rst_stream, Id, refused_stream} || Id <- Refused],
+        [F || {rst_stream, _, _} = F <- Frames]
+    ),
+    ?assertMatch({goaway, 2 * ?PRE_SETTINGS_STREAMS - 1, enhance_your_calm, _}, lists:last(Frames)),
+    release(Handlers).
+
 %% =============================================================================
 %% HTTP/3
 %% =============================================================================
@@ -370,13 +443,35 @@ stop(Handler) ->
 
 %% --- HTTP/2 client ---
 
+%% A connection whose client has acknowledged our SETTINGS, so the stream
+%% limit is in force.
 open(Config) ->
+    #{sock := Sock} = C = connect(Config),
+    ok = gen_tcp:send(Sock, preface()),
+    settings_ack(C).
+
+%% A connection opened by one write: the preface, then the requests on
+%% `Ids`, each reset at once when `Reset`, all sent before the client could
+%% have read our SETTINGS.
+burst(Config, Ids, Reset) ->
+    {Frames, #{sock := Sock} = C} = lists:mapfoldl(
+        fun(Id, C0) ->
+            {Headers, C1} = headers_frame(C0, Id, ~"/"),
+            case Reset of
+                true -> {[Headers, roadrunner_http2_frame:encode({rst_stream, Id, cancel})], C1};
+                false -> {Headers, C1}
+            end
+        end,
+        connect(Config),
+        Ids
+    ),
+    ok = gen_tcp:send(Sock, [preface(), Frames]),
+    C.
+
+connect(Config) ->
     {ok, Sock} = gen_tcp:connect(
         {127, 0, 0, 1}, ?config(port, Config), [binary, {active, false}], 5000
     ),
-    ok = gen_tcp:send(Sock, [
-        ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", roadrunner_http2_frame:encode({settings, 0, []})
-    ]),
     #{
         sock => Sock,
         buf => <<>>,
@@ -384,11 +479,28 @@ open(Config) ->
         dec => roadrunner_http2_hpack:new_decoder(4096)
     }.
 
+preface() ->
+    [~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", roadrunner_http2_frame:encode({settings, 0, []})].
+
+%% Read the server's SETTINGS and acknowledge them (RFC 9113 §6.5.3).
+settings_ack(#{sock := Sock} = C0) ->
+    {_, C1} = until(C0, fun
+        ({settings, 0, _}) -> true;
+        (_) -> false
+    end),
+    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({settings, 1, []})),
+    C1.
+
 %% A GET with END_STREAM: its handler starts at once.
 send_headers(C, StreamId) ->
     send_headers(C, StreamId, ~"/").
 
-send_headers(#{sock := Sock, enc := Enc} = C, StreamId, Path) ->
+send_headers(#{sock := Sock} = C, StreamId, Path) ->
+    {Frame, C1} = headers_frame(C, StreamId, Path),
+    ok = gen_tcp:send(Sock, Frame),
+    C1.
+
+headers_frame(#{enc := Enc} = C, StreamId, Path) ->
     Fields = [
         {~":method", ~"GET"},
         {~":scheme", ~"http"},
@@ -396,10 +508,7 @@ send_headers(#{sock := Sock, enc := Enc} = C, StreamId, Path) ->
         {~":path", Path}
     ],
     {Block, Enc1} = roadrunner_http2_hpack:encode(Fields, Enc),
-    ok = gen_tcp:send(
-        Sock, roadrunner_http2_frame:encode({headers, StreamId, 16#05, undefined, Block})
-    ),
-    C#{enc := Enc1}.
+    {roadrunner_http2_frame:encode({headers, StreamId, 16#05, undefined, Block}), C#{enc := Enc1}}.
 
 send_rst(#{sock := Sock} = C, StreamId) ->
     ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({rst_stream, StreamId, cancel})),
@@ -437,6 +546,31 @@ response(C, StreamId, Status, Body) ->
         {_Other, C1} ->
             response(C1, StreamId, Status, Body)
     end.
+
+%% The `{StreamId, Status}` of each of the next `Count` responses to end,
+%% in the order they end, however their frames interleave.
+responses(C, Count) ->
+    responses(C, Count, #{}).
+
+responses(_C, 0, _Statuses) ->
+    [];
+responses(C, Count, Statuses) ->
+    case next_frame(C) of
+        {{headers, StreamId, Flags, Headers}, C1} ->
+            {_, S} = lists:keyfind(~":status", 1, Headers),
+            Status = binary_to_integer(S),
+            ended(C1, Count, Statuses#{StreamId => Status}, StreamId, Flags);
+        {{data, StreamId, Flags, _Data, _}, C1} ->
+            ended(C1, Count, Statuses, StreamId, Flags);
+        {_Other, C1} ->
+            responses(C1, Count, Statuses)
+    end.
+
+ended(C, Count, Statuses, StreamId, Flags) when Flags band 16#01 =/= 0 ->
+    #{StreamId := Status} = Statuses,
+    [{StreamId, Status} | responses(C, Count - 1, Statuses)];
+ended(C, Count, Statuses, _StreamId, _Flags) ->
+    responses(C, Count, Statuses).
 
 until(C, Pred) ->
     until(C, Pred, []).

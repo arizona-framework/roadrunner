@@ -354,6 +354,15 @@ increments the `throttled` count from `roadrunner_listener:info/1`. HTTP/1
 is unaffected: it serves one request per connection, so `max_clients`
 already bounds it.
 
+An HTTP/2 client may open streams before it has read the connection's
+SETTINGS, so it cannot know `max_concurrent_streams` yet (RFC 9113
+§6.5.2 makes the limit unlimited until then). Such a burst is served, up
+to 100 streams when the limit is lower, and the limit applies to new
+streams once the client acknowledges the SETTINGS. A small
+`max_concurrent_streams` therefore does not bound a connection below 100
+streams until its client acknowledges the SETTINGS, and a client that
+never does keeps that bound; `max_concurrent_requests` does.
+
 `overload_mode` picks what a request over the ceiling gets. `refuse`, the
 default, is the refusal above. `{queue, #{max_queued => N, timeout =>
 Ms}}` parks it until a slot frees, refusing it only when the wait runs

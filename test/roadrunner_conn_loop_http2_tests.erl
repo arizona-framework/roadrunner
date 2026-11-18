@@ -214,6 +214,8 @@ all_test_() ->
 %% A non-ACK SETTINGS frame with empty body — the simplest valid
 %% client preamble after the connection preface.
 -define(EMPTY_SETTINGS_FRAME, <<0:24, 4, 0, 0:32>>).
+%% The client's ACK of our SETTINGS, which puts our stream limit in force.
+-define(SETTINGS_ACK_FRAME, <<0:24, 4, 1, 0:32>>).
 
 %% =============================================================================
 %% Phase H5 — `enter/5` performs the SETTINGS handshake then enters
@@ -2906,6 +2908,7 @@ oldest_reset_stream_is_forgotten() ->
     %% is ignored, while DATA on an older one gets STREAM_CLOSED as on any
     %% closed stream.
     {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_max_concurrent_streams => 1}),
+    serve_recv(ConnPid, ?SETTINGS_ACK_FRAME),
     serve_recv(ConnPid, open_headers(1, ~"/")),
     Refused = lists:seq(3, 3 + 2 * 128, 2),
     lists:foreach(
@@ -3455,6 +3458,7 @@ stream_slot_freed_when_response_ends_before_worker_down() ->
         serve_recv(ConnPid, ?PREFACE),
         serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
         _ = expect_send(),
+        serve_recv(ConnPid, ?SETTINGS_ACK_FRAME),
         serve_recv(ConnPid, complete_get_headers(1, ~"/stream/fin-then-park")),
         %% The worker registers only after `Send(_, fin)` returned, i.e.
         %% after the conn loop put stream 1's END_STREAM on the wire.
@@ -3495,6 +3499,7 @@ peer_rst_frees_stream_slot() ->
         serve_recv(ConnPid, ?PREFACE),
         serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
         _ = expect_send(),
+        serve_recv(ConnPid, ?SETTINGS_ACK_FRAME),
         %% Stream 1: HEADERS without END_STREAM — open and counted, no
         %% worker dispatched yet.
         HpackBin = encode_post_root_headers(),
@@ -4472,6 +4477,7 @@ refused_stream_keeps_hpack_in_sync() ->
     %% concurrency limit indexes `x-refused`; the client's next request
     %% references that entry and must decode instead of desyncing.
     {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_max_concurrent_streams => 1}),
+    serve_recv(ConnPid, ?SETTINGS_ACK_FRAME),
     Enc0 = roadrunner_http2_hpack:new_encoder(4096),
     %% Stream 1 stays open (no END_STREAM): the one stream allowed.
     {H1, Enc1} = indexed_get_headers(1, [], 16#04, Enc0),
@@ -4687,6 +4693,7 @@ refused_stream_with_undecodable_block_closes_conn() ->
     %% A refused stream's field block is still decoded, so one that cannot
     %% be decoded is the same connection error as on an accepted stream.
     {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_max_concurrent_streams => 1}),
+    serve_recv(ConnPid, ?SETTINGS_ACK_FRAME),
     {H1, _} = indexed_get_headers(1, [], 16#04, roadrunner_http2_hpack:new_encoder(4096)),
     serve_recv(ConnPid, H1),
     %% An indexed field naming index 254, past both tables.
