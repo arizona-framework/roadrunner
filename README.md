@@ -143,6 +143,11 @@ A route that can never match, because the routes above it already answer its
 path and methods, stops the listener from starting and names both routes. A
 mis-ordered table shows up at boot instead of as a 404 in production.
 
+`OPTIONS *` asks about the server rather than a resource, so a listener with
+routes answers it itself: a `200` with an empty body, and the connection stays
+open. No route or middleware sees it. A listener with a single handler passes it
+to that handler, with `*` as the path.
+
 The map form adds per-route options: allowed `methods` (others get `405` with an
 `Allow` header), a body cap, a request rate, and route middleware:
 

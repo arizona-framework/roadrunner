@@ -29,6 +29,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     large_post/1,
     not_found/1,
     method_not_allowed/1,
+    options_star/1,
+    star_with_other_method_is_malformed/1,
     crash_500/1,
     interim_response_500/1,
     rate_limited/1,
@@ -151,6 +153,8 @@ all() ->
         large_post,
         not_found,
         method_not_allowed,
+        options_star,
+        star_with_other_method_is_malformed,
         crash_500,
         interim_response_500,
         rate_limited,
@@ -268,6 +272,7 @@ end_per_suite(_Config) ->
 init_per_testcase(Case, Config) when
     Case =:= not_found;
     Case =:= method_not_allowed;
+    Case =:= options_star;
     Case =:= rate_limited;
     Case =:= oversized_413;
     Case =:= real_ip_resolves_client_behind_trusted_proxy;
@@ -434,6 +439,35 @@ method_not_allowed(_Config) ->
         close(Conn),
         roadrunner_listener:stop(Name)
     end.
+
+options_star(_Config) ->
+    %% `OPTIONS *` is about the server, not a resource (RFC 9110 §9.3.7):
+    %% a listener with routes answers it itself, a 200 with no body,
+    %% without reaching the `/*path` route that would match `*`, and the
+    %% connection serves the next request.
+    Name = listener_name(options_star),
+    {ok, _} = start_h3(Name, #{
+        routes => [{~"/", roadrunner_h3_test_handler}, {~"/*path", roadrunner_test_handler}]
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"OPTIONS", ~"*")),
+        ?assertMatch({200, _, ~""}, collect(Conn, StreamId)),
+        ?assertMatch({200, _}, status_body(get(Conn, ~"/")))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+star_with_other_method_is_malformed(Config) ->
+    %% `*` is a `:path` only for OPTIONS (RFC 9114 §4.3.1): with any other
+    %% method the request is malformed, its stream reset with
+    %% H3_MESSAGE_ERROR, and the connection lives on.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"*")),
+    ?assertEqual({error, {stream_reset, 16#10e}}, collect(Conn, StreamId)),
+    ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+    close(Conn).
 
 crash_500(Config) ->
     %% The crash also emits `request_exception`, with the handler's
