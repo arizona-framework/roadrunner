@@ -213,7 +213,7 @@ await_ping_ack(Sock, Buf) ->
     end.
 
 conn_pid(Name) ->
-    ProtoOpts = element(4, sys:get_state(whereis(Name))),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(whereis(Name)))),
     [{Pid}] = ets:tab2list(maps:get(drain_table, ProtoOpts)),
     Pid.
 

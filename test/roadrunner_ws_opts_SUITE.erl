@@ -262,7 +262,7 @@ tls_closed_before_arm_exits_cleanly(_Config) ->
     {ok, Accepted} = ssl:transport_accept(LSock, 5000),
     {ok, Sock} = ssl:handshake(Accepted, 5000),
     ok = ssl:close(Sock),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         ws_max_frame_size => 1024,
         ws_max_message_size => 1024,
         ws_hibernate_after => infinity,
@@ -270,7 +270,7 @@ tls_closed_before_arm_exits_cleanly(_Config) ->
         ws_active => undefined,
         ws_buffer => undefined,
         handler_spawn_opts => []
-    },
+    }),
     {module, _} = code:ensure_loaded(roadrunner_ws_echo_handler),
     {Pid, Ref} = spawn_monitor(fun() ->
         roadrunner_ws_session:serve(

@@ -1,6 +1,8 @@
 -module(roadrunner_conn_loop_http3).
 -moduledoc false.
 
+-include("roadrunner_proto_opts.hrl").
+
 %% HTTP/3 connection owner loop (RFC 9114) — the h3 analogue of
 %% `roadrunner_conn_loop_http2`. One process per QUIC connection,
 %% spawned by `roadrunner_listener`'s `connection_handler` and made the
@@ -122,12 +124,6 @@
 %% instruction may carry: a value is at most 62 bits, which 6 prefix bits
 %% plus 9 continuation bytes of 7 bits each cover.
 -define(MAX_QPACK_INT_CONTINUATION, 9).
-
-%% Default SETTINGS_QPACK_MAX_TABLE_CAPACITY (RFC 9204 §5): the dynamic
-%% table the peer's encoder may fill, the size of HTTP/2's default HPACK
-%% table. Overridable per listener via the `qpack_max_table_capacity` http3
-%% opt; 0 turns the dynamic table off.
--define(QPACK_MAX_TABLE_CAPACITY, 4096).
 
 %% Default SETTINGS_QPACK_BLOCKED_STREAMS (RFC 9204 §5): how many request
 %% streams may wait on the encoder stream at once. Clients reference an
@@ -348,13 +344,25 @@ start(ConnPid, ProtoOpts) ->
             _ = roadrunner_quic:close(ConnPid, ?H3_NO_ERROR),
             {error, max_clients};
         true ->
-            #{handler_spawn_opts := SpawnOpts} = ProtoOpts,
+            #proto_opts{handler_spawn_opts = SpawnOpts} = ProtoOpts,
             {ok, proc_lib:spawn_opt(?MODULE, init, [ConnPid, ProtoOpts], SpawnOpts)}
     end.
 
 -doc false.
 -spec init(pid(), roadrunner_conn:proto_opts()) -> ok.
-init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLength} = ProtoOpts) ->
+init(Conn, ProtoOpts) ->
+    #proto_opts{
+        listener_name = ListenerName,
+        max_content_length = MaxContentLength,
+        http3_max_header_block = MaxHeaderBlock,
+        http3_max_field_section_size = MaxFieldSectionSize,
+        http3_qpack_max_table_capacity = QpackMaxTableCapacity,
+        http3_qpack_blocked_streams = QpackBlockedStreams,
+        body_buffering = BodyBuffering,
+        max_concurrent_requests = MaxConcReq,
+        inflight_counter = InflightCounter,
+        overload = Overload
+    } = ProtoOpts,
     proc_lib:set_label({roadrunner_conn_loop_http3, ListenerName, Conn}),
     %% The `max_clients` slot was acquired by `start/2` (in the listener
     %% process); it is released in `terminate/1`.
@@ -369,7 +377,6 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
     %% available from the start (idle / handshaking states).
     {ok, Peer} = roadrunner_quic:peername(Conn),
     ConnSpan = roadrunner_event:listener_accept(ListenerName, Peer),
-    MaxHeaderBlock = maps:get(http3_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK),
     loop(#h3{
         conn = Conn,
         proto_opts = ProtoOpts,
@@ -379,22 +386,14 @@ init(Conn, #{listener_name := ListenerName, max_content_length := MaxContentLeng
         conn_info = conn_info(Conn),
         conn_span = ConnSpan,
         max_content_length = MaxContentLength,
-        qpack = roadrunner_qpack_table:new(
-            maps:get(http3_qpack_max_table_capacity, ProtoOpts, ?QPACK_MAX_TABLE_CAPACITY)
-        ),
-        qpack_blocked_streams = maps:get(
-            http3_qpack_blocked_streams, ProtoOpts, ?QPACK_BLOCKED_STREAMS
-        ),
-        body_buffering = maps:get(body_buffering, ProtoOpts, auto),
+        qpack = roadrunner_qpack_table:new(QpackMaxTableCapacity),
+        qpack_blocked_streams = QpackBlockedStreams,
+        body_buffering = BodyBuffering,
         max_header_block = MaxHeaderBlock,
-        %% Decoded-section cap defaults to 2x the (possibly overridden) encoded
-        %% cap, so raising `max_header_block` lifts both gates together.
-        max_field_section_size = maps:get(
-            http3_max_field_section_size, ProtoOpts, 2 * MaxHeaderBlock
-        ),
-        max_concurrent_requests = maps:get(max_concurrent_requests, ProtoOpts, infinity),
-        inflight_counter = maps:get(inflight_counter, ProtoOpts, undefined),
-        overload = maps:get(overload, ProtoOpts, refuse),
+        max_field_section_size = MaxFieldSectionSize,
+        max_concurrent_requests = MaxConcReq,
+        inflight_counter = InflightCounter,
+        overload = Overload,
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
         real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer)
     }).
@@ -1770,7 +1769,9 @@ apply_frame(_Frame, _Stream, _ProtoOpts, _MaxHdrBlock, _Qpack) ->
     roadrunner_qpack_table:t()
 ) ->
     {ok, #h3_stream{}} | too_large | {conn_error, non_neg_integer(), binary()}.
-raise_body_cap(_Stream, _Payload, _NewLen, #{dispatch := {handler, _, _, _}}, _Qpack) ->
+raise_body_cap(
+    _Stream, _Payload, _NewLen, #proto_opts{dispatch = {handler, _, _, _}}, _Qpack
+) ->
     too_large;
 raise_body_cap(
     #h3_stream{headers = undefined, header_block = Block} = Stream,
@@ -1806,7 +1807,7 @@ route_body_cap(
     Headers,
     Payload,
     NewLen,
-    #{dispatch := Dispatch}
+    #proto_opts{dispatch = Dispatch}
 ) ->
     case roadrunner_conn:route_body_cap(Dispatch, Headers, Cap) of
         RouteCap when NewLen =< RouteCap ->
@@ -2153,7 +2154,9 @@ build_request(Headers, Body, RequestContext) ->
 -spec with_body(roadrunner_req:request(), iodata() | reading, non_neg_integer(), #h3{}) ->
     roadrunner_req:request().
 with_body(Req, reading, StreamId, #h3{
-    proto_opts = #{request_timeout := Timeout}, max_content_length = MaxLen, streams = Streams
+    proto_opts = #proto_opts{request_timeout = Timeout},
+    max_content_length = MaxLen,
+    streams = Streams
 }) ->
     #{StreamId := #h3_stream{continue_owed = ContinueOwed}} = Streams,
     roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxLen, ContinueOwed);
@@ -2308,7 +2311,9 @@ reset_and_drop(#h3{conn = Conn, worker_pids = WorkerPids} = State0, StreamId, Er
 %% Bump the cumulative throttled counter and emit the throttled telemetry
 %% when a stream is refused at the `max_concurrent_requests` ceiling.
 -spec throttle_stream(#h3{}) -> ok.
-throttle_stream(#h3{proto_opts = #{throttled_counter := Counter}, listener_name = ListenerName}) ->
+throttle_stream(#h3{
+    proto_opts = #proto_opts{throttled_counter = Counter}, listener_name = ListenerName
+}) ->
     roadrunner_conn:throttled_telemetry(ListenerName, Counter, max_concurrent_requests).
 
 %% Per-peer rate-limit gate before spawning a stream worker. `ok` to proceed;
@@ -2430,5 +2435,6 @@ terminate(
     ok = roadrunner_conn:release_request_slots(
         MaxConcReq, InflightCounter, map_size(Refs), Overload
     ),
-    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
-    ok = roadrunner_conn:release_slot(ProtoOpts).
+    Close = roadrunner_conn:close_opts(ProtoOpts),
+    ok = roadrunner_conn:unregister_for_drain(Close),
+    ok = roadrunner_conn:release_slot(Close).

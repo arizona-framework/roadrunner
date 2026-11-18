@@ -11,8 +11,8 @@ per-socket-option lookups. TLS is backed by `ssl`, gated by the
 Both paths share the same `roadrunner_transport` tagged-socket abstraction.
 
 On `init/1` the listener opens the listen socket, builds the shared
-`roadrunner_conn:proto_opts()` (dispatch + body limits + timeouts +
-`max_clients` counter), and spawn-links `num_acceptors` (default: one per
+connection options (dispatch + body limits + timeouts + `max_clients`
+counter), and spawn-links `num_acceptors` (default: one per
 online scheduler, at most 10)
 `roadrunner_acceptor` processes that pull from the same listen socket.
 Connection workers are unlinked from the acceptor so a single
@@ -24,6 +24,8 @@ All duration and interval values in `opts()` are in milliseconds —
 """.
 
 -behaviour(gen_server).
+
+-include("roadrunner_proto_opts.hrl").
 
 -export([
     start_link/2,
@@ -1303,7 +1305,7 @@ init(#{port := Port} = Opts) ->
     ProtoOpts = build_proto_opts(Opts, ListenerName),
     RouteBuckets = publish_routes(ListenerName, Opts, ProtoOpts),
     proc_lib:set_label({roadrunner_listener, ListenerName, Port}),
-    #{protocols := Protocols} = ProtoOpts,
+    #proto_opts{protocols = Protocols} = ProtoOpts,
     %% TCP (`http1`/`http2`) and QUIC (`http3`) are independent
     %% transports that co-listen on the same port number. Bring up
     %% whichever the `protocols` list selects; an `http3`-only listener
@@ -1409,10 +1411,12 @@ start_quic(Port, Opts, Protocols, ProtoOpts, AcceptGate) ->
             %% when asked for an ephemeral port, hold a reuseport probe
             %% socket to pin a free port, start the pool on it, then drop
             %% the probe (the pool listeners keep the port via reuseport).
-            Listeners = maps:get(http3_listeners, ProtoOpts, ?DEFAULT_H3_LISTENERS),
+            #proto_opts{
+                http3_listeners = Listeners,
+                http3_max_streams_bidi = MaxStreamsBidi,
+                keep_alive_timeout = KeepAliveTimeout
+            } = ProtoOpts,
             {QuicPort, Probe} = resolve_quic_port(Port, Listeners, Opts),
-            MaxStreamsBidi = maps:get(http3_max_streams_bidi, ProtoOpts, ?H3_MAX_STREAMS_BIDI),
-            #{keep_alive_timeout := KeepAliveTimeout} = ProtoOpts,
             PoolOpts = #{
                 cert => Cert,
                 key => Key,
@@ -1449,7 +1453,7 @@ with_quic_secret(#{protocols := Protocols}, PoolOpts) ->
     end.
 
 -spec stream_credit(roadrunner_conn:proto_opts()) -> on_receipt | on_read.
-stream_credit(#{body_buffering := manual}) -> on_read;
+stream_credit(#proto_opts{body_buffering = manual}) -> on_read;
 stream_credit(_ProtoOpts) -> on_receipt.
 
 %% The pool is a supervisor, so it can only be `start_link`ed - which
@@ -1625,7 +1629,7 @@ arm_reconciliation(IntervalMs) ->
 %% listener exits, so there is no `terminate/2` cleanup; the ETS table dies with
 %% its owner (this gen_server) for the same reason.
 -spec setup_rate_limit_sweep(roadrunner_conn:proto_opts()) -> ok.
-setup_rate_limit_sweep(#{rate_limit := #{sweep_interval := IntervalMs}}) ->
+setup_rate_limit_sweep(#proto_opts{rate_limit = #{sweep_interval := IntervalMs}}) ->
     _ = erlang:send_after(IntervalMs, self(), rate_limit_sweep),
     ok;
 setup_rate_limit_sweep(_ProtoOpts) ->
@@ -1675,7 +1679,7 @@ route_rate_limited(Routes) ->
 %% listener's own store, the table is owned by this gen_server and dies with
 %% it, and the sweep timer cancels itself.
 -spec new_route_buckets(atom(), roadrunner_conn:proto_opts()) -> ets:table().
-new_route_buckets(ListenerName, #{rate_limited_counter := Counter}) ->
+new_route_buckets(ListenerName, #proto_opts{rate_limited_counter = Counter}) ->
     Table = ets:new(roadrunner_route_rate_limit, [set, public, {write_concurrency, auto}]),
     persistent_term:put({roadrunner_route_rate_limit, ListenerName}, {Table, Counter}),
     _ = erlang:send_after(?ROUTE_RATE_LIMIT_SWEEP_INTERVAL, self(), route_rate_limit_sweep),
@@ -1913,13 +1917,15 @@ setup_overload({shed, #{retry_after := RetryAfter}}, _Max, _Counter) ->
 %% listener accepts plain TCP (`open_listen_socket/3`) and the connection
 %% process upgrades each socket with these options once the header is in
 %% (`roadrunner_conn_loop:awaiting_shoot/3`). Every other listener leaves
-%% the key out, so the `ssl:listen` path is untouched.
+%% the field `undefined`, so the `ssl:listen` path is untouched.
 -spec maybe_tls_upgrade(
     roadrunner_conn:proto_opts(), opts(), [http1 | http2 | http3, ...]
 ) -> roadrunner_conn:proto_opts().
-maybe_tls_upgrade(#{proxy_protocol := true} = ProtoOpts, #{tls := UserTlsOpts}, Protocols) ->
+maybe_tls_upgrade(#proto_opts{proxy_protocol = true} = ProtoOpts, #{tls := UserTlsOpts}, Protocols) ->
     TcpProtocols = [P || P <- Protocols, P =/= http3],
-    ProtoOpts#{tls_upgrade => roadrunner_transport:build_tls_opts(TcpProtocols, UserTlsOpts)};
+    ProtoOpts#proto_opts{
+        tls_upgrade = roadrunner_transport:build_tls_opts(TcpProtocols, UserTlsOpts)
+    };
 maybe_tls_upgrade(ProtoOpts, _Opts, _Protocols) ->
     ProtoOpts.
 
@@ -1970,11 +1976,11 @@ validate_accept_priority(Other) ->
 -spec build_proto_opts(opts(), atom()) -> roadrunner_conn:proto_opts().
 build_proto_opts(Opts, ListenerName) ->
     %% Validate + normalize the `protocols` list. Public input may
-    %% nest `{http2, #{...}}` for protocol-specific tuning; the
-    %% normalizer flattens HTTP/2 sub-opts onto proto_opts top-level
-    %% with an `http2_` prefix so the hot path reads each knob via
-    %% a single `maps:get/2` instead of a nested map dive.
-    {Protocols, ProtoFlats} = normalize_protocols(Opts),
+    %% nest `{http2, #{...}}` for protocol-specific tuning;
+    %% `flatten_protocol_opts/2` flattens each protocol's sub-opts onto
+    %% its `http1_*` / `http2_*` / `http3_*` fields so the hot path reads
+    %% each knob without a nested map dive.
+    {Protocols, Entries} = normalize_protocols(Opts),
     %% Per-listener counters: live-connection counter (acceptors bump on
     %% accept; conns decrement on exit), a cumulative requests-served
     %% counter (conn bumps on each handler dispatch), and a cumulative
@@ -2047,89 +2053,71 @@ build_proto_opts(Opts, ListenerName) ->
     %% After `resolve_handler_spawn/1`, which rejects a malformed
     %% `handler_spawn` before its `heap_floor` is read here.
     {WsHeapFloorMin, WsHeapFloorMax} = ws_heap_floor(WsHeapFloor, Opts),
-    Optional = maps:merge(
-        maps:merge(maybe_alt_svc(Protocols, Opts), maybe_grow(Opts)), heap_floor(Opts)
-    ),
-    Base = maps:merge(
-        maps:merge(Optional, #{
-            dispatch => build_dispatch(Opts, ListenerName),
-            middlewares => maps:get(middlewares, Opts, []),
-            max_content_length =>
-                maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
-            ws_max_frame_size => WsFrame,
-            ws_max_message_size => WsMsg,
-            ws_buffer => ws_buffer(WsBuffer, idle_recv_buffer(Opts), validate_recv_buffer(Opts)),
-            ws_hibernate_after => WsHibernateAfter,
-            ws_compress => roadrunner_ws:compress_config(WsCompress),
-            ws_idle_timeout => WsIdleTimeout,
-            ws_active => WsActive,
-            ws_heap_floor_min => WsHeapFloorMin,
-            ws_heap_floor_max => WsHeapFloorMax,
-            request_timeout => timeout_opt(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT, 0),
-            tls_handshake_timeout =>
-                timeout_opt(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT, 1),
-            keep_alive_timeout =>
-                timeout_opt(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT, 0),
-            max_keep_alive_requests => max_keep_alive_requests(Opts),
-            max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
-            accept_priority => validate_accept_priority(maps:get(accept_priority, Opts, high)),
-            max_concurrent_requests => MaxConcurrentRequests,
-            overload => Overload,
-            client_counter => ClientCounter,
-            drain_table => DrainTable,
-            requests_counter => RequestsCounter,
-            rejected_counter => RejectedCounter,
-            inflight_counter => InflightCounter,
-            throttled_counter => ThrottledCounter,
-            rate_limited_counter => RateLimitedCounter,
-            rate_limit => RateLimit,
-            min_bytes_per_second =>
-                maps:get(min_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
-            body_buffering => maps:get(body_buffering, Opts, auto),
-            listener_name => ListenerName,
-            graceful_drain => maps:get(graceful_drain, Opts, true),
-            handler_spawn_opts => HandlerSpawnOpts,
-            proxy_protocol => validate_proxy_protocol(
-                maps:get(proxy_protocol, Opts, false), Protocols
-            ),
-            protocols => Protocols
-        }),
-        ProtoFlats
-    ),
-    WithTlsUpgrade = maybe_tls_upgrade(Base, Opts, Protocols),
-    WithHibernate =
-        %% Optional `hibernate_after` — `roadrunner_conn_loop` reads it
-        %% from proto_opts and routes the recv path through
-        %% `recv_active/3` so the conn auto-hibernates after
-        %% Ms of idle time. Omitted by default because hibernation has
-        %% a per-wake CPU cost (~tens of microseconds for the GC); only
-        %% worth enabling for workloads with mostly-idle keep-alive
-        %% conns where the heap-shrink win dominates.
-        case Opts of
-            #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 ->
-                WithTlsUpgrade#{hibernate_after => Ms};
-            #{} ->
-                WithTlsUpgrade
-        end,
-    %% Optional `rate_check_interval` — the rate-check timer
-    %% interval inside `reading_request`. Default 1000ms; ops can
-    %% override.
-    WithRateCheck =
-        case Opts of
-            #{rate_check_interval := IntervalMs} when is_integer(IntervalMs), IntervalMs > 0 ->
-                WithHibernate#{rate_check_interval => IntervalMs};
-            #{} ->
-                WithHibernate
-        end,
-    %% Optional `real_ip`, compiled (and validated) here so a bad config fails
-    %% the listener start; absent when off, the default, so a listener
-    %% without it never loads `roadrunner_real_ip`.
-    case Opts of
-        #{real_ip := RealIpOpts} when RealIpOpts =/= undefined ->
-            WithRateCheck#{real_ip => roadrunner_real_ip:compile(RealIpOpts)};
-        #{} ->
-            WithRateCheck
-    end.
+    Base = #proto_opts{
+        dispatch = build_dispatch(Opts, ListenerName),
+        middlewares = maps:get(middlewares, Opts, []),
+        max_content_length = maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
+        ws_max_frame_size = WsFrame,
+        ws_max_message_size = WsMsg,
+        ws_buffer = ws_buffer(WsBuffer, idle_recv_buffer(Opts), validate_recv_buffer(Opts)),
+        ws_hibernate_after = WsHibernateAfter,
+        ws_compress = roadrunner_ws:compress_config(WsCompress),
+        ws_idle_timeout = WsIdleTimeout,
+        ws_active = WsActive,
+        ws_heap_floor_min = WsHeapFloorMin,
+        ws_heap_floor_max = WsHeapFloorMax,
+        request_timeout = timeout_opt(request_timeout, Opts, ?DEFAULT_REQUEST_TIMEOUT, 0),
+        tls_handshake_timeout =
+            timeout_opt(tls_handshake_timeout, Opts, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT, 1),
+        keep_alive_timeout =
+            timeout_opt(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT, 0),
+        max_keep_alive_requests = max_keep_alive_requests(Opts),
+        max_clients = maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
+        accept_priority = validate_accept_priority(maps:get(accept_priority, Opts, high)),
+        max_concurrent_requests = MaxConcurrentRequests,
+        overload = Overload,
+        client_counter = ClientCounter,
+        drain_table = DrainTable,
+        requests_counter = RequestsCounter,
+        rejected_counter = RejectedCounter,
+        inflight_counter = InflightCounter,
+        throttled_counter = ThrottledCounter,
+        rate_limited_counter = RateLimitedCounter,
+        rate_limit = RateLimit,
+        min_bytes_per_second =
+            maps:get(min_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
+        body_buffering = maps:get(body_buffering, Opts, auto),
+        listener_name = ListenerName,
+        graceful_drain = maps:get(graceful_drain, Opts, true),
+        handler_spawn_opts = HandlerSpawnOpts,
+        proxy_protocol = validate_proxy_protocol(maps:get(proxy_protocol, Opts, false), Protocols),
+        protocols = Protocols,
+        alt_svc = maybe_alt_svc(Protocols, Opts),
+        grow_recv_buffer = maybe_grow(Opts),
+        heap_floor = heap_floor(Opts),
+        %% Optional `hibernate_after`: `roadrunner_conn_loop` routes the
+        %% recv path through `recv_active/3` so the conn auto-hibernates
+        %% after Ms of idle time. Off (`0`) by default because hibernation
+        %% has a per-wake CPU cost (~tens of microseconds for the GC); only
+        %% worth enabling for workloads with mostly-idle keep-alive conns
+        %% where the heap-shrink win dominates.
+        hibernate_after =
+            case Opts of
+                #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 -> Ms;
+                #{} -> 0
+            end,
+        %% Optional `real_ip`, compiled (and validated) here so a bad config
+        %% fails the listener start; `undefined` when off, the default, so a
+        %% listener without it never loads `roadrunner_real_ip`.
+        real_ip =
+            case Opts of
+                #{real_ip := RealIpOpts} when RealIpOpts =/= undefined ->
+                    roadrunner_real_ip:compile(RealIpOpts);
+                #{} ->
+                    undefined
+            end
+    },
+    maybe_tls_upgrade(flatten_protocol_opts(Entries, Base), Opts, Protocols).
 
 %% Resolve the public `handler_spawn` opt into the spawn options the spawn
 %% sites read: the caller's `opts` merged over the defaults.
@@ -2189,35 +2177,35 @@ is_reserved_spawn_opt(_) -> false.
 %% carry one. TLS sockets read with `recv_buffer` from the start (the
 %% TLS connection process leaves an idle one unarmed, so it holds no read
 %% buffer), and one lowered to `idle_recv_buffer` has nowhere to grow, so
-%% those leave the key out.
--spec maybe_grow(opts()) -> map().
+%% those leave it `undefined`.
+-spec maybe_grow(opts()) -> {pos_integer(), pos_integer()} | undefined.
 maybe_grow(#{tls := _}) ->
-    #{};
+    undefined;
 maybe_grow(Opts) ->
     case {idle_recv_buffer(Opts), validate_recv_buffer(Opts)} of
-        {Idle, Max} when Idle < Max -> #{grow_recv_buffer => {Idle, Max}};
-        _ -> #{}
+        {Idle, Max} when Idle < Max -> {Idle, Max};
+        _ -> undefined
     end.
 
-%% `heap_floor => Cap` for the connection loops: the most heap, in words, a
+%% The connection loops' heap floor cap: the most heap, in words, a
 %% connection raises its `min_heap_size` to
-%% (`roadrunner_conn_loop:raise_heap_floor/1`). Left out when
+%% (`roadrunner_conn_loop:raise_heap_floor/1`). `undefined` when
 %% `handler_spawn.heap_floor` is `false`.
--spec heap_floor(opts()) -> map().
+-spec heap_floor(opts()) -> pos_integer() | undefined.
 heap_floor(Opts) ->
     case maps:get(handler_spawn, Opts, #{}) of
         #{heap_floor := false} ->
-            #{};
+            undefined;
         #{heap_floor := #{max := Words} = Floor} when
             map_size(Floor) =:= 1, is_integer(Words), Words > 0
         ->
-            #{heap_floor => Words};
+            Words;
         #{heap_floor := Floor} when Floor =:= #{} ->
-            #{heap_floor => ?DEFAULT_HEAP_FLOOR};
+            ?DEFAULT_HEAP_FLOOR;
         #{heap_floor := _} = HandlerSpawn ->
             error({invalid_listener_opt, handler_spawn, HandlerSpawn});
         #{} ->
-            #{heap_floor => ?DEFAULT_HEAP_FLOOR}
+            ?DEFAULT_HEAP_FLOOR
     end.
 
 %% Precompute the `Alt-Svc` response-header value (RFC 7838) when the
@@ -2225,11 +2213,11 @@ heap_floor(Opts) ->
 %% so h1/h2 responses advertise the h3 endpoint and browsers upgrade to
 %% QUIC. Skipped on ephemeral (`port => 0`) listeners: there is no
 %% stable port to advertise, and TCP/UDP would not even share one.
--spec maybe_alt_svc([http1 | http2 | http3, ...], opts()) -> map().
+-spec maybe_alt_svc([http1 | http2 | http3, ...], opts()) -> binary() | undefined.
 maybe_alt_svc(Protocols, #{port := Port}) ->
     case h3_co_served(Protocols) andalso is_integer(Port) andalso Port > 0 of
-        true -> #{alt_svc => alt_svc_value(Port)};
-        false -> #{}
+        true -> alt_svc_value(Port);
+        false -> undefined
     end.
 
 -spec h3_co_served([http1 | http2 | http3, ...]) -> boolean().
@@ -2259,11 +2247,8 @@ alt_svc_value(Port) ->
 %%
 %% - `Protocols :: [http1 | http2, ...]` — the enabled protocols as a
 %%   flat atom list in user-supplied order (ALPN preference).
-%% - `ProtoFlats :: #{atom() => term()}` — HTTP/2 sub-opts flattened
-%%   with `http2_` prefix (`http2_conn_window`, `http2_stream_window`,
-%%   `http2_window_refill_threshold`), defaults filled. Empty map
-%%   when http2 is not in the list. Flat keys keep the hot path to
-%%   one `maps:get/2` per knob; no nested map dives.
+%% - `Entries`: each enabled protocol with its sub-opts, defaults
+%%   filled, for `flatten_protocol_opts/2`.
 %%
 %% Error shapes follow the existing `{invalid_listener_opt, K, V}` /
 %% `{listener_opt_conflict, ...}` convention:
@@ -2274,7 +2259,7 @@ alt_svc_value(Port) ->
 %%   entries.
 %% - `{listener_opt_conflict, protocols, V, http3_requires_tls}` for
 %%   `http3` on a listener without `tls`.
--spec normalize_protocols(opts()) -> {[http1 | http2 | http3, ...], #{atom() => term()}}.
+-spec normalize_protocols(opts()) -> {[http1 | http2 | http3, ...], [protocol_entry_norm(), ...]}.
 normalize_protocols(Opts) ->
     Raw = maps:get(protocols, Opts, [http1]),
     HasTls = maps:is_key(tls, Opts),
@@ -2282,11 +2267,14 @@ normalize_protocols(Opts) ->
     Names = [N || {N, _} <- Entries],
     %% QUIC mandates TLS 1.3, so `http3` without `tls` is a config error.
     ok = require_tls_for_h3(Names, HasTls, Raw),
-    {Names,
-        maps:merge(
-            flatten_http1_opts(Entries),
-            maps:merge(flatten_http2_opts(Entries), flatten_http3_opts(Entries))
-        )}.
+    {Names, Entries}.
+
+%% Flatten each enabled protocol's sub-opts onto its fields of the
+%% connection options; a protocol left out keeps its fields' defaults.
+-spec flatten_protocol_opts([protocol_entry_norm(), ...], roadrunner_conn:proto_opts()) ->
+    roadrunner_conn:proto_opts().
+flatten_protocol_opts(Entries, ProtoOpts) ->
+    lists:foldl(fun flatten_protocol_entry/2, ProtoOpts, Entries).
 
 -spec require_tls_for_h3([http1 | http2 | http3, ...], boolean(), term()) -> ok.
 require_tls_for_h3(Names, HasTls, Raw) ->
@@ -2356,34 +2344,76 @@ validate_http1_opts(Opts, Raw) ->
         Opts
     ).
 
-%% Flatten the http1 sub-opts onto proto_opts top-level with an `http1_`
-%% prefix so the conn loop reads each limit with a single `maps:get/2`.
-%% Returns an empty map when http1 isn't in the list.
--spec flatten_http1_opts([protocol_entry_norm(), ...]) -> #{atom() => term()}.
-flatten_http1_opts(Entries) ->
-    case lists:keyfind(http1, 1, Entries) of
-        false ->
-            #{};
-        {http1,
-            #{
-                max_request_line := ReqLine,
-                max_header_line := HdrLine,
-                max_header_block := HdrBlock,
-                max_header_count := HdrCount,
-                linger_timeout := Linger
-            } = Http1} ->
-            Flat = #{
-                http1_max_request_line => ReqLine,
-                http1_max_header_line => HdrLine,
-                http1_max_header_block => HdrBlock,
-                http1_max_header_count => HdrCount,
-                http1_linger_timeout => Linger
-            },
-            case Http1 of
-                #{active := Active} -> Flat#{http1_active => Active};
-                #{} -> Flat
-            end
-    end.
+%% Flatten one protocol's sub-opts onto its `http1_*`, `http2_*` or
+%% `http3_*` fields.
+-spec flatten_protocol_entry(protocol_entry_norm(), roadrunner_conn:proto_opts()) ->
+    roadrunner_conn:proto_opts().
+flatten_protocol_entry(
+    {http1,
+        #{
+            max_request_line := ReqLine,
+            max_header_line := HdrLine,
+            max_header_block := HdrBlock,
+            max_header_count := HdrCount,
+            linger_timeout := Linger
+        } = Http1},
+    ProtoOpts
+) ->
+    ProtoOpts#proto_opts{
+        http1_max_request_line = ReqLine,
+        http1_max_header_line = HdrLine,
+        http1_max_header_block = HdrBlock,
+        http1_max_header_count = HdrCount,
+        http1_linger_timeout = Linger,
+        %% Unset, the conn picks the read mode by transport.
+        http1_active = maps:get(active, Http1, undefined)
+    };
+flatten_protocol_entry(
+    {http2,
+        #{
+            conn_window := Conn,
+            stream_window := Stream,
+            max_concurrent_streams := MaxStreams,
+            max_header_block := MaxHeaderBlock,
+            max_header_list_size := MaxHeaderListSize,
+            active := Active,
+            ping_policy := PingPolicy,
+            connection_age := Age
+        } = Http2},
+    ProtoOpts
+) ->
+    flatten_connection_age(
+        Age,
+        flatten_ping_policy(PingPolicy, ProtoOpts#proto_opts{
+            http2_conn_window = Conn,
+            http2_stream_window = Stream,
+            %% Unset, each window refills at half its peak.
+            http2_window_refill_threshold = maps:get(window_refill_threshold, Http2, undefined),
+            http2_max_concurrent_streams = MaxStreams,
+            http2_max_header_block = MaxHeaderBlock,
+            http2_max_header_list_size = MaxHeaderListSize,
+            http2_active = Active
+        })
+    );
+flatten_protocol_entry(
+    {http3, #{
+        listeners := Listeners,
+        max_header_block := MaxHeaderBlock,
+        max_streams_bidi := MaxStreamsBidi,
+        max_field_section_size := MaxFieldSection,
+        qpack_max_table_capacity := QpackMaxTableCapacity,
+        qpack_blocked_streams := QpackBlockedStreams
+    }},
+    ProtoOpts
+) ->
+    ProtoOpts#proto_opts{
+        http3_listeners = Listeners,
+        http3_max_header_block = MaxHeaderBlock,
+        http3_max_streams_bidi = MaxStreamsBidi,
+        http3_max_field_section_size = MaxFieldSection,
+        http3_qpack_max_table_capacity = QpackMaxTableCapacity,
+        http3_qpack_blocked_streams = QpackBlockedStreams
+    }.
 
 -spec http2_defaults() -> http2_opts().
 http2_defaults() ->
@@ -2486,62 +2516,27 @@ resolve_max_header_list_size(Merged, Opts) when is_map_key(max_header_list_size,
 resolve_max_header_list_size(#{max_header_block := MaxHeaderBlock} = Merged, _Opts) ->
     Merged#{max_header_list_size => 2 * MaxHeaderBlock}.
 
-%% Flatten the http2 sub-opts onto proto_opts top-level with an
-%% `http2_` prefix so the hot path reads each knob with a single
-%% `maps:get/2`. Returns an empty map when http2 isn't in the list.
--spec flatten_http2_opts([protocol_entry_norm(), ...]) -> #{atom() => term()}.
-flatten_http2_opts(Entries) ->
-    case lists:keyfind(http2, 1, Entries) of
-        false ->
-            #{};
-        {http2,
-            #{
-                conn_window := Conn,
-                stream_window := Stream,
-                max_concurrent_streams := MaxStreams,
-                max_header_block := MaxHeaderBlock,
-                max_header_list_size := MaxHeaderListSize,
-                active := Active,
-                ping_policy := PingPolicy,
-                connection_age := Age
-            } = Http2} ->
-            Flat = maps:merge(
-                #{
-                    http2_conn_window => Conn,
-                    http2_stream_window => Stream,
-                    http2_max_concurrent_streams => MaxStreams,
-                    http2_max_header_block => MaxHeaderBlock,
-                    http2_max_header_list_size => MaxHeaderListSize,
-                    http2_active => Active
-                },
-                maps:merge(flatten_ping_policy(PingPolicy), flatten_connection_age(Age))
-            ),
-            case Http2 of
-                #{window_refill_threshold := Threshold} ->
-                    Flat#{http2_window_refill_threshold => Threshold};
-                #{} ->
-                    Flat
-            end
-    end.
+%% The `connection_age` fields, left `undefined` when it is off.
+-spec flatten_connection_age(false | map(), roadrunner_conn:proto_opts()) ->
+    roadrunner_conn:proto_opts().
+flatten_connection_age(false, ProtoOpts) ->
+    ProtoOpts;
+flatten_connection_age(#{max := Max, grace := Grace}, ProtoOpts) ->
+    ProtoOpts#proto_opts{http2_connection_age_max = Max, http2_connection_age_grace = Grace}.
 
-%% One `http2_connection_age_*` key per setting, none when it is off.
--spec flatten_connection_age(false | map()) -> #{atom() => term()}.
-flatten_connection_age(false) ->
-    #{};
-flatten_connection_age(#{max := Max, grace := Grace}) ->
-    #{http2_connection_age_max => Max, http2_connection_age_grace => Grace}.
-
-%% One `http2_ping_*` key per setting, none when the policy is off.
--spec flatten_ping_policy(false | map()) -> #{atom() => term()}.
-flatten_ping_policy(false) ->
-    #{};
-flatten_ping_policy(#{
-    min_time := MinTime, permit_without_stream := Permit, max_strikes := MaxStrikes
-}) ->
-    #{
-        http2_ping_min_time => MinTime,
-        http2_ping_permit_without_stream => Permit,
-        http2_ping_max_strikes => MaxStrikes
+%% The `ping_policy` fields, left `undefined` when the policy is off.
+-spec flatten_ping_policy(false | map(), roadrunner_conn:proto_opts()) ->
+    roadrunner_conn:proto_opts().
+flatten_ping_policy(false, ProtoOpts) ->
+    ProtoOpts;
+flatten_ping_policy(
+    #{min_time := MinTime, permit_without_stream := Permit, max_strikes := MaxStrikes},
+    ProtoOpts
+) ->
+    ProtoOpts#proto_opts{
+        http2_ping_min_time = MinTime,
+        http2_ping_permit_without_stream = Permit,
+        http2_ping_max_strikes = MaxStrikes
     }.
 
 -spec http3_defaults() -> http3_opts().
@@ -2607,32 +2602,6 @@ resolve_max_field_section_size(Merged, Opts) when is_map_key(max_field_section_s
 resolve_max_field_section_size(#{max_header_block := MaxHeaderBlock} = Merged, _Opts) ->
     Merged#{max_field_section_size => 2 * MaxHeaderBlock}.
 
-%% Flatten the http3 sub-opts onto proto_opts top-level (`http3_*`) so
-%% the conn loop reads each knob with a single `maps:get/2`. Returns an
-%% empty map when http3 isn't in the list.
--spec flatten_http3_opts([protocol_entry_norm(), ...]) -> #{atom() => term()}.
-flatten_http3_opts(Entries) ->
-    case lists:keyfind(http3, 1, Entries) of
-        false ->
-            #{};
-        {http3, #{
-            listeners := Listeners,
-            max_header_block := MaxHeaderBlock,
-            max_streams_bidi := MaxStreamsBidi,
-            max_field_section_size := MaxFieldSection,
-            qpack_max_table_capacity := QpackMaxTableCapacity,
-            qpack_blocked_streams := QpackBlockedStreams
-        }} ->
-            #{
-                http3_listeners => Listeners,
-                http3_max_header_block => MaxHeaderBlock,
-                http3_max_streams_bidi => MaxStreamsBidi,
-                http3_max_field_section_size => MaxFieldSection,
-                http3_qpack_max_table_capacity => QpackMaxTableCapacity,
-                http3_qpack_blocked_streams => QpackBlockedStreams
-            }
-    end.
-
 %% The `ws_buffer` proto opt: an explicit `ws.recv_buffer` as is; unset,
 %% adaptive from the listener's `idle_recv_buffer` up to its `recv_buffer`
 %% (`roadrunner_ws_session:apply_ws_buffer/2`).
@@ -2654,9 +2623,15 @@ ws_heap_floor(#{} = Floor, Opts) ->
     Cap =
         case Floor of
             #{max := Words} -> Words;
-            #{} -> maps:get(heap_floor, heap_floor(Opts), 0)
+            #{} -> heap_floor_cap(heap_floor(Opts))
         end,
     {maps:get(min, Floor, ?DEFAULT_WS_HEAP_FLOOR_MIN), Cap}.
+
+%% The connection heap floor's cap as a WebSocket session's default `max`:
+%% `0` (off) when the connection's is off.
+-spec heap_floor_cap(pos_integer() | undefined) -> non_neg_integer().
+heap_floor_cap(undefined) -> 0;
+heap_floor_cap(Words) -> Words.
 
 -spec ws_defaults() ->
     #{
@@ -2910,22 +2885,24 @@ handle_call({drain, _Timeout}, From, #state{drain = #{waiters := Waiters} = Drai
 handle_call({reload_routes, Routes}, _From, State) ->
     {Reply, State1} = do_reload_routes(State, Routes),
     {reply, Reply, State1};
-handle_call({notify_drain, Deadline}, _From, #state{proto_opts = #{drain_table := Table}} = State) ->
+handle_call(
+    {notify_drain, Deadline}, _From, #state{proto_opts = #proto_opts{drain_table = Table}} = State
+) ->
     {reply, notify_conns(Table, Deadline), State};
 handle_call(
-    {register_for_drain, Pid}, _From, #state{proto_opts = #{drain_table := Table}} = State
+    {register_for_drain, Pid}, _From, #state{proto_opts = #proto_opts{drain_table = Table}} = State
 ) ->
     true = ets:insert(Table, {Pid}),
     {reply, ok, State};
 handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
-    #{
-        client_counter := ClientCounter,
-        requests_counter := RequestsCounter,
-        rejected_counter := RejectedCounter,
-        throttled_counter := ThrottledCounter,
-        rate_limited_counter := RateLimitedCounter,
-        max_clients := MaxClients,
-        max_concurrent_requests := MaxConcurrentRequests
+    #proto_opts{
+        client_counter = ClientCounter,
+        requests_counter = RequestsCounter,
+        rejected_counter = RejectedCounter,
+        throttled_counter = ThrottledCounter,
+        rate_limited_counter = RateLimitedCounter,
+        max_clients = MaxClients,
+        max_concurrent_requests = MaxConcurrentRequests
     } = ProtoOpts,
     Reply = #{
         active_clients => counters:get(ClientCounter, 1),
@@ -2942,7 +2919,8 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     {ok | {error, no_routes} | {error, roadrunner_router:validation_error()}, #state{}}.
 do_reload_routes(
     #state{
-        proto_opts = #{dispatch := {router, Name}, middlewares := ListenerMws} = ProtoOpts,
+        proto_opts =
+            #proto_opts{dispatch = {router, Name}, middlewares = ListenerMws} = ProtoOpts,
         route_buckets = RouteBuckets
     } = State,
     Routes
@@ -2957,7 +2935,7 @@ do_reload_routes(
         {error, _Reason} = Error ->
             {Error, State}
     end;
-do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}} = State, _Routes) ->
+do_reload_routes(#state{proto_opts = #proto_opts{dispatch = {handler, _, _, _}}} = State, _Routes) ->
     {{error, no_routes}, State}.
 
 %% Compile a validated replacement table and publish it. Once `validate/1`
@@ -2974,7 +2952,7 @@ do_reload_routes(#state{proto_opts = #{dispatch := {handler, _, _, _}}} = State,
     roadrunner_middleware:middlewares()
 ) -> {ok | {error, {init_failed, term()}}, #state{}}.
 reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws) ->
-    #{body_buffering := BodyBuffering} = ProtoOpts,
+    #proto_opts{body_buffering = BodyBuffering} = ProtoOpts,
     try roadrunner_router:compile(Routes, ListenerMws, BodyBuffering) of
         Compiled ->
             %% The first table with a route `rate_limit` gets the bucket
@@ -2999,7 +2977,7 @@ start_drain(
     #state{
         listen_socket = LSocket,
         quic_accept_gate = QuicAcceptGate,
-        proto_opts = #{drain_table := Table}
+        proto_opts = #proto_opts{drain_table = Table}
     } = State,
     Timeout,
     From
@@ -3026,7 +3004,7 @@ start_drain(
 -spec check_drain(#state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
 check_drain(
     #state{
-        proto_opts = #{client_counter := Counter, drain_table := Table},
+        proto_opts = #proto_opts{client_counter = Counter, drain_table = Table},
         drain = #{deadline := Deadline}
     } = State
 ) ->
@@ -3084,7 +3062,9 @@ handle_info(reconcile_slots, #state{reconciliation = disabled} = State) ->
 handle_info(
     reconcile_slots,
     #state{
-        proto_opts = #{client_counter := Counter, listener_name := Name, drain_table := Table},
+        proto_opts = #proto_opts{
+            client_counter = Counter, listener_name = Name, drain_table = Table
+        },
         reconciliation = #{interval := Interval, prev_diff := PrevDiff}
     } = State
 ) ->
@@ -3120,7 +3100,9 @@ handle_info(
 handle_info(
     rate_limit_sweep,
     #state{
-        proto_opts = #{rate_limit := #{table := Table, sweep_interval := Interval} = RateLimit}
+        proto_opts = #proto_opts{
+            rate_limit = #{table := Table, sweep_interval := Interval} = RateLimit
+        }
     } = State
 ) ->
     %% Evict the per-peer buckets full again, then reschedule. Keeps the store
@@ -3193,7 +3175,7 @@ stop_quic(QuicPool) ->
     roadrunner_quic_listener_sup:stop(QuicPool).
 
 -spec erase_routes(roadrunner_conn:proto_opts()) -> ok.
-erase_routes(#{dispatch := {router, Name}}) ->
+erase_routes(#proto_opts{dispatch = {router, Name}}) ->
     _ = persistent_term:erase({roadrunner_routes, Name}),
     _ = persistent_term:erase({roadrunner_route_rate_limit, Name}),
     ok;

@@ -2494,7 +2494,9 @@ request_frame(Path) ->
 %% The listener's in-flight request gauge, read straight out of its state
 %% (`#state{proto_opts = #{inflight_counter := Counter}}`).
 inflight(Name) ->
-    #{inflight_counter := Counter} = element(4, sys:get_state(whereis(Name))),
+    #{inflight_counter := Counter} = roadrunner_test_proto_opts:to_map(
+        element(4, sys:get_state(whereis(Name)))
+    ),
     counters:get(Counter, 1).
 
 %% Wait for the server to reset `StreamId`, returning the error code.
@@ -2632,5 +2634,5 @@ find_goaway(Frames) ->
 %% Pids registered in the listener's drain registry, read straight out of
 %% the listener state (`#state{proto_opts = #{drain_table := Table}}`).
 drain_members(Name) ->
-    ProtoOpts = element(4, sys:get_state(whereis(Name))),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(whereis(Name)))),
     [Pid || {Pid} <- ets:tab2list(maps:get(drain_table, ProtoOpts))].

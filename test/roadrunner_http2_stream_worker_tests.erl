@@ -26,14 +26,14 @@ logger_metadata_set_in_h2_worker_test_() ->
             request_id => ~"deadbeefdeadbeef",
             listener_name => http2_worker_md_test
         },
-        ProtoOpts = #{
+        ProtoOpts = roadrunner_test_proto_opts:new(#{
             dispatch =>
                 {handler, roadrunner_logger_probe_handler,
                     fun roadrunner_logger_probe_handler:handle/1, undefined},
             middlewares => [],
             handler_spawn_opts => [{fullsweep_after, 0}],
             tls_handshake_timeout => 5000
-        },
+        }),
         {WorkerPid, MonRef} = roadrunner_http2_stream_worker:start(
             ConnPid, StreamId, Req, ProtoOpts, infinity, undefined
         ),

@@ -114,7 +114,7 @@ request_rejected_event_fires_on_bad_request_line_test() ->
         Self = self(),
         Tag = make_ref(),
         Sink = spawn(fun() -> drain_recv_sink(Tag, Self, [{recv, ~"NOT-A-REQUEST\r\n\r\n"}]) end),
-        Opts = #{
+        Opts = roadrunner_test_proto_opts:new(#{
             dispatch =>
                 {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1,
                     undefined},
@@ -134,7 +134,7 @@ request_rejected_event_fires_on_bad_request_line_test() ->
             listener_name => probe_listener_rej,
             handler_spawn_opts => [{fullsweep_after, 0}],
             tls_handshake_timeout => 5000
-        },
+        }),
         true = roadrunner_conn:try_acquire_slot(Opts),
         {ok, Pid} = roadrunner_conn:start({fake, Sink}, Opts),
         Ref = monitor(process, Pid),

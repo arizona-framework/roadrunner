@@ -190,9 +190,11 @@ floor_off_under_a_max_heap_size(Config) ->
 %% default turns the floor off; a size of 0 is no limit.
 floor_off_follows_the_max_heap_size(_Config) ->
     Floor = fun(SpawnOpts) ->
-        roadrunner_stream_worker:conn_heap_floor(#{
-            heap_floor => 46422, handler_spawn_opts => SpawnOpts
-        })
+        roadrunner_stream_worker:conn_heap_floor(
+            roadrunner_test_proto_opts:new(#{
+                heap_floor => 46422, handler_spawn_opts => SpawnOpts
+            })
+        )
     end,
     ?assertEqual(undefined, Floor([{max_heap_size, 20000}])),
     ?assertEqual(undefined, Floor([{max_heap_size, #{size => 20000}}])),

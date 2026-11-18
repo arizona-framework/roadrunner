@@ -1,6 +1,8 @@
 -module(roadrunner_http2_stream_worker).
 -moduledoc false.
 
+-include("roadrunner_proto_opts.hrl").
+
 %% Per-stream worker process for HTTP/2 dispatch (Phase H8b).
 %%
 %% Spawned by `roadrunner_conn_loop_http2` once a request stream
@@ -101,7 +103,7 @@ stream's id, leaving the other 99 streams intact.
     pid(),
     pos_integer(),
     roadrunner_req:request(),
-    map(),
+    roadrunner_conn:proto_opts(),
     non_neg_integer() | infinity,
     roadrunner_stream_worker:heap_floor()
 ) ->
@@ -110,26 +112,26 @@ start(
     ConnPid,
     StreamId,
     Req,
-    #{handler_spawn_opts := SpawnOpts, dispatch := Dispatch} = ProtoOpts,
+    #proto_opts{handler_spawn_opts = SpawnOpts, dispatch = Dispatch, alt_svc = AltSvc},
     PeerLimit,
     HeapFloor
 ) ->
     spawn_opt(
         ?MODULE,
         init,
-        [ConnPid, StreamId, Req, Dispatch, peer_limit(PeerLimit, ProtoOpts), HeapFloor],
+        [ConnPid, StreamId, Req, Dispatch, peer_limit(PeerLimit, AltSvc), HeapFloor],
         roadrunner_stream_worker:spawn_opts(SpawnOpts, HeapFloor)
     ).
 
 %% The client's limit, paired with the `alt-svc` value the conn adds to
 %% every response (read from the same proto opts, as the conn's
 %% `enter/6` does), or `infinity` for no limit.
--spec peer_limit(non_neg_integer() | infinity, map()) ->
+-spec peer_limit(non_neg_integer() | infinity, binary() | undefined) ->
     {non_neg_integer(), binary() | undefined} | infinity.
-peer_limit(infinity, _ProtoOpts) ->
+peer_limit(infinity, _AltSvc) ->
     infinity;
-peer_limit(Limit, ProtoOpts) ->
-    {Limit, maps:get(alt_svc, ProtoOpts, undefined)}.
+peer_limit(Limit, AltSvc) ->
+    {Limit, AltSvc}.
 
 -doc false.
 -spec init(

@@ -11,7 +11,11 @@ The connection-error codes asserted here are RFC 9114 §8.1 values:
 -include_lib("eunit/include/eunit.hrl").
 
 %% A single-handler listener: no route can raise a stream's body cap.
--define(HANDLER, #{dispatch => {handler, some_mod, fun some_mod:handle/1, undefined}}).
+-define(HANDLER,
+    roadrunner_test_proto_opts:new(#{
+        dispatch => {handler, some_mod, fun some_mod:handle/1, undefined}
+    })
+).
 
 new(MaxLen) ->
     roadrunner_conn_loop_http3:new_request_stream(MaxLen).
@@ -255,7 +259,7 @@ route_cap_test_() ->
             fun raises_with_dynamic_headers/0
         ]}.
 
--define(ROUTER, #{dispatch => {router, h3_route_cap}}).
+-define(ROUTER, roadrunner_test_proto_opts:new(#{dispatch => {router, h3_route_cap}})).
 
 req_block(Path) ->
     iolist_to_binary(

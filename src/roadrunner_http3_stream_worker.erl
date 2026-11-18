@@ -1,6 +1,8 @@
 -module(roadrunner_http3_stream_worker).
 -moduledoc false.
 
+-include("roadrunner_proto_opts.hrl").
+
 %% Per-stream worker process for HTTP/3 dispatch — the h3 analogue of
 %% `roadrunner_http2_stream_worker`. Spawned by
 %% `roadrunner_conn_loop_http3` once a request stream finishes
@@ -96,7 +98,7 @@ start(
     Conn,
     StreamId,
     Req,
-    #{handler_spawn_opts := SpawnOpts, dispatch := Dispatch},
+    #proto_opts{handler_spawn_opts = SpawnOpts, dispatch = Dispatch},
     MaxFieldSection,
     HeapFloor
 ) ->

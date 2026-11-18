@@ -1,6 +1,8 @@
 -module(roadrunner_acceptor).
 -moduledoc false.
 
+-include("roadrunner_proto_opts.hrl").
+
 %% Acceptor process — spins on `gen_tcp:accept/1` for a listen socket
 %% and hands each accepted connection off to a `roadrunner_conn` worker.
 %%
@@ -62,8 +64,7 @@ the same opts. The index is used in the `proc_lib` label so
 """.
 -spec start_link(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), pos_integer()) ->
     {ok, pid()}.
-start_link(LSocket, ProtoOpts, Index) ->
-    ListenerName = maps:get(listener_name, ProtoOpts, undefined),
+start_link(LSocket, #proto_opts{listener_name = ListenerName} = ProtoOpts, Index) ->
     Pid = proc_lib:spawn_link(fun() ->
         proc_lib:set_label({roadrunner_acceptor, ListenerName, Index}),
         loop(LSocket, ProtoOpts, initial_priority(ProtoOpts))
@@ -76,10 +77,10 @@ start_link(LSocket, ProtoOpts, Index) ->
 -type priority() :: high | normal | fixed.
 
 -spec initial_priority(roadrunner_conn:proto_opts()) -> priority().
-initial_priority(#{accept_priority := high}) ->
+initial_priority(#proto_opts{accept_priority = high}) ->
     _ = process_flag(priority, high),
     high;
-initial_priority(#{}) ->
+initial_priority(#proto_opts{accept_priority = normal}) ->
     fixed.
 
 -spec loop(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), priority()) -> ok.
@@ -97,7 +98,7 @@ loop(LSocket, ProtoOpts, Priority) ->
             %% listener permanently deaf with no diagnostic. Pacing is
             %% per error class; see `accept_error_class/1`.
             ok = roadrunner_event:listener_accept_error(
-                maps:get(listener_name, ProtoOpts, undefined), Reason
+                ProtoOpts#proto_opts.listener_name, Reason
             ),
             ok = pace_after_error(accept_error_class(Reason)),
             loop(LSocket, ProtoOpts, Priority)
@@ -175,11 +176,10 @@ handle_accepted(Socket, ProtoOpts, Priority) ->
             %% `listener_conn_rejected`. No `peername` lookup
             %% here — this is the floodable path, so it stays cheap.
             Next = set_priority(Priority, priority_after(rejected, Priority)),
-            #{rejected_counter := RejectedCounter} = ProtoOpts,
+            #proto_opts{rejected_counter = RejectedCounter, listener_name = ListenerName} =
+                ProtoOpts,
             ok = atomics:add(RejectedCounter, 1, 1),
-            ok = roadrunner_event:listener_conn_rejected(
-                maps:get(listener_name, ProtoOpts, undefined), max_clients
-            ),
+            ok = roadrunner_event:listener_conn_rejected(ListenerName, max_clients),
             _ = roadrunner_transport:close(Socket),
             Next
     end.

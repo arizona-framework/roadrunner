@@ -36,7 +36,7 @@ start_applies_handler_spawn_opts_to_process_test() ->
     %% just sit in proto_opts: start a conn with a non-default
     %% `fullsweep_after` and read it back from the live process's own
     %% garbage-collection info.
-    Opts = (fake_opts(gc_flag))#{handler_spawn_opts := [{fullsweep_after, 42}]},
+    Opts = fake_opts(gc_flag, #{handler_spawn_opts => [{fullsweep_after, 42}]}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, Opts),
     {garbage_collection, GcInfo} = process_info(Pid, garbage_collection),
     ?assertEqual(42, proplists:get_value(fullsweep_after, GcInfo)),
@@ -57,7 +57,7 @@ awaiting_shoot_registers_for_drain_test() ->
     %% is already in the drain registry by then: a drain that begins before
     %% it first runs still reaches it.
     Table = ets:new(drain_join, [set, public]),
-    Opts = (fake_opts(drain_join))#{drain_table => Table},
+    Opts = fake_opts(drain_join, #{drain_table => Table}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, Opts),
     ?assertEqual([{Pid}], ets:tab2list(Table)),
     drain_then_wait(Pid),
@@ -95,7 +95,7 @@ stray_msg_in_awaiting_shoot_is_ignored_test() ->
 slot_released_on_drain_in_awaiting_shoot_test() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    Opts = (fake_opts(slot))#{client_counter := Counter},
+    Opts = fake_opts(slot, #{client_counter => Counter}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, Opts),
     Ref = monitor(process, Pid),
     Pid ! {roadrunner_drain, infinity},
@@ -238,7 +238,7 @@ request_timeout_writes_408_then_exits_test() ->
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_silent_sink_with_send_log(Self, Tag),
-    Opts = (fake_opts(timeout_408))#{request_timeout := 50},
+    Opts = fake_opts(timeout_408, #{request_timeout => 50}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -371,7 +371,7 @@ request_timeout_during_body_recv_writes_408_test() ->
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_partial_then_sink(Self, Tag, partial_request(), silent),
-    Opts = (fake_opts(timeout_passive))#{request_timeout := 250},
+    Opts = fake_opts(timeout_passive, #{request_timeout => 250}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -395,11 +395,11 @@ drain_during_message_body_exits_silently_test() ->
     Tag = make_ref(),
     Headers = ~"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
     Sink = spawn_headers_then_drain_sink(Self, Tag, Headers),
-    Opts = (fake_opts(drain_body))#{
-        dispatch :=
+    Opts = fake_opts(drain_body, #{
+        dispatch =>
             {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -423,11 +423,11 @@ body_read_resumes_after_drain_tick_test() ->
         {passive, {error, timeout}},
         {passive, {ok, ~"hello"}}
     ]),
-    Opts = (fake_opts(body_tick))#{
-        dispatch :=
+    Opts = fake_opts(body_tick, #{
+        dispatch =>
             {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -556,7 +556,7 @@ setopts_on_dead_socket_exits_silently_test() ->
         [roadrunner, listener, accept],
         [roadrunner, listener, conn_close]
     ]),
-    Opts = (fake_opts(deadsock))#{hibernate_after => 5000},
+    Opts = fake_opts(deadsock, #{hibernate_after => 5000}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, DeadSink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -603,9 +603,9 @@ slowloris_during_passive_recv_drops_client_test() ->
         after 5000 -> ok
         end
     end),
-    Opts = (fake_opts(slow_passive))#{
+    Opts = fake_opts(slow_passive, #{
         min_bytes_per_second => 1000000
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -644,10 +644,10 @@ slowloris_during_active_mode_recv_drops_client_test() ->
         after 5000 -> ok
         end
     end),
-    Opts = (fake_opts(slow_active))#{
+    Opts = fake_opts(slow_active, #{
         hibernate_after => 5000,
         min_bytes_per_second => 1000000
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -668,15 +668,15 @@ keep_alive_reuse_after_idle_serves_second_request_passive_test() ->
     Tag = make_ref(),
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
     Sink = spawn_keepalive_idle_sink(Self, Tag, Req, 1500),
-    Opts = (fake_opts(ka_reuse_passive))#{
-        dispatch :=
+    Opts = fake_opts(ka_reuse_passive, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
-        max_keep_alive_requests := 2,
-        keep_alive_timeout := 5000,
-        request_timeout := 5000,
+        max_keep_alive_requests => 2,
+        keep_alive_timeout => 5000,
+        request_timeout => 5000,
         min_bytes_per_second => 1000000
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -697,16 +697,16 @@ keep_alive_reuse_after_idle_serves_second_request_hibernate_test() ->
     Tag = make_ref(),
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
     Sink = spawn_keepalive_idle_sink(Self, Tag, Req, 1500),
-    Opts = (fake_opts(ka_reuse_hib))#{
-        dispatch :=
+    Opts = fake_opts(ka_reuse_hib, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
-        max_keep_alive_requests := 2,
-        keep_alive_timeout := 5000,
-        request_timeout := 5000,
+        max_keep_alive_requests => 2,
+        keep_alive_timeout => 5000,
+        request_timeout => 5000,
         hibernate_after => 50,
         min_bytes_per_second => 1000000
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -747,7 +747,7 @@ shoot_fires_accept_paired_with_conn_close_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(accept))#{listener_name => accept},
+    Opts = fake_opts(accept, #{listener_name => accept}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -780,12 +780,12 @@ middleware_pipeline_runs_when_listener_has_middlewares_test() ->
     %% Identity middleware — just calls Inner(Req). Exercises the
     %% compose path without changing the response.
     Identity = fun(R, Inner) -> Inner(R) end,
-    Opts = (fake_opts(mw))#{
-        middlewares := [Identity],
-        dispatch :=
+    Opts = fake_opts(mw, #{
+        middlewares => [Identity],
+        dispatch =>
             {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -809,11 +809,11 @@ handler_crash_writes_500_and_fires_request_exception_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(crash))#{
-        dispatch :=
+    Opts = fake_opts(crash, #{
+        dispatch =>
             {handler, roadrunner_crashing_handler, fun roadrunner_crashing_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -844,11 +844,11 @@ interim_response_writes_500(Path) ->
     Sink = spawn_active_sink_once(
         Self, Tag, <<"GET ", Path/binary, " HTTP/1.1\r\nHost: x\r\n\r\n">>
     ),
-    Opts = (fake_opts(interim))#{
-        dispatch :=
+    Opts = fake_opts(interim, #{
+        dispatch =>
             {handler, roadrunner_interim_handler, fun roadrunner_interim_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -873,11 +873,11 @@ post_body_echoes_via_auto_mode_test() ->
         Body
     ]),
     Sink = spawn_active_sink_with_send_log(Self, Tag, Req),
-    Opts = (fake_opts(echo))#{
-        dispatch :=
+    Opts = fake_opts(echo, #{
+        dispatch =>
             {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -904,12 +904,12 @@ oversized_body_writes_413_and_fires_request_rejected_test() ->
         binary:copy(<<"x">>, 100)
     ]),
     Sink = spawn_active_sink_with_send_log(Self, Tag, Req),
-    Opts = (fake_opts(big))#{
-        max_content_length := 5,
-        dispatch :=
+    Opts = fake_opts(big, #{
+        max_content_length => 5,
+        dispatch =>
             {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -941,12 +941,12 @@ body_recv_timeout_writes_408_test() ->
         {passive, {ok, Headers}},
         {passive, {error, timeout}}
     ]),
-    Opts = (fake_opts(body_to))#{
-        request_timeout := 250,
-        dispatch :=
+    Opts = fake_opts(body_to, #{
+        request_timeout => 250,
+        dispatch =>
             {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -966,11 +966,11 @@ body_slow_client_exits_silently_test() ->
         {passive, {ok, Headers}},
         {passive, {error, slow_client}}
     ]),
-    Opts = (fake_opts(body_slow))#{
-        dispatch :=
+    Opts = fake_opts(body_slow, #{
+        dispatch =>
             {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -992,11 +992,11 @@ body_recv_error_writes_400_test() ->
         {passive, {ok, Headers}},
         {passive, {error, closed}}
     ]),
-    Opts = (fake_opts(body_err))#{
-        dispatch :=
+    Opts = fake_opts(body_err, #{
+        dispatch =>
             {handler, roadrunner_echo_body_handler, fun roadrunner_echo_body_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1021,12 +1021,12 @@ manual_mode_dispatches_with_body_reader_test() ->
         {passive, {ok, Headers}},
         {passive, {ok, ~"hello"}}
     ]),
-    Opts = (fake_opts(manual))#{
-        body_buffering := manual,
-        dispatch :=
+    Opts = fake_opts(manual, #{
+        body_buffering => manual,
+        dispatch =>
             {handler, roadrunner_manual_keepalive_handler,
                 fun roadrunner_manual_keepalive_handler:handle/1, undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1045,12 +1045,12 @@ manual_mode_bad_framing_writes_400_test() ->
     Tag = make_ref(),
     Headers = ~"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n",
     Sink = spawn_scripted_sink(Self, Tag, [{passive, {ok, Headers}}]),
-    Opts = (fake_opts(manual_bad))#{
-        body_buffering := manual,
-        dispatch :=
+    Opts = fake_opts(manual_bad, #{
+        body_buffering => manual,
+        dispatch =>
             {handler, roadrunner_manual_keepalive_handler,
                 fun roadrunner_manual_keepalive_handler:handle/1, undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1075,9 +1075,9 @@ not_found_writes_404_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET /missing HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(Listener))#{
-        dispatch := {router, Listener}
-    },
+    Opts = fake_opts(Listener, #{
+        dispatch => {router, Listener}
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1111,9 +1111,9 @@ method_not_allowed_writes_405_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(Listener))#{
-        dispatch := {router, Listener}
-    },
+    Opts = fake_opts(Listener, #{
+        dispatch => {router, Listener}
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1139,12 +1139,12 @@ two_pipelined_requests_in_one_packet_serve_both_test() ->
     Both =
         ~"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
     Sink = spawn_active_sink_with_send_log(Self, Tag, Both),
-    Opts = (fake_opts(pipelined))#{
-        dispatch :=
+    Opts = fake_opts(pipelined, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
-        max_keep_alive_requests := 2
-    },
+        max_keep_alive_requests => 2
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1169,11 +1169,11 @@ pipelined_responses_coalesce_into_one_send_test() ->
     Sink = spawn_active_sink_once(
         Self, Tag, <<Req/binary, Req/binary, Req/binary>>
     ),
-    Opts = (fake_opts(coalesced))#{
-        dispatch :=
+    Opts = fake_opts(coalesced, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1196,12 +1196,12 @@ manual_mode_bodyless_pipelined_requests_coalesce_test() ->
     Tag = make_ref(),
     Req = ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
     Sink = spawn_active_sink_once(Self, Tag, <<Req/binary, Req/binary>>),
-    Opts = (fake_opts(manual_coalesced))#{
-        body_buffering := manual,
-        dispatch :=
+    Opts = fake_opts(manual_coalesced, #{
+        body_buffering => manual,
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1226,11 +1226,11 @@ pipelined_response_precedes_error_for_malformed_followup_test() ->
         Tag,
         ~"GET / HTTP/1.1\r\nHost: x\r\n\r\nNOT-A-VALID-REQUEST-LINE\r\n\r\n"
     ),
-    Opts = (fake_opts(coalesce_order))#{
-        dispatch :=
+    Opts = fake_opts(coalesce_order, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1253,7 +1253,7 @@ keep_alive_max_cap_closes_after_max_test() ->
     Both =
         ~"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
     Sink = spawn_active_sink_with_send_log(Self, Tag, Both),
-    Opts = (fake_opts(max1))#{max_keep_alive_requests := 1},
+    Opts = fake_opts(max1, #{max_keep_alive_requests => 1}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1279,12 +1279,12 @@ manual_mode_drain_failure_closes_cleanly_test() ->
         %% No body bytes pre-buffered. The drain will recv → fail.
         {passive, {error, closed}}
     ]),
-    Opts = (fake_opts(drain_fail))#{
-        body_buffering := manual,
-        dispatch :=
+    Opts = fake_opts(drain_fail, #{
+        body_buffering => manual,
+        dispatch =>
             {handler, roadrunner_conn_loop_lazy_manual_handler,
                 fun roadrunner_conn_loop_lazy_manual_handler:handle/1, undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1313,13 +1313,13 @@ manual_mode_pipelined_leftover_uses_manual_drain_test() ->
     Req2 = ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nbye",
     Both = <<Req1/binary, Req2/binary>>,
     Sink = spawn_scripted_sink(Self, Tag, [{passive, {ok, Both}}]),
-    Opts = (fake_opts(manual_pipe))#{
-        body_buffering := manual,
-        dispatch :=
+    Opts = fake_opts(manual_pipe, #{
+        body_buffering => manual,
+        dispatch =>
             {handler, roadrunner_manual_keepalive_handler,
                 fun roadrunner_manual_keepalive_handler:handle/1, undefined},
-        max_keep_alive_requests := 2
-    },
+        max_keep_alive_requests => 2
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1346,12 +1346,12 @@ keep_alive_idle_timeout_silently_closes_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(ka_to))#{
-        dispatch :=
+    Opts = fake_opts(ka_to, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
-        keep_alive_timeout := 50
-    },
+        keep_alive_timeout => 50
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1376,13 +1376,13 @@ hibernate_after_fires_during_keep_alive_idle_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(hib))#{
-        dispatch :=
+    Opts = fake_opts(hib, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
         hibernate_after => 50,
-        keep_alive_timeout := 5000
-    },
+        keep_alive_timeout => 5000
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1411,12 +1411,12 @@ hibernate_path_handles_close_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(hib_closed))#{
-        dispatch :=
+    Opts = fake_opts(hib_closed, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
         hibernate_after => 50
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1434,12 +1434,12 @@ hibernate_path_handles_tcp_error_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(hib_err))#{
-        dispatch :=
+    Opts = fake_opts(hib_err, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
         hibernate_after => 50
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1460,13 +1460,13 @@ hibernate_path_handles_deadline_fired_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(hib_dl))#{
-        dispatch :=
+    Opts = fake_opts(hib_dl, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
         hibernate_after => 5000,
-        keep_alive_timeout := 50
-    },
+        keep_alive_timeout => 50
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1486,13 +1486,13 @@ hibernated_conn_still_times_out_on_keep_alive_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(hib_ka_to))#{
-        dispatch :=
+    Opts = fake_opts(hib_ka_to, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
         hibernate_after => 20,
-        keep_alive_timeout := 200
-    },
+        keep_alive_timeout => 200
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1512,10 +1512,10 @@ hibernated_conn_still_writes_408_on_request_timeout_test() ->
     Self = self(),
     Tag = make_ref(),
     Sink = spawn_silent_sink_with_send_log(Self, Tag),
-    Opts = (fake_opts(hib_req_to))#{
+    Opts = fake_opts(hib_req_to, #{
         hibernate_after => 20,
-        request_timeout := 200
-    },
+        request_timeout => 200
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1533,13 +1533,13 @@ hibernate_path_drops_stray_messages_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(hib_stray))#{
-        dispatch :=
+    Opts = fake_opts(hib_stray, #{
+        dispatch =>
             {handler, roadrunner_keepalive_handler, fun roadrunner_keepalive_handler:handle/1,
                 undefined},
         hibernate_after => 5000,
-        keep_alive_timeout := 200
-    },
+        keep_alive_timeout => 200
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1606,10 +1606,10 @@ stream_response_writes_chunked_body_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(stream))#{
-        dispatch :=
+    Opts = fake_opts(stream, #{
+        dispatch =>
             {handler, roadrunner_stream_handler, fun roadrunner_stream_handler:handle/1, undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1630,10 +1630,10 @@ loop_response_runs_until_stop_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(looprsp))#{
-        dispatch :=
+    Opts = fake_opts(looprsp, #{
+        dispatch =>
             {handler, roadrunner_loop_handler, fun roadrunner_loop_handler:handle/1, undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1666,11 +1666,11 @@ sendfile_response_writes_head_then_body_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     ),
-    Opts = (fake_opts(sendf))#{
-        dispatch :=
+    Opts = fake_opts(sendf, #{
+        dispatch =>
             {handler, roadrunner_conn_loop_sendfile_handler,
                 fun roadrunner_conn_loop_sendfile_handler:handle/1, undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1699,11 +1699,11 @@ sendfile_response_skips_body_for_head_method_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     ),
-    Opts = (fake_opts(sendf_head))#{
-        dispatch :=
+    Opts = fake_opts(sendf_head, #{
+        dispatch =>
             {handler, roadrunner_conn_loop_sendfile_handler,
                 fun roadrunner_conn_loop_sendfile_handler:handle/1, undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1735,12 +1735,12 @@ sendfile_at_keep_alive_ceiling_signals_close_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(sendf_ceiling))#{
-        max_keep_alive_requests := 1,
-        dispatch :=
+    Opts = fake_opts(sendf_ceiling, #{
+        max_keep_alive_requests => 1,
+        dispatch =>
             {handler, roadrunner_conn_loop_sendfile_handler,
                 fun roadrunner_conn_loop_sendfile_handler:handle/1, undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1779,9 +1779,9 @@ sendfile_dispatch_closes_socket_on_error_test() ->
             }},
         {Resp, Req}
     end,
-    Opts = (fake_opts(sendf_err))#{
-        dispatch := {handler, dummy_handler, HandlerFun, undefined}
-    },
+    Opts = fake_opts(sendf_err, #{
+        dispatch => {handler, dummy_handler, HandlerFun, undefined}
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -1805,12 +1805,12 @@ websocket_session_runs_in_the_conn_process_test() ->
     Sink = spawn_ws_sink(Self, Tag, upgrade_request_bytes()),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    Opts = (fake_opts(ws_inline))#{
-        client_counter := Counter,
-        dispatch :=
+    Opts = fake_opts(ws_inline, #{
+        client_counter => Counter,
+        dispatch =>
             {handler, roadrunner_ws_upgrade_handler, fun roadrunner_ws_upgrade_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     ConnRef = monitor(process, ConnPid),
     ConnPid ! shoot,
@@ -1848,12 +1848,12 @@ websocket_handler_crash_closes_conn_and_releases_slot_test() ->
     Sink = spawn_ws_sink(Self, Tag, upgrade_request_bytes()),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    Opts = (fake_opts(ws_crash))#{
-        client_counter := Counter,
-        dispatch :=
+    Opts = fake_opts(ws_crash, #{
+        client_counter => Counter,
+        dispatch =>
             {handler, roadrunner_ws_crash_upgrade_handler,
                 fun roadrunner_ws_crash_upgrade_handler:handle/1, undefined}
-    },
+    }),
     {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     ConnRef = monitor(process, ConnPid),
     ConnPid ! shoot,
@@ -1888,14 +1888,14 @@ websocket_close_lingers_over_an_unrequested_body_test() ->
     >>),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    Opts = (fake_opts(ws_linger))#{
-        client_counter := Counter,
-        body_buffering := manual,
+    Opts = fake_opts(ws_linger, #{
+        client_counter => Counter,
+        body_buffering => manual,
         http1_linger_timeout => 0,
-        dispatch :=
+        dispatch =>
             {handler, roadrunner_ws_upgrade_handler, fun roadrunner_ws_upgrade_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     ConnRef = monitor(process, ConnPid),
     ConnPid ! shoot,
@@ -1928,10 +1928,10 @@ ws_failure_releases_slot(Upgrade) ->
     Sink = spawn_ws_sink(Self, Tag, upgrade_request_bytes()),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    Opts = (fake_opts(ws_failure))#{
-        client_counter := Counter,
-        dispatch := {handler, roadrunner_ws_crash_upgrade_handler, Upgrade, undefined}
-    },
+    Opts = fake_opts(ws_failure, #{
+        client_counter => Counter,
+        dispatch => {handler, roadrunner_ws_crash_upgrade_handler, Upgrade, undefined}
+    }),
     {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     ConnRef = monitor(process, ConnPid),
     ConnPid ! shoot,
@@ -1975,9 +1975,9 @@ websocket_upgrade_headers_reach_the_101_test() ->
         Headers = [{~"set-cookie", ~"sid=abc; Path=/"}, {~"upgrade", ~"not-websocket"}],
         {{websocket, roadrunner_ws_echo_handler, no_state, #{headers => Headers}}, Req}
     end,
-    Opts = (fake_opts(ws_upgrade_headers))#{
-        dispatch := {handler, roadrunner_ws_upgrade_handler, Handle, undefined}
-    },
+    Opts = fake_opts(ws_upgrade_headers, #{
+        dispatch => {handler, roadrunner_ws_upgrade_handler, Handle, undefined}
+    }),
     {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     ConnRef = monitor(process, ConnPid),
     ConnPid ! shoot,
@@ -2028,9 +2028,9 @@ pipelined_response_flushes_once_before_ws_upgrade_test() ->
         []
     ),
     persistent_term:put({roadrunner_routes, ws_after_pipe}, Compiled),
-    Opts = (fake_opts(ws_after_pipe))#{
-        dispatch := {router, ws_after_pipe}
-    },
+    Opts = fake_opts(ws_after_pipe, #{
+        dispatch => {router, ws_after_pipe}
+    }),
     {ok, ConnPid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     ConnRef = monitor(process, ConnPid),
     ConnPid ! shoot,
@@ -2062,11 +2062,11 @@ websocket_dispatch_invokes_session_run_test() ->
     Sink = spawn_active_sink_with_send_log(
         Self, Tag, ~"GET /ws HTTP/1.1\r\nHost: x\r\n\r\n"
     ),
-    Opts = (fake_opts(wsdisp))#{
-        dispatch :=
+    Opts = fake_opts(wsdisp, #{
+        dispatch =>
             {handler, roadrunner_ws_upgrade_handler, fun roadrunner_ws_upgrade_handler:handle/1,
                 undefined}
-    },
+    }),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -2087,7 +2087,7 @@ slot_released_after_parse_exit_test() ->
     ),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    Opts = (fake_opts(slot_parse))#{client_counter := Counter},
+    Opts = fake_opts(slot_parse, #{client_counter => Counter}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, Sink}, Opts),
     Ref = monitor(process, Pid),
     Pid ! shoot,
@@ -2180,11 +2180,11 @@ active_n_stream_response_gets_a_passive_socket_test() ->
     %% A streamed response disarms the socket first, and drops a passive
     %% message already queued.
     Tag = make_ref(),
-    Opts = (fake_opts(active_n_stream))#{
-        dispatch :=
+    Opts = fake_opts(active_n_stream, #{
+        dispatch =>
             {handler, roadrunner_stream_handler, fun roadrunner_stream_handler:handle/1, undefined},
         http1_active => 4
-    },
+    }),
     {Pid, Ref} = start_active_n(Tag, Opts),
     [{active, 4}] = expect_setopts(Tag),
     %% Suspended, so all three are queued before it reads the first.
@@ -2202,16 +2202,16 @@ active_n_streaming_handler_reads_a_body_queued_at_disarm_test() ->
     %% that came in while the socket was armed are still read, in order,
     %% after the disarm.
     Tag = make_ref(),
-    Opts = (fake_opts(active_n_stream_echo))#{
+    Opts = fake_opts(active_n_stream_echo, #{
         %% The handler picks its behaviour from the route state, which this
         %% dispatch form does not set.
-        dispatch :=
+        dispatch =>
             {handler, roadrunner_manual_body_handler,
                 fun(Req) -> roadrunner_manual_body_handler:handle(Req#{state => stream_echo}) end,
                 undefined},
         body_buffering => manual,
         http1_active => 4
-    },
+    }),
     {Pid, Ref} = start_active_n(Tag, Opts),
     [{active, 4}] = expect_setopts(Tag),
     true = erlang:suspend_process(Pid),
@@ -2428,13 +2428,13 @@ post_head(Len, Body) ->
         Body/binary>>.
 
 size_opts(Extra) ->
-    maps:merge(
-        (fake_opts(active_n))#{
-            dispatch :=
+    fake_opts(
+        active_n,
+        Extra#{
+            dispatch =>
                 {handler, roadrunner_body_size_handler, fun roadrunner_body_size_handler:handle/1,
                     undefined}
-        },
-        Extra
+        }
     ).
 
 start_active_n(Tag, Opts) ->
@@ -2515,8 +2515,11 @@ await_normal_exit(Ref, Pid) ->
     after 2000 -> error(no_exit)
     end.
 
+fake_opts(ListenerName, Fields) ->
+    roadrunner_test_proto_opts:set(Fields, fake_opts(ListenerName)).
+
 fake_opts(ListenerName) ->
-    #{
+    roadrunner_test_proto_opts:new(#{
         dispatch =>
             {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
         middlewares => [],
@@ -2544,7 +2547,7 @@ fake_opts(ListenerName) ->
         listener_name => ListenerName,
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000
-    }.
+    }).
 
 %% Plain sink — discards every message. Used when the test doesn't need
 %% to drive bytes or capture sends; just absorbs the conn's

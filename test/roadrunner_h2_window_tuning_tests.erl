@@ -228,7 +228,7 @@ start_conn(H2Opts) ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         max_concurrent_requests => infinity,
         client_counter => Counter,
         listener_name => h2_window_test,
@@ -242,7 +242,7 @@ start_conn(H2Opts) ->
         http2_stream_window => maps:get(stream_window, H2Opts, 65535),
         http2_window_refill_threshold => maps:get(window_refill_threshold, H2Opts, 32768),
         http2_max_concurrent_streams => maps:get(max_concurrent_streams, H2Opts, 100)
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive

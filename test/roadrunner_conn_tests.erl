@@ -2084,9 +2084,12 @@ consume_state_next_chunk_bad_chunk_test() ->
 
 register_for_drain_registers_pid_test() ->
     Table = ets:new(register_for_drain, [set, public]),
-    ?assertEqual(ok, roadrunner_conn:register_for_drain(self(), #{drain_table => Table})),
+    ProtoOpts = roadrunner_test_proto_opts:new(#{drain_table => Table}),
+    ?assertEqual(ok, roadrunner_conn:register_for_drain(self(), ProtoOpts)),
     ?assertEqual([{self()}], ets:tab2list(Table)),
-    ?assertEqual(ok, roadrunner_conn:unregister_for_drain(#{drain_table => Table})),
+    ?assertEqual(
+        ok, roadrunner_conn:unregister_for_drain(roadrunner_conn:close_opts(ProtoOpts))
+    ),
     ?assertEqual([], ets:tab2list(Table)).
 
 register_for_drain_disabled_skips_registry_test() ->
@@ -2095,15 +2098,21 @@ register_for_drain_disabled_skips_registry_test() ->
     Table = ets:new(register_for_drain_disabled, [set, public]),
     ?assertEqual(
         ok,
-        roadrunner_conn:register_for_drain(self(), #{graceful_drain => false, drain_table => Table})
+        roadrunner_conn:register_for_drain(
+            self(),
+            roadrunner_test_proto_opts:new(#{graceful_drain => false, drain_table => Table})
+        )
     ),
     ?assertEqual([], ets:tab2list(Table)).
 
 register_for_drain_without_registry_is_noop_test() ->
     %% Hand-built proto_opts (tests) carry no table: nothing to register or
     %% unregister.
-    ?assertEqual(ok, roadrunner_conn:register_for_drain(self(), #{})),
-    ?assertEqual(ok, roadrunner_conn:unregister_for_drain(#{})).
+    ProtoOpts = roadrunner_test_proto_opts:new(#{}),
+    ?assertEqual(ok, roadrunner_conn:register_for_drain(self(), ProtoOpts)),
+    ?assertEqual(
+        ok, roadrunner_conn:unregister_for_drain(roadrunner_conn:close_opts(ProtoOpts))
+    ).
 
 unregister_for_drain_after_listener_gone_is_noop_test() ->
     %% The listener owns the table and `stop/1` does not wait for conns, so
@@ -2125,7 +2134,12 @@ unregister_for_drain_after_listener_gone_is_noop_test() ->
     receive
         {'DOWN', MRef, process, Owner, _} -> ok
     end,
-    ?assertEqual(ok, roadrunner_conn:unregister_for_drain(#{drain_table => Table})).
+    ?assertEqual(
+        ok,
+        roadrunner_conn:unregister_for_drain(
+            roadrunner_conn:close_opts(roadrunner_test_proto_opts:new(#{drain_table => Table}))
+        )
+    ).
 
 consume_state_next_chunk_for_content_length_drains_fully_test() ->
     %% Non-chunked framing: `next_chunk` drains the full body in one

@@ -1,6 +1,8 @@
 -module(roadrunner_conn).
 -moduledoc false.
 
+-include("roadrunner_proto_opts.hrl").
+
 %% Public connection-process API and pure helpers.
 %%
 %% `start/2` spawns the per-connection process — `roadrunner_conn_loop`,
@@ -122,12 +124,9 @@
 
 %% The part of `proto_opts()` a connection's close path reads
 %% (`release_slot/1`, `unregister_for_drain/1`): what a WebSocket session
-%% keeps for its whole lifetime instead of the full listener options.
--type close_opts() :: #{
-    client_counter := counters:counters_ref(),
-    drain_table => ets:table(),
-    _ => _
-}.
+%% keeps for its whole lifetime instead of the full listener options: the
+%% live-connection counter and the drain registry (`undefined` for none).
+-type close_opts() :: {counters:counters_ref(), ets:table() | undefined}.
 
 %% A request's routing outcome (`resolve_handler/2`): the handler, its
 %% bindings, pipeline and state, and the matched route's limits.
@@ -158,179 +157,9 @@ deadline in milliseconds. The shed form answers it `503` with the
     {handler, module(), roadrunner_middleware:next(), State :: term()}
     | {router, ListenerName :: atom()}.
 
--type proto_opts() :: #{
-    dispatch := dispatch(),
-    middlewares := roadrunner_middleware:middlewares(),
-    max_content_length := non_neg_integer(),
-    %% WebSocket inbound size caps. `ws_max_frame_size` bounds a single
-    %% frame's declared payload (enforced before buffering);
-    %% `ws_max_message_size` bounds a reassembled message (the running
-    %% sum of fragment payloads, and the decompressed size under
-    %% permessage-deflate). Both always present —
-    %% `roadrunner_listener:build_proto_opts/2` fills defaults.
-    ws_max_frame_size := non_neg_integer(),
-    ws_max_message_size := non_neg_integer(),
-    %% inet `buffer` for a WebSocket session: a fixed size,
-    %% `{adaptive, Base, Max}` (the default: from `Base`, the listener's
-    %% `idle_recv_buffer`, up to `Max`, its `recv_buffer`), or `undefined`
-    %% to keep the socket's buffer.
-    ws_buffer := pos_integer() | {adaptive, pos_integer(), pos_integer()} | undefined,
-    %% Idle ms after which a WebSocket session hibernates; `infinity`
-    %% (the default) never hibernates on idle.
-    ws_hibernate_after := pos_integer() | infinity,
-    %% Whether a WebSocket upgrade accepts permessage-deflate, and with
-    %% which zlib settings (`roadrunner_ws:compress_config/1`).
-    ws_compress := false | roadrunner_ws:compress_config(),
-    %% Ms of client silence after which a WebSocket session closes;
-    %% `infinity` (the default) never does.
-    ws_idle_timeout := pos_integer() | infinity,
-    %% How a WebSocket session reads its socket: `once`, or up to `N`
-    %% reads per arm (the listener's `ws.active`); `undefined` (the
-    %% default) is `once` on plain TCP and `16` on TLS.
-    ws_active := once | 1..32767 | undefined,
-    %% A WebSocket session's heap floor (`roadrunner_ws_session:raise_heap_floor/1`):
-    %% the least heap, in words, a `handle_info/2` must have needed to
-    %% raise it, and the most it rises to, `0` when off (the listener's
-    %% `ws.heap_floor` `min` and `max`).
-    ws_heap_floor_min => non_neg_integer(),
-    ws_heap_floor_max => non_neg_integer(),
-    request_timeout := non_neg_integer(),
-    %% Bound on the TLS handshake in the accept path; see the
-    %% `tls_handshake_timeout` listener opt.
-    tls_handshake_timeout := pos_integer(),
-    keep_alive_timeout := non_neg_integer(),
-    max_keep_alive_requests := infinity | pos_integer(),
-    max_clients := pos_integer(),
-    client_counter := counters:counters_ref(),
-    %% Per-listener drain registry (`{Pid}` rows). Optional so hand-built
-    %% proto_opts in tests can leave it out; the listener always sets it.
-    drain_table => ets:table(),
-    requests_counter := atomics:atomics_ref(),
-    rejected_counter := atomics:atomics_ref(),
-    %% Aggregate in-flight ceiling for the multiplexed protocols (h2/h3):
-    %% a cap on concurrent live stream-worker processes across the whole
-    %% listener, independent of `max_clients` and `max_concurrent_streams`.
-    %% `infinity` (default) disables it. `inflight_counter` is the live
-    %% gauge (acquired before a worker spawns, released on its `DOWN`);
-    %% `throttled_counter` is the cumulative count of streams refused at
-    %% the ceiling. h1 is bounded by `max_clients` and uses these only in
-    %% shed mode, where the ceiling is one budget across every protocol.
-    max_concurrent_requests := infinity | pos_integer(),
-    %% What happens to a request over that ceiling. Optional so a
-    %% hand-built proto_opts map (tests, embedded callers) defaults to
-    %% today's refuse behavior.
-    overload => overload(),
-    inflight_counter := counters:counters_ref(),
-    throttled_counter := atomics:atomics_ref(),
-    %% Per-peer request-rate guard (off by default). `rate_limit` carries the
-    %% resolved config + per-listener ETS bucket store when the `rate_limit`
-    %% opt is set, else `undefined`. `rate_limited_counter` is the cumulative
-    %% count of requests refused at the per-peer rate, mirroring
-    %% `throttled_counter`, surfaced in `roadrunner_listener:info/1` (always
-    %% present, stays 0 when the guard is off).
-    rate_limit := undefined | rate_limit(),
-    rate_limited_counter := atomics:atomics_ref(),
-    min_bytes_per_second := non_neg_integer(),
-    body_buffering := roadrunner_listener:body_buffering(),
-    listener_name => atom(),
-    %% When `false`, conns skip registering in the listener's drain
-    %% registry (`drain_table`). The registry is the mechanism
-    %% `roadrunner_listener:drain/2` uses to broadcast
-    %% `{roadrunner_drain, Deadline}` to in-flight conns; loop /
-    %% SSE / WebSocket handlers depend on it. Short-lived h1
-    %% workloads can opt out to skip the insert and delete per conn.
-    graceful_drain => boolean(),
-    %% Acceptor process priority (`roadrunner_acceptor`): `high` accepts
-    %% promptly and drops to `normal` while rejecting at `max_clients`;
-    %% `normal`, or absent, keeps the acceptor at `normal`. The listener
-    %% always sets it.
-    accept_priority => high | normal,
-    %% When `true`, `roadrunner_conn_loop:awaiting_shoot/3` reads and strips a
-    %% PROXY-protocol header (an L4 balancer prepends it) before serving, and
-    %% the request peer is the real client. TCP-only; the listener rejects it on
-    %% an HTTP/3-only listener.
-    proxy_protocol => boolean(),
-    %% The compiled `real_ip` listener option (`roadrunner_real_ip:compile/1`).
-    %% Absent when the option is off.
-    real_ip => roadrunner_real_ip:config(),
-    %% TLS options for a TLS listener that also reads the PROXY protocol: it
-    %% accepts plain TCP (the header comes before any TLS bytes) and the conn
-    %% upgrades each socket with these once the header is in. Absent on every
-    %% other listener; a TLS listener without the PROXY protocol handshakes
-    %% the socket `ssl:listen` accepted.
-    tls_upgrade => [ssl:tls_server_option()],
-    %% Enabled protocols as a flat atom list in user-supplied (ALPN
-    %% preference) order. On plain TCP with `[http2]`,
-    %% `roadrunner_conn_loop:serve/5` routes straight to the h2 conn
-    %% loop; with both `http1` and `http2` it picks the loop from each
-    %% connection's first bytes. HTTP/2 sub-opts are flattened onto proto_opts
-    %% top-level as `http2_conn_window`, `http2_stream_window`,
-    %% `http2_window_refill_threshold` — see those keys below. The
-    %% user-facing nested shape (`{http2, #{conn_window => N, ...}}`)
-    %% is documented in `t:roadrunner_listener:opts/0`.
-    protocols => [http1 | http2 | http3, ...],
-    %% HTTP/2 receive-window tuning, populated by the listener only
-    %% when `http2` is in the protocols list. Pattern-match these
-    %% keys directly in code paths that already know http2 is
-    %% enabled (e.g. `roadrunner_conn_loop_http2:enter/5`) — they're
-    %% guaranteed present, defaults filled at normalization time.
-    %% See `t:roadrunner_listener:opts/0` for the user-facing shape
-    %% (`{http2, #{conn_window => N, stream_window => N,
-    %% window_refill_threshold => N}}`) and RFC 9113 §6.5.2 / §6.9.2
-    %% for the wire semantics.
-    http2_conn_window => 1..16#7FFFFFFF,
-    http2_stream_window => 1..16#7FFFFFFF,
-    http2_window_refill_threshold => 1..16#7FFFFFFF,
-    http2_max_concurrent_streams => 1..16#7FFFFFFF,
-    http2_max_header_block => 1..16#7FFFFFFF,
-    http2_active => once | 1..32767,
-    %% The HTTP/2 `ping_policy`, one key per setting, none of them when it
-    %% is `false` (`roadrunner_conn_loop_http2:ping_policy/1`).
-    http2_ping_min_time => 1..16#FFFFFFFF,
-    http2_ping_permit_without_stream => boolean(),
-    http2_ping_max_strikes => 0..16#7FFFFFFF,
-    %% The HTTP/2 `connection_age`, both keys or neither (`false`).
-    http2_connection_age_max => 1..16#FFFFFFFF,
-    http2_connection_age_grace => 0..16#FFFFFFFF | infinity,
-    %% HTTP/3 tuning, flattened from `{http3, #{...}}` when http3 is enabled.
-    http3_listeners => 1..1024,
-    http3_max_header_block => 1..16#7FFFFFFF,
-    http3_qpack_max_table_capacity => 0..16#7FFFFFFF,
-    http3_qpack_blocked_streams => 0..16#7FFFFFFF,
-    %% HTTP/1 inbound size limits and close linger, flattened from
-    %% `{http1, #{...}}`.
-    http1_max_request_line => 1..16#7FFFFFFF,
-    http1_max_header_line => 1..16#7FFFFFFF,
-    http1_max_header_block => 1..16#7FFFFFFF,
-    http1_max_header_count => 1..16#7FFFFFFF,
-    http1_linger_timeout => 0..16#7FFFFFFF,
-    %% Set only when `{http1, #{active => ...}}` is given; unset, the
-    %% conn picks by transport.
-    http1_active => once | 1..32767,
-    %% Optional fields the listener injects only when the user
-    %% supplies them — see `roadrunner_listener:build_proto_opts/2`.
-    %% Declared here so dialyzer accepts pattern matches like
-    %% `#{hibernate_after := Ms}` against `proto_opts()`.
-    hibernate_after => pos_integer(),
-    rate_check_interval => pos_integer(),
-    %% `{Idle, Max}` on a plain-TCP listener whose sockets start at
-    %% `idle_recv_buffer` (`Idle`) below `recv_buffer` (`Max`): an HTTP/1.1
-    %% connection grows its buffer to `Max` before it reads a large body
-    %% (`roadrunner_conn_loop:grow_buffer/2`), an h2c one at its first DATA
-    %% payload (`roadrunner_conn_loop_http2:grow_buffer/2`). Absent on TLS.
-    grow_recv_buffer => {pos_integer(), pos_integer()},
-    %% The most heap, in words, an HTTP/1.1 connection raises its
-    %% `min_heap_size` to (`roadrunner_conn_loop:raise_heap_floor/1`), or
-    %% an HTTP/2 or HTTP/3 connection starts its stream workers at
-    %% (`roadrunner_stream_worker:conn_heap_floor/1`). Absent when
-    %% `handler_spawn.heap_floor` is `false`.
-    heap_floor => pos_integer(),
-    %% Flattened spawn config for every handler-running process. The public
-    %% `handler_spawn => #{opts}` listener opt is expanded into this top-level
-    %% key by `roadrunner_listener:build_proto_opts/2` so the spawn sites read
-    %% it with a single `maps:get/2`, never a nested lookup.
-    handler_spawn_opts => [proc_lib:start_spawn_option()]
-}.
+%% The connection options (`#proto_opts{}`, `roadrunner_proto_opts.hrl`),
+%% built once per listener by `roadrunner_listener:build_proto_opts/2`.
+-type proto_opts() :: #proto_opts{}.
 
 %% Resolved per-peer rate-limit config, built by `roadrunner_listener` when the
 %% `rate_limit` opt is set: `rate` requests per `period` seconds with a `burst`
@@ -371,7 +200,7 @@ ownership via `roadrunner_transport:controlling_process/2` and then
 send the process the atom `shoot` to release it.
 """.
 -spec start(roadrunner_transport:socket(), proto_opts()) -> {ok, pid()}.
-start(Socket, ProtoOpts) when is_map(ProtoOpts) ->
+start(Socket, #proto_opts{} = ProtoOpts) ->
     {ok, _Pid} = roadrunner_conn_loop:start(Socket, ProtoOpts).
 
 -doc """
@@ -391,12 +220,12 @@ registers through
 `roadrunner_listener:register_for_drain/2` instead.
 """.
 -spec register_for_drain(pid(), proto_opts()) -> ok.
-register_for_drain(_Pid, #{graceful_drain := false}) ->
+register_for_drain(_Pid, #proto_opts{graceful_drain = false}) ->
     ok;
-register_for_drain(Pid, #{drain_table := Table}) ->
+register_for_drain(_Pid, #proto_opts{drain_table = undefined}) ->
+    ok;
+register_for_drain(Pid, #proto_opts{drain_table = Table}) ->
     true = ets:insert(Table, {Pid}),
-    ok;
-register_for_drain(_Pid, #{}) ->
     ok.
 
 -doc """
@@ -406,14 +235,14 @@ does not wait for in-flight conns, so a conn that outlives its listener
 finds no registry to leave and that is fine.
 """.
 -spec unregister_for_drain(close_opts()) -> ok.
-unregister_for_drain(#{drain_table := Table}) ->
+unregister_for_drain({_Counter, undefined}) ->
+    ok;
+unregister_for_drain({_Counter, Table}) ->
     try ets:delete(Table, self()) of
         true -> ok
     catch
         error:badarg -> ok
-    end;
-unregister_for_drain(#{}) ->
-    ok.
+    end.
 
 -doc """
 Try to bump the live-connection counter under `max_clients`. Returns
@@ -444,7 +273,7 @@ leaks become a real concern under chaos-test conditions, the
 conns still alive against the live counter and reconciles the difference.
 """.
 -spec try_acquire_slot(proto_opts()) -> boolean().
-try_acquire_slot(#{client_counter := Ref, max_clients := Max}) ->
+try_acquire_slot(#proto_opts{client_counter = Ref, max_clients = Max}) ->
     ok = counters:add(Ref, 1, 1),
     case counters:get(Ref, 1) of
         N when N =< Max ->
@@ -456,15 +285,15 @@ try_acquire_slot(#{client_counter := Ref, max_clients := Max}) ->
 
 -doc "Decrement the live-connection counter, paired with `try_acquire_slot/1`.".
 -spec release_slot(close_opts()) -> ok.
-release_slot(#{client_counter := Ref}) ->
+release_slot({Ref, _Table}) ->
     ok = counters:sub(Ref, 1, 1),
     ok.
 
 %% The close-path slice of `ProtoOpts` (`close_opts()`).
 -doc false.
 -spec close_opts(proto_opts()) -> close_opts().
-close_opts(ProtoOpts) ->
-    maps:with([client_counter, drain_table], ProtoOpts).
+close_opts(#proto_opts{client_counter = Counter, drain_table = Table}) ->
+    {Counter, Table}.
 
 -doc """
 Try to bump the live in-flight-request counter under
@@ -502,13 +331,13 @@ try_acquire_request_slot(Max, Counter) ->
 %% `undefined` when the guard is off, so the per-request check is a single
 %% branch on a cached value. The peer IP is baked in here, so the catch-all
 %% also covers a missing peer (a 2-tuple `{IP, _}` is required) as well as
-%% `rate_limit => undefined` and the hand-built proto_opts in unit tests.
+%% a `rate_limit` of `undefined`.
 -doc false.
 -spec resolve_rate_limit(
     proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
 ) -> rate_limit_state().
 resolve_rate_limit(
-    #{rate_limit := #{table := Table} = RateLimit, rate_limited_counter := Counter},
+    #proto_opts{rate_limit = #{table := Table} = RateLimit, rate_limited_counter = Counter},
     {IP, _Port}
 ) ->
     %% Bake the derived `Cost` (units/request) and `Cap` (bucket capacity),
@@ -527,10 +356,10 @@ resolve_rate_limit(_ProtoOpts, _Peer) ->
 -spec resolve_real_ip(
     proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
 ) -> undefined | roadrunner_real_ip:config().
-resolve_real_ip(#{real_ip := RealIp}, Peer) ->
-    roadrunner_real_ip:peer_trust(RealIp, Peer);
-resolve_real_ip(_ProtoOpts, _Peer) ->
-    undefined.
+resolve_real_ip(#proto_opts{real_ip = undefined}, _Peer) ->
+    undefined;
+resolve_real_ip(#proto_opts{real_ip = RealIp}, Peer) ->
+    roadrunner_real_ip:peer_trust(RealIp, Peer).
 
 %% The per-peer rate-limit gate every protocol runs before it dispatches a
 %% request: `allow`, or `{deny, RetryAfterSecs}` once the throttle is counted
@@ -747,8 +576,7 @@ release_request_slots(_Max, Counter, N, Overload) ->
 -spec refine_conn_label(
     proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
 ) -> ok.
-refine_conn_label(ProtoOpts, Peer) ->
-    ListenerName = maps:get(listener_name, ProtoOpts, undefined),
+refine_conn_label(#proto_opts{listener_name = ListenerName}, Peer) ->
     proc_lib:set_label({roadrunner_conn, ListenerName, Peer}),
     ok.
 
@@ -1153,7 +981,7 @@ expect_answer(ProtoOpts, Headers, MaxCL) ->
                     roadrunner_http:request_content_length(Headers)
             of
                 {ok, Declared} ->
-                    #{dispatch := Dispatch} = ProtoOpts,
+                    #proto_opts{dispatch = Dispatch} = ProtoOpts,
                     case Declared > route_body_cap(Dispatch, Headers, MaxCL) of
                         true -> too_large;
                         false -> continue

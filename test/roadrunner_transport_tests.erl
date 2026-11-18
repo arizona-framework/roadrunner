@@ -633,7 +633,7 @@ fake_conn_drives_handler_without_sockets_test() ->
     end.
 
 fake_proto_opts(Handler) ->
-    #{
+    roadrunner_test_proto_opts:new(#{
         dispatch => {handler, Handler, fun Handler:handle/1, undefined},
         middlewares => [],
         max_content_length => 10485760,
@@ -650,4 +650,4 @@ fake_proto_opts(Handler) ->
         proxy_protocol => false,
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000
-    }.
+    }).

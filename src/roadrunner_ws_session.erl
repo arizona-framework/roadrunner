@@ -1,6 +1,8 @@
 -module(roadrunner_ws_session).
 -moduledoc false.
 
+-include("roadrunner_proto_opts.hrl").
+
 %% Per-connection WebSocket session — runs the frame loop in the
 %% connection's own process (a hand-rolled loop, never a gen_statem,
 %% mirroring `roadrunner_conn_loop_http2` / `roadrunner_quic_connection`)
@@ -310,7 +312,7 @@ They seed the session buffer so the first frame isn't lost.
     roadrunner_conn:proto_opts()
 ) -> {upgrade, run()} | rejected.
 start(Socket, Req, Mod, State, Opts, Buffered, ListenerOpts) ->
-    #{ws_compress := Compress} = ProtoOpts = session_opts(Opts, ListenerOpts),
+    #proto_opts{ws_compress = Compress} = ProtoOpts = session_opts(Opts, ListenerOpts),
     Headers = roadrunner_req:headers(Req),
     case roadrunner_ws:handshake_response(Headers, maps:get(headers, Opts, []), Compress) of
         {ok, Status, RespHeaders, _, Negotiated} ->
@@ -338,31 +340,33 @@ session_opts(Opts, ListenerOpts) ->
 session_opt(headers, _Headers, Opts) ->
     Opts;
 session_opt(compress, V, Opts) ->
-    Opts#{ws_compress := roadrunner_ws:compress_config(V)};
+    Opts#proto_opts{ws_compress = roadrunner_ws:compress_config(V)};
 session_opt(idle_timeout, V, Opts) ->
-    Opts#{ws_idle_timeout := V};
+    Opts#proto_opts{ws_idle_timeout = V};
 session_opt(max_frame_size, V, Opts) ->
-    Opts#{ws_max_frame_size := V};
+    Opts#proto_opts{ws_max_frame_size = V};
 session_opt(max_message_size, V, Opts) ->
-    Opts#{ws_max_message_size := V};
+    Opts#proto_opts{ws_max_message_size = V};
 session_opt(recv_buffer, V, Opts) ->
-    Opts#{ws_buffer := V};
+    Opts#proto_opts{ws_buffer = V};
 session_opt(active, V, Opts) ->
-    Opts#{ws_active := V};
+    Opts#proto_opts{ws_active = V};
 session_opt(hibernate_after, V, Opts) ->
-    Opts#{ws_hibernate_after := V};
+    Opts#proto_opts{ws_hibernate_after = V};
 session_opt(heap_floor, false, Opts) ->
-    Opts#{ws_heap_floor_max := 0};
-session_opt(heap_floor, #{} = Floor, #{ws_heap_floor_min := Min, ws_heap_floor_max := Cap} = Opts) ->
+    Opts#proto_opts{ws_heap_floor_max = 0};
+session_opt(
+    heap_floor, #{} = Floor, #proto_opts{ws_heap_floor_min = Min, ws_heap_floor_max = Cap} = Opts
+) ->
     %% Keys the upgrade leaves out keep the listener's.
-    Opts#{
-        ws_heap_floor_min := maps:get(min, Floor, Min),
-        ws_heap_floor_max := maps:get(max, Floor, Cap)
+    Opts#proto_opts{
+        ws_heap_floor_min = maps:get(min, Floor, Min),
+        ws_heap_floor_max = maps:get(max, Floor, Cap)
     };
-session_opt(Flag, V, #{handler_spawn_opts := Spawn} = Opts) when
+session_opt(Flag, V, #proto_opts{handler_spawn_opts = Spawn} = Opts) when
     Flag =:= fullsweep_after; Flag =:= min_heap_size; Flag =:= max_heap_size
 ->
-    Opts#{handler_spawn_opts := lists:keystore(Flag, 1, Spawn, {Flag, V})}.
+    Opts#proto_opts{handler_spawn_opts = lists:keystore(Flag, 1, Spawn, {Flag, V})}.
 
 %% RFC 6455 §4.4: a handshake asking for a version the server doesn't
 %% speak gets an error status and a `Sec-WebSocket-Version` listing the
@@ -423,9 +427,9 @@ upgrade(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) -
 %% discovers that on its first receive, so the result is ignored rather
 %% than special-cased.
 -spec apply_ws_buffer(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
-apply_ws_buffer(_Socket, #{ws_buffer := undefined}) ->
+apply_ws_buffer(_Socket, #proto_opts{ws_buffer = undefined}) ->
     ok;
-apply_ws_buffer(Socket, #{ws_buffer := {adaptive, Base, Max}, ws_active := Active}) ->
+apply_ws_buffer(Socket, #proto_opts{ws_buffer = {adaptive, Base, Max}, ws_active = Active}) ->
     _ =
         case {read_mode(Active, Socket), Socket} of
             {once, {ssl, _}} ->
@@ -448,7 +452,7 @@ apply_ws_buffer(Socket, #{ws_buffer := {adaptive, Base, Max}, ws_active := Activ
                 roadrunner_transport:setopts(Socket, [{buffer, Max}])
         end,
     ok;
-apply_ws_buffer(Socket, #{ws_buffer := Buffer}) ->
+apply_ws_buffer(Socket, #proto_opts{ws_buffer = Buffer}) ->
     _ = roadrunner_transport:setopts(Socket, [{buffer, Buffer}]),
     ok.
 
@@ -493,14 +497,14 @@ serve(
     {Socket, Mod, State, {ListenerName, Span}, Negotiated, Buffered, ProtoOpts}
 ) ->
     proc_lib:set_label({?MODULE, ListenerName}),
-    #{
-        handler_spawn_opts := SpawnOpts,
-        ws_max_frame_size := MaxFrame,
-        ws_max_message_size := MaxMsg,
-        ws_hibernate_after := HibernateAfter,
-        ws_idle_timeout := IdleTimeout,
-        ws_active := Active,
-        ws_buffer := WsBuffer
+    #proto_opts{
+        handler_spawn_opts = SpawnOpts,
+        ws_max_frame_size = MaxFrame,
+        ws_max_message_size = MaxMsg,
+        ws_hibernate_after = HibernateAfter,
+        ws_idle_timeout = IdleTimeout,
+        ws_active = Active,
+        ws_buffer = WsBuffer
     } = ProtoOpts,
     ok = apply_gc_settings(SpawnOpts),
     HeapFloor = heap_floor(ProtoOpts),
@@ -1215,7 +1219,7 @@ wait(Data, false) -> recv_loop(Data).
 %% smaller gives the heap back.
 -spec heap_floor(roadrunner_conn:proto_opts()) ->
     {pos_integer(), pos_integer(), pos_integer(), non_neg_integer()} | undefined.
-heap_floor(#{ws_heap_floor_min := Min, ws_heap_floor_max := Cap}) ->
+heap_floor(#proto_opts{ws_heap_floor_min = Min, ws_heap_floor_max = Cap}) ->
     %% After `apply_gc_settings/1`: the session's own `min_heap_size`, as
     %% the emulator rounded it, or the emulator's default.
     {min_heap_size, Base} = erlang:process_info(self(), min_heap_size),
@@ -1225,9 +1229,7 @@ heap_floor(#{ws_heap_floor_min := Min, ws_heap_floor_max := Cap}) ->
             {Base, Base, Cap, Min};
         false ->
             undefined
-    end;
-heap_floor(#{}) ->
-    undefined.
+    end.
 
 %% A session that runs in an HTTP/1.1 connection gets the heap the
 %% requests before it left: nothing collects between requests, so one

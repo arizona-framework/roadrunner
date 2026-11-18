@@ -85,7 +85,7 @@ ws_buffer_opt_applied_before_101_test() ->
         undefined,
         #{},
         frame(close, <<1000:16>>),
-        (ws_proto_opts())#{ws_buffer := 4096}
+        ws_proto_opts_with(#{ws_buffer => 4096})
     ),
     ok = await_down(Ref, Pid),
     Events = collect_events(Tag, 100),
@@ -138,7 +138,7 @@ adaptive_buffer_starts_at_its_base_test() ->
     %% `Base` once, before the 101, and sets nothing for a small message
     %% after.
     Events = adaptive_events(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}},
+        ws_proto_opts_with(#{ws_buffer => {adaptive, 8192, 65536}}),
         [{recv, frame(text, ~"hi")}, {recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual(
@@ -156,7 +156,7 @@ adaptive_buffer_grows_for_large_frames_and_shrinks_after_16_small_ones_test() ->
     <<Head:100/binary, Tail/binary>> = frame16(text, Big),
     Small = {recv, frame(text, ~"hi")},
     Arms = adaptive_arms(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}},
+        ws_proto_opts_with(#{ws_buffer => {adaptive, 8192, 65536}}),
         [{recv, Head}, {recv, Tail}] ++
             lists:duplicate(15, Small) ++
             [{recv, frame16(text, Big)}] ++
@@ -175,7 +175,7 @@ adaptive_buffer_shrinks_after_messages_without_a_reply_test() ->
     %% path counts toward the shrink too.
     <<Head:10/binary, Tail/binary>> = frame16(binary, binary:copy(~"x", 20000)),
     Arms = adaptive_arms(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}},
+        ws_proto_opts_with(#{ws_buffer => {adaptive, 8192, 65536}}),
         [{recv, Head}, {recv, Tail}] ++
             lists:duplicate(16, {recv, frame(binary, ~"b")}) ++
             [{recv, frame(close, <<1000:16>>)}]
@@ -192,7 +192,7 @@ adaptive_buffer_keeps_its_base_for_a_split_small_frame_test() ->
     %% the re-arm between its parts leaves the buffer as it is.
     <<Head:3/binary, Tail/binary>> = frame(text, ~"hello"),
     Arms = adaptive_arms(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}},
+        ws_proto_opts_with(#{ws_buffer => {adaptive, 8192, 65536}}),
         [{recv, Head}, {recv, Tail}, {recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual([[{active, once}], [{active, once}], [{active, once}]], Arms).
@@ -205,7 +205,7 @@ adaptive_buffer_stops_at_its_cap_test() ->
     Frame = frame64(binary, binary:copy(~"x", 70000)),
     <<One:1/binary, Head:99/binary, Mid:30000/binary, Tail/binary>> = Frame,
     Arms = adaptive_arms(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 16384}},
+        ws_proto_opts_with(#{ws_buffer => {adaptive, 8192, 16384}}),
         [{recv, One}, {recv, Head}, {recv, Mid}, {recv, Tail}, {recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual(
@@ -225,7 +225,7 @@ small_listener_buffer_is_kept_test() ->
     %% the session never resizes.
     <<Head:100/binary, Tail/binary>> = frame16(text, binary:copy(~"x", 20000)),
     Events = adaptive_events(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 8192}},
+        ws_proto_opts_with(#{ws_buffer => {adaptive, 8192, 8192}}),
         [{recv, Head}, {recv, Tail}, {recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual(
@@ -238,7 +238,7 @@ fixed_buffer_never_resizes_test() ->
     %% never changes after.
     <<Head:100/binary, Tail/binary>> = frame16(text, binary:copy(~"x", 20000)),
     Events = adaptive_events(
-        (ws_proto_opts())#{ws_buffer := 4096},
+        ws_proto_opts_with(#{ws_buffer => 4096}),
         [{recv, Head}, {recv, Tail}, {recv, frame(text, ~"hi")}, {recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual(
@@ -252,7 +252,7 @@ active_n_session_reads_with_the_listener_cap_test() ->
     %% message, so a plain socket is set to the cap (`recv_buffer`) once,
     %% before the 101, and never changed after.
     Events = adaptive_events(
-        (ws_proto_opts())#{ws_buffer := {adaptive, 8192, 65536}, ws_active := 4},
+        ws_proto_opts_with(#{ws_buffer => {adaptive, 8192, 65536}, ws_active => 4}),
         [{recv, frame(close, <<1000:16>>)}]
     ),
     ?assertEqual(
@@ -405,7 +405,7 @@ ws_hibernate_after_parks_idle_session_and_wakes_on_frame_test() ->
             ws_ctx(),
             none,
             <<>>,
-            (ws_proto_opts())#{ws_hibernate_after := 30}
+            ws_proto_opts_with(#{ws_hibernate_after => 30})
         },
         []
     ),
@@ -2824,8 +2824,11 @@ upgrade_req() ->
 ws_proto_opts() ->
     ws_proto_opts(16777216, 16777216).
 
+ws_proto_opts_with(Fields) ->
+    roadrunner_test_proto_opts:set(Fields, ws_proto_opts()).
+
 ws_proto_opts(MaxFrame, MaxMsg) ->
-    #{
+    roadrunner_test_proto_opts:new(#{
         ws_max_frame_size => MaxFrame,
         ws_max_message_size => MaxMsg,
         ws_buffer => undefined,
@@ -2835,7 +2838,7 @@ ws_proto_opts(MaxFrame, MaxMsg) ->
         ws_active => undefined,
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000
-    }.
+    }).
 
 %% A minimal text/binary single-fragment unmasked frame. Server-side
 %% receives masked frames per the WebSocket spec, so we mark fin=true
@@ -3446,7 +3449,7 @@ idle_timeout_test_() ->
     ]}.
 
 idle_proto_opts() ->
-    (ws_proto_opts())#{ws_idle_timeout := 50}.
+    ws_proto_opts_with(#{ws_idle_timeout => 50}).
 
 %% --- close with frames, IANA close codes, handle_control/2 ---
 
@@ -3692,7 +3695,7 @@ passive_rearm_on_a_closed_socket_ends_session_test() ->
             ws_ctx(),
             none,
             <<>>,
-            (ws_proto_opts())#{ws_active := 2}
+            ws_proto_opts_with(#{ws_active => 2})
         },
         []
     ),
