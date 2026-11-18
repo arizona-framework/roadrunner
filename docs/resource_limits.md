@@ -316,15 +316,15 @@ acceptors hit `emfile` at the descriptor ceiling — each emits
 back-off rather than going silent — so raise `ulimit -n` (and the systemd
 `LimitNOFILE`) for high concurrency.
 
-`max_keep_alive_requests` is off by default, as in Bandit, Go's
-`net/http`, Node.js and Envoy. Closing a connection after a fixed number
-of requests frees the memory it gathered in servers that keep it until the
-connection ends; a roadrunner connection is a process whose garbage
-collector does that while it lives. A fixed count also makes every client
-open a new connection (and redo its TLS handshake) each time it reaches the
-count, and connections a load generator or a proxy opens together reach it
-together, so they all reconnect at once. Set it when you want clients to move between servers,
-for example behind a load balancer that only places new connections.
+`max_keep_alive_requests` is off by default. Closing a connection after a
+fixed number of requests frees the memory it gathered in servers that keep
+it until the connection ends; a roadrunner connection is a process whose
+garbage collector does that while it lives. A fixed count also makes every
+client open a new connection (and redo its TLS handshake) each time it
+reaches the count, and connections a load generator or a proxy opens
+together reach it together, so they all reconnect at once. Set it when you
+want clients to move between servers, for example behind a load balancer
+that only places new connections.
 
 A plain-TCP connection waiting to read holds a read buffer of
 `idle_recv_buffer` (4 KB), so idle memory scales as `max_clients` times
