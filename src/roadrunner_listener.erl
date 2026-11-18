@@ -229,6 +229,14 @@ Optional middleware and timing knobs (durations in milliseconds):
   more acceptors than schedulers only adds contention: on one or two
   schedulers, matching them accepts 35-55% more connections a second than
   10 does, at about a third of the tail latency.
+- `accept_priority` is `high` (the default) or `normal`. At `high` the
+  acceptors run at high process priority, so a new connection is taken
+  from the kernel queue promptly even when the server is busy. While
+  the listener is turning connections away at `max_clients`, they drop
+  to normal priority on their own and return to high once a connection
+  is admitted again. `normal` keeps them at normal priority at all
+  times. Only TCP listeners have acceptors; HTTP/3 is not affected. See "Accepting connections" in
+  [Resource limits](resource_limits.md).
 - `max_keep_alive_requests` — requests served per conn before
   forced close. Default 1000.
 - `max_clients` — concurrent connection cap. Default 16384 (the modern
@@ -510,6 +518,7 @@ ops-tuning rationale.
     tls_handshake_timeout => 1..16#FFFFFFFF,
     keep_alive_timeout => 0..16#FFFFFFFF,
     num_acceptors => pos_integer(),
+    accept_priority => high | normal,
     max_keep_alive_requests => pos_integer(),
     max_clients => pos_integer(),
     max_concurrent_requests => infinity | pos_integer(),
@@ -1925,6 +1934,16 @@ validate_proxy_protocol(true, _Protocols) ->
 validate_proxy_protocol(Other, _Protocols) ->
     error({invalid_listener_opt, proxy_protocol, Other}).
 
+%% Validate the `accept_priority` listener opt: `high` (prompt accept,
+%% guarded at `max_clients`, see `roadrunner_acceptor`) or `normal`.
+-spec validate_accept_priority(term()) -> high | normal.
+validate_accept_priority(high) ->
+    high;
+validate_accept_priority(normal) ->
+    normal;
+validate_accept_priority(Other) ->
+    error({invalid_listener_opt, accept_priority, Other}).
+
 -spec build_proto_opts(opts(), atom()) -> roadrunner_conn:proto_opts().
 build_proto_opts(Opts, ListenerName) ->
     %% Validate + normalize the `protocols` list. Public input may
@@ -2031,6 +2050,7 @@ build_proto_opts(Opts, ListenerName) ->
             max_keep_alive_requests =>
                 maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE),
             max_clients => maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
+            accept_priority => validate_accept_priority(maps:get(accept_priority, Opts, high)),
             max_concurrent_requests => MaxConcurrentRequests,
             overload => Overload,
             client_counter => ClientCounter,

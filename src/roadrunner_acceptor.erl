@@ -21,6 +21,20 @@
 %% link so that a crash in one connection does not bring down the
 %% acceptor.
 %%
+%% Acceptors run at `high` process priority by default (the listener's
+%% `accept_priority` option). A pending connection waits in the kernel
+%% accept queue, where the client already sees it as connected and has
+%% usually sent its first request; at `normal` priority an acceptor
+%% queues behind every busy connection process before it can take the
+%% next one, so under load new connections wait a long time. At `high`
+%% priority the acceptor runs ahead of them, and the connection process
+%% it starts runs at `normal` priority like any other. The guard is the
+%% `max_clients` cap: while connections are being rejected there the
+%% acceptor drops to `normal`, so a connection flood at the cap cannot
+%% take scheduler time from the connections already admitted, and it
+%% goes back to `high` on the next admitted connection. The priority is
+%% carried in the loop, so it is only set when it changes.
+%%
 %% The TLS handshake is NOT run here. `roadrunner_transport:accept/1`
 %% returns the socket pre-handshake and the connection process
 %% completes it at `shoot` (`roadrunner_conn_loop`), so handshake time
@@ -36,7 +50,7 @@
 -define(ACCEPT_ERROR_BACKOFF_MS, 100).
 
 -export([start_link/3]).
--export([accept_error_class/1, pace_after_error/1]).
+-export([accept_error_class/1, pace_after_error/1, priority_after/2]).
 
 -doc """
 Spawn-link an acceptor process bound to `LSocket` with the given
@@ -52,16 +66,27 @@ start_link(LSocket, ProtoOpts, Index) ->
     ListenerName = maps:get(listener_name, ProtoOpts, undefined),
     Pid = proc_lib:spawn_link(fun() ->
         proc_lib:set_label({roadrunner_acceptor, ListenerName, Index}),
-        loop(LSocket, ProtoOpts)
+        loop(LSocket, ProtoOpts, initial_priority(ProtoOpts))
     end),
     {ok, Pid}.
 
--spec loop(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
-loop(LSocket, ProtoOpts) ->
+%% The acceptor's priority state: `high` or `normal` when the listener
+%% accepts promptly (it switches between them at the `max_clients` cap),
+%% `fixed` when `accept_priority => normal` keeps it at `normal` for good.
+-type priority() :: high | normal | fixed.
+
+-spec initial_priority(roadrunner_conn:proto_opts()) -> priority().
+initial_priority(#{accept_priority := high}) ->
+    _ = process_flag(priority, high),
+    high;
+initial_priority(#{}) ->
+    fixed.
+
+-spec loop(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), priority()) -> ok.
+loop(LSocket, ProtoOpts, Priority) ->
     case roadrunner_transport:accept(LSocket) of
         {ok, Socket} ->
-            handle_accepted(Socket, ProtoOpts),
-            loop(LSocket, ProtoOpts);
+            loop(LSocket, ProtoOpts, handle_accepted(Socket, ProtoOpts, Priority));
         {error, closed} ->
             %% Listen socket was closed — the listener is stopping. Exit
             %% cleanly; the linked listener tears the rest of the pool down.
@@ -75,8 +100,29 @@ loop(LSocket, ProtoOpts) ->
                 maps:get(listener_name, ProtoOpts, undefined), Reason
             ),
             ok = pace_after_error(accept_error_class(Reason)),
-            loop(LSocket, ProtoOpts)
+            loop(LSocket, ProtoOpts, Priority)
     end.
+
+%% The priority an acceptor takes after handing off (`admitted`) or
+%% turning away (`rejected`) a connection. A rejection means the listener
+%% is at `max_clients`: the acceptor drops to `normal` so accepting and
+%% closing a flood of connections at the cap competes fairly with the
+%% connections already admitted, and it returns to `high` once a
+%% connection is admitted again. `fixed` never changes. Exported for
+%% exhaustive unit coverage; not part of any public API.
+-doc false.
+-spec priority_after(admitted | rejected, priority()) -> priority().
+priority_after(_Admission, fixed) -> fixed;
+priority_after(admitted, _Priority) -> high;
+priority_after(rejected, _Priority) -> normal.
+
+%% Apply a priority change; a priority that stays the same costs nothing.
+-spec set_priority(priority(), priority()) -> priority().
+set_priority(Same, Same) ->
+    Same;
+set_priority(_Old, New) ->
+    _ = process_flag(priority, New),
+    New.
 
 %% Classify a non-`closed` accept error for retry pacing. Exported for
 %% exhaustive unit coverage; not part of any public API.
@@ -109,25 +155,31 @@ pace_after_error(backoff) ->
     after ?ACCEPT_ERROR_BACKOFF_MS -> ok
     end.
 
--spec handle_accepted(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) -> ok.
-handle_accepted(Socket, ProtoOpts) ->
+%% Admit or reject an accepted socket and return the acceptor's next
+%% priority. The priority is set before the connection is started or
+%% closed, so whatever the client sees next already runs under it.
+-spec handle_accepted(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), priority()) ->
+    priority().
+handle_accepted(Socket, ProtoOpts, Priority) ->
     case roadrunner_conn:try_acquire_slot(ProtoOpts) of
         true ->
+            Next = set_priority(Priority, priority_after(admitted, Priority)),
             {ok, ConnPid} = roadrunner_conn:start(Socket, ProtoOpts),
             ok = roadrunner_transport:controlling_process(Socket, ConnPid),
             ConnPid ! shoot,
-            ok;
+            Next;
         false ->
             %% Over max_clients — drop the new connection on the floor, but
             %% make the drop observable: bump the cumulative reject counter
             %% (surfaced via `roadrunner_listener:info/1`) and emit
             %% `listener_conn_rejected`. No `peername` lookup
             %% here — this is the floodable path, so it stays cheap.
+            Next = set_priority(Priority, priority_after(rejected, Priority)),
             #{rejected_counter := RejectedCounter} = ProtoOpts,
             ok = atomics:add(RejectedCounter, 1, 1),
             ok = roadrunner_event:listener_conn_rejected(
                 maps:get(listener_name, ProtoOpts, undefined), max_clients
             ),
             _ = roadrunner_transport:close(Socket),
-            ok
+            Next
     end.

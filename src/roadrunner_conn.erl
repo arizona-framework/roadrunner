@@ -240,6 +240,11 @@ deadline in milliseconds. The shed form answers it `503` with the
     %% SSE / WebSocket handlers depend on it. Short-lived h1
     %% workloads can opt out to skip the insert and delete per conn.
     graceful_drain => boolean(),
+    %% Acceptor process priority (`roadrunner_acceptor`): `high` accepts
+    %% promptly and drops to `normal` while rejecting at `max_clients`;
+    %% `normal`, or absent, keeps the acceptor at `normal`. The listener
+    %% always sets it.
+    accept_priority => high | normal,
     %% When `true`, `roadrunner_conn_loop:awaiting_shoot/3` reads and strips a
     %% PROXY-protocol header (an L4 balancer prepends it) before serving, and
     %% the request peer is the real client. TCP-only; the listener rejects it on

@@ -297,6 +297,7 @@ table.
 | Limit | Default | Configurable | Purpose |
 |---|---|---|---|
 | `socket_backlog` | 1024 | yes | TCP listen backlog (kernel SYN/accept queue depth) |
+| `accept_priority` | `high` | yes | how quickly new connections leave the kernel queue under load (TCP only); see [Accepting connections](#accepting-connections) |
 | `recv_buffer` | 64 KB | yes | the most one read takes: every read on TLS, a plain-TCP connection once a large request body comes in, a large WebSocket frame |
 | `idle_recv_buffer` | 4 KB | yes | the read buffer a plain-TCP connection starts with, and what it holds while it waits for the next request or message |
 | `max_clients` | 16384 | yes | concurrent connection cap per listener |
@@ -408,6 +409,101 @@ reported as a request, and the connection stays open. Its buckets are
 dropped like the listener's, once full again. `reload_routes/2` keeps the
 buckets of a route whose path, methods and limit stay the same, and
 starts new ones when they change.
+
+## Accepting connections
+
+A new connection reaches roadrunner in two steps. First the kernel
+completes the TCP handshake and puts the connection in the listen
+socket's queue, which holds up to `socket_backlog` connections (Linux
+caps it at `net.core.somaxconn`). From that moment the client sees
+itself as connected, and it has often sent its first request already.
+Then one of roadrunner's acceptors takes the connection from the queue
+and starts a process to serve it. Until that second step the server
+cannot see the client, time it out or answer it. When the queue is full,
+the kernel drops new connection attempts and clients retry.
+
+`accept_priority` decides how quickly the second step happens when the
+server is busy. It applies to the TCP side of a listener (HTTP/1.1 and
+HTTP/2, with or without TLS). HTTP/3 runs over UDP and takes its
+connections another way, so the option does not affect it. The gain is
+largest on plain TCP listeners. On a TLS listener, taking a connection
+from the queue also waits on the `ssl` application's own processes,
+which run at normal priority, so the acceptor's priority shortens only
+part of that wait.
+
+The default is `high`. The Erlang VM always runs a waiting high-priority
+process before a waiting normal-priority one, so the acceptors get CPU
+time ahead of the connections being served. Accepting a connection is
+only a little work, so this takes very little from them. The connection
+processes the acceptors start run at normal priority, like the rest of
+the system. High priority only covers taking the connection from the
+queue. The TLS handshake and the requests themselves run in the
+connection process at normal priority, and they share the server with
+everyone else.
+
+At `normal`, the acceptors take turns with every busy connection
+process. Under load that means a new client can sit in the kernel queue
+long after it connected, and it sees a slow first response. At `high`
+new clients are taken in promptly, and every client gets its share of
+the server instead of some waiting outside it.
+
+High priority has a guard. While the listener is at `max_clients`, it
+accepts each new connection and closes it right away without a
+response. During that time the acceptors drop to normal priority on
+their own, so a flood of connections at the cap cannot take CPU from the
+clients already being served. Each acceptor drops on the connection it
+turns away and returns to high on the next one it admits. The guard is
+always on and has no setting.
+
+The trade-off: taking every client in at once has a cost. More
+connections are in service at the same time, so more of them hold memory
+at the same time. Plan for `max_clients` connections being served at
+once; see the memory notes under
+[Connection and slow-client guards](#connection-and-slow-client-guards).
+On a saturated server the median latency rises, because the load is
+shared across every client instead of some clients waiting in the
+kernel queue. Workloads made mostly of very short-lived connections can
+also see lower throughput at saturation. Connection churn below
+`max_clients` is admitted promptly too: a flood of clients that connect
+and close under the cap shares CPU with the existing connections, so
+their deepest latency tail can rise, because the guard only engages at
+the cap. Below saturation both settings behave the same.
+
+Choose `accept_priority => normal` when three things are true: most
+connections are short-lived (clients make a few requests and reconnect),
+the server often runs saturated, and peak throughput matters more to you
+than the time to a first response. Keep the default for long-lived
+connections (keep-alive clients, pipelining, WebSockets, server-sent
+events), which covers most Arizona and Phoenix LiveView apps, and
+wherever a fast first response matters.
+
+The setting is per listener, because a connection is accepted before
+any request on it is read, so it cannot depend on the route. An app
+with mixed traffic, such as a short-lived API whose clients reconnect
+often next to long-lived browser and WebSocket traffic, can serve them
+on separate listeners (ports), each with its own `accept_priority`.
+
+```erlang
+%% Default: accept promptly, drop to normal priority at max_clients.
+roadrunner:start_listener(api, #{port => 8080, routes => my_handler}).
+
+%% Acceptors stay at normal priority.
+roadrunner:start_listener(api, #{
+    port => 8080,
+    routes => my_handler,
+    accept_priority => normal
+}).
+```
+
+On HTTP/1.1, two settings decide how many clients get in: `max_clients`
+caps the connections being served, and `socket_backlog` caps the
+connections waiting in the kernel queue. `max_concurrent_requests` does
+not limit HTTP/1.1 connections. In its default `refuse` mode and in
+`queue` mode it only counts HTTP/2 and HTTP/3 requests. In `shed` mode
+it counts HTTP/1.1 requests too, but it answers the ones over the
+ceiling with a `503`. It does not keep their connections out. See
+[Connection and slow-client guards](#connection-and-slow-client-guards)
+for these options.
 
 ## Configuring
 
