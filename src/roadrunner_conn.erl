@@ -124,7 +124,9 @@
     resolved/0,
     body_reader/0,
     h1_body_reader/0,
-    stream_body_reader/0
+    stream_body_reader/0,
+    read_result/0,
+    read_result/1
 ]).
 
 %% The part of `proto_opts()` a connection's close path reads
@@ -169,6 +171,13 @@ deadline in milliseconds. The shed form answers it `503` with the
 -type body_reader() :: h1_body_reader() | stream_body_reader().
 -type h1_body_reader() :: #h1_body_reader{}.
 -type stream_body_reader() :: #stream_body_reader{}.
+
+%% What a body read gives back: the bytes read and the reader to continue
+%% with (`ok` when the body is done, `more` when there is more to read), or
+%% the error that ended the read.
+-type read_result(Reader) ::
+    {ok, iodata(), Reader} | {more, iodata(), Reader} | {error, term()}.
+-type read_result() :: read_result(body_reader()).
 
 %% The connection options (`#proto_opts{}`, `roadrunner_proto_opts.hrl`),
 %% built once per listener by `roadrunner_listener:build_proto_opts/2`.
@@ -1371,9 +1380,7 @@ demand_body(_BS) ->
 %% does not end the body comes back as `more` with no bytes.
 -doc false.
 -spec body_message(term(), body_reader()) ->
-    {ok, iodata(), body_reader()}
-    | {more, iodata(), body_reader()}
-    | {error, term()}
+    read_result()
     | ignore.
 body_message(
     {roadrunner_body, StreamId, Data, Fin}, #stream_body_reader{source = {_Conn, StreamId}} = BS
@@ -1391,9 +1398,7 @@ body_message(_Message, _BS) ->
 %% deadline, as a `next_chunk` read would.
 -doc false.
 -spec await_body(body_reader()) ->
-    {ok, iodata(), body_reader()}
-    | {more, iodata(), body_reader()}
-    | {error, term()}.
+    read_result().
 await_body(#stream_body_reader{source = {Conn, StreamId}, deadline = Deadline} = BS) ->
     MRef = monitor(process, Conn),
     delivered(BS, await_reply(Conn, StreamId, MRef, Deadline)).
@@ -1410,9 +1415,7 @@ withdraw_body(#stream_body_reader{source = {Conn, StreamId}} = BS) ->
 
 %% The connection's answer taken into the reader, all of it handed out.
 -spec delivered(stream_body_reader(), {ok, iodata(), boolean()} | {error, term()}) ->
-    {ok, iodata(), stream_body_reader()}
-    | {more, iodata(), stream_body_reader()}
-    | {error, term()}.
+    read_result(stream_body_reader()).
 delivered(BS, Answer) ->
     Result =
         case pulled(BS, Answer) of
@@ -1627,9 +1630,7 @@ full read).
 -spec consume_body_reader(
     body_reader(), all | next_chunk | {length, non_neg_integer()}
 ) ->
-    {ok, iodata(), body_reader()}
-    | {more, iodata(), body_reader()}
-    | {error, term()}.
+    read_result().
 consume_body_reader(BS, Mode) ->
     case {get(?READER_PDKEY), reader_id(BS)} of
         {{failed, Id, Reason}, Id} -> {error, Reason};
@@ -1652,13 +1653,9 @@ reader_id(#stream_body_reader{id = Id}) -> Id.
 %% (`consume_body_reader/2`) instead of reading on from the wrong place.
 -spec remember_reader(
     body_reader(),
-    {ok, iodata(), body_reader()}
-    | {more, iodata(), body_reader()}
-    | {error, term()}
+    read_result()
 ) ->
-    {ok, iodata(), body_reader()}
-    | {more, iodata(), body_reader()}
-    | {error, term()}.
+    read_result().
 remember_reader(BS, {error, Reason} = E) ->
     _ = put(?READER_PDKEY, {failed, reader_id(BS), Reason}),
     E;
@@ -1669,9 +1666,7 @@ remember_reader(_BS, {_, _Bytes, BS} = Result) ->
 -spec consume_reader(
     body_reader(), all | next_chunk | {length, non_neg_integer()}
 ) ->
-    {ok, iodata(), body_reader()}
-    | {more, iodata(), body_reader()}
-    | {error, term()}.
+    read_result().
 consume_reader(
     #h1_body_reader{continue = {Socket, MinRate, Owed}, buffered = Buffered} = BS, Mode
 ) ->
@@ -1753,9 +1748,7 @@ consume_reader(#h1_body_reader{framing = chunked} = BS, next_chunk) ->
 -spec stream_collect(
     stream_body_reader(), infinity | non_neg_integer(), iodata(), non_neg_integer()
 ) ->
-    {ok, iodata(), stream_body_reader()}
-    | {more, iodata(), stream_body_reader()}
-    | {error, term()}.
+    read_result(stream_body_reader()).
 stream_collect(#stream_body_reader{buffered = Buf, done = Done} = BS, Want, Acc, Got) ->
     Size = iolist_size(Buf),
     case Want of
@@ -1782,9 +1775,7 @@ stream_collect(#stream_body_reader{buffered = Buf, done = Done} = BS, Want, Acc,
 %% The next piece of a stream body: what an earlier read left over, else the
 %% next DATA the connection hands over.
 -spec stream_next(stream_body_reader()) ->
-    {ok, iodata(), stream_body_reader()}
-    | {more, iodata(), stream_body_reader()}
-    | {error, term()}.
+    read_result(stream_body_reader()).
 stream_next(#stream_body_reader{buffered = Buf, done = Done} = BS) ->
     case iolist_size(Buf) of
         0 when Done ->
@@ -1828,9 +1819,7 @@ pulled(_BS, {error, _} = E) ->
 %% `{ok | more, Bytes, BS2}` with Bytes as iodata (propagated through
 %% `consume_body_reader` to the public API unflattened).
 -spec chunked_collect(h1_body_reader(), infinity | non_neg_integer()) ->
-    {ok, iodata(), h1_body_reader()}
-    | {more, iodata(), h1_body_reader()}
-    | {error, term()}.
+    read_result(h1_body_reader()).
 chunked_collect(#h1_body_reader{pending = Pending} = BS, Want) when
     Want =/= infinity, byte_size(Pending) >= Want
 ->

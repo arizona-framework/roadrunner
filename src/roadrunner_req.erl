@@ -22,7 +22,9 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 -include("roadrunner_swar.hrl").
 -include("roadrunner_body_reader.hrl").
 
--export_type([request/0, body_reader/0, deadline/0, cached_decisions/0, private/0, conn_info/0]).
+-export_type([
+    request/0, body_reader/0, read_result/0, deadline/0, cached_decisions/0, private/0, conn_info/0
+]).
 
 -doc """
 The parsed request map handlers receive.
@@ -171,6 +173,13 @@ whether there is one with `has_body/1`, and move its deadline with
 `set_body_timeout/2`.
 """.
 -type body_reader() :: term().
+
+-doc """
+What a body read returns: `{ok, Bytes, Req}` when the body is done,
+`{more, Bytes, Req}` when there is more to read, or `{error, Reason}`.
+Continue with the returned `Req`.
+""".
+-type read_result() :: {ok, iodata(), request()} | {more, iodata(), request()} | {error, term()}.
 
 -doc """
 When a body read times out: an `erlang:monotonic_time(millisecond)`
@@ -453,9 +462,7 @@ A read that fails ends the body: every later read of it, in the process
 that read it, returns the same error.
 """.
 -spec read_body(request(), #{length => non_neg_integer()}) ->
-    {ok, iodata(), request()}
-    | {more, iodata(), request()}
-    | {error, term()}.
+    read_result().
 read_body(#{body_reader := BS} = Req, Opts) ->
     Mode =
         case Opts of
@@ -488,9 +495,7 @@ conn via the `{Response, Req2}` handler return shape so any unread
 chunks get drained for keep-alive.
 """.
 -spec read_body_chunked(request()) ->
-    {ok, iodata(), request()}
-    | {more, iodata(), request()}
-    | {error, term()}.
+    read_result().
 read_body_chunked(#{body_reader := BS} = Req) ->
     with_reader(roadrunner_conn:consume_body_reader(BS, next_chunk), Req);
 read_body_chunked(Req) ->
@@ -513,7 +518,7 @@ demand_body(_Req) ->
 
 -doc false.
 -spec body_message(term(), request()) ->
-    {ok, iodata(), request()} | {more, iodata(), request()} | {error, term()} | ignore.
+    read_result() | ignore.
 body_message(Message, #{body_reader := BS} = Req) ->
     case roadrunner_conn:body_message(Message, BS) of
         ignore -> ignore;
@@ -522,7 +527,7 @@ body_message(Message, #{body_reader := BS} = Req) ->
 
 -doc false.
 -spec await_body(request()) ->
-    {ok, iodata(), request()} | {more, iodata(), request()} | {error, term()}.
+    read_result().
 await_body(#{body_reader := BS} = Req) ->
     with_reader(roadrunner_conn:await_body(BS), Req).
 
@@ -533,12 +538,10 @@ withdraw_body(#{body_reader := BS}) ->
 
 %% A read's result, its reader put back in the request.
 -spec with_reader(
-    {ok, iodata(), roadrunner_conn:body_reader()}
-    | {more, iodata(), roadrunner_conn:body_reader()}
-    | {error, term()},
+    roadrunner_conn:read_result(),
     request()
 ) ->
-    {ok, iodata(), request()} | {more, iodata(), request()} | {error, term()}.
+    read_result().
 with_reader({ok, Bytes, BS}, Req) ->
     {ok, Bytes, Req#{body_reader := BS, body => Bytes}};
 with_reader({more, Bytes, BS}, Req) ->
