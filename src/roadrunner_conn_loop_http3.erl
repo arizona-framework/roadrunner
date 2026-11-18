@@ -2100,14 +2100,9 @@ respond_field_section_too_large(#h3{conn = Conn} = State, StreamId) ->
     handle_result().
 dispatch_decoded(State, StreamId, Headers, Body, HeadersAt) ->
     {ReqId, NewBuf} = roadrunner_conn:generate_request_id(State#h3.req_id_buffer),
-    RequestContext = #{
-        peer => State#h3.peer,
-        conn_info => State#h3.conn_info,
-        scheme => https,
-        listener_name => State#h3.listener_name,
-        request_id => ReqId,
-        headers_at => HeadersAt
-    },
+    RequestContext = roadrunner_http:request_context(
+        State#h3.peer, State#h3.conn_info, https, State#h3.listener_name, ReqId, HeadersAt
+    ),
     State1 = State#h3{req_id_buffer = NewBuf},
     case build_request(Headers, Body, RequestContext) of
         {error, Reason} when Reason =:= not_implemented; Reason =:= unsupported_expectation ->
@@ -2141,7 +2136,9 @@ dispatch_decoded(State, StreamId, Headers, Body, HeadersAt) ->
             end
     end.
 
--spec build_request(roadrunner_http:headers(), iodata() | reading, map()) ->
+-spec build_request(
+    roadrunner_http:headers(), iodata() | reading, roadrunner_http:request_context()
+) ->
     {ok, roadrunner_req:request()} | {error, roadrunner_http3_request:build_error()}.
 build_request(Headers, reading, RequestContext) ->
     roadrunner_http3_request:from_headers_reading(Headers, RequestContext);

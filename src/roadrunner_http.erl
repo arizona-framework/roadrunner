@@ -44,6 +44,8 @@ accessors that operate on it.
 -export([
     request_pseudo_headers/1,
     check_request_authority/3,
+    request_context/6,
+    request_context_scheme/1,
     valid_host/1,
     valid_target_bytes/1,
     check_fields/1,
@@ -73,16 +75,17 @@ accessors that operate on it.
 -type version() :: {1, 0} | {1, 1} | {2, 0} | {3, 0}.
 %% The per-connection fields an HTTP/2 or HTTP/3 connection passes to
 %% build a request.
--type request_context() :: #{
-    peer := {inet:ip_address(), inet:port_number()} | undefined,
-    conn_info := roadrunner_req:conn_info(),
-    scheme := http | https,
-    request_id := binary(),
-    listener_name := atom(),
+-record(request_context, {
+    peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    conn_info :: roadrunner_req:conn_info(),
+    scheme :: http | https,
+    request_id :: binary(),
+    listener_name :: atom(),
     %% When the request's header block was decoded, in
     %% `erlang:monotonic_time(millisecond)`.
-    headers_at := integer()
-}.
+    headers_at :: integer()
+}).
+-opaque request_context() :: #request_context{}.
 %% Why `request_pseudo_headers/1` rejects an HTTP/2 or HTTP/3 request's
 %% pseudo-header section.
 -type pseudo_error() ::
@@ -847,14 +850,43 @@ find_content_length([{~"content-length", Value} | Rest], undefined) ->
 find_content_length([_ | Rest], Value) ->
     find_content_length(Rest, Value).
 
+%% The per-connection fields an HTTP/2 or HTTP/3 request is built with
+%% (`build_request/7`): its peer, the connection queries, the scheme of
+%% the connection, the listener, the request id, and when its header block
+%% was decoded.
+-doc false.
+-spec request_context(
+    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_req:conn_info(),
+    http | https,
+    atom(),
+    binary(),
+    integer()
+) -> request_context().
+request_context(Peer, ConnInfo, Scheme, ListenerName, RequestId, HeadersAt) ->
+    #request_context{
+        peer = Peer,
+        conn_info = ConnInfo,
+        scheme = Scheme,
+        listener_name = ListenerName,
+        request_id = RequestId,
+        headers_at = HeadersAt
+    }.
+
+%% The connection's scheme, the authoritative one for a request (its
+%% `:scheme` pseudo-header is not trusted).
+-doc false.
+-spec request_context_scheme(request_context()) -> http | https.
+request_context_scheme(#request_context{scheme = Scheme}) ->
+    Scheme.
+
 %% Build the request map for a validated HTTP/2 or HTTP/3 request. The
 %% `:authority` pseudo-header is forwarded as a `host` header so handler
 %% code that reads `Host` still works (RFC 9113 §8.3.1 and RFC 9114
 %% §4.3.1 treat `:authority` like `Host`); a client-sent `host`, already
 %% checked equal by `check_request_authority/2`, is dropped first so a
 %% single canonical entry survives instead of a duplicate. The connection
-%% loop always builds `RequestContext` with all four fields, so it is
-%% destructured in one match rather than four `maps:get/3` calls.
+%% context is read in one match.
 -doc false.
 -spec build_request(
     version(),
@@ -871,13 +903,13 @@ build_request(Version, Method, Path, Authority, Regular, Body, RequestContext) -
             undefined -> Regular;
             _ -> [{~"host", Authority} | without_host(Regular)]
         end,
-    #{
-        peer := Peer,
-        conn_info := ConnInfo,
-        scheme := Scheme,
-        request_id := RequestId,
-        listener_name := ListenerName,
-        headers_at := HeadersAt
+    #request_context{
+        peer = Peer,
+        conn_info = ConnInfo,
+        scheme = Scheme,
+        request_id = RequestId,
+        listener_name = ListenerName,
+        headers_at = HeadersAt
     } = RequestContext,
     #{
         method => Method,

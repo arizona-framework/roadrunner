@@ -94,7 +94,7 @@ from_headers_reading(Headers, RequestContext) ->
 
 -spec build(roadrunner_http:headers(), iodata(), request_context(), boolean()) ->
     {ok, roadrunner_req:request()} | {error, build_error()}.
-build(Headers, Body, #{scheme := Scheme} = RequestContext, CheckLength) ->
+build(Headers, Body, RequestContext, CheckLength) ->
     maybe
         %% The parsed `:scheme` value is validated but deliberately
         %% discarded — the authoritative scheme comes from the conn
@@ -104,7 +104,10 @@ build(Headers, Body, #{scheme := Scheme} = RequestContext, CheckLength) ->
         {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),
         ok ?= check_banned(Regular),
         ok ?= check_content_length(Regular, Body, CheckLength),
-        ok ?= roadrunner_http:check_request_authority(Authority, Regular, Scheme),
+        ok ?=
+            roadrunner_http:check_request_authority(
+                Authority, Regular, roadrunner_http:request_context_scheme(RequestContext)
+            ),
         {ok,
             roadrunner_http:build_request(
                 {3, 0}, Method, Path, Authority, Regular, Body, RequestContext

@@ -75,7 +75,7 @@ handlers requiring a flat binary call `iolist_to_binary/1` themselves.
 """.
 -spec from_headers(roadrunner_http:headers(), iodata(), request_context()) ->
     {ok, roadrunner_req:request()} | {error, build_error()}.
-from_headers(Headers, Body, #{scheme := Scheme} = RequestContext) ->
+from_headers(Headers, Body, RequestContext) ->
     maybe
         %% The `:scheme` pseudo-header must be present, but its value is
         %% deliberately discarded — the authoritative scheme comes from the conn
@@ -83,7 +83,10 @@ from_headers(Headers, Body, #{scheme := Scheme} = RequestContext) ->
         %% pseudo-header value.
         {ok, Method, Path, Authority, Regular} ?= roadrunner_http:request_pseudo_headers(Headers),
         ok ?= check_banned(Regular),
-        ok ?= roadrunner_http:check_request_authority(Authority, Regular, Scheme),
+        ok ?=
+            roadrunner_http:check_request_authority(
+                Authority, Regular, roadrunner_http:request_context_scheme(RequestContext)
+            ),
         {ok,
             roadrunner_http:build_request(
                 {2, 0}, Method, Path, Authority, Regular, Body, RequestContext
