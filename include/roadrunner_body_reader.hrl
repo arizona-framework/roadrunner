@@ -39,10 +39,10 @@
     %% between chunks (`roadrunner_http1:parse_chunk_part/4`).
     chunk_left = 0 :: non_neg_integer(),
     %% Set while a 100 Continue is owed to a client holding its body back:
-    %% the transport socket the first read sends it on, the minimum byte
-    %% rate of the recv that read then starts, and the flag that has it
-    %% sent once, by that read or by a streaming response starting first.
-    continue = undefined :: {term(), non_neg_integer(), atomics:atomics_ref()} | undefined
+    %% the transport socket the first read sends it on and the flag that
+    %% has it sent once, by that read or by a streaming response starting
+    %% first.
+    continue = undefined :: {term(), atomics:atomics_ref()} | undefined
 }).
 
 %% HTTP/2 and HTTP/3: the request's DATA is delimited by the stream itself.

@@ -279,26 +279,6 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 **Scope:** small per attribute. Add when a real caller hits the gap.
 
-### Anchor the manual-mode body rate window at the first body byte — small
-
-**What:** `make_reader_recv/3` (`roadrunner_conn.erl`) captures its rate-window
-start at closure creation (`read_body_phase/3`), so in manual body-buffering mode a
-handler that delays before calling `roadrunner_req:read_body/1,2` has its
-think-time counted toward the body's minimum-byte-rate average. Auto mode has no
-gap (it reads the body synchronously right after the closure is built), the
-request-read phase already anchors at the first byte, and a manual-mode request
-expecting `100-continue` anchors at the 100, which its first read sends.
-
-**Why deferred:** a narrow self-inflicted case (manual mode + a slow handler + a
-configured `min_bytes_per_second` + a small body). A handler that lengthens its
-body reads with `roadrunner_req:set_body_timeout/2` can take longer before its
-first read, so this matters more for it. Anchoring at the first body recv would
-also slightly weaken Slowloris protection for a client that stalls between
-headers-done and body-start, so it is defensible as-is. Revisit if a real
-workload reports false `slow_client` drops.
-
-**Scope:** small.
-
 ### Keep counting a handler's slot after its connection closes — medium
 
 **What:** `max_concurrent_requests` counts a handler from dispatch until its

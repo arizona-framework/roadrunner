@@ -375,10 +375,12 @@ Optional middleware and timing knobs (durations in milliseconds):
   `buffer` note in `base_listen_opts/2`.
 - `min_bytes_per_second`: slow-loris guard on HTTP/1.1 request
   heads and bodies (0 disables). Default 100. After a 1 s grace from a
-  request's first byte (from the start of its body, for the body), the
-  bytes so far must average at least this; a client that stops sending
-  falls below it as time passes and is closed then, before
-  `request_timeout`. Body bytes that came in with the head count. On a
+  request's first byte, the head's bytes so far must average at least
+  this. A body's bytes must average at least this over the time the
+  server spends waiting for them, after 1 s of such waiting; the time a
+  handler spends before or between its reads does not count. A client
+  that stops sending falls below it as time passes and is closed then,
+  before `request_timeout`. Body bytes that came in with the head count. On a
   plain-TCP listener that also serves HTTP/2, a connection whose bytes
   so far are only a prefix of the HTTP/2 preface is held to
   `request_timeout` alone.

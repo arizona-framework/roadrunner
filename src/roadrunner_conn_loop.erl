@@ -1522,8 +1522,9 @@ expect_answer(_S, _Req, _Framing, _MaxCL) ->
 %% reading never asks: the client sends nothing, and the connection closes
 %% after the response, as the client may still send the body once it stops
 %% waiting. Queued pipelined responses go out ahead of the 100 either way.
-%% The manual read's slow-client rate window starts with the 100, when the
-%% client can start sending, so `continue` carries what its recv is made of.
+%% The manual reads' minimum byte rate counts only the time they wait on
+%% the client, so neither the wait for the 100 nor the time the handler
+%% takes before or between its reads counts against it.
 -spec read_body(
     roadrunner_listener:body_buffering(),
     continue | none,
@@ -1555,7 +1556,7 @@ read_body(manual, Answer, S, Req, Framing, MaxCL, Resolved, Deadline) ->
     case Answer of
         continue ->
             Owed = atomics:new(1, []),
-            Reader = BodyState#h1_body_reader{continue = {Socket, MinRate, Owed}},
+            Reader = BodyState#h1_body_reader{continue = {Socket, Owed}},
             dispatch_phase(flush_out(S), Req#{body_reader => Reader}, Resolved);
         none ->
             dispatch_phase(S, Req#{body_reader => BodyState}, Resolved)
@@ -1608,7 +1609,7 @@ read_auto_body(
     end.
 
 %% The body's recv closure: passive reads bounded by the request
-%% deadline, with the anti-slowloris rate anchored at this call.
+%% deadline, with the anti-slowloris rate over the time they wait.
 -spec body_recv(#loop_state{}, integer()) ->
     fun(() -> {ok, binary()} | {error, term()}).
 body_recv(#loop_state{socket = Socket, min_rate = MinRate, buffered = Buffered}, Deadline) ->
@@ -1874,7 +1875,7 @@ ensure_close_signaled(_S, _Req, Response) ->
     roadrunner_http:headers().
 with_close_if_closing(
     #loop_state{body_buffering = manual},
-    #{body_reader := #h1_body_reader{continue = {_, _, _}}} = Req,
+    #{body_reader := #h1_body_reader{continue = {_, _}}} = Req,
     Headers
 ) ->
     with_close(Req, Headers);
@@ -2307,7 +2308,7 @@ drain_latest({failed, Reason}) ->
     %% A read of the body failed: where the rest of it starts is unknown,
     %% so the connection closes instead of draining it.
     {error, Reason};
-drain_latest(#h1_body_reader{continue = {_, _, _}}) ->
+drain_latest(#h1_body_reader{continue = {_, _}}) ->
     %% The handler answered without asking for the body (`read_body/8`):
     %% no 100 went out and the client is holding the body back, so there is
     %% nothing to drain, and the connection closes.

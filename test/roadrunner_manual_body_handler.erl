@@ -34,6 +34,15 @@ picks what the handler does with the body:
 - `{unbounded, Pid}`: give the reads no deadline, then `{report, Pid}`
 - `{spawned_report, Pid}`: read the body in a process the handler spawns,
   then send `Pid` the outcome, `{read_result, _}`
+- `{held_report, Pid}`: send `Pid` `{held, Self}`, wait for `go`, then
+  `{report, Pid}`
+- `{piece_then_held_report, Pid}`: read 10 bytes of the body, send `Pid`
+  `{held, Self}`, wait for `go`, then `{report, Pid}` for the rest (its
+  size counts only the rest)
+- `{pieces_report, Pid}`: read the body a byte at a time, then send
+  `Pid` the outcome, `{read_result, _}`
+- `{held_unread, Pid}`: send `Pid` `{held, Self}`, wait for `go`, then
+  answer `200` without reading the body
 """.
 
 -behaviour(roadrunner_handler).
@@ -141,6 +150,19 @@ behave({report, Pid}, Req) ->
 behave({announce_report, Pid}, Req) ->
     Pid ! reading,
     behave({report, Pid}, Req);
+behave({held_report, Pid}, Req) ->
+    ok = hold(Pid),
+    behave({report, Pid}, Req);
+behave({piece_then_held_report, Pid}, Req) ->
+    {more, _Piece, Req1} = roadrunner_req:read_body(Req, #{length => 10}),
+    ok = hold(Pid),
+    behave({report, Pid}, Req1);
+behave({pieces_report, Pid}, Req) ->
+    Pid ! {read_result, bytewise(Req, 0)},
+    {roadrunner_resp:text(200, ~"ok"), Req};
+behave({held_unread, Pid}, Req) ->
+    ok = hold(Pid),
+    {roadrunner_resp:text(200, ~"ok"), Req};
 behave({gated_report, Name, Pid}, Req) ->
     true = register(Name, self()),
     receive
@@ -167,6 +189,19 @@ behave({answer_first, Name, Pid}, Req) ->
         end
     end,
     {{stream, 200, [{~"content-type", ~"text/plain"}], Fun}, Req}.
+
+bytewise(Req, Total) ->
+    case roadrunner_req:read_body(Req, #{length => 1}) of
+        {more, Byte, Req1} -> bytewise(Req1, Total + iolist_size(Byte));
+        {ok, Byte, _} -> {ok, Total + iolist_size(Byte)};
+        {error, _} = E -> E
+    end.
+
+hold(Pid) ->
+    Pid ! {held, self()},
+    receive
+        go -> ok
+    end.
 
 count(Req, Read, Count, Total) ->
     case Read(Req) of
