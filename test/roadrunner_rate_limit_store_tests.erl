@@ -194,20 +194,21 @@ proto_opts(RateLimit) ->
                     table => Table
                 }
         end,
-    #{
+    roadrunner_test_proto_opts:new(#{
         rate_limit => Cfg,
         rate_limited_counter => atomics:new(1, [{signed, false}])
-    }.
+    }).
 
 proto_opts_with_counter(Table) ->
     Counter = atomics:new(1, [{signed, false}]),
-    {Counter, #{
-        rate_limit => #{
-            rate => 10,
-            burst => 20,
-            period => 30,
-            sweep_interval => 10000,
-            table => Table
-        },
-        rate_limited_counter => Counter
-    }}.
+    {Counter,
+        roadrunner_test_proto_opts:new(#{
+            rate_limit => #{
+                rate => 10,
+                burst => 20,
+                period => 30,
+                sweep_interval => 10000,
+                table => Table
+            },
+            rate_limited_counter => Counter
+        })}.

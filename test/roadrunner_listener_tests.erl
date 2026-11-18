@@ -238,7 +238,7 @@ slot_reconciliation_releases_sustained_orphan_slots_test() ->
         %% Reach into state to grab the counter ref. {state, LSocket, Port,
         %% ProtoOpts, Phase, Reconciliation} — relies on field order.
         State = sys:get_state(ListenerPid),
-        ProtoOpts = element(4, State),
+        ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
         Counter = maps:get(client_counter, ProtoOpts),
         ?assertEqual(0, counters:get(Counter, 1)),
         %% Plant 3 orphan slots — bumped without a corresponding registration.
@@ -272,7 +272,7 @@ slot_reconciliation_only_reaps_excess_over_live_members_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     Counter = maps:get(client_counter, ProtoOpts),
     %% Plant 2 fake "live conn" pids in the registry, plus one that is
     %% registered but already dead, and bump the counter to 5. Live diff
@@ -305,18 +305,6 @@ slot_reconciliation_only_reaps_excess_over_live_members_test() ->
     Stub2 ! stop,
     ok = roadrunner_listener:stop(Name).
 
-listener_threads_rate_check_interval_into_proto_opts_test() ->
-    Name = listener_test_rate_check_interval,
-    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
-        port => 0,
-        rate_check_interval => 500,
-        routes => roadrunner_hello_handler
-    }),
-    State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
-    ?assertEqual(500, maps:get(rate_check_interval, ProtoOpts)),
-    ok = roadrunner_listener:stop(Name).
-
 listener_threads_hibernate_after_into_proto_opts_test() ->
     %% `hibernate_after` listener opt must thread into proto_opts so
     %% `roadrunner_conn_loop` reads it and routes the recv path through
@@ -329,7 +317,7 @@ listener_threads_hibernate_after_into_proto_opts_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual(5000, maps:get(hibernate_after, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
@@ -351,7 +339,7 @@ listener_threads_ws_buffer_into_proto_opts_test() ->
             {ok, ListenerPid} = roadrunner_listener:start_link(
                 Name, Extra#{port => 0, routes => roadrunner_hello_handler}
             ),
-            ProtoOpts = element(4, sys:get_state(ListenerPid)),
+            ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(ListenerPid))),
             ?assertEqual(Expected, maps:get(ws_buffer, ProtoOpts)),
             ok = roadrunner_listener:stop(Name)
         end,
@@ -375,7 +363,7 @@ listener_threads_ws_compress_into_proto_opts_test() ->
             {ok, ListenerPid} = roadrunner_listener:start_link(
                 Name, Extra#{port => 0, routes => roadrunner_hello_handler}
             ),
-            ProtoOpts = element(4, sys:get_state(ListenerPid)),
+            ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(ListenerPid))),
             ?assertEqual(Expected, maps:get(ws_compress, ProtoOpts)),
             ok = roadrunner_listener:stop(Name)
         end,
@@ -417,7 +405,7 @@ listener_threads_protocols_into_proto_opts_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual([http2], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
@@ -430,7 +418,7 @@ listener_protocols_default_is_http1_only_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual([http1], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
@@ -445,7 +433,7 @@ listener_threads_handler_spawn_defaults_into_proto_opts_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual([{fullsweep_after, 0}], maps:get(handler_spawn_opts, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
@@ -463,7 +451,7 @@ listener_threads_custom_handler_spawn_into_proto_opts_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual(
         [{fullsweep_after, 20}, {min_bin_vheap_size, 1024}],
         lists:sort(maps:get(handler_spawn_opts, ProtoOpts))
@@ -481,7 +469,7 @@ listener_handler_spawn_opts_keep_unset_defaults_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     Merged = maps:get(handler_spawn_opts, ProtoOpts),
     ?assert(lists:member({min_bin_vheap_size, 1024}, Merged)),
     ?assert(lists:member({fullsweep_after, 0}, Merged)),
@@ -499,7 +487,7 @@ listener_handler_spawn_opts_allow_overriding_gc_default_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual([{fullsweep_after, 65535}], maps:get(handler_spawn_opts, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
@@ -514,7 +502,7 @@ listener_accepts_http1_tuple_form_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual([http1], maps:get(protocols, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
@@ -536,7 +524,7 @@ listener_threads_http1_limits_into_proto_opts_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual(16384, maps:get(http1_max_request_line, ProtoOpts)),
     ?assertEqual(16384, maps:get(http1_max_header_line, ProtoOpts)),
     ?assertEqual(65536, maps:get(http1_max_header_block, ProtoOpts)),
@@ -555,7 +543,7 @@ listener_http2_max_header_list_size_threads_into_proto_opts_test() ->
         protocols => [{http2, #{max_header_list_size => 50000}}],
         routes => roadrunner_hello_handler
     }),
-    PO1 = element(4, sys:get_state(P1)),
+    PO1 = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(P1))),
     ?assertEqual(50000, maps:get(http2_max_header_list_size, PO1)),
     ok = roadrunner_listener:stop(Explicit),
     Derived = listener_test_h2_hls_derived,
@@ -564,7 +552,7 @@ listener_http2_max_header_list_size_threads_into_proto_opts_test() ->
         protocols => [{http2, #{max_header_block => 65536}}],
         routes => roadrunner_hello_handler
     }),
-    PO2 = element(4, sys:get_state(P2)),
+    PO2 = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(P2))),
     ?assertEqual(65536, maps:get(http2_max_header_block, PO2)),
     ?assertEqual(131072, maps:get(http2_max_header_list_size, PO2)),
     ok = roadrunner_listener:stop(Derived).
@@ -580,7 +568,12 @@ listener_http2_active_threads_into_proto_opts_test() ->
                 protocols => [Http2],
                 routes => roadrunner_hello_handler
             }),
-            ?assertEqual(Expected, maps:get(http2_active, element(4, sys:get_state(Pid)))),
+            ?assertEqual(
+                Expected,
+                maps:get(
+                    http2_active, roadrunner_test_proto_opts:to_map(element(4, sys:get_state(Pid)))
+                )
+            ),
             ok = roadrunner_listener:stop(Name)
         end,
         [
@@ -592,8 +585,8 @@ listener_http2_active_threads_into_proto_opts_test() ->
     ).
 
 listener_http2_ping_policy_threads_into_proto_opts_test() ->
-    %% The default policy, a partial map over it, and `false` (no
-    %% `http2_ping_*` keys at all).
+    %% The default policy, a partial map over it, and `false` (every
+    %% `http2_ping_*` field `undefined`).
     lists:foreach(
         fun({Http2, Expected}) ->
             Name = listener_test_h2_ping_policy,
@@ -602,7 +595,7 @@ listener_http2_ping_policy_threads_into_proto_opts_test() ->
                 protocols => [Http2],
                 routes => roadrunner_hello_handler
             }),
-            ProtoOpts = element(4, sys:get_state(Pid)),
+            ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(Pid))),
             ?assertEqual(
                 Expected,
                 maps:with(
@@ -632,13 +625,17 @@ listener_http2_ping_policy_threads_into_proto_opts_test() ->
                 http2_ping_permit_without_stream => true,
                 http2_ping_max_strikes => 0
             }},
-            {{http2, #{ping_policy => false}}, #{}}
+            {{http2, #{ping_policy => false}}, #{
+                http2_ping_min_time => undefined,
+                http2_ping_permit_without_stream => undefined,
+                http2_ping_max_strikes => undefined
+            }}
         ]
     ).
 
 listener_http2_connection_age_threads_into_proto_opts_test() ->
-    %% Off by default (no `http2_connection_age_*` keys); `grace` is
-    %% `infinity` unless set.
+    %% Off by default (both `http2_connection_age_*` fields `undefined`);
+    %% `grace` is `infinity` unless set.
     lists:foreach(
         fun({Http2, Expected}) ->
             Name = listener_test_h2_connection_age,
@@ -647,7 +644,7 @@ listener_http2_connection_age_threads_into_proto_opts_test() ->
                 protocols => [Http2],
                 routes => roadrunner_hello_handler
             }),
-            ProtoOpts = element(4, sys:get_state(Pid)),
+            ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(Pid))),
             ?assertEqual(
                 Expected,
                 maps:with([http2_connection_age_max, http2_connection_age_grace], ProtoOpts)
@@ -655,8 +652,12 @@ listener_http2_connection_age_threads_into_proto_opts_test() ->
             ok = roadrunner_listener:stop(Name)
         end,
         [
-            {http2, #{}},
-            {{http2, #{connection_age => false}}, #{}},
+            {http2, #{
+                http2_connection_age_max => undefined, http2_connection_age_grace => undefined
+            }},
+            {{http2, #{connection_age => false}}, #{
+                http2_connection_age_max => undefined, http2_connection_age_grace => undefined
+            }},
             {{http2, #{connection_age => #{max => 60_000}}}, #{
                 http2_connection_age_max => 60_000, http2_connection_age_grace => infinity
             }},
@@ -773,11 +774,14 @@ listener_http1_active_threads_into_proto_opts_test() ->
                 protocols => [Http1],
                 routes => roadrunner_hello_handler
             }),
-            ?assertEqual(Expected, maps:get(http1_active, element(4, sys:get_state(Pid)), unset)),
+            ?assertEqual(
+                Expected,
+                roadrunner_test_proto_opts:get(http1_active, element(4, sys:get_state(Pid)))
+            ),
             ok = roadrunner_listener:stop(Name)
         end,
         [
-            {http1, unset},
+            {http1, undefined},
             {{http1, #{active => once}}, once},
             {{http1, #{active => 1}}, 1},
             {{http1, #{active => 32767}}, 32767}
@@ -808,7 +812,7 @@ listener_http1_defaults_thread_into_proto_opts_test() ->
         routes => roadrunner_hello_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual(8192, maps:get(http1_max_request_line, ProtoOpts)),
     ?assertEqual(100, maps:get(http1_max_header_count, ProtoOpts)),
     ?assertEqual(1000, maps:get(http1_linger_timeout, ProtoOpts)),
@@ -1076,17 +1080,17 @@ listener_socket_buffer_by_transport_test() ->
     %% `recv_buffer`) and carry `grow_recv_buffer`, the sizes a conn grows
     %% between before a large body, when that is below `recv_buffer`. TLS
     %% sockets, and TLS behind the PROXY protocol (plain until the conn
-    %% upgrades it), keep `recv_buffer` and carry no key.
+    %% upgrades it), keep `recv_buffer` and leave it `undefined`.
     Tls = roadrunner_test_certs:server_opts(),
     Cases = [
         {#{}, 4096, {4096, 65536}},
         {#{idle_recv_buffer => 16384}, 16384, {16384, 65536}},
         {#{recv_buffer => 8192}, 4096, {4096, 8192}},
-        {#{recv_buffer => 2048}, 2048, none},
+        {#{recv_buffer => 2048}, 2048, undefined},
         {#{idle_recv_buffer => 32768, recv_buffer => 131072}, 32768, {32768, 131072}},
         {#{protocols => [http2]}, 4096, {4096, 65536}},
-        {#{tls => Tls}, 65536, none},
-        {#{tls => Tls, proxy_protocol => true}, 65536, none}
+        {#{tls => Tls}, 65536, undefined},
+        {#{tls => Tls, proxy_protocol => true}, 65536, undefined}
     ],
     lists:foreach(
         fun({Extra, SocketBuffer, Grow}) ->
@@ -1096,7 +1100,7 @@ listener_socket_buffer_by_transport_test() ->
             ),
             State = sys:get_state(ListenerPid),
             ?assertEqual({ok, [{buffer, SocketBuffer}]}, listen_buffer(element(2, State))),
-            ?assertEqual(Grow, maps:get(grow_recv_buffer, element(4, State), none)),
+            ?assertEqual(Grow, roadrunner_test_proto_opts:get(grow_recv_buffer, element(4, State))),
             ok = roadrunner_listener:stop(Name)
         end,
         Cases
@@ -1134,14 +1138,14 @@ listener_rejects_invalid_handler_spawn_test() ->
     ).
 
 listener_heap_floor_into_proto_opts_test() ->
-    %% `handler_spawn.heap_floor`'s `max` becomes `heap_floor => Cap`, 46422
-    %% unless set; `0` leaves the key out.
+    %% `handler_spawn.heap_floor`'s `max` becomes the `heap_floor` cap, 46422
+    %% unless set; `false` leaves it `undefined`.
     Cases = [
         {#{}, 46422},
         {#{handler_spawn => #{heap_floor => #{max => 5000}}}, 5000},
         {#{handler_spawn => #{heap_floor => #{}}}, 46422},
         {#{handler_spawn => #{opts => [{min_heap_size, 1000}]}}, 46422},
-        {#{handler_spawn => #{heap_floor => false}}, none}
+        {#{handler_spawn => #{heap_floor => false}}, undefined}
     ],
     lists:foreach(
         fun({Extra, Expected}) ->
@@ -1150,7 +1154,7 @@ listener_heap_floor_into_proto_opts_test() ->
                 Name, Extra#{port => 0, routes => roadrunner_hello_handler}
             ),
             ProtoOpts = element(4, sys:get_state(ListenerPid)),
-            ?assertEqual(Expected, maps:get(heap_floor, ProtoOpts, none)),
+            ?assertEqual(Expected, roadrunner_test_proto_opts:get(heap_floor, ProtoOpts)),
             ok = roadrunner_listener:stop(Name)
         end,
         Cases
@@ -1178,7 +1182,7 @@ listener_ws_heap_floor_into_proto_opts_test() ->
             {ok, ListenerPid} = roadrunner_listener:start_link(
                 Name, Extra#{port => 0, routes => roadrunner_hello_handler}
             ),
-            ProtoOpts = element(4, sys:get_state(ListenerPid)),
+            ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(ListenerPid))),
             #{ws_heap_floor_min := Min, ws_heap_floor_max := Max} = ProtoOpts,
             ?assertEqual(Expected, {Min, Max}),
             ok = roadrunner_listener:stop(Name)
@@ -1228,7 +1232,7 @@ slot_reconciliation_disabled_keeps_orphans_test() ->
     }),
     State = sys:get_state(ListenerPid),
     ?assertEqual(disabled, element(6, State)),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     Counter = maps:get(client_counter, ProtoOpts),
     %% Plant orphan slots; without reconciliation they stay forever.
     ok = counters:add(Counter, 1, 3),
@@ -1464,7 +1468,10 @@ overload_mode_shed_resolves_its_retry_after_test() ->
                 max_concurrent_requests => 4,
                 overload_mode => Mode
             }),
-            ?assertMatch(#{overload := Want}, element(4, sys:get_state(whereis(Name)))),
+            ?assertMatch(
+                #{overload := Want},
+                roadrunner_test_proto_opts:to_map(element(4, sys:get_state(whereis(Name))))
+            ),
             ok = roadrunner_listener:stop(Name)
         end,
         [

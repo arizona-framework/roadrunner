@@ -503,7 +503,7 @@ concurrent_streams_both_dispatch() ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -515,7 +515,7 @@ concurrent_streams_both_dispatch() ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -576,7 +576,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     RequestsCounter = atomics:new(1, [{signed, false}]),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -600,7 +600,7 @@ h2c_dispatch_routes_plaintext_to_http2_loop() ->
         http2_conn_window => 65535,
         http2_stream_window => 65535,
         http2_window_refill_threshold => 32768
-    },
+    }),
     Sock = {fake, Self},
     {ok, Pid} = roadrunner_conn_loop:start(Sock, ProtoOpts),
     Ref = monitor(process, Pid),
@@ -632,7 +632,7 @@ plaintext_listener_without_h2c_stays_h1() ->
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     RequestsCounter = atomics:new(1, [{signed, false}]),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -653,7 +653,7 @@ plaintext_listener_without_h2c_stays_h1() ->
         proxy_protocol => false,
         graceful_drain => false,
         protocols => [http1]
-    },
+    }),
     Sock = {fake, Self},
     {ok, Pid} = roadrunner_conn_loop:start(Sock, ProtoOpts),
     Ref = monitor(process, Pid),
@@ -959,14 +959,16 @@ continuation_flood_triggers_goaway() ->
     end.
 
 configured_max_header_block_triggers_goaway() ->
-    %% With `max_header_block => 200` the ceiling is the 400 list size it
-    %% implies, so a CONTINUATION block of ~500 bytes (well UNDER the
+    %% With `max_header_block => 200` the ceiling is the 400 list size the
+    %% listener derives from it, so a CONTINUATION block of ~500 bytes (well UNDER the
     %% default ceiling) must still trip the flood guard and close with
     %% GOAWAY(ENHANCE_YOUR_CALM), proving the configured cap, not the
     %% macro default, is what's enforced.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
-    {Pid, Ref, ConnPid} = start_http2_conn(#{http2_max_header_block => 200}),
+    {Pid, Ref, ConnPid} = start_http2_conn(#{
+        http2_max_header_block => 200, http2_max_header_list_size => 400
+    }),
     _ = expect_send(),
     serve_recv(ConnPid, ?PREFACE),
     serve_recv(ConnPid, ?EMPTY_SETTINGS_FRAME),
@@ -1731,7 +1733,7 @@ middleware_chain_runs() ->
     Mw = fun(Req, Next) -> Next(Req) end,
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -1742,7 +1744,7 @@ middleware_chain_runs() ->
         middlewares => [Mw],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Self = self(),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
@@ -1803,7 +1805,7 @@ router_404_returns_not_found() ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -1813,7 +1815,7 @@ router_404_returns_not_found() ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -1873,7 +1875,7 @@ router_405_returns_method_not_allowed() ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -1883,7 +1885,7 @@ router_405_returns_method_not_allowed() ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -3574,7 +3576,7 @@ rst_during_stream_response_unwinds_worker() ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -3586,7 +3588,7 @@ rst_during_stream_response_unwinds_worker() ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -3663,7 +3665,7 @@ drain_refuses_new_streams() ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -3675,7 +3677,7 @@ drain_refuses_new_streams() ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -3728,7 +3730,7 @@ drain_with_in_flight_stream_waits() ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -3740,7 +3742,7 @@ drain_with_in_flight_stream_waits() ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -3798,7 +3800,7 @@ drain_message_is_idempotent() ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -3810,7 +3812,7 @@ drain_message_is_idempotent() ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -3858,7 +3860,7 @@ drain_then_peer_rst_exits_via_frame_loop() ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -3870,7 +3872,7 @@ drain_then_peer_rst_exits_via_frame_loop() ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -4137,7 +4139,7 @@ telemetry_request_stop_fires_for_router_404() ->
         Self = self(),
         Counter = counters:new(1, [write_concurrency]),
         ok = counters:add(Counter, 1, 1),
-        ProtoOpts = #{
+        ProtoOpts = roadrunner_test_proto_opts:new(#{
             handler_spawn_opts => [{fullsweep_after, 0}],
             tls_handshake_timeout => 5000,
             max_concurrent_requests => infinity,
@@ -4147,7 +4149,7 @@ telemetry_request_stop_fires_for_router_404() ->
             middlewares => [],
             http2_conn_window => 65535,
             http2_stream_window => 65535
-        },
+        }),
         Sock = {fake, Self},
         Pid = spawn(fun() ->
             receive
@@ -4228,7 +4230,7 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -4243,7 +4245,7 @@ run_h2_with_compress_middleware(Path, ExtraHeaders) ->
         middlewares => [roadrunner_compress],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -5588,7 +5590,7 @@ post_handshake_handler(Handler) ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -5598,7 +5600,7 @@ post_handshake_handler(Handler) ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -5723,25 +5725,27 @@ start_http2_conn(Extra) ->
     %% empty middleware chain. `Extra` overrides / adds proto_opts
     %% (e.g. `hibernate_after` for the idle-hibernation tests); a key
     %% set to `unset` is left out, so its default applies.
-    ProtoOpts = maps:filter(
-        fun(_Key, Value) -> Value =/= unset end,
-        maps:merge(
-            #{
-                max_concurrent_requests => infinity,
-                client_counter => Counter,
-                listener_name => http2_test,
-                handler_spawn_opts => [{fullsweep_after, 0}],
-                tls_handshake_timeout => 5000,
-                dispatch =>
-                    {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1,
-                        undefined},
-                middlewares => [],
-                protocols => [http2],
-                http2_conn_window => 65535,
-                http2_stream_window => 65535,
-                http2_window_refill_threshold => 32768
-            },
-            Extra
+    ProtoOpts = roadrunner_test_proto_opts:new(
+        maps:filter(
+            fun(_Key, Value) -> Value =/= unset end,
+            maps:merge(
+                #{
+                    max_concurrent_requests => infinity,
+                    client_counter => Counter,
+                    listener_name => http2_test,
+                    handler_spawn_opts => [{fullsweep_after, 0}],
+                    tls_handshake_timeout => 5000,
+                    dispatch =>
+                        {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1,
+                            undefined},
+                    middlewares => [],
+                    protocols => [http2],
+                    http2_conn_window => 65535,
+                    http2_stream_window => 65535,
+                    http2_window_refill_threshold => 32768
+                },
+                Extra
+            )
         )
     ),
     Sock = {fake, Self},
@@ -5926,7 +5930,7 @@ run_h2_request_with_handler(Handler, Path) ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = #{
+    ProtoOpts = roadrunner_test_proto_opts:new(#{
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000,
         max_concurrent_requests => infinity,
@@ -5936,7 +5940,7 @@ run_h2_request_with_handler(Handler, Path) ->
         middlewares => [],
         http2_conn_window => 65535,
         http2_stream_window => 65535
-    },
+    }),
     Sock = {fake, Self},
     Pid = spawn(fun() ->
         receive
@@ -6000,21 +6004,23 @@ run_stream_request(Path, PrefaceSettings, ExtraOpts) ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = maps:merge(
-        #{
-            handler_spawn_opts => [{fullsweep_after, 0}],
-            tls_handshake_timeout => 5000,
-            max_concurrent_requests => infinity,
-            client_counter => Counter,
-            listener_name => h2_stream_test,
-            dispatch =>
-                {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
-                    undefined},
-            middlewares => [],
-            http2_conn_window => 65535,
-            http2_stream_window => 65535
-        },
-        ExtraOpts
+    ProtoOpts = roadrunner_test_proto_opts:new(
+        maps:merge(
+            #{
+                handler_spawn_opts => [{fullsweep_after, 0}],
+                tls_handshake_timeout => 5000,
+                max_concurrent_requests => infinity,
+                client_counter => Counter,
+                listener_name => h2_stream_test,
+                dispatch =>
+                    {handler, roadrunner_h2_test_handler, fun roadrunner_h2_test_handler:handle/1,
+                        undefined},
+                middlewares => [],
+                http2_conn_window => 65535,
+                http2_stream_window => 65535
+            },
+            ExtraOpts
+        )
     ),
     Sock = {fake, Self},
     Pid = spawn(fun() ->

@@ -552,21 +552,23 @@ start_conn(Handler, Extra) ->
     Self = self(),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
-    ProtoOpts = maps:merge(
-        #{
-            max_concurrent_requests => infinity,
-            client_counter => Counter,
-            listener_name => h2_flow_test,
-            dispatch => {handler, Handler, fun Handler:handle/1, undefined},
-            middlewares => [],
-            handler_spawn_opts => [{fullsweep_after, 0}],
-            tls_handshake_timeout => 5000,
-            %% The RFC 9113 §6.9.2 baseline windows these cases count from.
-            http2_conn_window => 65535,
-            http2_stream_window => 65535,
-            http2_window_refill_threshold => 32768
-        },
-        Extra
+    ProtoOpts = roadrunner_test_proto_opts:new(
+        maps:merge(
+            #{
+                max_concurrent_requests => infinity,
+                client_counter => Counter,
+                listener_name => h2_flow_test,
+                dispatch => {handler, Handler, fun Handler:handle/1, undefined},
+                middlewares => [],
+                handler_spawn_opts => [{fullsweep_after, 0}],
+                tls_handshake_timeout => 5000,
+                %% The RFC 9113 §6.9.2 baseline windows these cases count from.
+                http2_conn_window => 65535,
+                http2_stream_window => 65535,
+                http2_window_refill_threshold => 32768
+            },
+            Extra
+        )
     ),
     Sock = {fake, Self},
     Pid = spawn(fun() ->

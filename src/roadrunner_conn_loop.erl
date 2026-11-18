@@ -1,6 +1,8 @@
 -module(roadrunner_conn_loop).
 -moduledoc false.
 
+-include("roadrunner_proto_opts.hrl").
+
 %% Tail-recursive per-connection process for HTTP/1.1.
 %%
 %% The lifecycle (`awaiting_shoot → reading_request → reading_body →
@@ -207,7 +209,7 @@
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.
-start(Socket, #{handler_spawn_opts := SpawnOpts} = ProtoOpts) ->
+start(Socket, #proto_opts{handler_spawn_opts = SpawnOpts} = ProtoOpts) ->
     %% Unlinked from the acceptor, so a single-conn crash never reaches the
     %% acceptor pool. Spawned without an init-ack wait: the acceptor hands
     %% the socket over (`controlling_process` then `! shoot`) and goes back
@@ -221,8 +223,7 @@ start(Socket, #{handler_spawn_opts := SpawnOpts} = ProtoOpts) ->
 -doc false.
 -spec init_loop(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     no_return().
-init_loop(Socket, ProtoOpts) ->
-    ListenerName = maps:get(listener_name, ProtoOpts, undefined),
+init_loop(Socket, #proto_opts{listener_name = ListenerName} = ProtoOpts) ->
     proc_lib:set_label({roadrunner_conn, awaiting_shoot, ListenerName}),
     awaiting_shoot(Socket, ProtoOpts, ListenerName).
 
@@ -262,13 +263,13 @@ awaiting_shoot(Socket0, ProtoOpts, ListenerName) ->
                     ok = roadrunner_event:listener_accept_error(
                         ListenerName, {proxy_protocol, Reason}
                     ),
-                    exit_unaccepted(Socket0, ProtoOpts)
+                    exit_unaccepted(Socket0, roadrunner_conn:close_opts(ProtoOpts))
             end;
         {roadrunner_drain, _Deadline} ->
             %% Drain before `shoot` — no telemetry was fired yet (accept
             %% pairs with `shoot`), so no listener_conn_close either. Just
             %% release the slot and close the socket.
-            exit_unaccepted(Socket0, ProtoOpts);
+            exit_unaccepted(Socket0, roadrunner_conn:close_opts(ProtoOpts));
         _Stray ->
             %% Stray-msg tolerance — gen_statem drops unmatched info events
             %% silently; we do the same so a buggy library can't crash the
@@ -281,10 +282,10 @@ awaiting_shoot(Socket0, ProtoOpts, ListenerName) ->
 %% out a pre-handshake `ssl` socket. Plain TCP passes through unchanged.
 -spec tls_handshake(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, roadrunner_transport:socket()} | {error, {handshake, term()}}.
-tls_handshake(Socket, #{tls_upgrade := TlsOpts, tls_handshake_timeout := HsTimeout}) ->
-    roadrunner_transport:handshake(Socket, TlsOpts, HsTimeout);
-tls_handshake(Socket, #{tls_handshake_timeout := HsTimeout}) ->
-    roadrunner_transport:handshake(Socket, HsTimeout).
+tls_handshake(Socket, #proto_opts{tls_upgrade = undefined, tls_handshake_timeout = HsTimeout}) ->
+    roadrunner_transport:handshake(Socket, HsTimeout);
+tls_handshake(Socket, #proto_opts{tls_upgrade = TlsOpts, tls_handshake_timeout = HsTimeout}) ->
+    roadrunner_transport:handshake(Socket, TlsOpts, HsTimeout).
 
 -spec handshake_failed(roadrunner_conn:proto_opts(), atom(), {handshake, term()}) -> no_return().
 handshake_failed(ProtoOpts, ListenerName, Reason) ->
@@ -298,8 +299,9 @@ handshake_failed(ProtoOpts, ListenerName, Reason) ->
     %% failure, for the `handshake/3` upgrade) `ssl` tore the connection
     %% down itself.
     ok = roadrunner_event:listener_accept_error(ListenerName, Reason),
-    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
-    ok = roadrunner_conn:release_slot(ProtoOpts),
+    Close = roadrunner_conn:close_opts(ProtoOpts),
+    ok = roadrunner_conn:unregister_for_drain(Close),
+    ok = roadrunner_conn:release_slot(Close),
     exit(normal).
 
 %% The handshake is the one pre-serve phase that can block for a while (up
@@ -310,8 +312,8 @@ handshake_failed(ProtoOpts, ListenerName, Reason) ->
 %% has no handshake and keeps the `awaiting_shoot` label until then.
 -spec label_handshake(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), atom()) ->
     ok.
-label_handshake(Socket, ProtoOpts, ListenerName) ->
-    case is_map_key(tls_upgrade, ProtoOpts) orelse roadrunner_conn:scheme(Socket) =:= https of
+label_handshake(Socket, #proto_opts{tls_upgrade = TlsUpgrade}, ListenerName) ->
+    case TlsUpgrade =/= undefined orelse roadrunner_conn:scheme(Socket) =:= https of
         true -> proc_lib:set_label({roadrunner_conn, tls_handshake, ListenerName});
         false -> ok
     end.
@@ -342,16 +344,24 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered
             );
         false ->
-            #{
-                requests_counter := RequestsCounter,
-                dispatch := Dispatch,
-                middlewares := Middlewares,
-                max_content_length := MaxContentLength,
-                max_keep_alive_requests := MaxKeepAliveRequests,
-                min_bytes_per_second := MinRate,
-                request_timeout := RequestTimeout,
-                keep_alive_timeout := KeepAliveTimeout,
-                body_buffering := BodyBuffering
+            #proto_opts{
+                requests_counter = RequestsCounter,
+                dispatch = Dispatch,
+                middlewares = Middlewares,
+                max_content_length = MaxContentLength,
+                max_keep_alive_requests = MaxKeepAliveRequests,
+                min_bytes_per_second = MinRate,
+                request_timeout = RequestTimeout,
+                keep_alive_timeout = KeepAliveTimeout,
+                body_buffering = BodyBuffering,
+                grow_recv_buffer = GrowBuffer,
+                http1_active = Active,
+                hibernate_after = HibernateAfter,
+                alt_svc = AltSvc,
+                http1_max_request_line = MaxRequestLine,
+                http1_max_header_line = MaxHeaderLine,
+                http1_max_header_block = MaxHeaderBlock,
+                http1_max_header_count = MaxHeaderCount
             } = ProtoOpts,
             S = #loop_state{
                 socket = Socket,
@@ -371,19 +381,11 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 request_timeout = RequestTimeout,
                 keep_alive_timeout = KeepAliveTimeout,
                 body_buffering = BodyBuffering,
-                grow_buffer = maps:get(grow_recv_buffer, ProtoOpts, undefined),
+                grow_buffer = GrowBuffer,
                 heap_floor = heap_floor(ProtoOpts),
-                recv_mode = recv_mode(
-                    read_mode(maps:get(http1_active, ProtoOpts, undefined), Socket),
-                    maps:get(hibernate_after, ProtoOpts, 0)
-                ),
-                alt_svc = maps:get(alt_svc, ProtoOpts, undefined),
-                http1_limits = {
-                    maps:get(http1_max_request_line, ProtoOpts, 8192),
-                    maps:get(http1_max_header_line, ProtoOpts, 8192),
-                    maps:get(http1_max_header_block, ProtoOpts, 10240),
-                    maps:get(http1_max_header_count, ProtoOpts, 100)
-                },
+                recv_mode = recv_mode(read_mode(Active, Socket), HibernateAfter),
+                alt_svc = AltSvc,
+                http1_limits = {MaxRequestLine, MaxHeaderLine, MaxHeaderBlock, MaxHeaderCount},
                 rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
                 real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
                 request_slot = request_slot(ProtoOpts)
@@ -403,7 +405,7 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
 %% HTTP/1.1 (RFC 9113 §3.2), and a plain-TCP `[http1]` listener reads its
 %% first request with no detour.
 -spec shares_port_with_h2c(http | https, roadrunner_conn:proto_opts()) -> boolean().
-shares_port_with_h2c(http, #{protocols := Protocols}) -> lists:member(http2, Protocols);
+shares_port_with_h2c(http, #proto_opts{protocols = Protocols}) -> lists:member(http2, Protocols);
 shares_port_with_h2c(_Scheme, _ProtoOpts) -> false.
 
 %% --- protocol detection on a shared plain-TCP port ---
@@ -558,10 +560,10 @@ arm_reading(#loop_state{recv_mode = Mode} = S) ->
 %% run past would shed nothing.
 -spec request_slot(roadrunner_conn:proto_opts()) ->
     undefined | {idle, pos_integer(), counters:counters_ref(), roadrunner_conn:overload()}.
-request_slot(#{
-    overload := {shed, _} = Overload,
-    max_concurrent_requests := Max,
-    inflight_counter := Counter
+request_slot(#proto_opts{
+    overload = {shed, _} = Overload,
+    max_concurrent_requests = Max,
+    inflight_counter = Counter
 }) ->
     {idle, Max, Counter, Overload};
 request_slot(_ProtoOpts) ->
@@ -582,11 +584,13 @@ request_slot(_ProtoOpts) ->
     roadrunner_conn:proto_opts(),
     {inet:ip_address(), inet:port_number()} | undefined
 ) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
-proxy_protocol_stage(_Socket, #{proxy_protocol := false}, OsPeer) ->
+proxy_protocol_stage(_Socket, #proto_opts{proxy_protocol = false}, OsPeer) ->
     {ok, OsPeer, <<>>};
 proxy_protocol_stage(
-    Socket, #{proxy_protocol := true, tls_upgrade := _, tls_handshake_timeout := Timeout}, OsPeer
-) ->
+    Socket,
+    #proto_opts{proxy_protocol = true, tls_upgrade = TlsOpts, tls_handshake_timeout = Timeout},
+    OsPeer
+) when is_list(TlsOpts) ->
     %% The header read is connection setup like the handshake that follows
     %% it, so it shares the handshake bound rather than `request_timeout`:
     %% a peer that connects and sends nothing holds its slot no longer here
@@ -596,7 +600,7 @@ proxy_protocol_stage(
         {local, <<>>} -> {ok, OsPeer, <<>>};
         {error, Reason} -> {close, Reason}
     end;
-proxy_protocol_stage(Socket, #{proxy_protocol := true} = ProtoOpts, OsPeer) ->
+proxy_protocol_stage(Socket, #proto_opts{proxy_protocol = true} = ProtoOpts, OsPeer) ->
     read_proxy_header(Socket, ProtoOpts, OsPeer, <<>>).
 
 %% A v1 header (CRLF included) never exceeds 107 bytes (HAProxy spec §2.1).
@@ -685,7 +689,7 @@ read_proxy_v1_line(Socket, Timeout) ->
     {inet:ip_address(), inet:port_number()} | undefined,
     binary()
 ) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
-read_proxy_header(Socket, #{request_timeout := Timeout} = ProtoOpts, OsPeer, Acc) ->
+read_proxy_header(Socket, #proto_opts{request_timeout = Timeout} = ProtoOpts, OsPeer, Acc) ->
     case roadrunner_transport:recv(Socket, 0, Timeout) of
         {ok, Bytes} ->
             Buf = <<Acc/binary, Bytes/binary>>,
@@ -717,7 +721,7 @@ http2_negotiated(Socket) ->
 %% §3.4). On TLS the ALPN handshake already drove the dispatch via
 %% `http2_negotiated/1`; this short-circuit is a no-op there.
 -spec h2c_only(roadrunner_conn:proto_opts()) -> boolean().
-h2c_only(#{protocols := [http2]}) -> true;
+h2c_only(#proto_opts{protocols = [http2]}) -> true;
 h2c_only(_) -> false.
 
 %% --- read_request phase ---
@@ -1169,7 +1173,9 @@ admit(#loop_state{request_slot = {idle, Max, Counter, Overload}} = S, Req, Deadl
                 S#loop_state{request_slot = {held, Max, Counter, Overload}}, Req, Deadline
             );
         {shed, RetryAfter} ->
-            #loop_state{proto_opts = #{throttled_counter := Throttled}, listener_name = Name} = S,
+            #loop_state{
+                proto_opts = #proto_opts{throttled_counter = Throttled}, listener_name = Name
+            } = S,
             ok = roadrunner_conn:throttled_telemetry(Name, Throttled, max_concurrent_requests),
             refuse_retry_later(S, 503, RetryAfter, roadrunner_conn:body_framing(Req))
     end.
@@ -1316,7 +1322,9 @@ large_body({error, _}, _Buffered, _Idle) -> false.
 %% has not served a request yet keeps `Base`.
 -spec heap_floor(roadrunner_conn:proto_opts()) ->
     {pos_integer(), pos_integer(), pos_integer(), pos_integer()} | undefined.
-heap_floor(#{heap_floor := Cap}) ->
+heap_floor(#proto_opts{heap_floor = undefined}) ->
+    undefined;
+heap_floor(#proto_opts{heap_floor = Cap}) ->
     %% The base is the size this process was spawned with: the listener's
     %% `handler_spawn` `min_heap_size`, as the emulator rounded it up, or
     %% the emulator's default.
@@ -1332,9 +1340,7 @@ heap_floor(#{heap_floor := Cap}) ->
             {Base, min(max(?HEAP_FLOOR_LEAST, Base), Cap), Base, Cap};
         {max_heap_size, _} ->
             undefined
-    end;
-heap_floor(#{}) ->
-    undefined.
+    end.
 
 -spec raise_heap_floor(#loop_state{}) -> #loop_state{}.
 raise_heap_floor(#loop_state{heap_floor = undefined} = S) ->
@@ -2142,7 +2148,7 @@ ws_finish(
     Response
 ) ->
     Close = roadrunner_conn:close_opts(ProtoOpts),
-    Linger = maps:get(http1_linger_timeout, ProtoOpts, 1000),
+    #proto_opts{http1_linger_timeout = Linger} = ProtoOpts,
     Status = roadrunner_conn:response_status(Response),
     Kind = roadrunner_conn:response_kind(Response),
     Reader = maps:get(body_reader, Req, none),
@@ -2214,10 +2220,13 @@ refuse_too_large(S) ->
 %% lingering over what the client may still be sending
 %% (`roadrunner_conn:linger/2`) for the listener's `http1` `linger_timeout`.
 -spec exit_lingering(#loop_state{}, roadrunner_event_handler:close_reason()) -> no_return().
-exit_lingering(#loop_state{socket = Socket, proto_opts = ProtoOpts} = S, Reason) ->
+exit_lingering(
+    #loop_state{socket = Socket, proto_opts = #proto_opts{http1_linger_timeout = Linger}} = S,
+    Reason
+) ->
     %% The request is over; its slot is not held through the linger.
     S1 = flush_out(release_request_slot(S)),
-    ok = roadrunner_conn:linger(Socket, maps:get(http1_linger_timeout, ProtoOpts, 1000)),
+    ok = roadrunner_conn:linger(Socket, Linger),
     exit_normal(S1, Reason).
 
 %% Close after a response sent ahead of the handler, or for its crash: a
@@ -2312,7 +2321,7 @@ exit_normal(S, Reason) ->
         conn_span = ConnSpan,
         requests_served = Served
     } = flush_out(release_request_slot(S)),
-    exit_clean(Socket, ProtoOpts, ConnSpan, Served, Reason).
+    exit_clean(Socket, roadrunner_conn:close_opts(ProtoOpts), ConnSpan, Served, Reason).
 
 %% Funnel for every clean exit path once the connection was accepted.
 %% Fires the paired `listener_conn_close` event, then releases the
@@ -2329,17 +2338,17 @@ exit_normal(S, Reason) ->
     non_neg_integer(),
     roadrunner_event_handler:close_reason()
 ) -> no_return().
-exit_clean(Socket, ProtoOpts, ConnSpan, Served, Reason) ->
+exit_clean(Socket, Close, ConnSpan, Served, Reason) ->
     ok = roadrunner_event:listener_conn_close(ConnSpan, Served, Reason),
-    exit_unaccepted(Socket, ProtoOpts).
+    exit_unaccepted(Socket, Close).
 
 %% Exit before `listener_accept` fired (a drain or a bad PROXY header
 %% ahead of `serve/5`), so no `listener_conn_close` pairs with it:
 %% release the listener slot, close the socket, and exit normally.
 -spec exit_unaccepted(roadrunner_transport:socket(), roadrunner_conn:close_opts()) ->
     no_return().
-exit_unaccepted(Socket, ProtoOpts) ->
-    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
-    ok = roadrunner_conn:release_slot(ProtoOpts),
+exit_unaccepted(Socket, Close) ->
+    ok = roadrunner_conn:unregister_for_drain(Close),
+    ok = roadrunner_conn:release_slot(Close),
     ok = roadrunner_transport:close(Socket),
     exit(normal).

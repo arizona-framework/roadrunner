@@ -161,7 +161,7 @@ method() ->
 %% =============================================================================
 
 proto_opts(ListenerName, Counter) ->
-    #{
+    roadrunner_test_proto_opts:new(#{
         dispatch => {handler, roadrunner_hello_handler, fun roadrunner_hello_handler:handle/1, undefined},
         middlewares => [],
         max_content_length => 1_000_000,
@@ -179,7 +179,7 @@ proto_opts(ListenerName, Counter) ->
         listener_name => ListenerName,
         handler_spawn_opts => [{fullsweep_after, 0}],
         tls_handshake_timeout => 5000
-    }.
+    }).
 
 spawn_recv_sink(Script) ->
     spawn(fun() -> recv_sink_loop(Script) end).

@@ -82,7 +82,7 @@ custom_max_streams_bidi_threads_into_proto_opts() ->
         routes => roadrunner_keepalive_handler
     }),
     State = sys:get_state(ListenerPid),
-    ProtoOpts = element(4, State),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, State)),
     ?assertEqual(256, maps:get(http3_max_streams_bidi, ProtoOpts)),
     ok = roadrunner_listener:stop(Name).
 
@@ -103,7 +103,9 @@ secret_keys_the_quic_pool() ->
         routes => roadrunner_keepalive_handler
     }),
     State = sys:get_state(ListenerPid),
-    ?assertNot(lists:member(Secret, maps:values(element(4, State)))),
+    ?assertNot(
+        lists:member(Secret, maps:values(roadrunner_test_proto_opts:to_map(element(4, State))))
+    ),
     [QuicListener | _] = roadrunner_quic_listener_sup:get_listeners(element(7, State)),
     Registry = element(5, sys:get_state(QuicListener)),
     ?assertEqual(

@@ -108,7 +108,7 @@ care which protocol delivered the bytes.
     %% up automatically.
     request_id => binary(),
     %% Registered name of the owning `roadrunner_listener`. Set
-    %% once per conn from `proto_opts.listener_name`. Surfaced in
+    %% once per conn from the listener's connection options. Surfaced in
     %% the events handed to the `roadrunner_event_handler` so a
     %% handler can filter by listener in multi-listener deployments.
     listener_name => atom(),
@@ -1096,7 +1096,7 @@ request_id(_) -> undefined.
 -doc """
 Return the atom name of the listener that accepted this request.
 
-Set by `roadrunner_conn` from `proto_opts.listener_name` and stable
+Set by roadrunner when the connection starts and stable
 for the lifetime of the connection. Useful for adapter code that
 needs to address the listener (e.g. `pg`-based broadcasts keyed by
 listener name).

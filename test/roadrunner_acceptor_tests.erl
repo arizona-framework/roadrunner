@@ -125,7 +125,9 @@ acceptor_retries_on_transient_accept_error_test() ->
     ),
     {ok, Pid} = roadrunner_acceptor:start_link(
         {gen_tcp, CSock},
-        #{listener_name => acceptor_test_accept_error, tls_handshake_timeout => 5000},
+        roadrunner_test_proto_opts:new(#{
+            listener_name => acceptor_test_accept_error, tls_handshake_timeout => 5000
+        }),
         1
     ),
     receive
@@ -191,7 +193,7 @@ acceptor_hands_tls_sockets_off_before_the_handshake_test() ->
     Counter = counters:new(1, [write_concurrency]),
     {ok, Pid} = roadrunner_acceptor:start_link(
         LSock,
-        #{
+        roadrunner_test_proto_opts:new(#{
             listener_name => acceptor_test_tls_noise,
             tls_handshake_timeout => 5000,
             proxy_protocol => false,
@@ -199,7 +201,7 @@ acceptor_hands_tls_sockets_off_before_the_handshake_test() ->
             max_clients => 10,
             graceful_drain => false,
             handler_spawn_opts => [{fullsweep_after, 0}]
-        },
+        }),
         1
     ),
     %% Plain-HTTP bytes can't form a TLS hello — the conn's handshake fails.

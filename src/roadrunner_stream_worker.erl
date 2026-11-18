@@ -1,6 +1,8 @@
 -module(roadrunner_stream_worker).
 -moduledoc false.
 
+-include("roadrunner_proto_opts.hrl").
+
 %% Runs one HTTP/2 or HTTP/3 request inside its stream worker: route it,
 %% run the handler pipeline, send the response and emit the request
 %% telemetry. Both protocols share this flow; only how a response is put
@@ -148,7 +150,9 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch, HeapFloor0) ->
 %% base, or the workers have a `max_heap_size` (see max_heap_size_set/1).
 -doc false.
 -spec conn_heap_floor(roadrunner_conn:proto_opts()) -> conn_heap_floor().
-conn_heap_floor(#{heap_floor := Cap, handler_spawn_opts := SpawnOpts}) ->
+conn_heap_floor(#proto_opts{heap_floor = undefined}) ->
+    undefined;
+conn_heap_floor(#proto_opts{heap_floor = Cap, handler_spawn_opts = SpawnOpts}) ->
     Base =
         case last_spawn_opt(min_heap_size, SpawnOpts) of
             {min_heap_size, Words} -> Words;
@@ -161,9 +165,7 @@ conn_heap_floor(#{heap_floor := Cap, handler_spawn_opts := SpawnOpts}) ->
             {Cell, Base, Cap};
         false ->
             undefined
-    end;
-conn_heap_floor(#{}) ->
-    undefined.
+    end.
 
 %% Whether workers spawned with `SpawnOpts` have a `max_heap_size`, the
 %% listener's or the emulator's default (a size of 0 is no limit). The

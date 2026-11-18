@@ -1,6 +1,8 @@
 -module(roadrunner_conn_loop_http2).
 -moduledoc false.
 
+-include("roadrunner_proto_opts.hrl").
+
 %% HTTP/2 (RFC 9113) connection process.
 %%
 %% Driven by either TLS ALPN-negotiated `h2` or a plaintext connection
@@ -92,10 +94,8 @@
 %% override via `persistent_term:put/2` on `{?MODULE, handshake_timeout}`
 %% / `{?MODULE, idle_timeout}` so the timeout branches are exercisable
 %% without forcing 10–60 s waits per case. The idle one is the listener's
-%% `keep_alive_timeout`; the default stands in for a conn started without
-%% it, and matches the listener's.
+%% `keep_alive_timeout`.
 -define(HANDSHAKE_TIMEOUT_DEFAULT, 10_000).
--define(IDLE_TIMEOUT_DEFAULT, 60_000).
 %% The shortest idle wait an HTTP/2 conn takes from `keep_alive_timeout`:
 %% shorter would close it before a client's first request, or before a
 %% client could answer the liveness PING. A value of 0 means "no keep-alive
@@ -181,8 +181,8 @@
 %% threshold for both. `roadrunner_listener:opts()` carries the override
 %% knobs as nested `http2` sub-opts (`conn_window`, `stream_window`,
 %% `window_refill_threshold`). Defaults here mirror the listener's for
-%% static record initialization; runtime values come from the proto_opts
-%% map populated by `roadrunner_listener:normalize_protocols/1`.
+%% static record initialization; runtime values come from the `http2_*`
+%% fields of the connection options (`#proto_opts{}`).
 -define(DEFAULT_CONN_RECV_WINDOW, 16#7FFFFFFF).
 -define(DEFAULT_STREAM_RECV_WINDOW, 16_777_216).
 
@@ -196,16 +196,6 @@
 %% `max_concurrent_streams` http2 opt; clients exceeding the live cap get
 %% RST_STREAM(REFUSED_STREAM) on the over-limit HEADERS.
 -define(MAX_CONCURRENT_STREAMS, 100).
-
-%% Socket read mode fallback when proto_opts omits `http2_active` (only
-%% test harnesses do; the listener always sets it). Matches the listener
-%% default.
--define(DEFAULT_ACTIVE, 16).
-
-%% Request-body cap fallback when proto_opts omits `max_content_length`
-%% (only test harnesses do; the listener always sets it). Matches the
-%% listener default.
--define(DEFAULT_MAX_CONTENT_LENGTH, 10_485_760).
 
 -define(GOAWAY(LastStreamId, ErrorCode),
     roadrunner_http2_frame:encode({goaway, (LastStreamId), (ErrorCode), <<>>})
@@ -384,13 +374,13 @@
     %% Request-body cap (`max_content_length` listener opt); an over-cap
     %% body answers 413 + RST_STREAM(NO_ERROR). Read from proto_opts at
     %% `enter/6`.
-    max_content_length = ?DEFAULT_MAX_CONTENT_LENGTH :: non_neg_integer(),
+    max_content_length :: non_neg_integer(),
     %% `auto` buffers a request's body and starts its worker at END_STREAM;
     %% `manual` starts the worker at the end of the headers and hands it the
     %% body as it reads (`dispatch_reading/3`), within `request_timeout`
     %% from then. Read from proto_opts at `enter/6`.
     body_buffering = auto :: roadrunner_listener:body_buffering(),
-    request_timeout = 0 :: non_neg_integer(),
+    request_timeout :: non_neg_integer(),
     %% Decoded header-list cap (RFC 9113 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE):
     %% advertised in our SETTINGS and enforced after HPACK decode in
     %% `finalize_headers/2`. Read from proto_opts at `enter/6`.
@@ -404,7 +394,7 @@
     %% persistent_term every loop. The persistent_term override (a test
     %% hook) is captured at `enter/6`, so it must be set before connect.
     handshake_timeout = ?HANDSHAKE_TIMEOUT_DEFAULT :: non_neg_integer(),
-    idle_timeout = ?IDLE_TIMEOUT_DEFAULT :: non_neg_integer(),
+    idle_timeout :: non_neg_integer(),
     %% When (`erlang:monotonic_time(millisecond)`) the conn closes for
     %% being idle: set once it has no stream and no worker left (from the
     %% start, and as its last stream goes, `idle_deadline/3`), cleared by
@@ -517,24 +507,27 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
     proc_lib:set_label({roadrunner_conn_loop_http2, ListenerName, Peer}),
     Scheme = roadrunner_conn:scheme(Socket),
     {Data, Closed, Error} = roadrunner_transport:messages(Socket),
-    %% h2 window knobs are flattened onto proto_opts top-level with
-    %% an `http2_` prefix by `roadrunner_listener:normalize_protocols/1`
-    %% — one `maps:get/2` per knob, no nested map dives. Fallback
-    %% defaults match the listener's so tests that build proto_opts
-    %% directly stay short.
-    ConnPeak = maps:get(http2_conn_window, ProtoOpts, ?DEFAULT_CONN_RECV_WINDOW),
-    StreamPeak = maps:get(http2_stream_window, ProtoOpts, ?DEFAULT_STREAM_RECV_WINDOW),
-    {ConnThreshold, StreamThreshold} = refill_thresholds(ProtoOpts, ConnPeak, StreamPeak),
-    MaxStreams = maps:get(http2_max_concurrent_streams, ProtoOpts, ?MAX_CONCURRENT_STREAMS),
-    MaxHeaderBlock = maps:get(http2_max_header_block, ProtoOpts, ?MAX_HEADER_BLOCK),
-    %% Decoded-list cap defaults to 2x the (possibly overridden) encoded cap,
-    %% so raising `max_header_block` for big headers lifts both gates together.
-    MaxHeaderListSize = maps:get(http2_max_header_list_size, ProtoOpts, 2 * MaxHeaderBlock),
-    MaxContentLength = maps:get(max_content_length, ProtoOpts, ?DEFAULT_MAX_CONTENT_LENGTH),
-    HibernateAfter = maps:get(hibernate_after, ProtoOpts, 0),
-    AltSvc = maps:get(alt_svc, ProtoOpts, undefined),
-    MaxConcReq = maps:get(max_concurrent_requests, ProtoOpts, infinity),
-    InflightCounter = maps:get(inflight_counter, ProtoOpts, undefined),
+    %% h2 knobs are flattened onto `http2_*` fields by
+    %% `roadrunner_listener:normalize_protocols/1`, no nested map dives.
+    #proto_opts{
+        http2_conn_window = ConnPeak,
+        http2_stream_window = StreamPeak,
+        http2_window_refill_threshold = RefillThreshold,
+        http2_max_concurrent_streams = MaxStreams,
+        http2_max_header_block = MaxHeaderBlock,
+        http2_max_header_list_size = MaxHeaderListSize,
+        http2_active = Active,
+        max_content_length = MaxContentLength,
+        hibernate_after = HibernateAfter,
+        alt_svc = AltSvc,
+        max_concurrent_requests = MaxConcReq,
+        inflight_counter = InflightCounter,
+        grow_recv_buffer = GrowBuffer,
+        body_buffering = BodyBuffering,
+        request_timeout = RequestTimeout,
+        overload = Overload
+    } = ProtoOpts,
+    {ConnThreshold, StreamThreshold} = refill_thresholds(RefillThreshold, ConnPeak, StreamPeak),
     HandshakeTimeout = handshake_timeout(),
     IdleTimeout = idle_timeout(ProtoOpts),
     State = #loop{
@@ -550,8 +543,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         msg_closed = Closed,
         msg_error = Error,
         msg_passive = roadrunner_transport:passive_message(Socket),
-        active = maps:get(http2_active, ProtoOpts, ?DEFAULT_ACTIVE),
-        grow_buffer = maps:get(grow_recv_buffer, ProtoOpts, undefined),
+        active = Active,
+        grow_buffer = GrowBuffer,
         hpack_dec = roadrunner_http2_hpack:new_decoder(?HPACK_TABLE_SIZE),
         hpack_enc = roadrunner_http2_hpack:new_encoder(?HPACK_TABLE_SIZE),
         buffer = Buffered,
@@ -564,13 +557,13 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         header_block_ceiling = max(MaxHeaderBlock, MaxHeaderListSize),
         max_header_list_size = MaxHeaderListSize,
         max_content_length = MaxContentLength,
-        body_buffering = maps:get(body_buffering, ProtoOpts, auto),
-        request_timeout = maps:get(request_timeout, ProtoOpts, 0),
+        body_buffering = BodyBuffering,
+        request_timeout = RequestTimeout,
         hibernate_after = HibernateAfter,
         alt_svc = AltSvc,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
-        overload = maps:get(overload, ProtoOpts, refuse),
+        overload = Overload,
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
         real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
         handshake_timeout = HandshakeTimeout,
@@ -584,10 +577,12 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
 %% The listener's `connection_age`: one timer for the conn's whole life,
 %% at its age, carrying the grace that follows (`handle_timer/3`).
 -spec start_connection_age(roadrunner_conn:proto_opts()) -> ok.
-start_connection_age(#{http2_connection_age_max := Max, http2_connection_age_grace := Grace}) ->
-    _ = erlang:start_timer(jittered(Max), self(), {?MODULE, {connection_age, Grace}}),
+start_connection_age(#proto_opts{http2_connection_age_max = undefined}) ->
     ok;
-start_connection_age(#{}) ->
+start_connection_age(#proto_opts{
+    http2_connection_age_max = Max, http2_connection_age_grace = Grace
+}) ->
+    _ = erlang:start_timer(jittered(Max), self(), {?MODULE, {connection_age, Grace}}),
     ok.
 
 %% `Max` give or take up to a tenth of it, as grpc-go jitters its
@@ -598,34 +593,34 @@ jittered(Max) ->
     Spread = Max div 10,
     Max - Spread + rand:uniform(2 * Spread + 1) - 1.
 
-%% The listener's `ping_policy`, flattened onto `http2_ping_*` keys, none
-%% of them when it is off. Without stream, a PING must wait `MinTime`
+%% The listener's `ping_policy`, flattened onto `http2_ping_*` fields, all
+%% `undefined` when it is off. Without stream, a PING must wait `MinTime`
 %% when PINGs are permitted then, and at least 2 hours otherwise.
 -spec ping_policy(roadrunner_conn:proto_opts()) ->
     off | {pos_integer(), pos_integer(), non_neg_integer()}.
-ping_policy(#{
-    http2_ping_min_time := MinTime,
-    http2_ping_permit_without_stream := Permit,
-    http2_ping_max_strikes := MaxStrikes
+ping_policy(#proto_opts{http2_ping_min_time = undefined}) ->
+    off;
+ping_policy(#proto_opts{
+    http2_ping_min_time = MinTime,
+    http2_ping_permit_without_stream = Permit,
+    http2_ping_max_strikes = MaxStrikes
 }) ->
     IdleMinTime =
         case Permit of
             true -> MinTime;
             false -> max(MinTime, ?PING_IDLE_MIN_TIME)
         end,
-    {MinTime, IdleMinTime, MaxStrikes};
-ping_policy(#{}) ->
-    off.
+    {MinTime, IdleMinTime, MaxStrikes}.
 
 %% The connection and stream refill thresholds: the configured
 %% `window_refill_threshold` for both, else half of each window's peak
 %% (at least 1, so a window of 1 byte still refills once spent).
--spec refill_thresholds(roadrunner_conn:proto_opts(), pos_integer(), pos_integer()) ->
+-spec refill_thresholds(pos_integer() | undefined, pos_integer(), pos_integer()) ->
     {pos_integer(), pos_integer()}.
-refill_thresholds(#{http2_window_refill_threshold := Threshold}, _ConnPeak, _StreamPeak) ->
-    {Threshold, Threshold};
-refill_thresholds(_ProtoOpts, ConnPeak, StreamPeak) ->
-    {max(1, ConnPeak div 2), max(1, StreamPeak div 2)}.
+refill_thresholds(undefined, ConnPeak, StreamPeak) ->
+    {max(1, ConnPeak div 2), max(1, StreamPeak div 2)};
+refill_thresholds(Threshold, _ConnPeak, _StreamPeak) ->
+    {Threshold, Threshold}.
 
 %% =============================================================================
 %% Handshake — RFC 9113 §3.4
@@ -675,11 +670,11 @@ handshake_timeout() ->
 %% quiet before it is closed, or, with a handler still at work, checked
 %% with a liveness PING (`recv_idle_expired/1`). Tests shorten it through
 %% `persistent_term`.
--spec idle_timeout(map()) -> non_neg_integer().
-idle_timeout(ProtoOpts) ->
+-spec idle_timeout(roadrunner_conn:proto_opts()) -> non_neg_integer().
+idle_timeout(#proto_opts{keep_alive_timeout = KeepAliveTimeout}) ->
     case persistent_term:get({?MODULE, idle_timeout}, undefined) of
         undefined ->
-            max(maps:get(keep_alive_timeout, ProtoOpts, ?IDLE_TIMEOUT_DEFAULT), ?MIN_IDLE_TIMEOUT);
+            max(KeepAliveTimeout, ?MIN_IDLE_TIMEOUT);
         Override ->
             Override
     end.
@@ -2047,7 +2042,7 @@ stream_body_cap(
     _NewLen,
     _Cap,
     #stream{headers = Headers},
-    #loop{proto_opts = #{dispatch := Dispatch}, max_content_length = MaxCL}
+    #loop{proto_opts = #proto_opts{dispatch = Dispatch}, max_content_length = MaxCL}
 ) ->
     roadrunner_conn:route_body_cap(Dispatch, Headers, MaxCL).
 
@@ -3233,7 +3228,7 @@ send_rst_stream(State, StreamId, ErrorCode) ->
 %% Bump the cumulative throttled counter and emit the throttled telemetry
 %% when a stream is refused at the `max_concurrent_requests` ceiling.
 -spec throttle_stream(#loop{}, atom()) -> ok.
-throttle_stream(#loop{proto_opts = #{throttled_counter := Counter}}, ListenerName) ->
+throttle_stream(#loop{proto_opts = #proto_opts{throttled_counter = Counter}}, ListenerName) ->
     roadrunner_conn:throttled_telemetry(ListenerName, Counter, max_concurrent_requests).
 
 %% Per-peer rate-limit gate before spawning a stream worker. `ok` to proceed;
@@ -3293,7 +3288,8 @@ exit_clean(
     ok = roadrunner_conn:release_request_slots(
         MaxConcReq, InflightCounter, map_size(Refs), Overload
     ),
-    ok = roadrunner_conn:unregister_for_drain(ProtoOpts),
-    ok = roadrunner_conn:release_slot(ProtoOpts),
+    Close = roadrunner_conn:close_opts(ProtoOpts),
+    ok = roadrunner_conn:unregister_for_drain(Close),
+    ok = roadrunner_conn:release_slot(Close),
     ok = roadrunner_transport:close(Socket),
     exit(normal).
