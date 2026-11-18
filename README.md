@@ -513,7 +513,7 @@ type. Beyond `port`,
   limit),
   `max_content_length`, `max_keep_alive_requests`, `request_timeout`,
   `keep_alive_timeout`, `tls_handshake_timeout`, `min_bytes_per_second`,
-  `rate_check_interval`, `rate_limit`
+  `rate_limit`
 - **Real client IP**: `proxy_protocol`, `real_ip` (see
   [Behind a proxy](#behind-a-proxy))
 - **Sockets**: `ip` (bind address, all interfaces by default),

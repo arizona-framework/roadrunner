@@ -19,8 +19,8 @@ Connection workers are unlinked from the acceptor so a single
 connection crash doesn't take the pool down.
 
 All duration and interval values in `opts()` are in milliseconds —
-`request_timeout`, `keep_alive_timeout`, `rate_check_interval`,
-`hibernate_after`, and `slot_reconciliation.interval`.
+`request_timeout`, `keep_alive_timeout`, `hibernate_after`, and
+`slot_reconciliation.interval`.
 """.
 
 -behaviour(gen_server).
@@ -375,8 +375,6 @@ Optional middleware and timing knobs (durations in milliseconds):
   `buffer` note in `base_listen_opts/2`.
 - `min_bytes_per_second`: slow-loris guard on the request-read
   phase (0 disables). Default 100.
-- `rate_check_interval`: how often the rate guard re-checks
-  (ms). Default 1000.
 - `body_buffering`: `auto` (default; framework reads the full
   body before invoking the handler) or `manual` (handler calls
   `roadrunner_req:read_body/1,2`; a client sending
@@ -549,13 +547,6 @@ ops-tuning rationale.
     recv_buffer => pos_integer(),
     idle_recv_buffer => pos_integer(),
     min_bytes_per_second => non_neg_integer(),
-    %% How often `reading_request` re-checks the running
-    %% bytes-per-second average against `min_bytes_per_second`.
-    %% Default `1000` — matches the 1-second grace period of the
-    %% rate check itself. Tests use shorter intervals (20–30) to
-    %% exercise rate-check fires deterministically without
-    %% second-scale waits; ops can tune for chattier observability.
-    rate_check_interval => pos_integer(),
     body_buffering => body_buffering(),
     slot_reconciliation => disabled | #{interval := pos_integer()},
     %% Opt out of the per-conn drain registry. Default `true`
