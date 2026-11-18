@@ -16,6 +16,10 @@ The connection-error codes asserted here are RFC 9114 §8.1 values:
 new(MaxLen) ->
     roadrunner_conn_loop_http3:new_request_stream(MaxLen).
 
+%% A request stream's fields by name.
+fields(Stream) ->
+    roadrunner_conn_loop_http3:request_stream_fields(Stream).
+
 decode(Buf, MaxLen) ->
     roadrunner_conn_loop_http3:decode_request_frames(Buf, new(MaxLen), ?HANDLER).
 
@@ -52,21 +56,29 @@ new_request_stream_test() ->
             body_len => 0,
             unreleased => 0,
             body_cap => 8,
-            frame_state => expecting_headers
+            frame_state => expecting_headers,
+            blocked => undefined,
+            manual => false,
+            reader => undefined,
+            continue_owed => false,
+            body_error => undefined,
+            declared => undefined,
+            fin => false,
+            headers_at => undefined
         },
-        new(8)
+        fields(new(8))
     ).
 
 headers_first_test() ->
     {ok, Stream} = decode(hf(~"block"), 1000),
-    ?assertEqual(~"block", maps:get(header_block, Stream)),
-    ?assertEqual(expecting_data, maps:get(frame_state, Stream)).
+    ?assertEqual(~"block", maps:get(header_block, fields(Stream))),
+    ?assertEqual(expecting_data, maps:get(frame_state, fields(Stream))).
 
 headers_then_data_test() ->
     {ok, Stream} = decode(<<(hf(~"blk"))/binary, (df(~"hello"))/binary>>, 1000),
-    ?assertEqual(~"blk", maps:get(header_block, Stream)),
-    ?assertEqual(~"hello", iolist_to_binary(maps:get(body, Stream))),
-    ?assertEqual(5, maps:get(body_len, Stream)).
+    ?assertEqual(~"blk", maps:get(header_block, fields(Stream))),
+    ?assertEqual(~"hello", iolist_to_binary(maps:get(body, fields(Stream)))),
+    ?assertEqual(5, maps:get(body_len, fields(Stream))).
 
 closed_reason_maps_each_quic_close_test() ->
     ?assertEqual(peer_closed, roadrunner_conn_loop_http3:closed_reason({peer, 0})),
@@ -91,8 +103,8 @@ trailers_accepted_test() ->
     %% not surfaced (header_block keeps the request headers).
     Buf = <<(hf(~"req"))/binary, (df(~"body"))/binary, (hf(<<0, "trailer">>))/binary>>,
     {ok, Stream} = decode(Buf, 1000),
-    ?assertEqual(expecting_done, maps:get(frame_state, Stream)),
-    ?assertEqual(~"req", maps:get(header_block, Stream)).
+    ?assertEqual(expecting_done, maps:get(frame_state, fields(Stream))),
+    ?assertEqual(~"req", maps:get(header_block, fields(Stream))).
 
 dynamic_trailers_acknowledged_test() ->
     %% Trailers that use the QPACK dynamic table (RFC 9204 §2.2.2.1) are
@@ -103,7 +115,7 @@ dynamic_trailers_acknowledged_test() ->
     {ok, Stream, {section_ack, 1}} = roadrunner_conn_loop_http3:decode_request_frames(
         <<Request/binary, (hf(<<2, 0, 16#80>>))/binary>>, new(1000), ?HANDLER, 16384, Table
     ),
-    ?assertEqual(expecting_done, maps:get(frame_state, Stream)),
+    ?assertEqual(expecting_done, maps:get(frame_state, fields(Stream))),
     ?assertMatch(
         {conn_error, 16#0200, _},
         roadrunner_conn_loop_http3:decode_request_frames(
@@ -132,13 +144,13 @@ blocked_headers_test() ->
         Buf, new(1000), ?HANDLER, 16384, One
     ),
     ?assertMatch(
-        #{buf := Buf, header_block := undefined, frame_state := expecting_headers}, Stream
+        #{buf := Buf, header_block := undefined, frame_state := expecting_headers}, fields(Stream)
     ),
     Two = qpack_table([{~":authority", ~"localhost"}, {~"x-custom", ~"v"}]),
-    ?assertMatch(
-        {ok, #{header_block := Block, body_len := 4, buf := <<>>}},
-        roadrunner_conn_loop_http3:decode_request_frames(Buf, Stream, ?HANDLER, 16384, Two)
-    ).
+    {ok, Unblocked} = roadrunner_conn_loop_http3:decode_request_frames(
+        Buf, Stream, ?HANDLER, 16384, Two
+    ),
+    ?assertMatch(#{header_block := Block, body_len := 4, buf := <<>>}, fields(Unblocked)).
 
 blocked_trailers_test() ->
     %% Trailers block the same way, the body before them already read.
@@ -147,7 +159,7 @@ blocked_trailers_test() ->
     {blocked, 2, Stream} = roadrunner_conn_loop_http3:decode_request_frames(
         Buf, new(1000), ?HANDLER, 16384, qpack_table([{~"x-trailer", ~"t"}])
     ),
-    ?assertMatch(#{buf := Trailers, body_len := 4, frame_state := expecting_data}, Stream).
+    ?assertMatch(#{buf := Trailers, body_len := 4, frame_state := expecting_data}, fields(Stream)).
 
 frame_after_trailers_test() ->
     %% A DATA frame after the trailing HEADERS → H3_FRAME_UNEXPECTED.
@@ -164,11 +176,11 @@ settings_on_request_stream_test() ->
 unknown_frame_ignored_test() ->
     %% Grease frame type 0x21 (empty payload) — ignored (RFC 9114 §9).
     {ok, Stream} = decode(<<16#21, 0>>, 1000),
-    ?assertEqual(expecting_headers, maps:get(frame_state, Stream)).
+    ?assertEqual(expecting_headers, maps:get(frame_state, fields(Stream))).
 
 partial_frame_buffered_test() ->
     {ok, Stream} = decode(<<1>>, 1000),
-    ?assertEqual(<<1>>, maps:get(buf, Stream)).
+    ?assertEqual(<<1>>, maps:get(buf, fields(Stream))).
 
 h2_reserved_frame_test() ->
     %% Frame type 0x02 is HTTP/2-reserved → H3_FRAME_UNEXPECTED (§7.2.8).
@@ -260,7 +272,7 @@ raises_to_route_cap() ->
     %% decoded for the route and kept for dispatch.
     Buf = <<(hf(req_block(~"/up")))/binary, (df(binary:copy(~"x", 20)))/binary>>,
     {ok, Stream} = roadrunner_conn_loop_http3:decode_request_frames(Buf, new(8), ?ROUTER),
-    ?assertMatch(#{body_len := 20, body_cap := 64, headers := [_ | _]}, Stream).
+    ?assertMatch(#{body_len := 20, body_cap := 64, headers := [_ | _]}, fields(Stream)).
 
 route_cap_still_too_small() ->
     Buf = <<(hf(req_block(~"/up")))/binary, (df(binary:copy(~"x", 65)))/binary>>,
@@ -295,21 +307,22 @@ raises_with_dynamic_headers() ->
     {ok, Stream} = roadrunner_conn_loop_http3:decode_request_frames(
         Buf, new(8), ?ROUTER, 16384, Table
     ),
-    ?assertMatch(#{body_len := 20, body_cap := 64, headers := undefined}, Stream).
+    ?assertMatch(#{body_len := 20, body_cap := 64, headers := undefined}, fields(Stream)).
 
 raises_with_decoded_headers() ->
     %% Headers decoded earlier (on their own chunk) are used as they are: the
     %% raw block is not decoded again. Past the raised cap, the route is asked
     %% again and the body refused.
-    Decoded = (new(8))#{
-        header_block := ~"not qpack",
-        headers := [{~":method", ~"POST"}, {~":path", ~"/up"}],
-        frame_state := expecting_data
-    },
+    Decoded = roadrunner_conn_loop_http3:request_stream(#{
+        body_cap => 8,
+        header_block => ~"not qpack",
+        headers => [{~":method", ~"POST"}, {~":path", ~"/up"}],
+        frame_state => expecting_data
+    }),
     {ok, Raised} = roadrunner_conn_loop_http3:decode_request_frames(
         df(binary:copy(~"x", 60)), Decoded, ?ROUTER
     ),
-    ?assertMatch(#{body_len := 60, body_cap := 64}, Raised),
+    ?assertMatch(#{body_len := 60, body_cap := 64}, fields(Raised)),
     ?assertEqual(
         too_large,
         roadrunner_conn_loop_http3:decode_request_frames(df(~"12345"), Raised, ?ROUTER)

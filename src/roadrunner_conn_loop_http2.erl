@@ -2200,14 +2200,9 @@ dispatch_request(
     } = State
 ) ->
     {RequestId, NewBuf} = roadrunner_conn:generate_request_id(State#loop.req_id_buffer),
-    RequestContext = #{
-        peer => Peer,
-        conn_info => ConnInfo,
-        scheme => Scheme,
-        listener_name => ListenerName,
-        request_id => RequestId,
-        headers_at => headers_at(Stream)
-    },
+    RequestContext = roadrunner_http:request_context(
+        Peer, ConnInfo, Scheme, ListenerName, RequestId, headers_at(Stream)
+    ),
     case roadrunner_http2_request:from_headers(Headers, buffered_body(Body), RequestContext) of
         {ok, Req0} ->
             Req = request_body(

@@ -321,11 +321,11 @@ authority_and_equal_host_leave_one_host_test() ->
 %% --- helpers ---
 
 request_context() ->
-    #{
-        peer => {{127, 0, 0, 1}, 12345},
-        conn_info => fun(_Query) -> {error, unavailable} end,
-        scheme => https,
-        listener_name => h2_test,
-        request_id => ~"abc123",
-        headers_at => 0
-    }.
+    roadrunner_http:request_context(
+        {{127, 0, 0, 1}, 12345},
+        fun(_Query) -> {error, unavailable} end,
+        https,
+        h2_test,
+        ~"abc123",
+        0
+    ).
