@@ -63,12 +63,19 @@ body_framing_combines_transfer_encoding_lines_test_() ->
 
 body_framing_http10_transfer_encoding_test_() ->
     %% RFC 9112 §6.1: an HTTP/1.0 request with Transfer-Encoding has faulty
-    %% framing, `chunked` included; without one it frames as before.
+    %% framing (400), `chunked` included, and so has one ending in chunked
+    %% after an unsupported coding, which HTTP/1.1 answers 501. Without one
+    %% it frames as before.
     [
         ?_assertEqual(Want, roadrunner_conn:body_framing(Req))
      || {Req, Want} <- [
             {req_v10([{~"transfer-encoding", ~"chunked"}]), {error, bad_transfer_encoding}},
             {req_v10([{~"transfer-encoding", ~"gzip"}]), {error, bad_transfer_encoding}},
+            {req_v10([{~"transfer-encoding", ~"gzip, chunked"}]), {error, bad_transfer_encoding}},
+            {
+                req_with_headers([{~"transfer-encoding", ~"gzip, chunked"}]),
+                {error, unsupported_transfer_coding}
+            },
             {req_v10([{~"content-length", ~"3"}]), {content_length, 3}},
             {req_v10([]), none}
         ]
@@ -2744,6 +2751,11 @@ parse_error_status_request_line_too_long_test() ->
 parse_error_status_not_implemented_test() ->
     %% RFC 9110 §15.6.2: a method the server doesn't implement is a 501.
     ?assertEqual(501, roadrunner_conn:parse_error_status(not_implemented)).
+
+parse_error_status_unsupported_transfer_coding_test() ->
+    %% RFC 9112 §6.1: a transfer coding the server doesn't understand SHOULD
+    %% be answered 501.
+    ?assertEqual(501, roadrunner_conn:parse_error_status(unsupported_transfer_coding)).
 
 parse_error_status_header_too_long_test() ->
     ?assertEqual(431, roadrunner_conn:parse_error_status(header_too_long)).

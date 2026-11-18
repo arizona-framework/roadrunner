@@ -942,7 +942,7 @@ cached_decisions_full_map_test_() ->
                 framing => {error, bad_transfer_encoding}
             }},
             {[{~"transfer-encoding", ~"gzip"}, {~"transfer-encoding", ~"chunked"}], #{
-                framing => {error, bad_transfer_encoding}
+                framing => {error, unsupported_transfer_coding}
             }},
             {[{~"transfer-encoding", ~"chunked"}, {~"transfer-encoding", ~"chunked"}], #{
                 framing => {error, bad_transfer_encoding}
@@ -972,7 +972,7 @@ cached_decisions_full_map_test_() ->
                 framing => {error, bad_transfer_encoding}
             }},
             {[{~"transfer-encoding", ~"gzip, chunked"}], #{
-                framing => {error, bad_transfer_encoding}
+                framing => {error, unsupported_transfer_coding}
             }},
             {[{~"transfer-encoding", ~"chunked, chunked"}], #{
                 framing => {error, bad_transfer_encoding}
@@ -982,6 +982,32 @@ cached_decisions_full_map_test_() ->
             {[{~"transfer-encoding", ~"xchunked"}], #{framing => {error, bad_transfer_encoding}}},
             {[{~"transfer-encoding", ~""}], #{framing => {error, bad_transfer_encoding}}},
             {[{~"transfer-encoding", ~","}], #{framing => {error, bad_transfer_encoding}}},
+            % Ends in one chunked after codings roadrunner doesn't implement:
+            % the length is known but the body can't be decoded (501).
+            {[{~"transfer-encoding", ~"GZIP, deflate ,chunked"}], #{
+                framing => {error, unsupported_transfer_coding}
+            }},
+            {[{~"transfer-encoding", ~"gzip;q=1, chunked"}], #{
+                framing => {error, unsupported_transfer_coding}
+            }},
+            {[{~"transfer-encoding", ~"gzip"}, {~"transfer-encoding", ~", chunked"}], #{
+                framing => {error, unsupported_transfer_coding}
+            }},
+            {[{~"transfer-encoding", ~"gzip, chunked, chunked"}], #{
+                framing => {error, bad_transfer_encoding}
+            }},
+            {[{~"transfer-encoding", ~"gzip, chunked"}, {~"transfer-encoding", ~"gzip"}], #{
+                framing => {error, bad_transfer_encoding}
+            }},
+            {[{~"transfer-encoding", ~"gzip, chunked"}, {~"transfer-encoding", ~"chunked"}], #{
+                framing => {error, bad_transfer_encoding}
+            }},
+            {[{~"transfer-encoding", ~"gzip"}, {~"transfer-encoding", ~""}], #{
+                framing => {error, bad_transfer_encoding}
+            }},
+            {[{~"transfer-encoding", ~"gzip, deflate"}], #{
+                framing => {error, bad_transfer_encoding}
+            }},
             %% Empty list elements and the whitespace around them are skipped.
             {[{~"transfer-encoding", ~",chunked"}], #{framing => chunked}},
             {[{~"transfer-encoding", ~"chunked,"}], #{framing => chunked}},

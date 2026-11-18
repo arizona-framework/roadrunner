@@ -1195,7 +1195,7 @@ allow_header_value(Allowed) ->
 -spec read_body(
     chunked
     | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding},
+    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding},
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer(),
@@ -1533,7 +1533,7 @@ drop_delivered(StreamId) ->
     none
     | chunked
     | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding}.
+    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding}.
 body_framing(#{cached_decisions := Decisions} = Req) ->
     version_framing(roadrunner_http1:framing(Decisions), Req);
 body_framing(#{headers := Headers} = Req) ->
@@ -1549,21 +1549,24 @@ body_framing(#{headers := Headers} = Req) ->
 %% frame the body by Content-Length or by close instead, so its length
 %% cannot be determined reliably: answer it as RFC 9112 §6.3 answers a
 %% request whose length is unreliable, 400 and close, rather than read a
-%% body the hops may disagree on. Any other Transfer-Encoding is already an
-%% error on every version, so only `chunked` needs the version check.
+%% body the hops may disagree on. That includes a list ending in chunked
+%% after an unsupported coding, which HTTP/1.1 answers 501. Any other
+%% Transfer-Encoding is already a 400 on every version.
 -spec version_framing(
     none
     | chunked
     | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding},
+    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding},
     roadrunner_req:request()
 ) ->
     none
     | chunked
     | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding}.
+    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding}.
 version_framing(chunked, #{version := {1, 1}}) -> chunked;
+version_framing({error, unsupported_transfer_coding} = Err, #{version := {1, 1}}) -> Err;
 version_framing(chunked, _Req) -> {error, bad_transfer_encoding};
+version_framing({error, unsupported_transfer_coding}, _Req) -> {error, bad_transfer_encoding};
 version_framing(Framing, _Req) -> Framing.
 
 -spec read_body_until(
@@ -2308,6 +2311,7 @@ send_status(Socket, Status) ->
 -spec parse_error_status(atom()) -> roadrunner_http:status().
 parse_error_status(request_line_too_long) -> 414;
 parse_error_status(not_implemented) -> 501;
+parse_error_status(unsupported_transfer_coding) -> 501;
 parse_error_status(unsupported_expectation) -> 417;
 parse_error_status(header_too_long) -> 431;
 parse_error_status(header_block_too_long) -> 431;

@@ -82,19 +82,27 @@
 %% walk. `has_host` and `has_content_type` only feed `parse_request/2`'s
 %% checks; the rest is read through `framing/1`, `expectation/1` and
 %% `connection_lower/1`.
+%% A request body's framing, as `framing/1` reports it.
+-type framing() ::
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding}.
+
+%% The request's Transfer-Encoding list so far: absent, `chunked` alone,
+%% only other codings, other codings then a final `chunked`, or spoiled
+%% (chunked not last, chunked twice, or a line with no coding).
+-type te_state() :: none | chunked | other | coded_chunked | bad.
+
 -record(cached_decisions, {
-    framing ::
-        none
-        | chunked
-        | {content_length, non_neg_integer()}
-        | {error, bad_content_length | bad_transfer_encoding},
+    framing :: framing(),
     expectation :: none | continue | unsupported,
     connection_lower :: binary(),
     has_host :: boolean() | multiple | invalid,
     has_content_type :: boolean() | multiple
 }).
 -opaque cached_decisions() :: #cached_decisions{}.
--export_type([cached_decisions/0]).
+-export_type([cached_decisions/0, framing/0]).
 
 -doc """
 Parse the HTTP/1.1 request line.
@@ -917,7 +925,7 @@ check_cls_consistent(_, _) -> error.
 -doc false.
 -spec compute_cached_decisions(headers()) -> cached_decisions().
 compute_cached_decisions(Headers) ->
-    compute_cached_decisions_loop(Headers, false, false, none, ~"", none, false, false).
+    compute_cached_decisions_loop(Headers, none, none, ~"", none, false, false).
 
 %% The decisions travel as arguments and become the record once, at the
 %% end: updating a 7-key map per relevant header copied it each time, which
@@ -925,17 +933,16 @@ compute_cached_decisions(Headers) ->
 %% 50 ns more.
 -spec compute_cached_decisions_loop(
     headers(),
-    IsChunked :: boolean(),
-    HasTransferEncoding :: boolean(),
+    TransferEncoding :: te_state(),
     Expectation :: none | continue | unsupported,
     ConnectionLower :: binary(),
     ContentLength :: none | {ok, non_neg_integer()} | {error, bad_content_length},
     HasHost :: boolean() | multiple | invalid,
     HasContentType :: boolean() | multiple
 ) -> cached_decisions().
-compute_cached_decisions_loop([], Chunked, TE, Expect, Conn, CL, Host, CT) ->
+compute_cached_decisions_loop([], TE, Expect, Conn, CL, Host, CT) ->
     #cached_decisions{
-        framing = framing(Chunked, TE, CL),
+        framing = framing(TE, CL),
         expectation = Expect,
         connection_lower = Conn,
         has_host = Host,
@@ -946,27 +953,27 @@ compute_cached_decisions_loop([], Chunked, TE, Expect, Conn, CL, Host, CT) ->
 %% `ascii_lowercase/1` would walk it only to hand back the same term;
 %% matching the clause head compares it once instead.
 %%
-%% Transfer-Encoding lines combine into one list (RFC 9110 §5.3), and
-%% roadrunner frames only on a list that is exactly `chunked`: chunked must
-%% be the final coding and appear once (RFC 9112 §6.1, §6.3), and no other
-%% coding is supported. So the first line must be that list on its own, and
-%% any later line spoils it: it either adds a coding after chunked or
-%% repeats it. A spoiled list frames as `{error, bad_transfer_encoding}`
-%% (`framing/3`), which the conn answers with 400 and a close.
+%% Transfer-Encoding lines combine into one list (RFC 9110 §5.3), walked
+%% coding by coding across lines (`te_codings/3`). Only a list that is
+%% `chunked` alone frames the body. Chunked must be the final coding and
+%% appear once (RFC 9112 §6.1, §6.3), so a list where it is not last, or
+%% twice, frames as `{error, bad_transfer_encoding}` (400 and close). A list
+%% that ends in a single chunked after codings roadrunner doesn't implement
+%% (`gzip, chunked`) has a known length but a body it can't decode: that is
+%% `{error, unsupported_transfer_coding}`, answered 501 and close (RFC 9112
+%% §6.1: a server SHOULD answer a transfer coding it does not understand
+%% with 501). The common single `chunked` line takes the literal clause.
 compute_cached_decisions_loop(
-    [{~"transfer-encoding", ~"chunked"} | Rest], _Chunked, false, Expect, Conn, CL, Host, CT
+    [{~"transfer-encoding", ~"chunked"} | Rest], none, Expect, Conn, CL, Host, CT
 ) ->
-    compute_cached_decisions_loop(Rest, true, true, Expect, Conn, CL, Host, CT);
+    compute_cached_decisions_loop(Rest, chunked, Expect, Conn, CL, Host, CT);
 compute_cached_decisions_loop(
-    [{~"transfer-encoding", V} | Rest], _Chunked, false, Expect, Conn, CL, Host, CT
+    [{~"transfer-encoding", V} | Rest], TE, Expect, Conn, CL, Host, CT
 ) ->
-    Chunked = only_chunked(roadrunner_bin:ascii_lowercase(V)),
-    compute_cached_decisions_loop(Rest, Chunked, true, Expect, Conn, CL, Host, CT);
-compute_cached_decisions_loop(
-    [{~"transfer-encoding", _} | Rest], _Chunked, true, Expect, Conn, CL, Host, CT
-) ->
-    compute_cached_decisions_loop(Rest, false, true, Expect, Conn, CL, Host, CT);
-compute_cached_decisions_loop([{~"expect", V} | Rest], Chunked, TE, Was, Conn, CL, Host, CT) ->
+    compute_cached_decisions_loop(
+        Rest, te_codings(roadrunner_bin:ascii_lowercase(V), TE, false), Expect, Conn, CL, Host, CT
+    );
+compute_cached_decisions_loop([{~"expect", V} | Rest], TE, Was, Conn, CL, Host, CT) ->
     %% Every `Expect` line counts: one unsupported member anywhere makes
     %% the whole request's expectation unsupported.
     Expect =
@@ -975,96 +982,104 @@ compute_cached_decisions_loop([{~"expect", V} | Rest], Chunked, TE, Was, Conn, C
             {continue, none} -> continue;
             {_, This} -> This
         end,
-    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, CT);
+    compute_cached_decisions_loop(Rest, TE, Expect, Conn, CL, Host, CT);
 compute_cached_decisions_loop(
-    [{~"connection", ~"keep-alive"} | Rest], Chunked, TE, Expect, _Conn, CL, Host, CT
+    [{~"connection", ~"keep-alive"} | Rest], TE, Expect, _Conn, CL, Host, CT
 ) ->
-    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, ~"keep-alive", CL, Host, CT);
+    compute_cached_decisions_loop(Rest, TE, Expect, ~"keep-alive", CL, Host, CT);
 compute_cached_decisions_loop(
-    [{~"connection", ~"close"} | Rest], Chunked, TE, Expect, _Conn, CL, Host, CT
+    [{~"connection", ~"close"} | Rest], TE, Expect, _Conn, CL, Host, CT
 ) ->
-    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, ~"close", CL, Host, CT);
+    compute_cached_decisions_loop(Rest, TE, Expect, ~"close", CL, Host, CT);
 compute_cached_decisions_loop(
-    [{~"connection", V} | Rest], Chunked, TE, Expect, _Conn, CL, Host, CT
-) ->
-    compute_cached_decisions_loop(
-        Rest, Chunked, TE, Expect, roadrunner_bin:ascii_lowercase(V), CL, Host, CT
-    );
-compute_cached_decisions_loop(
-    [{~"content-length", V} | Rest], Chunked, TE, Expect, Conn, _CL, Host, CT
+    [{~"connection", V} | Rest], TE, Expect, _Conn, CL, Host, CT
 ) ->
     compute_cached_decisions_loop(
-        Rest, Chunked, TE, Expect, Conn, parse_content_length(V), Host, CT
+        Rest, TE, Expect, roadrunner_bin:ascii_lowercase(V), CL, Host, CT
     );
 compute_cached_decisions_loop(
-    [{~"content-type", _} | Rest], Chunked, TE, Expect, Conn, CL, Host, false
+    [{~"content-length", V} | Rest], TE, Expect, Conn, _CL, Host, CT
 ) ->
-    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, true);
+    compute_cached_decisions_loop(
+        Rest, TE, Expect, Conn, parse_content_length(V), Host, CT
+    );
 compute_cached_decisions_loop(
-    [{~"content-type", _} | Rest], Chunked, TE, Expect, Conn, CL, Host, _CT
+    [{~"content-type", _} | Rest], TE, Expect, Conn, CL, Host, false
+) ->
+    compute_cached_decisions_loop(Rest, TE, Expect, Conn, CL, Host, true);
+compute_cached_decisions_loop(
+    [{~"content-type", _} | Rest], TE, Expect, Conn, CL, Host, _CT
 ) ->
     %% Content-Type is a singleton field (RFC 9110 §5.3, §8.3): a second
     %% line leaves the body's media type ambiguous.
-    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, multiple);
-compute_cached_decisions_loop([{~"host", V} | Rest], Chunked, TE, Expect, Conn, CL, false, CT) ->
+    compute_cached_decisions_loop(Rest, TE, Expect, Conn, CL, Host, multiple);
+compute_cached_decisions_loop([{~"host", V} | Rest], TE, Expect, Conn, CL, false, CT) ->
     Host =
         case roadrunner_http:valid_host(V) of
             true -> true;
             false -> invalid
         end,
-    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, CT);
-compute_cached_decisions_loop([{~"host", _} | Rest], Chunked, TE, Expect, Conn, CL, _Host, CT) ->
+    compute_cached_decisions_loop(Rest, TE, Expect, Conn, CL, Host, CT);
+compute_cached_decisions_loop([{~"host", _} | Rest], TE, Expect, Conn, CL, _Host, CT) ->
     %% RFC 9112 §3.2: more than one Host field line is a 400.
-    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, multiple, CT);
-compute_cached_decisions_loop([_ | Rest], Chunked, TE, Expect, Conn, CL, Host, CT) ->
-    compute_cached_decisions_loop(Rest, Chunked, TE, Expect, Conn, CL, Host, CT).
+    compute_cached_decisions_loop(Rest, TE, Expect, Conn, CL, multiple, CT);
+compute_cached_decisions_loop([_ | Rest], TE, Expect, Conn, CL, Host, CT) ->
+    compute_cached_decisions_loop(Rest, TE, Expect, Conn, CL, Host, CT).
 
-%% Whether a lowercased Transfer-Encoding value lists `chunked` alone. Empty
-%% list elements and the whitespace around them are skipped (RFC 9110
-%% §5.6.1), so `, chunked` and `chunked ,` qualify; any other coding, a
-%% parameter, or a second `chunked` does not.
--spec only_chunked(binary()) -> boolean().
-only_chunked(<<C, Rest/binary>>) when C =:= $,; C =:= $\s; C =:= $\t ->
-    only_chunked(Rest);
-only_chunked(<<"chunked", Rest/binary>>) ->
-    only_separators(Rest);
-only_chunked(_) ->
-    false.
+%% One lowercased Transfer-Encoding line's codings folded into the state
+%% of the list so far. Empty list elements and the whitespace around them
+%% are skipped (RFC 9110 §5.6.1), so `, chunked` and `chunked ,` are
+%% `chunked`; a line with no coding at all spoils the list. A coding runs to
+%% the next comma, parameters included, and anything but a bare `chunked` is
+%% a coding roadrunner doesn't implement.
+-spec te_codings(binary(), te_state(), boolean()) -> te_state().
+te_codings(<<>>, State, true) ->
+    State;
+te_codings(<<>>, _State, false) ->
+    bad;
+te_codings(<<C, Rest/binary>>, State, Seen) when C =:= $,; C =:= $\s; C =:= $\t ->
+    te_codings(Rest, State, Seen);
+te_codings(<<"chunked">>, State, _Seen) ->
+    te_chunked(State);
+te_codings(<<"chunked", C, Rest/binary>>, State, _Seen) when
+    C =:= $,; C =:= $\s; C =:= $\t
+->
+    te_codings(Rest, te_chunked(State), true);
+te_codings(Bin, State, _Seen) ->
+    te_codings(skip_coding(Bin), te_other(State), true).
 
--spec only_separators(binary()) -> boolean().
-only_separators(<<>>) ->
-    true;
-only_separators(<<C, Rest/binary>>) when C =:= $,; C =:= $\s; C =:= $\t ->
-    only_separators(Rest);
-only_separators(_) ->
-    false.
+-spec skip_coding(binary()) -> binary().
+skip_coding(<<$,, _/binary>> = Bin) -> Bin;
+skip_coding(<<_, Rest/binary>>) -> skip_coding(Rest);
+skip_coding(<<>>) -> <<>>.
 
-%% The body's framing: a chunked Transfer-Encoding wins, any other
-%% coding is rejected (RFC 9112 §6.1: only identity and chunked are
-%% supported), and with no Transfer-Encoding the Content-Length decides.
-%% `parse_headers/2`'s `check_framing/1` has already rejected TE+CL
-%% combos and inconsistent repeated Content-Length lines.
--spec framing(
-    IsChunked :: boolean(),
-    HasTransferEncoding :: boolean(),
-    none | {ok, non_neg_integer()} | {error, bad_content_length}
-) ->
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding}.
-framing(true, _TE, _CL) -> chunked;
-framing(false, true, _CL) -> {error, bad_transfer_encoding};
-framing(false, false, none) -> none;
-framing(false, false, {ok, N}) -> {content_length, N};
-framing(false, false, {error, _} = Err) -> Err.
+%% `chunked` after the list so far: it may only come once, last.
+-spec te_chunked(te_state()) -> te_state().
+te_chunked(none) -> chunked;
+te_chunked(other) -> coded_chunked;
+te_chunked(_State) -> bad.
+
+%% Another coding after the list so far: never after chunked.
+-spec te_other(te_state()) -> te_state().
+te_other(none) -> other;
+te_other(other) -> other;
+te_other(_State) -> bad.
+
+%% The body's framing. With no Transfer-Encoding the Content-Length
+%% decides; `parse_headers/2`'s `check_framing/1` has already rejected
+%% TE+CL combos and inconsistent repeated Content-Length lines. Otherwise
+%% only `chunked` alone frames the body (see `compute_cached_decisions_loop`).
+-spec framing(te_state(), none | {ok, non_neg_integer()} | {error, bad_content_length}) ->
+    framing().
+framing(none, none) -> none;
+framing(none, {ok, N}) -> {content_length, N};
+framing(none, {error, _} = Err) -> Err;
+framing(chunked, _CL) -> chunked;
+framing(coded_chunked, _CL) -> {error, unsupported_transfer_coding};
+framing(_TE, _CL) -> {error, bad_transfer_encoding}.
 
 -doc false.
--spec framing(cached_decisions()) ->
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding}.
+-spec framing(cached_decisions()) -> framing().
 framing(#cached_decisions{framing = Framing}) -> Framing.
 
 -doc false.

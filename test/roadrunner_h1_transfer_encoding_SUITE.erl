@@ -3,6 +3,8 @@
 HTTP/1.1 request framing by `Transfer-Encoding` over a real socket. The
 field's lines combine into one list (RFC 9110 §5.3), and a list that is not
 `chunked` alone is answered 400 and the connection closed (RFC 9112 §6.3),
+or 501 and closed when it ends in chunked after a coding roadrunner doesn't
+implement (RFC 9112 §6.1),
 so a body framed differently by a proxy in front cannot smuggle a request.
 An HTTP/1.0 request with any `Transfer-Encoding` is answered the same way
 (RFC 9112 §6.1).
@@ -16,7 +18,11 @@ An HTTP/1.0 request with any `Transfer-Encoding` is answered the same way
 -export([init_per_group/2, end_per_group/2, init_per_testcase/2, end_per_testcase/2]).
 -export([
     chunked_then_gzip_lines_rejected/1,
-    gzip_then_chunked_lines_rejected/1,
+    gzip_then_chunked_lines_not_implemented/1,
+    gzip_then_chunked_line_not_implemented/1,
+    http10_gzip_then_chunked_rejected/1,
+    expect_continue_gzip_then_chunked_not_implemented/1,
+    expect_continue_chunked_not_final_rejected/1,
     chunked_twice_across_lines_rejected/1,
     chunked_with_empty_elements_accepted/1,
     http10_chunked_rejected/1,
@@ -32,7 +38,11 @@ all() ->
 groups() ->
     Cases = [
         chunked_then_gzip_lines_rejected,
-        gzip_then_chunked_lines_rejected,
+        gzip_then_chunked_lines_not_implemented,
+        gzip_then_chunked_line_not_implemented,
+        http10_gzip_then_chunked_rejected,
+        expect_continue_gzip_then_chunked_not_implemented,
+        expect_continue_chunked_not_final_rejected,
         chunked_twice_across_lines_rejected,
         chunked_with_empty_elements_accepted,
         http10_chunked_rejected,
@@ -73,10 +83,17 @@ chunked_then_gzip_lines_rejected(Config) ->
     %% coding, so the body's length is unknown.
     assert_rejected(?config(sock, Config), request([~"chunked", ~"gzip"])).
 
-gzip_then_chunked_lines_rejected(Config) ->
+gzip_then_chunked_lines_not_implemented(Config) ->
     %% `gzip, chunked` ends in chunked, but gzip is not a coding roadrunner
-    %% decodes.
-    assert_rejected(?config(sock, Config), request([~"gzip", ~"chunked"])).
+    %% decodes: RFC 9112 §6.1 SHOULD answer it 501.
+    assert_rejected(?config(sock, Config), request([~"gzip", ~"chunked"]), 501).
+
+gzip_then_chunked_line_not_implemented(Config) ->
+    assert_rejected(?config(sock, Config), request([~"gzip, chunked"]), 501).
+
+http10_gzip_then_chunked_rejected(Config) ->
+    %% HTTP/1.0 with Transfer-Encoding is faulty framing first: 400.
+    assert_rejected(?config(sock, Config), request(~"HTTP/1.0", [~"gzip, chunked"], [])).
 
 chunked_twice_across_lines_rejected(Config) ->
     %% RFC 9112 §6.1: chunked is applied at most once.
@@ -103,15 +120,41 @@ http10_chunked_with_content_length_rejected(Config) ->
         request(~"HTTP/1.0", [~"chunked"], [~"Content-Length: 15\r\n"])
     ).
 
+expect_continue_gzip_then_chunked_not_implemented(Config) ->
+    %% A client waiting on `100 Continue` gets the 501 instead, before it
+    %% sends a byte of the body it can't have read.
+    assert_refused_before_continue(?config(sock, Config), ~"gzip, chunked", 501).
+
+expect_continue_chunked_not_final_rejected(Config) ->
+    assert_refused_before_continue(?config(sock, Config), ~"chunked, gzip", 400).
+
 %% --- helpers ---
+
+%% The head alone, asking for `100 Continue`: the answer is the final
+%% status, with no interim 100 ahead of it, and the server closes.
+assert_refused_before_continue(Sock, TransferEncoding, Status) ->
+    ok = gen_tcp:send(Sock, [
+        ~"POST /echo-keepalive HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n",
+        ~"Transfer-Encoding: ",
+        TransferEncoding,
+        ~"\r\n\r\n"
+    ]),
+    Reply = recv_until_closed(Sock, <<>>),
+    Code = integer_to_binary(Status),
+    ?assertMatch(<<"HTTP/1.1 ", Code:3/binary, " ", _/binary>>, Reply),
+    ?assertEqual(nomatch, binary:match(Reply, ~"100 Continue")).
 
 %% The request carries a chunked body and, behind it, a second request a
 %% chunked reading would take as pipelined: neither must be answered past
-%% the 400, and the server closes.
+%% the error status, and the server closes.
 assert_rejected(Sock, Request) ->
+    assert_rejected(Sock, Request, 400).
+
+assert_rejected(Sock, Request, Status) ->
     ok = gen_tcp:send(Sock, [Request, ~"GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n"]),
     Reply = recv_until_closed(Sock, <<>>),
-    ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, Reply),
+    Code = integer_to_binary(Status),
+    ?assertMatch(<<"HTTP/1.1 ", Code:3/binary, " ", _/binary>>, Reply),
     ?assertEqual(nomatch, binary:match(Reply, ~"HTTP/1.1 ", [{scope, {1, byte_size(Reply) - 1}}])).
 
 request(Lines) ->
