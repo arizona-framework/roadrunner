@@ -398,8 +398,11 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `proxy_protocol`: `true` reads and strips the PROXY protocol header
   (HAProxy v1 / v2) an L4 balancer prepends, so `roadrunner_req:peer/1`
   is the real client. On TLS listeners the header is read before the
-  handshake. TCP only. Default `false`. Enable it only behind a balancer
-  that always sends the header, or a direct peer can spoof its address.
+  handshake. The whole header must arrive within `request_timeout`
+  (`tls_handshake_timeout` on TLS listeners), and on plain TCP keep up
+  with `min_bytes_per_second`. TCP only. Default `false`. Enable it only
+  behind a balancer that always sends the header, or a direct peer can
+  spoof its address.
 - `real_ip`: the real client IP behind HTTP reverse proxies, read from
   `X-Forwarded-For` (default) or `Forwarded` (`header => forwarded`).
   Set exactly one trust mode: `trusted_proxies => [CIDR]` (for example
