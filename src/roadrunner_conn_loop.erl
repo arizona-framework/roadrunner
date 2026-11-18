@@ -579,6 +579,11 @@ request_slot(_ProtoOpts) ->
 %% ClientHello, and bytes read past the header cannot be handed back to `ssl`,
 %% so the header is read exactly and `Leftover` is always empty. On plain TCP
 %% whatever arrived with the header is kept as the start of the first request.
+%%
+%% The whole header shares one deadline, so a peer that dribbles it out a
+%% byte at a time cannot hold the connection past that budget by restarting
+%% a per-read timeout. On plain TCP the reads also count toward
+%% `min_bytes_per_second`, like the request head that follows.
 -spec proxy_protocol_stage(
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
@@ -595,13 +600,22 @@ proxy_protocol_stage(
     %% it, so it shares the handshake bound rather than `request_timeout`:
     %% a peer that connects and sends nothing holds its slot no longer here
     %% than on a TLS listener without the PROXY protocol.
-    case read_proxy_header_exact(Socket, Timeout) of
+    case read_proxy_header_exact(Socket, erlang:monotonic_time(millisecond) + Timeout) of
         {ok, Peer, <<>>} -> {ok, Peer, <<>>};
         {local, <<>>} -> {ok, OsPeer, <<>>};
         {error, Reason} -> {close, Reason}
     end;
-proxy_protocol_stage(Socket, #proto_opts{proxy_protocol = true} = ProtoOpts, OsPeer) ->
-    read_proxy_header(Socket, ProtoOpts, OsPeer, <<>>).
+proxy_protocol_stage(
+    Socket,
+    #proto_opts{
+        proxy_protocol = true, request_timeout = Timeout, min_bytes_per_second = MinRate
+    },
+    OsPeer
+) ->
+    %% On plain TCP the header arrives in the bytes that start the first
+    %% request, so it gets the budget that request's head gets.
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    read_proxy_header(Socket, Deadline, MinRate, OsPeer, 0, <<>>).
 
 %% A v1 header (CRLF included) never exceeds 107 bytes (HAProxy spec §2.1).
 -define(PROXY_V1_MAX, 107).
@@ -619,28 +633,28 @@ proxy_protocol_stage(Socket, #proto_opts{proxy_protocol = true} = ProtoOpts, OsP
 %% first six bytes of its signature); a v2 prefix then declares the length of
 %% the rest, while a v1 line is read in one call with the socket in `line`
 %% packet mode, bounded at the spec's 107 bytes.
--spec read_proxy_header_exact(roadrunner_transport:socket(), timeout()) ->
+-spec read_proxy_header_exact(roadrunner_transport:socket(), integer()) ->
     {ok, {inet:ip_address(), inet:port_number()}, binary()}
     | {local, binary()}
     | more
     | {error, term()}.
-read_proxy_header_exact(Socket, Timeout) ->
+read_proxy_header_exact(Socket, Deadline) ->
     maybe
-        {ok, Head} ?= roadrunner_transport:recv(Socket, 6, Timeout),
-        {ok, Header} ?= read_proxy_header_rest(Head, Socket, Timeout),
+        {ok, Head} ?= roadrunner_transport:recv(Socket, 6, time_left(Deadline)),
+        {ok, Header} ?= read_proxy_header_rest(Head, Socket, Deadline),
         roadrunner_proxy_protocol:parse(Header)
     end.
 
--spec read_proxy_header_rest(binary(), roadrunner_transport:socket(), timeout()) ->
+-spec read_proxy_header_rest(binary(), roadrunner_transport:socket(), integer()) ->
     {ok, binary()} | {error, term()}.
-read_proxy_header_rest(~"PROXY ", Socket, Timeout) ->
-    read_proxy_v1_line(Socket, Timeout);
-read_proxy_header_rest(Head, Socket, Timeout) ->
+read_proxy_header_rest(~"PROXY ", Socket, Deadline) ->
+    read_proxy_v1_line(Socket, time_left(Deadline));
+read_proxy_header_rest(Head, Socket, Deadline) ->
     maybe
-        {ok, Rest} ?= roadrunner_transport:recv(Socket, 10, Timeout),
+        {ok, Rest} ?= roadrunner_transport:recv(Socket, 10, time_left(Deadline)),
         Prefix = <<Head/binary, Rest/binary>>,
         {ok, Len} ?= roadrunner_proxy_protocol:v2_body_length(Prefix),
-        {ok, Body} ?= recv_exact(Socket, Len, Timeout),
+        {ok, Body} ?= recv_exact(Socket, Len, time_left(Deadline)),
         {ok, <<Prefix/binary, Body/binary>>}
     end.
 
@@ -680,28 +694,59 @@ read_proxy_v1_line(Socket, Timeout) ->
 %% Plain TCP: the socket is passive at this phase, so read synchronously,
 %% accumulating until `roadrunner_proxy_protocol:parse/1` decides. The parser
 %% bounds the header size (v1 107 bytes, v2 by its declared length), so `Acc`
-%% cannot grow without bound, and each recv carries the per-request timeout
-%% against a dribbling sender. Over-reading is fine here: leftover bytes are
-%% the start of the first request and are threaded into its parse.
+%% cannot grow without bound. Every read waits only for what is left of the
+%% header's `Deadline`, and the bytes so far must keep up with `MinRate`
+%% (`roadrunner_conn:rate_ok/3`, with its grace) from `Start`, the arrival of
+%% the first byte, as the request head's bytes do. Over-reading is fine here:
+%% leftover bytes are the start of the first request and are threaded into
+%% its parse.
 -spec read_proxy_header(
     roadrunner_transport:socket(),
-    roadrunner_conn:proto_opts(),
+    integer(),
+    non_neg_integer(),
     {inet:ip_address(), inet:port_number()} | undefined,
+    integer(),
     binary()
 ) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
-read_proxy_header(Socket, #proto_opts{request_timeout = Timeout} = ProtoOpts, OsPeer, Acc) ->
-    case roadrunner_transport:recv(Socket, 0, Timeout) of
+read_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
+    case roadrunner_transport:recv(Socket, 0, time_left(Deadline)) of
         {ok, Bytes} ->
+            Now = erlang:monotonic_time(millisecond),
+            Start1 =
+                case Acc of
+                    <<>> -> Now;
+                    _ -> Start
+                end,
             Buf = <<Acc/binary, Bytes/binary>>,
-            case roadrunner_proxy_protocol:parse(Buf) of
-                {ok, Peer, Rest} -> {ok, Peer, Rest};
-                {local, Rest} -> {ok, OsPeer, Rest};
-                more -> read_proxy_header(Socket, ProtoOpts, OsPeer, Buf);
-                {error, Reason} -> {close, Reason}
+            case roadrunner_conn:rate_ok(Now - Start1, byte_size(Buf), MinRate) of
+                true -> parsed_proxy_header(Socket, Deadline, MinRate, OsPeer, Start1, Buf);
+                false -> {close, slow_client}
             end;
         {error, Reason} ->
             {close, Reason}
     end.
+
+-spec parsed_proxy_header(
+    roadrunner_transport:socket(),
+    integer(),
+    non_neg_integer(),
+    {inet:ip_address(), inet:port_number()} | undefined,
+    integer(),
+    binary()
+) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+parsed_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Buf) ->
+    case roadrunner_proxy_protocol:parse(Buf) of
+        {ok, Peer, Rest} -> {ok, Peer, Rest};
+        {local, Rest} -> {ok, OsPeer, Rest};
+        more -> read_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Buf);
+        {error, Reason} -> {close, Reason}
+    end.
+
+%% Milliseconds left before `Deadline`, none once it has passed (a zero
+%% timeout still returns bytes already buffered).
+-spec time_left(integer()) -> non_neg_integer().
+time_left(Deadline) ->
+    max(0, Deadline - erlang:monotonic_time(millisecond)).
 
 %% True iff the TLS handshake negotiated `h2`. Plain TCP and TLS
 %% sessions where the client picked `http/1.1` (or sent no ALPN)
