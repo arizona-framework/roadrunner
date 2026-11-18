@@ -373,8 +373,15 @@ Optional middleware and timing knobs (durations in milliseconds):
   Values above `recv_buffer` are lowered to it. An idle TLS connection
   holds no read buffer, so TLS listeners do not use it. See the
   `buffer` note in `base_listen_opts/2`.
-- `min_bytes_per_second`: slow-loris guard on the request-read
-  phase (0 disables). Default 100.
+- `min_bytes_per_second`: slow-loris guard on HTTP/1.1 request
+  heads and bodies (0 disables). Default 100. After a 1 s grace from a
+  request's first byte (from the start of its body, for the body), the
+  bytes so far must average at least this; a client that stops sending
+  falls below it as time passes and is closed then, before
+  `request_timeout`. Body bytes that came in with the head count. On a
+  plain-TCP listener that also serves HTTP/2, a connection whose bytes
+  so far are only a prefix of the HTTP/2 preface is held to
+  `request_timeout` alone.
 - `body_buffering`: `auto` (default; framework reads the full
   body before invoking the handler) or `manual` (handler calls
   `roadrunner_req:read_body/1,2`; a client sending

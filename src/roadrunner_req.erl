@@ -616,7 +616,8 @@ With `infinity`, a client that stops sending keeps the request, and its
 slot, until the client or its connection goes away, so set it only where
 a long, quiet body is expected. The connection's own limits still apply:
 on HTTP/1.1 the listener's `min_bytes_per_second`, as an average from the
-start of the body, waiting included (a long, quiet body there needs
+start of the body, waiting included, so a client that stops sending is
+closed once its average falls below it (a long, quiet body there needs
 `min_bytes_per_second => 0`); on HTTP/2, a PING after each
 `keep_alive_timeout` of silence, the connection closing if the next one
 passes with no answer, so a client that answers the PING keeps the

@@ -386,7 +386,7 @@ request_timeout_during_body_recv_writes_408_test() ->
 drain_during_message_body_exits_silently_test() ->
     %% Drain arriving while the conn is reading a message body — the
     %% path past the header parse, where the recv closure built by
-    %% `roadrunner_conn:make_recv/3` owns the socket. Each read is
+    %% `roadrunner_conn:make_recv/4` owns the socket. Each read is
     %% capped at the drain-check interval, so the tick after the drain
     %% lands closes the conn cleanly; without the cap the conn would
     %% hold the full request_timeout, outlive the drain deadline and be

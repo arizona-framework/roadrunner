@@ -173,9 +173,10 @@
     %% `recv_passive/2` tracks bytes received since `recv_phase_start`
     %% and closes the conn if the running average drops below
     %% `min_rate` after a 1 s grace (matches `roadrunner_conn:rate_ok/3`).
-    %% `recv_phase_bytes` is reset to 0 at every `read_request_phase`
-    %% entry; `recv_phase_start` is then anchored at the first byte of
-    %% that request (per-request window, idle keep-alive gap excluded).
+    %% `recv_phase_bytes` is reset at every `read_request_phase` entry:
+    %% to 0, with `recv_phase_start` then anchored at the first byte of
+    %% that request (per-request window, idle keep-alive gap excluded),
+    %% or to a pipelined leftover's size, with the window starting there.
     min_rate = 0 :: non_neg_integer(),
     recv_phase_start = 0 :: integer(),
     recv_phase_bytes = 0 :: non_neg_integer(),
@@ -438,7 +439,7 @@ sniff_preface(#loop_state{buffered = Buf} = S, Deadline) ->
     case roadrunner_conn_loop_http2:preface(Buf) of
         http1 ->
             ok = arm_reading(S),
-            handle_request_bytes(S, Deadline);
+            handle_request_bytes(proxy_leftover_anchored(S), Deadline);
         http2 ->
             #loop_state{
                 socket = Socket,
@@ -454,6 +455,19 @@ sniff_preface(#loop_state{buffered = Buf} = S, Deadline) ->
             sniff_recv(S, Deadline)
     end.
 
+%% A first request told apart from bytes that came in behind a PROXY
+%% header, which no read anchored: they are the request's first bytes,
+%% so its rate window starts now with them, as a pipelined leftover's
+%% does in `read_request_phase/1`. A read already anchored it otherwise.
+-spec proxy_leftover_anchored(#loop_state{}) -> #loop_state{}.
+proxy_leftover_anchored(#loop_state{recv_phase_bytes = 0, buffered = Buf} = S) ->
+    S#loop_state{
+        recv_phase_bytes = request_bytes(Buf),
+        recv_phase_start = erlang:monotonic_time(millisecond)
+    };
+proxy_leftover_anchored(S) ->
+    S.
+
 %% One read toward `sniff_preface/2`, armed `{active, once}` and parked
 %% in `receive` like `recv_idle/2`, so a drain is seen at once. The socket
 %% is passive again when the bytes arrive, as both loops expect it.
@@ -462,7 +476,6 @@ sniff_recv(
     #loop_state{
         socket = Socket,
         buffered = Buf,
-        recv_phase_start = PhaseStart,
         recv_phase_bytes = PhaseBytes,
         recv_mode = Mode
     } = S,
@@ -476,19 +489,18 @@ sniff_recv(
         {DataTag, _Sock, Bytes} ->
             %% The slowloris window opens at the first byte, so an HTTP/1.1
             %% request is measured from there once it is told apart.
-            PhaseStart1 =
-                case PhaseBytes of
-                    0 -> erlang:monotonic_time(millisecond);
-                    _ -> PhaseStart
-                end,
-            sniff_preface(
-                S#loop_state{
-                    buffered = roadrunner_bin:append(Buf, Bytes),
-                    recv_phase_bytes = PhaseBytes + byte_size(Bytes),
-                    recv_phase_start = PhaseStart1
-                },
-                Deadline
-            );
+            case PhaseBytes of
+                0 ->
+                    sniff_preface(anchored(S, Buf, Bytes), Deadline);
+                _ ->
+                    sniff_preface(
+                        S#loop_state{
+                            buffered = roadrunner_bin:append(Buf, Bytes),
+                            recv_phase_bytes = PhaseBytes + byte_size(Bytes)
+                        },
+                        Deadline
+                    )
+            end;
         {ClosedTag, _Sock} ->
             exit_normal(S, peer_closed);
         {ErrorTag, _Sock, Reason} ->
@@ -800,16 +812,50 @@ read_request_phase(#loop_state{buffered = Buf} = S) ->
     %% keep-alive gap before a reused connection's next request is not
     %% counted as slow transmission. `recv_phase_bytes =:= 0` is the
     %% "no byte yet this request" signal those paths key off to anchor.
-    S1 = S#loop_state{recv_phase_bytes = 0},
     case Buf of
         <<>> ->
-            recv_request_bytes(S1, Deadline);
+            recv_request_bytes(S#loop_state{recv_phase_bytes = 0}, Deadline);
         _ ->
             %% Pipelined leftover from a prior keep-alive iteration —
             %% try parsing it before reading more bytes. If the parse
             %% returns `{more, _}` we'll fall back to recv_request_bytes.
-            handle_request_bytes(S1, Deadline)
+            %% The leftover is this request's first bytes, so the rate
+            %% window starts now with them: a peer that stops partway
+            %% through a pipelined head is held to the rate like any other.
+            %% A leftover that is only the CRLF a client may send after a
+            %% body (`request_bytes/1`) counts as no bytes, so
+            %% the connection still waits idle for its next request.
+            handle_request_bytes(
+                S#loop_state{
+                    recv_phase_bytes = request_bytes(Buf), recv_phase_start = Now
+                },
+                Deadline
+            )
     end.
+
+%% How many of a request buffer's bytes are the request's, past the one
+%% empty line RFC 9112 §2.2 lets a client send before its request line
+%% (the parser skips it too). A buffer of only that line, or of its first
+%% byte, holds none: the request has not begun, so the connection still
+%% waits idle for it, with no rate window, until its deadline.
+%% `anchored/3` and the pipelined-leftover path count with it.
+-spec request_bytes(binary()) -> non_neg_integer().
+request_bytes(<<"\r\n", Rest/binary>>) -> byte_size(Rest);
+request_bytes(<<"\r">>) -> 0;
+request_bytes(Buf) -> byte_size(Buf).
+
+%% A request's first read: `Bytes` joins the buffer, and the slowloris
+%% window opens now with the buffer's request bytes. While there are none
+%% (only the empty line a client may send first) the window stays shut,
+%% and the next read anchors it again.
+-spec anchored(#loop_state{}, binary(), binary()) -> #loop_state{}.
+anchored(S, Buf, Bytes) ->
+    NewBuf = roadrunner_bin:append(Buf, Bytes),
+    S#loop_state{
+        buffered = NewBuf,
+        recv_phase_bytes = request_bytes(NewBuf),
+        recv_phase_start = erlang:monotonic_time(millisecond)
+    }.
 
 %% First requests use `request_timeout`; keep-alive loop-backs use
 %% `keep_alive_timeout` (typically shorter — connections that have
@@ -868,14 +914,7 @@ recv_idle(#loop_state{socket = Socket, buffered = Buf} = S, Deadline) ->
             %% here: the window is zero-length at its own anchor, so the
             %% first chunk always passes. `recv_passive/2` measures every
             %% chunk after it.
-            handle_request_bytes(
-                S#loop_state{
-                    buffered = roadrunner_bin:append(Buf, Bytes),
-                    recv_phase_bytes = byte_size(Bytes),
-                    recv_phase_start = erlang:monotonic_time(millisecond)
-                },
-                Deadline
-            );
+            handle_request_bytes(anchored(S, Buf, Bytes), Deadline);
         {ClosedTag, _Sock} ->
             exit_normal(S, peer_closed);
         {ErrorTag, _Sock, Reason} ->
@@ -969,9 +1008,19 @@ recv_passive(
                     timeout_response(S),
                     exit_normal(S, timeout_reason(S));
                 {error, timeout} ->
-                    %% Drain-check tick. Loop back to the mailbox
-                    %% drain + recv.
-                    recv_passive(S, Deadline);
+                    %% Drain-check tick. Silence counts toward the rate
+                    %% too: a peer that stopped sending mid-request is
+                    %% closed once the bytes so far fall below `min_rate`,
+                    %% not left until the deadline. Otherwise loop back to
+                    %% the mailbox drain + recv.
+                    case
+                        roadrunner_conn:rate_ok(
+                            erlang:monotonic_time(millisecond) - PhaseStart, PhaseBytes, MinRate
+                        )
+                    of
+                        true -> recv_passive(S, Deadline);
+                        false -> exit_normal(S, slow_client)
+                    end;
                 {error, Reason} ->
                     %% Peer close, kernel error, etc. Silent exit.
                     exit_normal(S, transport_reason(Reason))
@@ -996,16 +1045,18 @@ drain_mailbox_check() ->
 
 %% Recv path in `receive`: every read of an `{active, N}` socket, and
 %% every read of an `{active, once}` one when the conn hibernates. The
-%% receive's `after` covers both the hibernate trigger and the
-%% request/keep-alive deadline: it waits `min(HibernateAfter, Remaining)`,
-%% and on firing either times the conn out (the deadline came first) or
-%% hibernates (`infinity` never does). A busy conn therefore
-%% arms no timer per recv. Only a conn about to hibernate arms one, an
-%% absolute `start_timer` at the deadline, because a hibernated process
-%% only wakes on a message: without it an idle conn would outlive its
-%% `keep_alive_timeout` / `request_timeout` for as long as the peer
-%% stays silent. On wake the function re-enters via
-%% `recv_request_bytes_hib/3`, which drops that timer first.
+%% receive's `after` covers the hibernate trigger, the request/keep-alive
+%% deadline and, mid-request, the moment silence would drop the bytes so
+%% far below `min_rate` (`Wake`, the earlier of the two): it waits
+%% `min(HibernateAfter, Remaining)`, and on firing either closes the conn
+%% (the deadline or the rate came first) or hibernates (`infinity` never
+%% does). A busy conn therefore arms no timer per recv. Only a conn about
+%% to hibernate arms one, an absolute `start_timer` at `Wake`, because a
+%% hibernated process only wakes on a message: without it an idle conn
+%% would outlive its `keep_alive_timeout` / `request_timeout`, or a
+%% stalled one its rate, for as long as the peer stays silent. On wake
+%% the function re-enters via `recv_request_bytes_hib/3`, which drops
+%% that timer first.
 -spec recv_active(#loop_state{}, integer(), pos_integer() | infinity) -> no_return().
 recv_active(
     #loop_state{
@@ -1021,32 +1072,34 @@ recv_active(
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
     PassiveTag = roadrunner_transport:passive_message(Socket),
     Active = active_count(S#loop_state.recv_mode),
-    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    %% Waiting for a request's first byte is idle time, not slow sending,
+    %% so the rate only bounds the wait once the request has begun.
+    Wake =
+        case PhaseBytes of
+            0 -> Deadline;
+            _ -> min(Deadline, roadrunner_conn:rate_deadline(PhaseStart, PhaseBytes, MinRate))
+        end,
+    Remaining = max(0, Wake - erlang:monotonic_time(millisecond)),
     receive
         {DataTag, _Sock, Bytes} ->
-            Now = erlang:monotonic_time(millisecond),
             %% Anchor the slowloris window at the first byte of the
             %% request (`PhaseBytes =:= 0`), not at phase entry, so an
             %% idle keep-alive gap before a reused connection's next
-            %% request is not counted as slow transmission.
-            PhaseStart1 =
-                case PhaseBytes of
-                    0 -> Now;
-                    _ -> PhaseStart
-                end,
-            NewBytes = PhaseBytes + byte_size(Bytes),
-            case roadrunner_conn:rate_ok(Now - PhaseStart1, NewBytes, MinRate) of
-                true ->
+            %% request is not counted as slow transmission. No rate check
+            %% here: more bytes only raise the average, and the next wait
+            %% ends at `Wake` from the new total, so a peer below the rate
+            %% is closed there, as soon as it leaves a gap.
+            case PhaseBytes of
+                0 ->
+                    handle_request_bytes(anchored(S, Buf, Bytes), Deadline);
+                _ ->
                     handle_request_bytes(
                         S#loop_state{
                             buffered = roadrunner_bin:append(Buf, Bytes),
-                            recv_phase_bytes = NewBytes,
-                            recv_phase_start = PhaseStart1
+                            recv_phase_bytes = PhaseBytes + byte_size(Bytes)
                         },
                         Deadline
-                    );
-                false ->
-                    exit_normal(S, slow_client)
+                    )
             end;
         {ClosedTag, _Sock} ->
             exit_normal(S, peer_closed);
@@ -1064,18 +1117,27 @@ recv_active(
     after min(HibernateAfter, Remaining) ->
         case Remaining =< HibernateAfter of
             true ->
-                timeout_response(S),
-                exit_normal(S, timeout_reason(S));
+                rate_or_deadline_passed(S, Wake, Deadline);
             false ->
                 %% Idle window elapsed with the deadline still ahead.
                 %% The heap GCs and shrinks; the next inbound packet,
-                %% or the deadline timer, wakes the conn.
+                %% or the `Wake` timer, wakes the conn.
                 %% The floor drops first, or the conn would wake at it.
                 S1 = reset_heap_floor(S),
-                TRef = erlang:start_timer(Deadline, self(), ?MODULE, [{abs, true}]),
+                TRef = erlang:start_timer(Wake, self(), ?MODULE, [{abs, true}]),
                 erlang:hibernate(?MODULE, recv_request_bytes_hib, [S1, Deadline, TRef])
         end
     end.
+
+%% `recv_active/3`'s wait ran out at `Wake`: the request/keep-alive
+%% deadline, or, before it, the point where the silent peer's bytes fell
+%% below `min_rate`.
+-spec rate_or_deadline_passed(#loop_state{}, integer(), integer()) -> no_return().
+rate_or_deadline_passed(S, Deadline, Deadline) ->
+    timeout_response(S),
+    exit_normal(S, timeout_reason(S));
+rate_or_deadline_passed(S, _Wake, _Deadline) ->
+    exit_normal(S, slow_client).
 
 %% Hibernate continuation. Drops the deadline timer armed before
 %% hibernating, then re-enters `recv_request_bytes/2` so the next
@@ -1484,7 +1546,7 @@ read_body(manual, Answer, S, Req, Framing, MaxCL, Resolved, Deadline) ->
     BodyState = roadrunner_conn:make_body_reader(
         Framing,
         S#loop_state.buffered,
-        roadrunner_conn:make_reader_recv(Socket, MinRate),
+        roadrunner_conn:make_reader_recv(Socket, MinRate, byte_size(S#loop_state.buffered)),
         MaxCL,
         trailer_limits(S),
         Deadline
@@ -1548,8 +1610,8 @@ read_auto_body(
 %% deadline, with the anti-slowloris rate anchored at this call.
 -spec body_recv(#loop_state{}, integer()) ->
     fun(() -> {ok, binary()} | {error, term()}).
-body_recv(#loop_state{socket = Socket, min_rate = MinRate}, Deadline) ->
-    roadrunner_conn:make_recv(Socket, Deadline, MinRate).
+body_recv(#loop_state{socket = Socket, min_rate = MinRate, buffered = Buffered}, Deadline) ->
+    roadrunner_conn:make_recv(Socket, Deadline, MinRate, byte_size(Buffered)).
 
 %% Trailer headers (chunked bodies) obey the same caps as request
 %% headers; the request-line cap doesn't apply to a trailer block.
