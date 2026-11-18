@@ -225,23 +225,24 @@ a default no real client meets, and the tests.
 bounded by the client's own sending rate and by `max_clients`, and none
 of these frames holds memory or keeps an idle connection open now.
 
-### CI bench-vs-baseline comparison
+### CI performance regression check — medium
 
-**What:** The `Bench` workflow (`.github/workflows/bench.yml`) writes its
-result to the step summary and already uploads `bench.log` as a
-downloadable artifact. The remaining follow-up is a comparison step (or
-dashboard) that diffs a PR run against a baseline (e.g. `main` HEAD) and
-surfaces the delta.
+**What:** a CI job that catches a performance regression before merge.
+Timing on shared CI runners is too noisy to gate on, so the check counts
+work instead: for each bench scenario, the reductions, words allocated,
+garbage collections and messages or socket sends per request, measured
+on one connection with a fixed number of requests after a warm-up, on
+`+S 1`, with `main` and the pull request built and run in the same job.
+The first step is a stability check (`main` against itself, many times,
+on CI and on a loaded machine); only if the counts stay within about
+0.5% does the job fail a pull request past a small threshold.
 
-**Why deferred:** GH free runners are too noisy for automated
-regression gating (deltas under ~15 % are inside variance per
-`scripts/bench.escript`'s own NOTE). A useful comparison needs a
-baseline-collection strategy that filters noise (multi-sample on
-both sides, distribution stats, alerting only on shifts well outside
-variance). Eyeball-from-summary covers the v1 use case.
+**Why deferred:** counts miss native time (BIFs, NIFs, zlib, crypto, the
+kernel) and scheduling effects such as accept latency, so a local
+two-sided A/B stays the check before a performance-sensitive change
+merges. The CI job is a safety net on top of it.
 
-**Scope:** medium. The parser, distribution stats, baseline storage, and
-presentation are the bulk; the artifact upload already ships.
+**Scope:** medium.
 
 ### Extend the erlang_quic h3 comparison past the small-response scenarios
 
@@ -279,20 +280,54 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 **Scope:** small per attribute. Add when a real caller hits the gap.
 
+### Count a crashed connection's running handlers — medium
+
+**What:** when a connection process crashes or is killed, the listener
+takes back its request slots on the next `slot_reconciliation` tick.
+The handlers it leaves running stop counting toward
+`max_concurrent_requests` at that point, so until they end the server
+can run that many more than the limit. With `graceful_drain => false`
+there is no connection registry, so a crashed connection's slots are
+not taken back at all. Counting each handler until it ends whatever
+happens to its connection needs the handler registered with the slot
+keeper as it starts.
+
+**Why deferred:** registering every handler costs a message per
+request, and a connection process only dies this way through a bug, a
+`max_heap_size` kill or an operator; a clean close already keeps its
+handlers counted until they end.
+
+**Scope:** medium.
+
+### Load-sensitive HTTP/2 connection-loop tests — small
+
+**What:** many cases in `roadrunner_conn_loop_http2_tests` wait 500 ms
+for the connection to send or close on a fake socket, and a few must
+answer a liveness PING within a 100 ms idle timeout. On a machine with
+its CPUs fully busy they fail (no send in time); they pass in normal
+runs and in CI. Longer waits for sends and closes, and a larger idle
+timeout where a test only needs the ordering, would make them hold
+under load.
+
+**Why deferred:** seen only under deliberate CPU starvation, never in a
+gate or CI run.
+
+**Scope:** small.
+
 ### Cheaper accepts under load — medium
 
-**What:** an acceptor still gives up its scheduler a few times per accept
+**What:** acceptors run at high priority by default (`accept_priority`),
+so a busy server takes new connections from the kernel queue promptly.
+Each accept still gives up the scheduler a few times
 (`controlling_process` and the inet port calls on the shared listen
-socket), and under load each wait sits behind busy connection
-processes. When hundreds of clients connect at once to a busy server,
-the last ones wait tens of milliseconds to be accepted. Two ways to
-remove most of that cost: the acceptor becomes the connection and
-spawns its replacement (no handoff), or one listen socket per scheduler
-with `reuseport`.
+socket), and on a TLS listener it also waits on the `ssl` application's
+own processes, which run at normal priority. Two ways to remove most of
+that cost: the acceptor becomes the connection and spawns its
+replacement (no handoff), or one listen socket per scheduler with
+`reuseport`.
 
-**Why deferred:** both change the acceptor pool's design. Running
-acceptors at high priority cut the wait further but cost about 2.5% of
-new connections per second, so it was not kept.
+**Why deferred:** high priority already removes most of the wait on
+plain TCP; both remaining options change the acceptor pool's design.
 
 **Scope:** medium.
 
