@@ -548,8 +548,9 @@ rst_stream_during_blocked_stream_send_wakes_worker(_Config) ->
 start_conn(Handler) ->
     start_conn(Handler, #{}).
 
-start_conn(Handler, Extra) ->
+start_conn(Handler, Extra0) ->
     Self = self(),
+    Extra = roadrunner_test_proto_opts:with_slot_keeper(Extra0),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     ProtoOpts = roadrunner_test_proto_opts:new(

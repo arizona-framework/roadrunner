@@ -192,7 +192,13 @@
     %% knows whether it has a slot to hand back.
     request_slot = undefined ::
         undefined
-        | {idle | held, pos_integer(), counters:counters_ref(), roadrunner_conn:overload()},
+        | {
+            idle | held,
+            pos_integer(),
+            counters:counters_ref(),
+            atomics:atomics_ref(),
+            roadrunner_conn:overload()
+        },
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
     %% otherwise, the common case, so the request path resolves nothing.
@@ -211,7 +217,10 @@
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.
-start(Socket, #proto_opts{handler_spawn_opts = SpawnOpts} = ProtoOpts) ->
+start(Socket, #proto_opts{handler_spawn_opts = SpawnOpts} = ProtoOpts0) ->
+    %% Its own in-flight cell when the ceiling is finite, created here so
+    %% the drain-registry row the listener's reaper reads carries it.
+    ProtoOpts = roadrunner_conn:with_slot_cell(ProtoOpts0),
     %% Unlinked from the acceptor, so a single-conn crash never reaches the
     %% acceptor pool. Spawned without an init-ack wait: the acceptor hands
     %% the socket over (`controlling_process` then `! shoot`) and goes back
@@ -572,13 +581,21 @@ arm_reading(#loop_state{recv_mode = Mode} = S) ->
 %% already does for HTTP/1, while a shed budget that HTTP/1 traffic could
 %% run past would shed nothing.
 -spec request_slot(roadrunner_conn:proto_opts()) ->
-    undefined | {idle, pos_integer(), counters:counters_ref(), roadrunner_conn:overload()}.
+    undefined
+    | {
+        idle,
+        pos_integer(),
+        counters:counters_ref(),
+        atomics:atomics_ref(),
+        roadrunner_conn:overload()
+    }.
 request_slot(#proto_opts{
     overload = {shed, _} = Overload,
     max_concurrent_requests = Max,
-    inflight_counter = Counter
+    inflight_counter = Counter,
+    slot_cell = Cell
 }) ->
-    {idle, Max, Counter, Overload};
+    {idle, Max, Counter, Cell, Overload};
 request_slot(_ProtoOpts) ->
     undefined.
 
@@ -1274,11 +1291,11 @@ read_body_phase(
 -spec admit(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
 admit(#loop_state{request_slot = undefined} = S, Req, Deadline) ->
     route_and_read(S, Req, Deadline);
-admit(#loop_state{request_slot = {idle, Max, Counter, Overload}} = S, Req, Deadline) ->
-    case roadrunner_conn:acquire_request_slot(Max, Counter, Overload, h1) of
+admit(#loop_state{request_slot = {idle, Max, Counter, Cell, Overload}} = S, Req, Deadline) ->
+    case roadrunner_conn:acquire_request_slot(Max, Counter, Cell, Overload, h1) of
         true ->
             route_and_read(
-                S#loop_state{request_slot = {held, Max, Counter, Overload}}, Req, Deadline
+                S#loop_state{request_slot = {held, Max, Counter, Cell, Overload}}, Req, Deadline
             );
         {shed, RetryAfter} ->
             #loop_state{
@@ -1292,9 +1309,9 @@ admit(#loop_state{request_slot = {idle, Max, Counter, Overload}} = S, Req, Deadl
 %% next request on a kept-alive connection, on the way out, or as a
 %% WebSocket session starts.
 -spec release_request_slot(#loop_state{}) -> #loop_state{}.
-release_request_slot(#loop_state{request_slot = {held, Max, Counter, Overload}} = S) ->
-    ok = roadrunner_conn:release_request_slot(Max, Counter, Overload),
-    S#loop_state{request_slot = {idle, Max, Counter, Overload}};
+release_request_slot(#loop_state{request_slot = {held, Max, Counter, Cell, Overload}} = S) ->
+    ok = roadrunner_conn:release_request_slot(Max, Counter, Cell, Overload),
+    S#loop_state{request_slot = {idle, Max, Counter, Cell, Overload}};
 release_request_slot(S) ->
     S.
 

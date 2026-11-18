@@ -15,7 +15,7 @@
 %% and the connection releases it on the worker's `DOWN`. Workers are
 %% monitored, not linked, so they can outlive their connection (the client
 %% went away, or a drain ended it). A closing connection hands the workers
-%% still running to this process (`adopt/2`), which monitors them and
+%% still running to this process (`adopt/4`), which monitors them and
 %% releases each slot as its worker ends. Without that, a client could fill
 %% the ceiling with slow handlers, drop the connection, reconnect and
 %% repeat, running any number of handlers past it.
@@ -24,10 +24,14 @@
 %% multiplexed connection releases in-flight slots by processing its own
 %% workers' `DOWN` messages, so a loop that blocked waiting for a slot
 %% would stop reading the very messages that free one and park forever.
-%% Callers therefore `enqueue/3` and go back to their frame loop; the
-%% grant arrives later as a message. Only `adopt/2` waits for a reply,
-%% and only from a connection on its way out, which frees no slot by
-%% reading its mailbox any more.
+%% Callers therefore `enqueue/4` and go back to their frame loop; the
+%% grant arrives later as a message.
+%%
+%% Each connection keeps its own count of the slots it holds, an
+%% `atomics` cell (`roadrunner_conn:with_slot_cell/1`). A grant adds to it
+%% before it is sent. A connection that dies without its exit path has
+%% the cell emptied here, when it was parked, or by the listener's reaper
+%% otherwise; `atomics:exchange/3` makes every slot released exactly once.
 %%
 %% The queue sits on the slow path only. Taking a slot is a plain
 %% `counters` operation in the caller, and this process is consulted
@@ -36,12 +40,12 @@
 
 -export([
     start_link/3,
-    enqueue/3,
+    enqueue/4,
     cancel/2,
     note_release/1,
     waiting/1,
     waiters_ref/1,
-    adopt/2
+    adopt/4
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -51,6 +55,9 @@
 -record(entry, {
     pid :: pid(),
     token :: term(),
+    %% The caller's in-flight cell: a grant adds its slot to it before it
+    %% is sent, so a slot on its way to a conn is already the conn's.
+    cell :: atomics:atomics_ref(),
     monitor :: reference(),
     timer :: reference()
 }).
@@ -67,7 +74,7 @@
     order = queue:new() :: queue:queue(key()),
     live = #{} :: #{key() => #entry{}},
     %% The monitors of workers whose connection closed while they ran
-    %% (`adopt/2`). Each holds one slot, released on its `DOWN`.
+    %% (`adopt/4`). Each holds one slot, released on its `DOWN`.
     adopted = #{} :: #{reference() => []}
 }).
 
@@ -84,9 +91,9 @@ start_link(Max, Counter, MaxQueued) ->
 %% message means the slot has ALREADY been taken on the caller's behalf,
 %% so a caller that no longer wants it must release it rather than drop
 %% it.
--spec enqueue(pid(), term(), pos_integer()) -> ok.
-enqueue(Pid, Token, Timeout) ->
-    gen_server:cast(Pid, {enqueue, self(), Token, Timeout}).
+-spec enqueue(pid(), term(), atomics:atomics_ref(), pos_integer()) -> ok.
+enqueue(Pid, Token, Cell, Timeout) ->
+    gen_server:cast(Pid, {enqueue, self(), Token, Cell, Timeout}).
 
 %% Withdraw a parked request (the stream was reset, or its connection is
 %% going away). Racing a grant is expected and safe: the caller may still
@@ -110,30 +117,17 @@ waiters_ref(Pid) ->
 
 %% Hand the in-flight slots of `Workers`, the handlers still running as the
 %% calling connection closes, to the keeper at `Pid`, which releases each
-%% one when its worker ends, and withdraw every request the caller has
-%% parked. A worker already gone is released at once. Synchronous, so once
-%% it returns no grant is still on its way to the caller: the grants that
-%% raced it are already in the caller's mailbox, and their number is
-%% returned for the caller to give back. A keeper already gone went down
-%% with its listener, whose counter nothing reads any more.
--spec adopt(pid(), [pid()]) -> non_neg_integer().
-adopt(Pid, Workers) ->
-    Mon = erlang:monitor(process, Pid),
-    _ = erlang:send(Pid, {adopt, self(), Mon, Workers}),
-    receive
-        {Mon, adopted} ->
-            true = erlang:demonitor(Mon, [flush]),
-            stale_grants(0);
-        {'DOWN', Mon, process, Pid, _Reason} ->
-            0
-    end.
-
--spec stale_grants(non_neg_integer()) -> non_neg_integer().
-stale_grants(N) ->
-    receive
-        {roadrunner_slot, _Token, granted} -> stale_grants(N + 1)
-    after 0 -> N
-    end.
+%% one when its worker ends (at once for one already gone), and withdraw
+%% every request the caller has parked. The caller has emptied its `Cell`
+%% already: `Raced` are the grants it held beyond its workers, released at
+%% once, and the keeper empties the cell again once the caller's parked
+%% requests are withdrawn, for a grant sent in between. Asynchronous: the
+%% caller is exiting. A keeper already gone went down with its listener,
+%% whose counter nothing reads any more.
+-spec adopt(pid(), atomics:atomics_ref(), [pid()], non_neg_integer()) -> ok.
+adopt(Pid, Cell, Workers, Raced) ->
+    _ = erlang:send(Pid, {adopt, self(), Cell, Workers, Raced}),
+    ok.
 
 -spec init({pos_integer(), counters:counters_ref(), pos_integer()}) -> {ok, #state{}}.
 init({Max, Counter, MaxQueued}) ->
@@ -152,7 +146,7 @@ handle_call(_Other, _From, State) ->
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast(
-    {enqueue, Pid, Token, _Timeout}, #state{live = Live, max_queued = MaxQueued} = State
+    {enqueue, Pid, Token, _Cell, _Timeout}, #state{live = Live, max_queued = MaxQueued} = State
 ) when
     map_size(Live) >= MaxQueued
 ->
@@ -160,12 +154,13 @@ handle_cast(
     %% without bound. The caller refuses the request as it does today.
     _ = erlang:send(Pid, {roadrunner_slot, Token, full}),
     {noreply, State};
-handle_cast({enqueue, Pid, Token, Timeout}, State) ->
+handle_cast({enqueue, Pid, Token, Cell, Timeout}, State) ->
     #state{order = Order, live = Live, waiters = Waiters} = State,
     Key = {Pid, Token},
     Entry = #entry{
         pid = Pid,
         token = Token,
+        cell = Cell,
         monitor = erlang:monitor(process, Pid),
         timer = erlang:send_after(Timeout, self(), {expire, Key})
     },
@@ -188,28 +183,35 @@ handle_info(slot_freed, State) ->
     {noreply, serve(State)};
 handle_info({expire, Key}, State) ->
     {noreply, resolve(Key, timeout, State)};
-handle_info({adopt, Conn, Ref, Workers}, #state{adopted = Adopted, live = Live} = State) ->
+handle_info(
+    {adopt, Conn, Cell, Workers, Raced}, #state{adopted = Adopted, live = Live} = State
+) ->
+    %% The connection's parked requests have no stream left to serve. Once
+    %% they are gone no grant can reach its cell, so what it holds now is
+    %% the last of the grants that raced the close.
+    Parked = [Key || {ConnPid, _Token} = Key <- maps:keys(Live), ConnPid =:= Conn],
+    State1 = lists:foldl(fun forget/2, State, Parked),
     Adopted1 = lists:foldl(
         fun(Worker, Acc) -> Acc#{erlang:monitor(process, Worker) => []} end, Adopted, Workers
     ),
-    %% The connection's parked requests have no stream left to serve.
-    Parked = [Key || {ConnPid, _Token} = Key <- maps:keys(Live), ConnPid =:= Conn],
-    State1 = lists:foldl(fun forget/2, State#state{adopted = Adopted1}, Parked),
-    _ = erlang:send(Conn, {Ref, adopted}),
-    {noreply, State1};
+    Late = atomics:exchange(Cell, 1, 0),
+    {noreply, release(Raced + Late, State1#state{adopted = Adopted1})};
 handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{adopted = Adopted} = State) when
     is_map_key(Mon, Adopted)
 ->
     %% A handler that outlived its connection ended: its slot is free, and
     %% the oldest parked request may take it.
-    #state{counter = Counter} = State,
-    ok = counters:sub(Counter, 1, 1),
-    {noreply, serve(State#state{adopted = maps:remove(Mon, Adopted)})};
+    {noreply, release(1, State#state{adopted = maps:remove(Mon, Adopted)})};
 handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{live = Live} = State) ->
     %% A parked connection died. Drop everything it was waiting on; no
-    %% slot was taken for those entries, so nothing leaks.
-    Keys = [K || {K, #entry{monitor = M}} <- maps:to_list(Live), M =:= Mon],
-    {noreply, lists:foldl(fun forget/2, State, Keys)};
+    %% slot was taken for those entries. If it died without its exit path,
+    %% the slots it still held (its workers', and grants it never read) are
+    %% reclaimed from its cell: emptied, so the listener's reaper or the
+    %% connection's own exit path cannot release them again.
+    [#entry{pid = Pid, token = Token, cell = Cell}] =
+        [E || _ := #entry{monitor = M} = E <- Live, M =:= Mon],
+    State1 = forget({Pid, Token}, State),
+    {noreply, release(atomics:exchange(Cell, 1, 0), State1)};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -221,18 +223,43 @@ serve(#state{max = Max, counter = Counter} = State) ->
     case next(State) of
         empty ->
             State;
-        {Key, #entry{pid = Pid, token = Token} = Entry, State1} ->
+        {Key, #entry{pid = Pid, token = Token, cell = Cell} = Entry, State1} ->
             case roadrunner_conn:try_acquire_request_slot(Max, Counter) of
                 true ->
                     ok = cancel_entry(Entry),
+                    ok = atomics:add(Cell, 1, 1),
                     _ = erlang:send(Pid, {roadrunner_slot, Token, granted}),
-                    decrement(State1);
+                    %% Several slots may have freed at once: keep granting
+                    %% until the queue is empty or the ceiling is reached.
+                    serve(granted_to(Pid, Cell, decrement(State1)));
                 false ->
                     %% Lost the slot to a fresh request between the
                     %% release and here. Keep our place at the head.
                     requeue(Key, Entry, State1)
             end
     end.
+
+%% A grant to a conn that is already dead is never read. Its `DOWN` went
+%% with the entry's monitor, and the listener's reaper may have emptied
+%% its cell before this grant reached it, so the cell is emptied again
+%% here: whichever exchange comes first takes each slot, once.
+-spec granted_to(pid(), atomics:atomics_ref(), #state{}) -> #state{}.
+granted_to(Pid, Cell, #state{counter = Counter} = State) ->
+    case is_process_alive(Pid) of
+        true ->
+            State;
+        false ->
+            ok = counters:sub(Counter, 1, atomics:exchange(Cell, 1, 0)),
+            State
+    end.
+
+%% Release `N` slots and hand them to the parked requests.
+-spec release(non_neg_integer(), #state{}) -> #state{}.
+release(0, State) ->
+    State;
+release(N, #state{counter = Counter} = State) ->
+    ok = counters:sub(Counter, 1, N),
+    serve(State).
 
 -spec next(#state{}) -> empty | {key(), #entry{}, #state{}}.
 next(#state{order = Order, live = Live} = State) ->

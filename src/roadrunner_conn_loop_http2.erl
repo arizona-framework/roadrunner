@@ -447,6 +447,9 @@
     %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
     max_concurrent_requests = infinity :: infinity | pos_integer(),
     inflight_counter :: counters:counters_ref() | undefined,
+    %% The conn's own count of the slots it holds
+    %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
+    slot_cell = undefined :: roadrunner_conn:slot_cell(),
     %% What happens to a stream that arrives over the ceiling: refuse it
     %% (the default) or park it until a slot frees. Read from proto_opts
     %% at `enter/6` so the per-stream path never re-reads the map.
@@ -456,8 +459,9 @@
     %% releases slots by processing its own workers' `DOWN` messages, so
     %% a blocked loop would wait on something only it can deliver.
     awaiting_slot = #{} :: #{stream_id() => roadrunner_req:request()},
-    %% Whether a stream ever parked here: a grant may then still be on its
-    %% way when the conn exits, which `hand_off_slots/1` gives back.
+    %% Whether a request ever parked here: the conn's exit then goes through
+    %% the slot keeper, which withdraws what it parked before emptying its
+    %% cell, so a grant on its way is released rather than lost.
     parked = false :: boolean(),
     %% Per-peer rate-limit guard resolved from proto_opts + peer at `enter/6`
     %% (`undefined` when off). Checked in `dispatch_stream/2`.
@@ -552,6 +556,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         alt_svc = AltSvc,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
+        slot_cell = SlotCell,
         grow_recv_buffer = GrowBuffer,
         body_buffering = BodyBuffering,
         request_timeout = RequestTimeout,
@@ -594,6 +599,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         alt_svc = AltSvc,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
+        slot_cell = SlotCell,
         overload = Overload,
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
         real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
@@ -2226,6 +2232,7 @@ dispatch_request(
         listener_name = ListenerName,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
+        slot_cell = SlotCell,
         overload = Overload
     } = State
 ) ->
@@ -2257,7 +2264,7 @@ dispatch_request(
                 ok ->
                     case
                         roadrunner_conn:acquire_request_slot(
-                            MaxConcReq, InflightCounter, Overload, StreamId
+                            MaxConcReq, InflightCounter, SlotCell, Overload, StreamId
                         )
                     of
                         true ->
@@ -2428,11 +2435,12 @@ handle_worker_down(#loop{workers = Workers} = State, MonRef, Pid, Reason) ->
     case Workers of
         #{Pid := StreamId} ->
             %% Release the in-flight slot exactly once, tied to removing the
-            %% worker ref so a worker is accounted for by its `DOWN` here or
-            %% by the conn's clean exit, never both.
+            %% worker so it is accounted for by its `DOWN` here or by the
+            %% conn's clean exit, never both.
             ok = roadrunner_conn:release_request_slot(
                 State#loop.max_concurrent_requests,
                 State#loop.inflight_counter,
+                State#loop.slot_cell,
                 State#loop.overload
             ),
             Workers1 = maps:remove(Pid, Workers),
@@ -3111,6 +3119,7 @@ give_back_slot(State) ->
     ok = roadrunner_conn:release_request_slot(
         State#loop.max_concurrent_requests,
         State#loop.inflight_counter,
+        State#loop.slot_cell,
         State#loop.overload
     ),
     State.
@@ -3314,25 +3323,28 @@ exit_clean(#loop{socket = Socket, proto_opts = ProtoOpts, conn_span = ConnSpan} 
     ok = roadrunner_transport:close(Socket),
     exit(normal).
 
-%% The in-flight slots the conn still holds as it exits, one per worker not
-%% yet seen ending (`workers`). A worker still running keeps its slot after
-%% the conn is gone: every one is handed to the listener's slot keeper,
-%% which releases it when the worker ends, or at once for one already gone
-%% (`roadrunner_conn:hand_off_request_slots/5`). Releasing them here instead
-%% would let a client that drops its connection and opens another run
-%% handlers past `max_concurrent_requests`. A conn that crashes or is killed
-%% never gets here: its workers' slots stay counted, erring on the side of
-%% the ceiling, until the listener restarts.
+%% The in-flight slots the conn still holds as it exits, counted in its
+%% cell: one per worker not yet seen ending (`workers`), plus any grant on
+%% its way. A worker still running keeps its slot after the conn is gone:
+%% it is handed to the listener's slot keeper, which releases it when the
+%% worker ends (`roadrunner_conn:hand_off_request_slots/7`). Releasing it
+%% here instead would let a client that drops its connection and opens
+%% another run handlers past `max_concurrent_requests`. A conn that crashes
+%% or is killed never gets here: the slot keeper (for a conn that parked a
+%% request) or the listener's reaper (`slot_reconciliation`) empties its
+%% cell instead, and its workers still running stop counting then.
 -spec hand_off_slots(#loop{}) -> ok.
-hand_off_slots(#loop{proto_opts = #proto_opts{slot_keeper = undefined}}) ->
-    ok;
-hand_off_slots(#loop{workers = Workers, parked = false}) when map_size(Workers) =:= 0 ->
+hand_off_slots(#loop{slot_cell = undefined}) ->
     ok;
 hand_off_slots(#loop{
     proto_opts = #proto_opts{slot_keeper = Keeper},
     workers = Workers,
+    parked = Parked,
     max_concurrent_requests = Max,
     inflight_counter = Counter,
+    slot_cell = Cell,
     overload = Overload
 }) ->
-    roadrunner_conn:hand_off_request_slots(Keeper, maps:keys(Workers), Max, Counter, Overload).
+    roadrunner_conn:hand_off_request_slots(
+        Keeper, Cell, maps:keys(Workers), Parked, Max, Counter, Overload
+    ).

@@ -306,6 +306,9 @@
     %% them to `roadrunner_conn` directly. See `dispatch_decoded/5`.
     max_concurrent_requests = infinity :: infinity | pos_integer(),
     inflight_counter :: counters:counters_ref() | undefined,
+    %% The loop's own count of the slots it holds
+    %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
+    slot_cell = undefined :: roadrunner_conn:slot_cell(),
     %% What happens to a request that arrives over the ceiling: refuse it
     %% (the default) or park it until a slot frees. Read from proto_opts
     %% alongside the two fields above.
@@ -315,8 +318,9 @@
     %% its own workers' `DOWN` messages, so a blocked loop would wait on
     %% something only it can deliver.
     awaiting_slot = #{} :: #{non_neg_integer() => roadrunner_req:request()},
-    %% Whether a request ever parked here: a grant may then still be on its
-    %% way when the loop ends, which `hand_off_slots/1` gives back.
+    %% Whether a request ever parked here: the conn's exit then goes through
+    %% the slot keeper, which withdraws what it parked before emptying its
+    %% cell, so a grant on its way is released rather than lost.
     parked = false :: boolean(),
     %% Per-peer rate-limit guard resolved from proto_opts + peer at conn start
     %% (`undefined` when off). Checked in `dispatch_decoded/5`.
@@ -353,7 +357,8 @@ start(ConnPid, ProtoOpts) ->
 
 -doc false.
 -spec init(pid(), roadrunner_conn:proto_opts()) -> ok.
-init(Conn, ProtoOpts) ->
+init(Conn, ProtoOpts0) ->
+    ProtoOpts = roadrunner_conn:with_slot_cell(ProtoOpts0),
     #proto_opts{
         listener_name = ListenerName,
         max_content_length = MaxContentLength,
@@ -364,6 +369,7 @@ init(Conn, ProtoOpts) ->
         body_buffering = BodyBuffering,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
+        slot_cell = SlotCell,
         overload = Overload
     } = ProtoOpts,
     proc_lib:set_label({roadrunner_conn_loop_http3, ListenerName, Conn}),
@@ -373,8 +379,9 @@ init(Conn, ProtoOpts) ->
     %% Share fate with the QUIC connection process: if it dies abnormally
     %% (without a `closed` event) the loop dies too, rather than hanging.
     %% The slot then leaks until slot reconciliation reaps it, the same
-    %% bound h1/h2 carry for a `kill`-ed conn. The graceful path releases
-    %% it in `terminate/1` on the `closed` event.
+    %% bound h1/h2 carry for a `kill`-ed conn, which also reclaims the
+    %% in-flight slots in the loop's cell. The graceful path releases them
+    %% in `terminate/1` on the `closed` event.
     true = link(Conn),
     %% `remote_addr` is set at connection creation, so peername is
     %% available from the start (idle / handshaking states).
@@ -396,6 +403,7 @@ init(Conn, ProtoOpts) ->
         max_field_section_size = MaxFieldSectionSize,
         max_concurrent_requests = MaxConcReq,
         inflight_counter = InflightCounter,
+        slot_cell = SlotCell,
         overload = Overload,
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
         real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer)
@@ -2181,6 +2189,7 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
         roadrunner_conn:acquire_request_slot(
             State1#h3.max_concurrent_requests,
             State1#h3.inflight_counter,
+            State1#h3.slot_cell,
             State1#h3.overload,
             StreamId
         )
@@ -2258,7 +2267,10 @@ handle_slot(#h3{awaiting_slot = Awaiting} = State, StreamId, _Refused) ->
 -spec give_back_slot(#h3{}) -> #h3{}.
 give_back_slot(State) ->
     ok = roadrunner_conn:release_request_slot(
-        State#h3.max_concurrent_requests, State#h3.inflight_counter, State#h3.overload
+        State#h3.max_concurrent_requests,
+        State#h3.inflight_counter,
+        State#h3.slot_cell,
+        State#h3.overload
     ),
     State.
 
@@ -2276,7 +2288,10 @@ handle_worker_down(#h3{worker_refs = WorkerRefs, worker_pids = WorkerPids} = Sta
     %% ref so it is accounted for by this `DOWN` or by the conn's clean
     %% exit, never both.
     ok = roadrunner_conn:release_request_slot(
-        State#h3.max_concurrent_requests, State#h3.inflight_counter, State#h3.overload
+        State#h3.max_concurrent_requests,
+        State#h3.inflight_counter,
+        State#h3.slot_cell,
+        State#h3.overload
     ),
     State1 = release_cancelled(
         State#h3{worker_refs = WorkerRefs1, worker_pids = maps:remove(StreamId, WorkerPids)},
@@ -2420,28 +2435,32 @@ discard_stream(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream) ->
     },
     State#h3{streams = Streams#{StreamId := Discarding}}.
 
-%% The in-flight slots the loop still holds as it ends, one per worker not
-%% yet seen ending (`worker_pids`). A worker still running keeps its slot
-%% after the connection is gone: every one is handed to the listener's slot
-%% keeper, which releases it when the worker ends, or at once for one
-%% already gone (`roadrunner_conn:hand_off_request_slots/5`). Releasing them
-%% here instead would let a client that drops its connection and opens
-%% another run handlers past `max_concurrent_requests`. A loop taken down
-%% with its QUIC connection never gets here: its workers' slots stay
-%% counted, erring on the side of the ceiling, until the listener restarts.
+%% The in-flight slots the loop still holds as it ends, counted in its
+%% cell: one per worker not yet seen ending (`worker_pids`), plus any grant
+%% on its way. A worker still running keeps its slot after the connection
+%% is gone: it is handed to the listener's slot keeper, which releases it
+%% when the worker ends (`roadrunner_conn:hand_off_request_slots/7`).
+%% Releasing it here instead would let a client that drops its connection
+%% and opens another run handlers past `max_concurrent_requests`. A loop
+%% taken down with its QUIC connection never gets here: the slot keeper
+%% (for a loop that parked a request) or the listener's reaper
+%% (`slot_reconciliation`) empties its cell instead, and its workers still
+%% running stop counting then.
 -spec hand_off_slots(#h3{}) -> ok.
-hand_off_slots(#h3{proto_opts = #proto_opts{slot_keeper = undefined}}) ->
-    ok;
-hand_off_slots(#h3{worker_pids = Pids, parked = false}) when map_size(Pids) =:= 0 ->
+hand_off_slots(#h3{slot_cell = undefined}) ->
     ok;
 hand_off_slots(#h3{
     proto_opts = #proto_opts{slot_keeper = Keeper},
     worker_pids = Pids,
+    parked = Parked,
     max_concurrent_requests = Max,
     inflight_counter = Counter,
+    slot_cell = Cell,
     overload = Overload
 }) ->
-    roadrunner_conn:hand_off_request_slots(Keeper, maps:values(Pids), Max, Counter, Overload).
+    roadrunner_conn:hand_off_request_slots(
+        Keeper, Cell, maps:values(Pids), Parked, Max, Counter, Overload
+    ).
 
 -spec terminate(#h3{}, roadrunner_event_handler:close_reason()) -> ok.
 terminate(#h3{proto_opts = ProtoOpts, conn_span = ConnSpan} = State, Reason) ->

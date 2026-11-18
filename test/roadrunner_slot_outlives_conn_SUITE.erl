@@ -9,6 +9,11 @@ each one when its worker ends. A client that fills the ceiling with slow
 handlers, drops the connection and reconnects is refused (or queued) until
 those handlers end, and every slot is released exactly once.
 
+A connection that dies without its exit path (killed, or crashed) has the
+slots it held reclaimed from its own cell: by the slot keeper when it had a
+request parked, else by the listener's reaper (`slot_reconciliation`),
+whose tick the tests send directly.
+
 The handlers announce themselves to the test process and wait for
 `release`, so the test decides when each one ends.
 """.
@@ -25,6 +30,11 @@ The handlers announce themselves to the test process and wait for
     queued_until_the_old_handler_ends/1,
     parked_request_of_a_closed_conn_is_dropped/1,
     grant_racing_the_close_is_given_back/1,
+    killed_conn_is_reclaimed/1,
+    killed_parked_conn_is_reclaimed_by_the_keeper/1,
+    grant_racing_a_crash_is_reclaimed/1,
+    grant_to_a_reaped_conn_is_reclaimed/1,
+    reclaimed_slots_are_all_granted/1,
     drained_conn_keeps_its_reset_handler_counted/1,
     conn_closing_after_its_listener_stopped_exits_cleanly/1
 ]).
@@ -36,14 +46,15 @@ suite() ->
     [{timetrap, {seconds, 30}}].
 
 all() ->
-    [{group, h2}, {group, h3}].
+    [{group, h1}, {group, h2}, {group, h3}].
 
 groups() ->
     Common = [
         refused_until_the_old_handlers_end,
         queued_until_the_old_handler_ends,
         parked_request_of_a_closed_conn_is_dropped,
-        drained_conn_keeps_its_reset_handler_counted
+        drained_conn_keeps_its_reset_handler_counted,
+        killed_conn_is_reclaimed
     ],
     %% HTTP/3 has no listener-stopped case: stopping the listener stops its
     %% QUIC connections, and with them the linked request loops.
@@ -52,9 +63,16 @@ groups() ->
             Common ++
                 [
                     grant_racing_the_close_is_given_back,
+                    killed_parked_conn_is_reclaimed_by_the_keeper,
+                    grant_racing_a_crash_is_reclaimed,
+                    grant_to_a_reaped_conn_is_reclaimed,
+                    reclaimed_slots_are_all_granted,
                     conn_closing_after_its_listener_stopped_exits_cleanly
                 ]},
-        {h3, [], Common}
+        {h3, [], Common},
+        %% HTTP/1.1 counts a request against the ceiling in shed mode only,
+        %% its handler running in the connection process itself.
+        {h1, [], [killed_conn_is_reclaimed]}
     ].
 
 init_per_suite(Config) ->
@@ -143,9 +161,9 @@ queued_until_the_old_handler_ends(Config) ->
     ok = close_and_wait(Name, New),
     ok = await_inflight(Name, 0).
 
-%% A connection's hand-off withdraws the requests it parked before it exits,
-%% so no slot that frees later is granted to a connection that is gone,
-%% which would leak it. The queue is empty the moment the connection is.
+%% The keeper drops the request a closed connection parked, so the slot
+%% that frees next is not granted to it; and a grant that did reach it
+%% would be in its cell, reclaimed with it. Either way nothing leaks.
 parked_request_of_a_closed_conn_is_dropped(Config) ->
     Name = start(Config, 1, {queue, #{max_queued => 4, timeout => 10000}}),
     Holder = connect(Config),
@@ -155,13 +173,18 @@ parked_request_of_a_closed_conn_is_dropped(Config) ->
     ok = request(Parker),
     ok = await_parked(Name),
     ok = close_and_wait(Name, Parker),
-    ?assertNot(roadrunner_overload_queue:waiting(waiters(Name))),
+    Waiters = waiters(Name),
+    ok = spin(
+        fun() -> not roadrunner_overload_queue:waiting(Waiters) end,
+        erlang:monotonic_time(millisecond) + 5000
+    ),
     ok = finish(Handler, release),
     ok = close_and_wait(Name, Holder),
     ok = await_inflight(Name, 0),
-    %% Once the keeper has handled everything sent to it so far, nothing has
-    %% taken the slot back.
+    %% Once the keeper and the reaper have handled everything so far,
+    %% nothing has taken the slot back.
     _ = sys:get_state(keeper(Name)),
+    ok = reap(Name),
     ?assertEqual(0, inflight(Name)),
     ?assertEqual(no_handler, no_handler()).
 
@@ -207,6 +230,155 @@ drained_conn_keeps_its_reset_handler_counted(Config) ->
     ok = finish(Handler, release),
     ok = await_inflight(Name, 0).
 
+%% A connection killed while its handlers run leaves its slots in its cell.
+%% The reaper's next tick reclaims them; the handlers still running stop
+%% counting then, and their own ends release nothing more.
+killed_conn_is_reclaimed(Config) ->
+    Protocol = ?config(protocol, Config),
+    Name = start(Config, 2, kill_mode(Protocol)),
+    Client = connect(Config),
+    Handlers = start_handlers(Protocol, Client),
+    N = length(Handlers),
+    ?assertEqual(N, inflight(Name)),
+    Conn = server_conn(Name, Client, Handlers),
+    Mon = monitor(process, Conn),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    %% Nothing ran the exit path: the slots are still held.
+    ?assertEqual(N, inflight(Name)),
+    ok = reap(Name),
+    ?assertEqual(0, inflight(Name)),
+    [ok = finish(H, release) || H <- Handlers, is_process_alive(H)],
+    _ = sys:get_state(keeper(Name)),
+    ok = reap(Name),
+    ?assertEqual(0, inflight(Name)).
+
+%% A killed connection with a request parked is watched by the keeper,
+%% which reclaims what it held at once, before any reaper tick.
+killed_parked_conn_is_reclaimed_by_the_keeper(Config) ->
+    Name = start(Config, 2, {queue, #{max_queued => 4, timeout => 10000}}),
+    Other = connect(Config),
+    ok = request(Other),
+    OtherHandler = expect_handler(),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    ok = request(Client),
+    ok = await_parked(Name),
+    Conn = conn_of(Name, Client),
+    Mon = monitor(process, Conn),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    ok = await_inflight(Name, 1),
+    ok = reap(Name),
+    ?assertEqual(1, inflight(Name)),
+    ok = finish(Handler, release),
+    ok = finish(OtherHandler, release),
+    ok = close_and_wait(Name, Other),
+    ok = await_inflight(Name, 0),
+    ?assertEqual(no_handler, no_handler()).
+
+%% A grant on its way to a connection that is killed before it reads it is
+%% in the connection's cell already, so the reaper reclaims it. The
+%% connection is suspended to have it killed with the grant unread.
+grant_racing_a_crash_is_reclaimed(Config) ->
+    Name = start(Config, 1, {queue, #{max_queued => 4, timeout => 10000}}),
+    Holder = connect(Config),
+    ok = request(Holder),
+    Handler = expect_handler(),
+    Parker = connect(Config),
+    ok = request(Parker),
+    ok = await_parked(Name),
+    Conn = conn_of(Name, Parker),
+    Mon = monitor(process, Conn),
+    true = erlang:suspend_process(Conn),
+    ok = finish(Handler, release),
+    ok = await_queued(Conn, 1),
+    ?assertEqual(1, inflight(Name)),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    ok = reap(Name),
+    ?assertEqual(0, inflight(Name)),
+    ok = close_and_wait(Name, Holder),
+    ok = reap(Name),
+    ?assertEqual(0, inflight(Name)),
+    ?assertEqual(no_handler, no_handler()).
+
+%% The keeper grants a freed slot to a parked connection that died after
+%% the reaper had already emptied its cell. The grant lands in that cell
+%% with nothing left to empty it, so the keeper does. The keeper is
+%% suspended to order its mailbox: the freed slot first, then the reaper's
+%% tick runs, then the keeper serves.
+grant_to_a_reaped_conn_is_reclaimed(Config) ->
+    Name = start(Config, 1, {queue, #{max_queued => 4, timeout => 10000}}),
+    Holder = connect(Config),
+    ok = request(Holder),
+    Handler = expect_handler(),
+    Parker = connect(Config),
+    ok = request(Parker),
+    ok = await_parked(Name),
+    Conn = conn_of(Name, Parker),
+    Keeper = keeper(Name),
+    ok = sys:suspend(Keeper),
+    ok = finish(Handler, release),
+    %% The holder's conn frees the slot and wakes the keeper.
+    ok = await_queued(Keeper, 1),
+    Mon = monitor(process, Conn),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    ok = reap(Name),
+    ok = sys:resume(Keeper),
+    _ = sys:get_state(Keeper),
+    ?assertEqual(0, inflight(Name)),
+    ok = close_and_wait(Name, Holder),
+    ok = reap(Name),
+    ?assertEqual(0, inflight(Name)),
+    ?assertEqual(no_handler, no_handler()).
+
+%% Reclaiming a killed connection's slots frees several at once: every
+%% request parked behind them is granted, not just the first.
+reclaimed_slots_are_all_granted(Config) ->
+    Name = start(Config, 2, {queue, #{max_queued => 4, timeout => 10000}}),
+    Killed = connect(Config),
+    Handlers = start_handlers(h2, Killed),
+    Parker = connect(Config),
+    ok = request(Parker),
+    ok = request(Parker),
+    ok = await_parked(Name, 2),
+    Conn = conn_of(Name, Killed),
+    Mon = monitor(process, Conn),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    ok = reap(Name),
+    Served = [expect_handler(), expect_handler()],
+    ?assertEqual(2, inflight(Name)),
+    [ok = finish(H, release) || H <- Served ++ Handlers],
+    ok = close_and_wait(Name, Parker),
+    ok = await_inflight(Name, 0).
+
+kill_mode(h1) -> {shed, #{}};
+kill_mode(_) -> refuse.
+
+%% Start the handlers the killed-connection case holds: one on HTTP/1.1
+%% (its connection serves one request at a time), two otherwise.
+start_handlers(h1, Client) ->
+    ok = request(Client),
+    [expect_handler()];
+start_handlers(_Protocol, Client) ->
+    ok = request(Client),
+    ok = request(Client),
+    [expect_handler(), expect_handler()].
+
+%% On HTTP/1.1 the handler runs in the connection process.
+server_conn(_Name, {h1, _Sock}, [Handler]) -> Handler;
+server_conn(Name, Client, _Handlers) -> conn_of(Name, Client).
+
+%% Run one tick of the listener's reaper, in its process.
+reap(Name) ->
+    whereis(Name) ! reconcile_slots,
+    _ = sys:get_state(Name),
+    ok.
+
 %% The keeper stops with its listener. A connection that outlives both still
 %% exits cleanly, with nothing left to hand its handlers' slots to.
 conn_closing_after_its_listener_stopped_exits_cleanly(Config) ->
@@ -244,6 +416,8 @@ start(Config, Max, Overload) ->
     ),
     Name.
 
+listener_opts(h1, Opts) ->
+    Opts#{protocols => [http1]};
 listener_opts(h2, Opts) ->
     Opts#{protocols => [http2]};
 listener_opts(h3, Opts) ->
@@ -290,9 +464,13 @@ await_queued(Pid, N) ->
 
 %% Spin until the keeper holds a parked request.
 await_parked(Name) ->
+    await_parked(Name, 1).
+
+%% Spin until the keeper holds at least `N` parked requests.
+await_parked(Name, N) ->
     Waiters = waiters(Name),
     Deadline = erlang:monotonic_time(millisecond) + 5000,
-    spin(fun() -> roadrunner_overload_queue:waiting(Waiters) end, Deadline).
+    spin(fun() -> atomics:get(Waiters, 1) >= N end, Deadline).
 
 spin(Check, Deadline) ->
     case Check() of
@@ -333,6 +511,11 @@ no_handler() ->
 connect(Config) ->
     connect(?config(protocol, Config), roadrunner_listener:port(?config(listener, Config))).
 
+connect(h1, Port) ->
+    {ok, Sock} = gen_tcp:connect(
+        {127, 0, 0, 1}, Port, [binary, {active, false}, {nodelay, true}], 5000
+    ),
+    {h1, Sock};
 connect(h2, Port) ->
     {ok, Sock} = gen_tcp:connect(
         {127, 0, 0, 1}, Port, [binary, {active, false}, {nodelay, true}], 5000
@@ -364,7 +547,7 @@ conn_of(Name, Client) ->
     Port = client_port(Client),
     [Conn] = [
         Pid
-     || {Pid} <- ets:tab2list(Table), server_peer_port(Pid) =:= Port
+     || {Pid, _Cell} <- ets:tab2list(Table), server_peer_port(Pid) =:= Port
     ],
     Conn.
 
@@ -389,6 +572,8 @@ quic_peer_port(QuicConn) ->
 
 %% Send a GET on a new stream. h2 streams take the next odd id, and h3
 %% remembers the stream it opened, both in the process dictionary.
+request({h1, Sock}) ->
+    gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n");
 request({h2, Sock}) ->
     StreamId = next_stream_id(Sock),
     Enc = roadrunner_http2_hpack:new_encoder(4096),

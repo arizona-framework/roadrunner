@@ -38,11 +38,13 @@
     try_acquire_slot/1,
     release_slot/1,
     try_acquire_request_slot/2,
-    acquire_request_slot/4,
+    acquire_request_slot/5,
     cancel_slot_wait/2,
-    release_request_slot/3,
+    release_request_slot/4,
     release_request_slots/4,
-    hand_off_request_slots/5,
+    hand_off_request_slots/7,
+    reclaim_request_slots/4,
+    with_slot_cell/1,
     consume_body_reader/2,
     register_for_drain/2,
     unregister_for_drain/1
@@ -122,6 +124,7 @@
     rate_limit/0,
     rate_limit_state/0,
     overload/0,
+    slot_cell/0,
     resolved/0,
     body_reader/0,
     h1_body_reader/0,
@@ -158,6 +161,10 @@ listener's queue process, the atomic that says whether anyone is parked
 deadline in milliseconds. The shed form answers it `503` with the
 `Retry-After` seconds it carries.
 """.
+%% A conn's own count of the in-flight slots it holds (`with_slot_cell/1`),
+%% or `undefined` when the listener has no ceiling.
+-type slot_cell() :: atomics:atomics_ref() | undefined.
+
 -type overload() ::
     refuse | {queue, pid(), atomics:atomics_ref(), pos_integer()} | {shed, pos_integer()}.
 
@@ -247,8 +254,10 @@ register_for_drain(_Pid, #proto_opts{graceful_drain = false}) ->
     ok;
 register_for_drain(_Pid, #proto_opts{drain_table = undefined}) ->
     ok;
-register_for_drain(Pid, #proto_opts{drain_table = Table}) ->
-    true = ets:insert(Table, {Pid}),
+register_for_drain(Pid, #proto_opts{drain_table = Table, slot_cell = Cell}) ->
+    %% The row carries the conn's in-flight cell, so the listener's reaper
+    %% can reclaim the slots of a conn that died without its exit path.
+    true = ets:insert(Table, {Pid, Cell}),
     ok.
 
 -doc """
@@ -328,7 +337,7 @@ unconfigured listener pays nothing on the hot path.
 Same eventually-consistent overshoot contract as `try_acquire_slot/1`: the
 `counters` ref uses `write_concurrency`, so a brief read slightly above the
 cap is possible before rollbacks reconcile, bounded by in-flight admissions.
-Paired with `release_request_slot/3`, which must run exactly once per
+Paired with `release_request_slot/4`, which must run exactly once per
 successfully-acquired worker (tie it to the worker monitor-ref removal so a
 worker is released by its `DOWN`, or by the listener's slot keeper once the
 conn has handed it over at its clean exit, never both).
@@ -525,21 +534,30 @@ the request has to release it rather than ignore it.
 is the natural choice.
 """.
 -spec acquire_request_slot(
-    infinity | pos_integer(), counters:counters_ref() | undefined, overload(), term()
+    infinity | pos_integer(),
+    counters:counters_ref() | undefined,
+    slot_cell(),
+    overload(),
+    term()
 ) -> true | false | queued | {shed, pos_integer()}.
-acquire_request_slot(Max, Counter, Overload, Token) ->
+acquire_request_slot(infinity, _Counter, _Cell, _Overload, _Token) ->
+    true;
+acquire_request_slot(Max, Counter, Cell, Overload, Token) ->
     case try_acquire_request_slot(Max, Counter) of
-        true -> true;
-        false -> park(Overload, Token)
+        true ->
+            ok = atomics:add(Cell, 1, 1),
+            true;
+        false ->
+            park(Overload, Cell, Token)
     end.
 
--spec park(overload(), term()) -> false | queued | {shed, pos_integer()}.
-park(refuse, _Token) ->
+-spec park(overload(), slot_cell(), term()) -> false | queued | {shed, pos_integer()}.
+park(refuse, _Cell, _Token) ->
     false;
-park({queue, Pid, _Waiters, Timeout}, Token) ->
-    ok = roadrunner_overload_queue:enqueue(Pid, Token, Timeout),
+park({queue, Pid, _Waiters, Timeout}, Cell, Token) ->
+    ok = roadrunner_overload_queue:enqueue(Pid, Token, Cell, Timeout),
     queued;
-park({shed, _RetryAfter} = Shed, _Token) ->
+park({shed, _RetryAfter} = Shed, _Cell, _Token) ->
     Shed.
 
 -doc """
@@ -554,19 +572,21 @@ cancel_slot_wait(_NeverParks, _Token) ->
     ok.
 
 -doc """
-Decrement the in-flight-request counter, paired with
-`acquire_request_slot/4`, and wake a parked request if one is waiting.
+Decrement the in-flight-request counter and the conn's own cell, paired
+with `acquire_request_slot/5` (or a queue grant), and wake a parked
+request if one is waiting.
 
 The wake is guarded by an atomic read rather than sent unconditionally,
 so a listener in queue mode that is not at its ceiling pays one extra
 `atomics:get/2` per request and no message.
 """.
 -spec release_request_slot(
-    infinity | pos_integer(), counters:counters_ref() | undefined, overload()
+    infinity | pos_integer(), counters:counters_ref() | undefined, slot_cell(), overload()
 ) -> ok.
-release_request_slot(infinity, _Counter, _Overload) ->
+release_request_slot(infinity, _Counter, _Cell, _Overload) ->
     ok;
-release_request_slot(_Max, Counter, Overload) ->
+release_request_slot(_Max, Counter, Cell, Overload) ->
+    ok = atomics:sub(Cell, 1, 1),
     ok = counters:sub(Counter, 1, 1),
     notify_release(Overload).
 
@@ -580,9 +600,9 @@ notify_release(_NeverParks) ->
     ok.
 
 -doc """
-Release `N` in-flight slots at once: the grants that raced a conn's exit
-(`hand_off_request_slots/5`), taken on its behalf for requests it no
-longer has. `N = 0` and `infinity` are no-ops.
+Release `N` in-flight slots at once, taken out of a conn's cell by
+`reclaim_request_slots/4` or the slot keeper. `N = 0` and `infinity` are
+no-ops.
 """.
 -spec release_request_slots(
     infinity | pos_integer(), counters:counters_ref() | undefined, non_neg_integer(), overload()
@@ -596,20 +616,66 @@ release_request_slots(_Max, Counter, N, Overload) ->
     notify_release(Overload).
 
 -doc """
-Hand the in-flight slots of `Workers`, the stream workers still running as
-an HTTP/2 or HTTP/3 connection closes, to the listener's slot `Keeper`,
-which releases each one when its worker ends. Workers are monitored, not
-linked, so they can outlive their connection; releasing their slots with it
-would let a client that drops and reopens connections run handlers past
-`max_concurrent_requests`. It also withdraws the requests the connection
-parked, and gives back the grants that raced its exit.
+Give a connection its own in-flight cell when the listener has a finite
+`max_concurrent_requests`: an `atomics` cell holding the number of slots
+the conn holds (its running workers, plus grants on their way to it).
+Every release the conn makes takes one off it, and a conn that is gone
+has its cell emptied with `atomics:exchange/3` by whichever of its exit
+path, the slot keeper or the listener's reaper sees it first, so each
+slot is released exactly once.
+""".
+-spec with_slot_cell(proto_opts()) -> proto_opts().
+with_slot_cell(#proto_opts{slot_keeper = undefined} = ProtoOpts) ->
+    ProtoOpts;
+with_slot_cell(ProtoOpts) ->
+    ProtoOpts#proto_opts{slot_cell = atomics:new(1, [])}.
+
+-doc """
+Release every slot still in a dead conn's cell (`undefined` for a conn
+with no ceiling). The listener's reaper calls it for a conn that died
+without its exit path.
+""".
+-spec reclaim_request_slots(
+    slot_cell(), infinity | pos_integer(), counters:counters_ref() | undefined, overload()
+) -> ok.
+reclaim_request_slots(undefined, _Max, _Counter, _Overload) ->
+    ok;
+reclaim_request_slots(Cell, Max, Counter, Overload) ->
+    release_request_slots(Max, Counter, atomics:exchange(Cell, 1, 0), Overload).
+
+-doc """
+The in-flight slots an HTTP/2 or HTTP/3 connection still holds as it
+closes, all counted in its `Cell`. `Workers` are its stream workers still
+running (or not yet seen ending): they keep their slots after the
+connection is gone, handed to the listener's slot `Keeper`, which releases
+each one when its worker ends. Workers are monitored, not linked, so they
+can outlive their connection; releasing their slots with it would let a
+client that drops and reopens connections run handlers past
+`max_concurrent_requests`. What the cell holds beyond the workers are
+grants that raced the close, released at once.
+
+A connection that ever `Parked` a request goes through the keeper even
+with no worker left: the keeper withdraws its parked requests and then
+empties the cell again, so a grant sent before the withdrawal is released
+rather than lost.
 """.
 -spec hand_off_request_slots(
-    pid(), [pid()], pos_integer(), counters:counters_ref(), overload()
+    pid(),
+    atomics:atomics_ref(),
+    [pid()],
+    boolean(),
+    pos_integer(),
+    counters:counters_ref(),
+    overload()
 ) -> ok.
-hand_off_request_slots(Keeper, Workers, Max, Counter, Overload) ->
-    Granted = roadrunner_overload_queue:adopt(Keeper, Workers),
-    release_request_slots(Max, Counter, Granted, Overload).
+hand_off_request_slots(_Keeper, Cell, [], false, Max, Counter, Overload) ->
+    reclaim_request_slots(Cell, Max, Counter, Overload);
+hand_off_request_slots(Keeper, Cell, Workers, _Parked, _Max, _Counter, _Overload) ->
+    %% Emptied here, while no one else may touch a live conn's cell: the
+    %% workers' slots go with them to the keeper, which collects the
+    %% grants that reach the cell later.
+    Raced = atomics:exchange(Cell, 1, 0) - length(Workers),
+    roadrunner_overload_queue:adopt(Keeper, Cell, Workers, Raced).
 
 -doc false.
 -spec refine_conn_label(

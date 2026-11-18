@@ -77,6 +77,10 @@
     %% of the workers still running, so they stay counted until those
     %% workers end. `undefined` with no ceiling.
     slot_keeper = undefined :: pid() | undefined,
+    %% The conn's own in-flight cell (`roadrunner_conn:with_slot_cell/1`),
+    %% set per connection as it starts when the ceiling is finite. The
+    %% listener's copy carries `undefined`.
+    slot_cell = undefined :: roadrunner_conn:slot_cell(),
     inflight_counter = undefined :: counters:counters_ref() | undefined,
     throttled_counter :: atomics:atomics_ref(),
     %% Per-peer request-rate guard (off by default). `rate_limit` carries the

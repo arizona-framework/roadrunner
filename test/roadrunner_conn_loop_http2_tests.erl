@@ -5742,8 +5742,9 @@ idle_timeout_emits_goaway() ->
 start_http2_conn() ->
     start_http2_conn(#{}).
 
-start_http2_conn(Extra) ->
+start_http2_conn(Extra0) ->
     Self = self(),
+    Extra = roadrunner_test_proto_opts:with_slot_keeper(Extra0),
     Counter = counters:new(1, [write_concurrency]),
     ok = counters:add(Counter, 1, 1),
     %% Phase H5 dispatch needs at least the route resolver + an

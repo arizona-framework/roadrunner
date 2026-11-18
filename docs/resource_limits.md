@@ -350,7 +350,12 @@ after its client reset the stream. It also counts one still running
 after its connection closed (the client went away, or a drain ended
 it): the slot is released when the handler ends, not with the
 connection, so a client that fills the ceiling, drops the connection
-and reconnects cannot run more handlers than it allows. Over the
+and reconnects cannot run more handlers than it allows. A connection
+that dies without closing (killed, or crashed) has the slots it held
+reclaimed on the next `slot_reconciliation` tick (at once when it had a
+request queued): the handlers it leaves running stop counting then.
+With `graceful_drain => false` there is no registry to reclaim from, so
+those slots stay counted until the listener restarts. Over the
 ceiling, a new HTTP/2 or HTTP/3 stream is refused with `REFUSED_STREAM` /
 `H3_REQUEST_REJECTED` (both retry-safe per RFC 9113 §8.7) before any
 handler runs, and the refusal emits `request_throttled` and

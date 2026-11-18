@@ -280,7 +280,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   top of unbounded handler memory. This caps the product directly; set it
   to a finite value when enabling HTTP/2 or HTTP/3 under a high
   `max_clients`. A handler still running when its connection closes
-  keeps counting until it ends. Over-limit streams
+  keeps counting until it ends. A connection that dies without closing
+  (killed, or crashed) has its slots reclaimed by `slot_reconciliation`,
+  and the handlers it leaves running stop counting then. Over-limit
+  streams
   are refused with `REFUSED_STREAM` (h2) / `H3_REQUEST_REJECTED` (h3),
   which RFC 9113 §8.7 marks safe to retry; each refusal emits
   `request_throttled` and increments the `throttled`
@@ -401,9 +404,12 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `slot_reconciliation`: `#{interval := Ms}` (default 60000) for the
   periodic reaper that releases slots orphaned by brutal-kill exits,
   and with them the killed conns' rows in the drain registry, or
-  `disabled` to turn it off. A `graceful_drain => false` listener keeps
-  no registry to compare against, so the reaper is off there; asking
-  for both is a configuration conflict.
+  `disabled` to turn it off. It also releases, on the tick that finds a
+  killed conn gone, the `max_concurrent_requests` slots that conn still
+  held. A `graceful_drain => false` listener keeps no registry to
+  compare against, so the reaper is off there, and a killed conn's
+  request slots stay counted until the listener restarts; asking for
+  both is a configuration conflict.
 - `graceful_drain`: opt out of the per-conn drain registry
   (`true` default; `false` trades drain notification for a little
   less per-conn work on short-lived workloads).
@@ -2916,7 +2922,7 @@ handle_call(
 handle_call(
     {register_for_drain, Pid}, _From, #state{proto_opts = #proto_opts{drain_table = Table}} = State
 ) ->
-    true = ets:insert(Table, {Pid}),
+    true = ets:insert(Table, {Pid, undefined}),
     {reply, ok, State};
 handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     #proto_opts{
@@ -3039,7 +3045,7 @@ check_drain(
             Remaining = Deadline - erlang:monotonic_time(millisecond),
             case Remaining =< 0 of
                 true ->
-                    _ = [exit(Pid, kill) || {Pid} <- ets:tab2list(Table)],
+                    _ = [exit(Pid, kill) || {Pid, _Cell} <- ets:tab2list(Table)],
                     finish_drain({timeout, N}, State);
                 false ->
                     _ = erlang:send_after(min(50, Remaining), self(), drain_check),
@@ -3066,7 +3072,7 @@ finish_drain(Reply, #state{quic_listener = QuicListener, drain = #{waiters := Wa
 %% to the mailbox check at the next keep-alive boundary.
 -spec notify_conns(ets:table(), integer()) -> ok.
 notify_conns(Table, Deadline) ->
-    _ = [Pid ! {roadrunner_drain, Deadline} || {Pid} <- ets:tab2list(Table)],
+    _ = [Pid ! {roadrunner_drain, Deadline} || {Pid, _Cell} <- ets:tab2list(Table)],
     ok.
 
 -doc false.
@@ -3097,7 +3103,7 @@ handle_info(
     %% a bounded count short-circuits at the counter so the alive checks
     %% per tick are capped at `min(members, counter)`.
     Counter0 = counters:get(Counter, 1),
-    LiveBounded = count_live_up_to(Table, Counter0),
+    LiveBounded = count_live_up_to(Table, Counter0, State#state.proto_opts),
     NewDiff = Counter0 - LiveBounded,
     %% Only release slots that have been orphaned for two consecutive
     %% ticks — filters out the spawn-time race where a fresh conn has
@@ -3158,25 +3164,49 @@ handle_info(_Msg, State) ->
 %% alive checks are bounded by the counter rather than by the registry
 %% size. A conn that was `kill`ed never ran its exit path, so its pid is
 %% still registered: it is dropped here, the same reaping this tick does
-%% for its slot.
--spec count_live_up_to(ets:table(), non_neg_integer()) -> non_neg_integer().
-count_live_up_to(Table, Cap) ->
-    count_live_up_to(ets:tab2list(Table), Table, Cap, 0).
-
--spec count_live_up_to([{pid()}], ets:table(), non_neg_integer(), non_neg_integer()) ->
+%% for its slot, and the in-flight request slots in its cell are released
+%% at once. A listener with a request ceiling checks every row, so no dead
+%% conn's request slots wait behind the short-circuit.
+-spec count_live_up_to(ets:table(), non_neg_integer(), roadrunner_conn:proto_opts()) ->
     non_neg_integer().
-count_live_up_to(_, _Table, Cap, N) when N >= Cap ->
+count_live_up_to(Table, Cap, #proto_opts{slot_keeper = undefined} = ProtoOpts) ->
+    count_live_up_to(ets:tab2list(Table), Table, Cap, 0, ProtoOpts);
+count_live_up_to(Table, Cap, ProtoOpts) ->
+    %% With a request ceiling every row is checked: a dead conn's row is
+    %% the only record of the in-flight slots it still holds.
+    min(Cap, count_live_up_to(ets:tab2list(Table), Table, infinity, 0, ProtoOpts)).
+
+-spec count_live_up_to(
+    [{pid(), roadrunner_conn:slot_cell()}],
+    ets:table(),
+    non_neg_integer() | infinity,
+    non_neg_integer(),
+    roadrunner_conn:proto_opts()
+) ->
+    non_neg_integer().
+count_live_up_to(_, _Table, Cap, N, _ProtoOpts) when N >= Cap ->
     Cap;
-count_live_up_to([], _Table, _Cap, N) ->
+count_live_up_to([], _Table, _Cap, N, _ProtoOpts) ->
     N;
-count_live_up_to([{Pid} | T], Table, Cap, N) ->
+count_live_up_to([{Pid, Cell} | T], Table, Cap, N, ProtoOpts) ->
     case is_process_alive(Pid) of
         true ->
-            count_live_up_to(T, Table, Cap, N + 1);
+            count_live_up_to(T, Table, Cap, N + 1, ProtoOpts);
         false ->
             true = ets:delete(Table, Pid),
-            count_live_up_to(T, Table, Cap, N)
+            ok = reclaim_request_slots(Cell, ProtoOpts),
+            count_live_up_to(T, Table, Cap, N, ProtoOpts)
     end.
+
+%% The in-flight slots a conn that died without its exit path still held
+%% (its running workers', and grants it never read). Its cell is emptied,
+%% so the slot keeper cannot release them again; its workers still
+%% running stop counting from here.
+-spec reclaim_request_slots(roadrunner_conn:slot_cell(), roadrunner_conn:proto_opts()) -> ok.
+reclaim_request_slots(Cell, #proto_opts{
+    max_concurrent_requests = Max, inflight_counter = Counter, overload = Overload
+}) ->
+    roadrunner_conn:reclaim_request_slots(Cell, Max, Counter, Overload).
 
 -doc false.
 -spec terminate(term(), #state{}) -> ok.

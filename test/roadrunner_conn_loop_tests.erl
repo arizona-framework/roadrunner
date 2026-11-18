@@ -59,7 +59,7 @@ awaiting_shoot_registers_for_drain_test() ->
     Table = ets:new(drain_join, [set, public]),
     Opts = fake_opts(drain_join, #{drain_table => Table}),
     {ok, Pid} = roadrunner_conn_loop:start({fake, spawn_sink()}, Opts),
-    ?assertEqual([{Pid}], ets:tab2list(Table)),
+    ?assertEqual([{Pid, undefined}], ets:tab2list(Table)),
     drain_then_wait(Pid),
     %% The exit path takes the row back out.
     ?assertEqual([], ets:tab2list(Table)).

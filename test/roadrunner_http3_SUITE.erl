@@ -2637,4 +2637,4 @@ find_goaway(Frames) ->
 %% the listener state (`#state{proto_opts = #{drain_table := Table}}`).
 drain_members(Name) ->
     ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(whereis(Name)))),
-    [Pid || {Pid} <- ets:tab2list(maps:get(drain_table, ProtoOpts))].
+    [Pid || {Pid, _Cell} <- ets:tab2list(maps:get(drain_table, ProtoOpts))].
