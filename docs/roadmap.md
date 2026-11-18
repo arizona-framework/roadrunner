@@ -299,21 +299,6 @@ handlers counted until they end.
 
 **Scope:** medium.
 
-### Load-sensitive HTTP/2 connection-loop tests — small
-
-**What:** many cases in `roadrunner_conn_loop_http2_tests` wait 500 ms
-for the connection to send or close on a fake socket, and a few must
-answer a liveness PING within a 100 ms idle timeout. On a machine with
-its CPUs fully busy they fail (no send in time); they pass in normal
-runs and in CI. Longer waits for sends and closes, and a larger idle
-timeout where a test only needs the ordering, would make them hold
-under load.
-
-**Why deferred:** seen only under deliberate CPU starvation, never in a
-gate or CI run.
-
-**Scope:** small.
-
 ### Cheaper accepts under load — medium
 
 **What:** acceptors run at high priority by default (`accept_priority`),
