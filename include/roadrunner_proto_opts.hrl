@@ -144,6 +144,10 @@
     http2_ping_min_time = undefined :: 1..16#FFFFFFFF | undefined,
     http2_ping_permit_without_stream = undefined :: boolean() | undefined,
     http2_ping_max_strikes = undefined :: 0..16#7FFFFFFF | undefined,
+    %% The HTTP/2 `control_frame_policy`, both fields `undefined` when it is
+    %% `false`.
+    http2_control_frame_max = undefined :: 1..16#7FFFFFFF | undefined,
+    http2_control_frame_window = undefined :: 1..16#FFFFFFFF | undefined,
     %% The HTTP/2 `connection_age`, both fields `undefined` when it is
     %% `false`.
     http2_connection_age_max = undefined :: 1..16#FFFFFFFF | undefined,

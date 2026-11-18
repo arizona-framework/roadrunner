@@ -148,8 +148,9 @@ http2_opts(age_grace_after_the_final_goaway_only_resets) ->
 http2_opts(age_during_a_drain_keeps_its_grace) ->
     #{connection_age => #{max => ?AGE, grace => 100}};
 http2_opts(_Case) ->
-    %% The idle cases ping as fast as the server answers.
-    #{ping_policy => false}.
+    %% The idle cases ping, and send frames that serve nothing, as fast as
+    %% the server answers.
+    #{ping_policy => false, control_frame_policy => false}.
 
 %% =============================================================================
 %% Cases

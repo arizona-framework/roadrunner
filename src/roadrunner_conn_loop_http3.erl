@@ -1747,6 +1747,13 @@ apply_frame(
 ) ->
     {ok, Stream#h3_stream{frame_state = expecting_done}};
 apply_frame(
+    {data, <<>>}, #h3_stream{frame_state = expecting_data} = Stream, _ProtoOpts, _MaxHdr, _Qpack
+) ->
+    %% A DATA frame with nothing in it adds nothing to the body: kept, a
+    %% stream of them would grow the body's iolist by a cons per two bytes
+    %% received, with nothing counted against its cap.
+    {ok, Stream};
+apply_frame(
     {data, Payload}, #h3_stream{frame_state = expecting_data} = Stream, ProtoOpts, _MaxHdr, Qpack
 ) ->
     #h3_stream{body = Body, body_len = Len, body_cap = Cap} = Stream,

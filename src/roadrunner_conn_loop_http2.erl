@@ -132,6 +132,14 @@
 %% peer still sends on them (`remember_reset/2`).
 -define(RESET_MEMORY, 128).
 
+%% What each HEADERS or DATA frame the conn sends takes off the count of
+%% frames that serve nothing (`control_credit/2`): a client reading a
+%% response sends a WINDOW_UPDATE or two (stream and connection) per DATA
+%% frame it reads, so 4 leaves it room, while a client that buys a frame
+%% from the server at a time (a WINDOW_UPDATE for one byte) gains few
+%% frames of its own for each.
+-define(CONTROL_CREDIT, 4).
+
 %% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`.
 -define(MAX_FRAME_SIZE, 16_384).
 
@@ -437,6 +445,12 @@
     %% since; `undefined` while its next PING is free: none came yet, or
     %% HEADERS or DATA went out since (`ping_strike/1`).
     ping_clock = undefined :: undefined | {integer(), non_neg_integer()},
+    %% The count of frames that serve nothing (`control_frame/1`), less
+    %% `?CONTROL_CREDIT` for each HEADERS or DATA frame the conn sent, or,
+    %% once more than the `control_frame_policy` allows free came, that
+    %% count since `Mark`, when (in milliseconds) the conn last read the
+    %% clock for them.
+    control_frames = 0 :: control_frames(),
     %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
     %% Prepended to every response by `roadrunner_http:auto_headers/2`.
     %% Read from proto_opts at `enter/6`.
@@ -479,7 +493,10 @@
     liveness_ping = false :: boolean(),
     %% Streams this conn reset, oldest first, so frames the peer sent
     %% before it saw the reset are ignored (`remember_reset/2`).
-    reset_ids = {queue:new(), #{}} :: {queue:queue(stream_id()), #{stream_id() => []}},
+    %% Each with the receive window it had left: DATA within it is what the
+    %% peer may have had in flight, DATA past it serves nothing.
+    reset_ids = {queue:new(), #{}} ::
+        {queue:queue(stream_id()), #{stream_id() => non_neg_integer()}},
     %% Set to a stream id while a HEADERS / PUSH_PROMISE block is
     %% still being assembled (no END_HEADERS yet). The next inbound
     %% frame MUST be a CONTINUATION on the same stream — anything
@@ -517,6 +534,7 @@
 }).
 
 -type close_reason() :: roadrunner_event_handler:close_reason().
+-type control_frames() :: non_neg_integer() | {non_neg_integer(), integer()}.
 
 -doc """
 Top-level entry from the HTTP/1.1 dispatch fork. Owns the socket
@@ -1019,6 +1037,92 @@ too_many_pings(#loop{last_stream_id = LastId} = State, Ack) ->
     ]),
     exit_clean(State, too_many_pings).
 
+%% Count a frame that serves nothing against the listener's
+%% `control_frame_policy` (RFC 9113 §10.5, `http2_control_frame_*`
+%% proto_opts, read only here): SETTINGS, WINDOW_UPDATE, PRIORITY, a frame
+%% of an unknown type, a DATA frame that carries nothing and does not end
+%% its stream, RST_STREAM or DATA on a stream already closed (DATA within
+%% the window a stream the conn reset had left excepted), RST_STREAM on a
+%% stream no handler runs for, HEADERS the conn refuses, and field blocks
+%% on a stream it reset; a
+%% WINDOW_UPDATE that opens a window our DATA waited on is not counted.
+%% Each
+%% HEADERS or DATA frame the conn sends takes `?CONTROL_CREDIT` off the
+%% count (`control_credit/2`), so a client opening its windows as it reads
+%% is never closed. The first `Max`
+%% are free; past them the clock is read once per `Max` frames, and when
+%% the `Max` frames from the last reading on came within `Window`, the
+%% next one closes the conn with GOAWAY(ENHANCE_YOUR_CALM). With the policy
+%% off `Max` is `undefined`, which no integer reaches.
+-spec control_frame(#loop{}) -> #loop{}.
+control_frame(State) ->
+    State#loop{control_frames = control_count(State)}.
+
+%% The `control_frames` one more such frame makes, for a caller that puts
+%% it in an update of its own (`control_frame/1`).
+-spec control_count(#loop{}) -> control_frames().
+control_count(#loop{
+    control_frames = N, proto_opts = #proto_opts{http2_control_frame_max = Max}
+}) when is_integer(N), N < Max ->
+    N + 1;
+control_count(#loop{control_frames = N}) when is_integer(N) ->
+    {1, erlang:monotonic_time(millisecond)};
+control_count(
+    #loop{
+        control_frames = {N, Mark},
+        proto_opts = #proto_opts{
+            http2_control_frame_max = Max, http2_control_frame_window = Window
+        }
+    } = State
+) ->
+    case N < Max of
+        true ->
+            {N + 1, Mark};
+        false ->
+            Now = erlang:monotonic_time(millisecond),
+            case Now - Mark >= Window of
+                true -> {1, Now};
+                false -> goaway_exit(State, enhance_your_calm)
+            end
+    end.
+
+%% The count after the conn sent `Frames` HEADERS or DATA frames.
+-spec control_credit(control_frames(), pos_integer()) -> control_frames().
+control_credit(0, _Frames) ->
+    %% A client that sent nothing to count, the usual case, costs nothing.
+    0;
+control_credit(N, Frames) when is_integer(N) ->
+    max(0, N - ?CONTROL_CREDIT * Frames);
+control_credit({N, Mark}, Frames) ->
+    {max(0, N - ?CONTROL_CREDIT * Frames), Mark}.
+
+%% The count after the conn sent `Bytes` of DATA, in frames of up to
+%% `?MAX_FRAME_SIZE`.
+-spec data_credit(control_frames(), pos_integer()) -> control_frames().
+data_credit(0, _Bytes) ->
+    0;
+data_credit(Count, Bytes) ->
+    control_credit(Count, (Bytes + ?MAX_FRAME_SIZE - 1) div ?MAX_FRAME_SIZE).
+
+%% The count after a WINDOW_UPDATE takes a stream's send window from `Old`
+%% to `New`. One that opens the window for DATA the stream holds back is
+%% not counted: that DATA goes out (or waits on the connection window
+%% alone), and a client cannot send another such one before more of ours
+%% spent the window, or a SETTINGS frame shrank it, which is charged for
+%% each stream it pushes to 0 (`apply_initial_window_size/2`).
+-spec stream_update_count(integer(), integer(), #stream{}, #loop{}) -> control_frames().
+stream_update_count(
+    Old, New, #stream{pending_sends = Pending}, #loop{control_frames = Count} = State
+) when
+    Old =< 0, New > 0
+->
+    case queue:is_empty(Pending) of
+        false -> Count;
+        true -> control_count(State)
+    end;
+stream_update_count(_Old, _New, _Stream, State) ->
+    control_count(State).
+
 %% Hibernate re-entry (see `recv_idle_expired/1`). Drops the idle
 %% timer and resumes the unified mailbox loop after an idle conn wakes
 %% from `erlang:hibernate/3`. If the timer already fired, the conn sat
@@ -1204,8 +1308,9 @@ handle_frame({settings, 1, _}, #loop{max_concurrent_streams = MaxStreams} = Stat
     %% The client applied our SETTINGS (RFC 9113 §6.5.3): we send one
     %% SETTINGS frame, so this puts our stream limit in force. Streams
     %% already open stay; new ones over the limit are refused.
-    frame_loop(State#loop{stream_limit = MaxStreams});
-handle_frame({settings, 0, Params}, State) ->
+    frame_loop((control_frame(State))#loop{stream_limit = MaxStreams});
+handle_frame({settings, 0, Params}, State0) ->
+    State = control_frame(State0),
     case validate_settings(Params) of
         ok ->
             case apply_initial_window_size(Params, State) of
@@ -1242,15 +1347,23 @@ handle_frame({ping, 0, Opaque}, State) ->
         too_many_pings ->
             too_many_pings(State, Ack)
     end;
-handle_frame({window_update, 0, Inc}, State) ->
-    case State#loop.conn_send_window + Inc of
+handle_frame({window_update, 0, Inc}, #loop{conn_send_window = Old} = State) ->
+    case Old + Inc of
         New when New > ?MAX_WINDOW ->
             goaway_exit(State, flow_control_error);
+        New when Old =< 0, New > 0 ->
+            %% It opens a window our DATA waited on (only our DATA spends
+            %% it), so it is not counted: the DATA it lets out is the work
+            %% it asked for, and a client cannot send another such one
+            %% before more of ours went out.
+            frame_loop(flush_all_pending_data(State#loop{conn_send_window = New}));
         New ->
-            State1 = State#loop{conn_send_window = New},
+            %% The count lands in the update the window takes: a client
+            %% reading a large response sends many of these.
+            State1 = State#loop{conn_send_window = New, control_frames = control_count(State)},
             frame_loop(flush_all_pending_data(State1))
     end;
-handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) ->
+handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State0) ->
     case Streams of
         #{StreamId := #stream{send_window = SW} = Stream} ->
             case SW + Inc of
@@ -1260,27 +1373,32 @@ handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State) -
                     %% worker may still be running, so tear the stream
                     %% down the way a peer reset does: the worker is told,
                     %% and its slot is held until it ends.
+                    State = control_frame(State0),
                     _ = send_rst_stream(State, StreamId, flow_control_error),
                     frame_loop(reset_stream(State, StreamId));
                 New ->
                     Stream1 = Stream#stream{send_window = New},
-                    State1 = State#loop{streams = Streams#{StreamId := Stream1}},
-                    frame_loop(flush_pending_data(State1, StreamId))
+                    State = State0#loop{
+                        streams = Streams#{StreamId := Stream1},
+                        control_frames = stream_update_count(SW, New, Stream, State0)
+                    },
+                    frame_loop(flush_pending_data(State, StreamId))
             end;
         #{} ->
             %% RFC 9113 §5.1: WINDOW_UPDATE on an idle stream is
             %% PROTOCOL_ERROR. A closed-stream WU (id <=
             %% peer_stream_id) is silently ignored per §6.9.
-            case StreamId > State#loop.peer_stream_id of
+            case StreamId > State0#loop.peer_stream_id of
                 true ->
-                    goaway_exit(State, protocol_error);
+                    goaway_exit(State0, protocol_error);
                 false ->
-                    frame_loop(State)
+                    frame_loop(control_frame(State0))
             end
     end;
 handle_frame(
-    {priority, StreamId, #{stream_dependency := StreamId}}, #loop{streams = Streams} = State
+    {priority, StreamId, #{stream_dependency := StreamId}}, #loop{streams = Streams} = State0
 ) ->
+    State = control_frame(State0),
     %% RFC 9113 §5.3.1: a stream cannot depend on itself —
     %% stream-error PROTOCOL_ERROR. A stream we hold is torn down the way
     %% a peer reset does (its worker told; its slot held until the worker
@@ -1291,9 +1409,15 @@ handle_frame(
         #{} -> frame_loop(State)
     end;
 handle_frame({priority, _, _}, State) ->
-    frame_loop(State);
+    frame_loop(control_frame(State));
 handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
     case Streams of
+        #{StreamId := #stream{worker_ref = undefined}} ->
+            %% No handler runs for it (its body was still to come, it
+            %% waited for a slot, or its handler ended with DATA still
+            %% queued), so the rapid reset guard does not see it: the
+            %% reset serves nothing.
+            frame_loop(drop_reset_stream(control_frame(State), StreamId));
         #{StreamId := _} ->
             frame_loop(drop_reset_stream(State, StreamId));
         #{} ->
@@ -1301,12 +1425,12 @@ handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
             %% PROTOCOL_ERROR (we never opened it). On a closed
             %% stream (id <= peer_stream_id) the receipt is a no-op
             %% per §5.4 — it's the peer telling us about the
-            %% already-closed lifecycle.
+            %% already-closed lifecycle, and serves nothing.
             case StreamId > State#loop.peer_stream_id of
                 true ->
                     goaway_exit(State, protocol_error);
                 false ->
-                    frame_loop(State)
+                    frame_loop(control_frame(State))
             end
     end;
 handle_frame({goaway, _, _, _}, State) ->
@@ -1316,6 +1440,21 @@ handle_frame({headers, StreamId, Flags, Priority, Fragment}, State) ->
     on_headers(StreamId, Flags, Priority, Fragment, State);
 handle_frame({continuation, StreamId, Flags, Fragment}, State) ->
     on_continuation(StreamId, Flags, Fragment, State);
+handle_frame({data, StreamId, Flags, <<>>, FlowLen}, #loop{streams = Streams} = State) when
+    Flags band 16#01 =:= 0
+->
+    %% A DATA frame that carries nothing and does not end its stream serves
+    %% nothing (CVE-2019-9518, empty frames flood). Without padding there is
+    %% nothing to take on a stream still open, not even window. On a stream
+    %% the conn no longer holds, `on_data/5` counts it.
+    case Streams of
+        #{StreamId := #stream{end_stream_seen = false}} when FlowLen =:= 0 ->
+            frame_loop(control_frame(State));
+        #{StreamId := _} ->
+            on_data(StreamId, Flags, <<>>, FlowLen, control_frame(State));
+        #{} ->
+            on_data(StreamId, Flags, <<>>, FlowLen, State)
+    end;
 handle_frame({data, StreamId, Flags, Payload, FlowLen}, State) ->
     on_data(StreamId, Flags, Payload, FlowLen, grow_buffer(Flags, Payload, State));
 handle_frame({push_promise, _, _, _, _}, State) ->
@@ -1324,8 +1463,9 @@ handle_frame({push_promise, _, _, _, _}, State) ->
 handle_frame({unknown, _Type, _StreamId}, State) ->
     %% RFC 9113 §4.1: unknown frame types MUST be ignored. The
     %% awaiting_continuation guard above already rejected the
-    %% mid-header-block case (§6.10), so reaching here is benign.
-    frame_loop(State).
+    %% mid-header-block case (§6.10), so reaching here is benign, and
+    %% serves nothing.
+    frame_loop(control_frame(State)).
 
 %% A prior-knowledge h2c socket starts with the small `idle_recv_buffer`,
 %% which bounds what an idle connection holds, and every `{active, N}` read
@@ -1496,7 +1636,11 @@ refuse_over_limit(StreamId, Flags, Fragment, false, State) ->
 -spec refuse_new_stream(
     stream_id(), non_neg_integer(), binary(), roadrunner_http2_frame:error_code() | ignore, #loop{}
 ) -> no_return().
-refuse_new_stream(StreamId, Flags, Fragment, Code, State) ->
+refuse_new_stream(StreamId, Flags, Fragment, Code, State0) ->
+    %% A refused request serves nothing, and nor does a field block on a
+    %% stream the conn reset (`control_frame/1`): decoding it is work all
+    %% the same, and a peer could send any number on one stream.
+    State = control_frame(State0),
     EndHeaders = (Flags band 16#04) =/= 0,
     Stream = new_stream(
         Fragment,
@@ -1767,7 +1911,11 @@ body_follows(StreamId, State) ->
 send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
     {Block, Enc1} = roadrunner_http2_hpack:encode([{~":status", ~"100"}], Enc),
     _ = send(State, roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block})),
-    State#loop{hpack_enc = Enc1, ping_clock = undefined}.
+    State#loop{
+        hpack_enc = Enc1,
+        ping_clock = undefined,
+        control_frames = control_credit(State#loop.control_frames, 1)
+    }.
 
 %% RFC 9113 §8.1: the request body is over its cap. Answer 413
 %% before the full request, then RST_STREAM(NO_ERROR) to ask the client to
@@ -1787,7 +1935,7 @@ reject_too_large(State, StreamId) ->
 on_data(StreamId, _Flags, _Payload, _FlowLen, State) when StreamId > State#loop.peer_stream_id ->
     %% RFC 9113 §5.1: DATA on an idle stream is PROTOCOL_ERROR.
     goaway_exit(State, protocol_error);
-on_data(StreamId, _Flags, _Payload, FlowLen, #loop{streams = Streams} = State) when
+on_data(StreamId, _Flags, Payload, FlowLen, #loop{streams = Streams} = State) when
     not is_map_key(StreamId, Streams)
 ->
     %% DATA on a stream we no longer hold. Its bytes still consumed the
@@ -1796,13 +1944,24 @@ on_data(StreamId, _Flags, _Payload, FlowLen, #loop{streams = Streams} = State) w
     %% them, so the conn window doesn't drift down across resets. On a
     %% stream we reset, the peer sent it before it saw our RST_STREAM:
     %% ignored (§5.1). On any other closed stream it is STREAM_CLOSED
-    %% (§6.1). A stream we hold, the common case, never gets here.
-    _ =
+    %% (§6.1). A stream we hold, the common case, never gets here. Each
+    %% such frame serves nothing (`control_frame/1`), but the ones with a
+    %% payload the peer sent before it saw our reset, within the window the
+    %% stream had left, which no refill grows after the reset. Each of
+    %% those is charged at least a full frame (`?MAX_FRAME_SIZE`), so a
+    %% window's worth sent a byte at a time is not free.
+    State1 =
         case State#loop.reset_ids of
-            {_, #{StreamId := _}} -> ok;
-            _ -> send_rst_stream(State, StreamId, stream_closed)
+            {Queue, #{StreamId := Left} = Ids} when Payload =/= <<>>, Left > 0 ->
+                Ids1 = Ids#{StreamId := max(0, Left - max(FlowLen, ?MAX_FRAME_SIZE))},
+                State#loop{reset_ids = {Queue, Ids1}};
+            {_, #{StreamId := _}} ->
+                control_frame(State);
+            _ ->
+                _ = send_rst_stream(State, StreamId, stream_closed),
+                control_frame(State)
         end,
-    frame_loop(replenish_conn_window(State, FlowLen));
+    frame_loop(replenish_conn_window(State1, FlowLen));
 on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
     case Streams of
         #{
@@ -2590,10 +2749,15 @@ encode_and_send_headers(
                 hpack_enc = Enc1,
                 streams = Streams#{StreamId := Closed},
                 live_streams = Live,
-                ping_clock = undefined
+                ping_clock = undefined,
+                control_frames = control_credit(State#loop.control_frames, 1)
             };
         false ->
-            State#loop{hpack_enc = Enc1, ping_clock = undefined}
+            State#loop{
+                hpack_enc = Enc1,
+                ping_clock = undefined,
+                control_frames = control_credit(State#loop.control_frames, 1)
+            }
     end.
 
 %% HEADERS + DATA (END_STREAM) packed into ONE `ssl:send/2`. Body
@@ -2632,7 +2796,8 @@ encode_and_send_response_atomic(
         conn_send_window = ConnW - BodyLen,
         streams = Streams#{StreamId := Closed},
         live_streams = Live,
-        ping_clock = undefined
+        ping_clock = undefined,
+        control_frames = control_credit(State#loop.control_frames, 2)
     }.
 
 encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
@@ -2661,8 +2826,14 @@ close_stream_send_side(#loop{streams = Streams, live_streams = Live0} = State, S
     #{StreamId := Stream} = Streams,
     {Closed, Live} = close_send(Stream, Live0),
     %% The frame that ended the stream (trailers, or an empty DATA) went
-    %% out: the client's next PING is free (`ping_strike/1`).
-    State#loop{streams = Streams#{StreamId := Closed}, live_streams = Live, ping_clock = undefined}.
+    %% out: the client's next PING is free (`ping_strike/1`), and it takes
+    %% `?CONTROL_CREDIT` off the count of frames that serve nothing.
+    State#loop{
+        streams = Streams#{StreamId := Closed},
+        live_streams = Live,
+        ping_clock = undefined,
+        control_frames = control_credit(State#loop.control_frames, 1)
+    }.
 
 %% A stream entry with its send side closed, and the live-stream count
 %% after it: a stream the peer already ended is closed both ways and
@@ -2791,17 +2962,23 @@ data_frames(StreamId, Bin, Fin) ->
 window_budget(#loop{conn_send_window = ConnW}, #stream{send_window = StreamW}) ->
     max(0, min(ConnW, StreamW)).
 
-%% DATA went out: spend the windows, and make the client's next PING free
-%% (`ping_strike/1`), as HEADERS do.
+%% DATA went out, `N` bytes in frames of up to `?MAX_FRAME_SIZE`: spend the
+%% windows, make the client's next PING free (`ping_strike/1`) and take
+%% `?CONTROL_CREDIT` per frame off the count of frames that serve nothing
+%% (`control_credit/2`), as HEADERS do.
 consume_send_window(
-    #loop{conn_send_window = ConnW, streams = Streams} = State, StreamId, Stream, N
+    #loop{conn_send_window = ConnW, streams = Streams, control_frames = Count} = State,
+    StreamId,
+    Stream,
+    N
 ) ->
     #stream{send_window = SW} = Stream,
     Stream1 = Stream#stream{send_window = SW - N},
     State#loop{
         conn_send_window = ConnW - N,
         streams = Streams#{StreamId := Stream1},
-        ping_clock = undefined
+        ping_clock = undefined,
+        control_frames = data_credit(Count, N)
     }.
 
 enqueue_pending(#stream{pending_sends = Pending} = Stream, Entry) ->
@@ -2983,19 +3160,16 @@ hold_reset_slot(Reset, _MonRef, false) -> Reset.
 %% Called by `handle_worker_down/4` when a worker dies abnormally.
 %% Send RST_STREAM(error_code) to the peer and drop our state.
 abort_stream(State0, StreamId, ErrorCode) ->
-    #loop{streams = Streams} = State = uncount_stream(State0, StreamId),
+    #loop{streams = Streams} = State = remember_reset(uncount_stream(State0, StreamId), StreamId),
     #{StreamId := #stream{pending_sends = Pending}} = Streams,
     notify_pending_reset(StreamId, Pending),
     _ = send_rst_stream(State, StreamId, ErrorCode),
     Streams1 = forget_stream(State, StreamId, Streams),
     withdraw_parked(
-        remember_reset(
-            State#loop{
-                streams = Streams1,
-                idle_deadline = idle_deadline(Streams1, State#loop.workers, State)
-            },
-            StreamId
-        ),
+        State#loop{
+            streams = Streams1,
+            idle_deadline = idle_deadline(Streams1, State#loop.workers, State)
+        },
         StreamId
     ).
 
@@ -3004,12 +3178,15 @@ abort_stream(State0, StreamId, ErrorCode) ->
 %% stream that never existed. The last `?RESET_MEMORY` are kept, which
 %% §5.1 allows ("MAY choose to limit the period"): a peer still sending
 %% on an older one is answered as before.
+%% Each is kept with the receive window the stream had left, all the peer
+%% may still send on it (`on_data/5`).
 -spec remember_reset(#loop{}, stream_id()) -> #loop{}.
 remember_reset(#loop{reset_ids = {_, Ids}} = State, StreamId) when is_map_key(StreamId, Ids) ->
     State;
-remember_reset(#loop{reset_ids = {Queue, Ids}} = State, StreamId) ->
+remember_reset(#loop{reset_ids = {Queue, Ids}, streams = Streams} = State, StreamId) ->
+    #{StreamId := #stream{recv_window = Window}} = Streams,
     Queue1 = queue:in(StreamId, Queue),
-    Ids1 = Ids#{StreamId => []},
+    Ids1 = Ids#{StreamId => Window},
     case map_size(Ids1) > ?RESET_MEMORY of
         true ->
             {{value, Oldest}, Queue2} = queue:out(Queue1),
@@ -3171,15 +3348,25 @@ apply_initial_window_size(Params, #loop{peer_initial_window = Old} = State) ->
         New ->
             Delta = New - Old,
             case shift_stream_send_windows(State#loop.streams, Delta) of
-                {ok, Streams1} ->
-                    {ok, State#loop{
-                        peer_initial_window = New,
-                        streams = Streams1
-                    }};
+                {ok, Streams1, Closed} ->
+                    %% Each stream whose window it closes buys the client a
+                    %% WINDOW_UPDATE that is not counted (`stream_update_count/4`),
+                    %% so it is charged for each (`control_frame/1`).
+                    {ok,
+                        charge_control_frames(
+                            State#loop{peer_initial_window = New, streams = Streams1}, Closed
+                        )};
                 {error, _} = E ->
                     E
             end
     end.
+
+%% `N` more frames that serve nothing (`control_frame/1`).
+-spec charge_control_frames(#loop{}, non_neg_integer()) -> #loop{}.
+charge_control_frames(State, 0) ->
+    State;
+charge_control_frames(State, N) ->
+    charge_control_frames(control_frame(State), N - 1).
 
 %% RFC 9113 §6.5.2 / RFC 7541 §6.3: the peer's SETTINGS_HEADER_TABLE_SIZE
 %% (id 1) caps OUR encoder's dynamic table. Apply the last value (§6.5.3),
@@ -3224,6 +3411,17 @@ last_setting([_ | Rest], Id, V) -> last_setting(Rest, Id, V).
 %% Map-comprehension shift across the streams map (OTP 28+). A
 %% single overflow short-circuits via `throw/1` — cleaner than
 %% threading a Result tuple through the comprehension.
+shift_stream_send_windows(Streams, Delta) when Delta < 0 ->
+    %% A smaller window cannot overflow; count the streams it closes.
+    {Streams1, Closed} = maps:fold(
+        fun(Id, #stream{send_window = SW} = Stream, {Acc, N}) ->
+            New = SW + Delta,
+            {Acc#{Id => Stream#stream{send_window = New}}, N + closes(SW, New)}
+        end,
+        {#{}, 0},
+        Streams
+    ),
+    {ok, Streams1, Closed};
 shift_stream_send_windows(Streams, Delta) ->
     try
         Streams1 =
@@ -3231,11 +3429,16 @@ shift_stream_send_windows(Streams, Delta) ->
                 Id => Stream#stream{send_window = check_window(SW + Delta)}
              || Id := #stream{send_window = SW} = Stream <- Streams
             },
-        {ok, Streams1}
+        {ok, Streams1, 0}
     catch
         throw:flow_control_error ->
             {error, flow_control_error}
     end.
+
+%% 1 when a window goes from open to closed, else 0.
+-spec closes(integer(), integer()) -> 0 | 1.
+closes(Old, New) when Old > 0, New =< 0 -> 1;
+closes(_Old, _New) -> 0.
 
 check_window(W) when W > ?MAX_WINDOW -> throw(flow_control_error);
 check_window(W) -> W.

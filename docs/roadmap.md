@@ -113,6 +113,24 @@ need.
   rather than the handshake's samples, and its first probe timeouts run
   long — small
 
+### QUIC frames that serve no request — medium
+
+**What:** HTTP/2's `control_frame_policy` bounds the frames that make the
+server work without serving anything. HTTP/3 has no such frames of its
+own worth a budget: SETTINGS may come once, there is no PING,
+WINDOW_UPDATE, PRIORITY or RST_STREAM at its layer, and unknown or empty
+frames are dropped with no answer, each paid for with stream data the
+client sends in an encrypted packet. The QUIC layer below has some (RFC
+9000 §21.9): each PATH_CHALLENGE is answered with a PATH_RESPONSE, and
+PING, empty STREAM frames and repeated MAX_DATA or MAX_STREAM_DATA frames
+cost a little work each. A budget per connection, counted the same way
+and closing the connection past it, would match HTTP/2.
+
+**Why deferred:** a QUIC flood costs the client one encrypted packet per
+1200 bytes or so of frames, every answer is as large as what it answers,
+and acknowledgments are already sent per packet, not per frame, so the
+work stays in proportion to the bytes received.
+
 ### Throughput levers identified by profiling
 
 All-scope eprof on current `main` over a steady-state download (`scripts/bench.escript
@@ -206,24 +224,6 @@ piece of its own:
 
 **Why deferred:** the client was built for roadrunner's own tests and
 tools; these matter only once it carries production traffic.
-
-### HTTP/2 control-frame flood guard — medium
-
-**What:** `ping_policy` bounds PINGs, and the idle timeout no longer
-lets frames without a request keep a connection open, but the other
-frames that make the server work without serving anything have no
-budget of their own (RFC 9113 §10.5): SETTINGS (each one answered),
-WINDOW_UPDATE, PRIORITY, empty DATA and CONTINUATION frames, frames of
-unknown types. A general guard would count those frames per connection
-over a window, as nghttp2, h2o and Go's `x/net/http2` do, and close the
-connection with `GOAWAY(ENHANCE_YOUR_CALM)` past a limit, with no timer
-per frame. The work is in deciding what counts (a WINDOW_UPDATE is
-useful while the server sends; an empty DATA frame can end a stream),
-a default no real client meets, and the tests.
-
-**Why deferred:** the cost of such a flood is CPU on one connection,
-bounded by the client's own sending rate and by `max_clients`, and none
-of these frames holds memory or keeps an idle connection open now.
 
 ### CI performance regression check — medium
 

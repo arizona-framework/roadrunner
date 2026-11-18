@@ -83,6 +83,9 @@ to the handler.
 %% The HTTP/2 `ping_policy` a listener takes unless set: a PING flood
 %% guard (see `t:http2_opts/0`).
 -define(DEFAULT_PING_POLICY, #{min_time => 1000, permit_without_stream => true, max_strikes => 2}).
+%% The HTTP/2 `control_frame_policy` a listener takes unless set: a guard
+%% against floods of frames that serve nothing (see `t:http2_opts/0`).
+-define(DEFAULT_CONTROL_FRAME_POLICY, #{max => 1000, window => 10000}).
 %% `Retry-After` seconds on a request shed at the in-flight ceiling.
 -define(DEFAULT_SHED_RETRY_AFTER, 1).
 -define(DEFAULT_MIN_BYTES_PER_SECOND, 100).
@@ -877,6 +880,29 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   connection before they reuse it, or every few seconds at most. gRPC's
   own servers default to `#{min_time => 300000, permit_without_stream =>
   false}`; see [gRPC keepalive](grpc.md#keepalive).
+- `control_frame_policy`: how many frames that serve no request a client
+  may send (RFC 9113 §10.5), or `false` for no limit. These are SETTINGS
+  (each one answered), WINDOW_UPDATE, PRIORITY, frames of an unknown
+  type, DATA frames that carry nothing and do not end their stream,
+  RST_STREAM or DATA frames on a stream already closed, a request reset
+  while no handler runs for it, a request the server refuses, and header
+  blocks on a stream the server reset. DATA the client sent on a stream
+  before it saw the server reset it is not counted, up to the receive
+  window the stream had left (each frame charged at least 16 KB), nor is
+  a WINDOW_UPDATE that lets out DATA the server was holding back.
+  Each HEADERS or
+  DATA frame the server sends takes 4 off the count, so a client that
+  opens its windows as it reads a response (a WINDOW_UPDATE or two per
+  DATA frame) is never closed for it. The first `max` are free; past
+  them a client may send `max` per `window` milliseconds, and one more
+  within the window closes the connection with
+  `GOAWAY(ENHANCE_YOUR_CALM)`. Keys left out take their default: `max`
+  `1000`, `window` `10000` (10 s). Clients send a handful of these frames
+  as they connect (a browser sends SETTINGS, WINDOW_UPDATE, the ACK of
+  the server's SETTINGS, and maybe a few PRIORITY frames) and one or two
+  per DATA frame they read, so no usual client comes near it. A flood
+  with no response in between is closed at its 2001st frame. PINGs are
+  left to `ping_policy`.
 - `connection_age`: how long a connection may live, as gRPC servers
   bound it (`MaxConnectionAge`), so long-lived clients spread over new
   servers as they come (behind a load balancer, say), or `false` (the
@@ -908,6 +934,8 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
             permit_without_stream => boolean(),
             max_strikes => 0..16#7FFFFFFF
         },
+    control_frame_policy =>
+        false | #{max => 1..16#7FFFFFFF, window => 1..16#FFFFFFFF},
     connection_age =>
         false | #{max := 1..16#FFFFFFFF, grace => 0..16#FFFFFFFF | infinity}
 }.
@@ -2408,13 +2436,15 @@ flatten_protocol_entry(
             max_header_list_size := MaxHeaderListSize,
             active := Active,
             ping_policy := PingPolicy,
+            control_frame_policy := ControlFramePolicy,
             connection_age := Age
         } = Http2},
     ProtoOpts
 ) ->
+    ProtoOpts1 = flatten_control_frame_policy(ControlFramePolicy, ProtoOpts),
     flatten_connection_age(
         Age,
-        flatten_ping_policy(PingPolicy, ProtoOpts#proto_opts{
+        flatten_ping_policy(PingPolicy, ProtoOpts1#proto_opts{
             http2_conn_window = Conn,
             http2_stream_window = Stream,
             %% Unset, each window refills at half its peak.
@@ -2457,6 +2487,7 @@ http2_defaults() ->
         max_header_list_size => 32768,
         active => 16,
         ping_policy => ?DEFAULT_PING_POLICY,
+        control_frame_policy => ?DEFAULT_CONTROL_FRAME_POLICY,
         connection_age => false
     }.
 
@@ -2468,12 +2499,16 @@ validate_http2_opts(Opts, Raw) ->
             %% `window_refill_threshold` has no default entry: unset,
             %% each window refills at half its own peak.
             case K =:= window_refill_threshold orelse is_map_key(K, Defaults) of
-                false -> error({invalid_listener_opt, protocols, Raw});
+                false ->
+                    error({invalid_listener_opt, protocols, Raw});
                 true when K =:= active -> Acc#{K => validate_http2_active(V, Raw)};
                 true when K =:= ping_policy -> Acc#{K => validate_ping_policy(V, Raw)};
+                true when K =:= control_frame_policy ->
+                    Acc#{K => validate_control_frame_policy(V, Raw)};
                 true when K =:= connection_age -> Acc#{K => validate_connection_age(V, Raw)};
                 true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
-                true -> error({invalid_listener_opt, protocols, Raw})
+                true ->
+                    error({invalid_listener_opt, protocols, Raw})
             end
         end,
         Defaults,
@@ -2498,6 +2533,36 @@ validate_ping_policy(Policy, Raw) when is_map(Policy) ->
     );
 validate_ping_policy(_Policy, Raw) ->
     error({invalid_listener_opt, protocols, Raw}).
+
+%% `false`, or a map whose keys left out take the default's.
+-spec validate_control_frame_policy(term(), term()) -> false | map().
+validate_control_frame_policy(false, _Raw) ->
+    false;
+validate_control_frame_policy(Policy, Raw) when is_map(Policy) ->
+    case maps:merge(?DEFAULT_CONTROL_FRAME_POLICY, Policy) of
+        #{max := Max, window := Window} = Policy1 when
+            map_size(Policy1) =:= 2,
+            is_integer(Max),
+            Max >= 1,
+            Max =< 16#7FFFFFFF,
+            is_integer(Window),
+            Window >= 1,
+            Window =< 16#FFFFFFFF
+        ->
+            Policy1;
+        #{} ->
+            error({invalid_listener_opt, protocols, Raw})
+    end;
+validate_control_frame_policy(_Policy, Raw) ->
+    error({invalid_listener_opt, protocols, Raw}).
+
+%% The `control_frame_policy` fields, left `undefined` when it is off.
+-spec flatten_control_frame_policy(false | map(), roadrunner_conn:proto_opts()) ->
+    roadrunner_conn:proto_opts().
+flatten_control_frame_policy(false, ProtoOpts) ->
+    ProtoOpts;
+flatten_control_frame_policy(#{max := Max, window := Window}, ProtoOpts) ->
+    ProtoOpts#proto_opts{http2_control_frame_max = Max, http2_control_frame_window = Window}.
 
 %% `false`, or a map with `max` and maybe `grace` (`infinity` unless set).
 -spec validate_connection_age(term(), term()) -> false | map().

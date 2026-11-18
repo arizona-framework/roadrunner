@@ -84,6 +84,14 @@ headers_then_data_test() ->
     ?assertEqual(~"hello", iolist_to_binary(maps:get(body, fields(Stream)))),
     ?assertEqual(5, maps:get(body_len, fields(Stream))).
 
+empty_data_adds_nothing_to_the_body_test() ->
+    %% DATA frames with nothing in them leave the body as it was, so a
+    %% stream of them holds no memory.
+    Empty = binary:copy(df(<<>>), 100),
+    {ok, Stream} = decode(<<(hf(~"blk"))/binary, Empty/binary, (df(~"hi"))/binary>>, 1000),
+    ?assertEqual([[], ~"hi"], maps:get(body, fields(Stream))),
+    ?assertEqual(2, maps:get(body_len, fields(Stream))).
+
 closed_reason_maps_each_quic_close_test() ->
     ?assertEqual(peer_closed, roadrunner_conn_loop_http3:closed_reason({peer, 0})),
     ?assertEqual(
