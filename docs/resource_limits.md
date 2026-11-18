@@ -306,7 +306,7 @@ table.
 | `request_timeout` | 30 s | yes | header-read timeout on a fresh connection; in `manual` body mode, also how long the body may take to read (on HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the request's read deadline, which is `keep_alive_timeout` for a connection's later requests), which `roadrunner_req:set_body_timeout/2` changes per request; at most `16#FFFFFFFF` ms, as `keep_alive_timeout` and `tls_handshake_timeout` |
 | `keep_alive_timeout` | 60 s | yes | idle timeout between requests (on HTTP/2 and HTTP/3, of the whole connection, at least 1 s; on HTTP/2 counted from the end of the last request, whatever else the client sends; an HTTP/2 connection with a handler still at work gets a PING instead, while on HTTP/3 the client waiting on a response keeps the connection open, as RFC 9114 §5.1 expects of it) |
 | `max_keep_alive_requests` | `infinity` | yes | requests an HTTP/1.1 connection serves before it closes |
-| `min_bytes_per_second` | 100 | yes (0 disables) | slow-loris guard on HTTP/1.1 request heads and bodies; silence counts |
+| `min_bytes_per_second` | 100 | yes (0 disables) | slow-loris guard on HTTP/1.1 request heads and bodies; silence counts; a body is measured over the time spent waiting for its bytes |
 | `rate_limit` | off | opt-in | per-peer request-rate cap (`429` + `Retry-After`) |
 
 `max_clients`'s effective cap is `min(max_clients, the OS file-descriptor

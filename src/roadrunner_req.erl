@@ -564,8 +564,8 @@ included, ends the body, and every later read of it fails the same way.
 With `infinity`, a client that stops sending keeps the request, and its
 slot, until the client or its connection goes away, so set it only where
 a long, quiet body is expected. The connection's own limits still apply:
-on HTTP/1.1 the listener's `min_bytes_per_second`, as an average from the
-start of the body, waiting included, so a client that stops sending is
+on HTTP/1.1 the listener's `min_bytes_per_second`, as an average over the
+time spent waiting for the body, so a client that stops sending is
 closed once its average falls below it (a long, quiet body there needs
 `min_bytes_per_second => 0`); on HTTP/2, a PING after each
 `keep_alive_timeout` of silence, the connection closing if the next one
@@ -573,7 +573,10 @@ passes with no answer, so a client that answers the PING keeps the
 request for as long as it stays connected; and on HTTP/3 the QUIC idle timeout,
 which a client keeps from passing by sending PINGs. Once the response is out,
 what is left of an unread body is drained by the request's own deadline
-at the latest.
+at the latest. On HTTP/1.1 a client that sends only as fast as the
+handler reads, its data already waiting at each read, is never measured
+as slow, as the rate counts only the time spent waiting: the handler's
+own pace bounds it.
 
 Only `body_buffering => manual` mode reads the body after dispatch. In
 `auto` mode the body is already read, and the request comes back as it
