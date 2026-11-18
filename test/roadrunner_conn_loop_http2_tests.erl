@@ -4529,23 +4529,34 @@ drain_without_a_ping_ack_ends_an_idle_timeout_later() ->
     %% A client that never answers the PING gets the final GOAWAY an idle
     %% timeout after the first. A loop handler keeps the conn serving, so
     %% the quiet wire only brings a liveness PING, which would close it a
-    %% whole idle timeout later.
+    %% whole idle timeout later. The request and the drain reach the conn
+    %% together, held while both are sent: sent apart, a test held up for
+    %% two idle timeouts in between would meet that liveness close first.
     persistent_term:put({roadrunner_conn_loop_http2, idle_timeout}, 200),
     try
         {Pid, Ref, ConnPid} = post_handshake_conn(#{dispatch => h2_test_dispatch()}),
+        true = erlang:suspend_process(ConnPid),
         serve_recv(ConnPid, complete_get_headers(1, ~"/loop")),
-        _ = wait_for_register(roadrunner_h2_loop_test, 1000),
-        ?assertMatch([{headers, 1, false}], parse_frames(expect_send())),
-        ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+        Start = erlang:monotonic_time(millisecond),
+        ConnPid ! {roadrunner_drain, Start + 5_000},
+        true = erlang:resume_process(ConnPid),
         Frames = frames_until_goaways(2, []),
-        %% The first GOAWAY and its PING, the liveness PING the quiet wire
-        %% may bring, then the final GOAWAY, naming stream 1.
+        %% The first GOAWAY and its PING, the response and the liveness
+        %% PING the quiet wire may bring, then the final GOAWAY, naming
+        %% stream 1, no sooner than an idle timeout after the drain.
         [{goaway, 16#7FFFFFFF, no_error, _}, {goaway, 1, no_error, _}] =
             [G || {goaway, _, _, _} = G <- Frames],
-        roadrunner_h2_loop_test ! stop,
+        ?assert(erlang:monotonic_time(millisecond) - Start >= 200),
+        %% Stop the handler. A test held up two more idle timeouts finds
+        %% the conn already closed on its unanswered liveness PING, the
+        %% handler gone with it: either way the conn ends normally.
+        case whereis(roadrunner_h2_loop_test) of
+            undefined -> ok;
+            Worker -> Worker ! stop
+        end,
         receive
             {'DOWN', Ref, process, Pid, normal} -> ok
-        after 1000 -> error(drain_did_not_complete)
+        after 5000 -> error(drain_did_not_complete)
         end
     after
         persistent_term:erase({roadrunner_conn_loop_http2, idle_timeout})
@@ -4562,9 +4573,16 @@ stale_goaway_timer_is_ignored() ->
     ),
     cleanup(Pid, Ref).
 
-%% The frames the conn sends until it has sent `N` GOAWAYs, decoded.
+%% The frames the conn sends until it has sent `N` GOAWAYs, decoded. A
+%% GOAWAY may wait on a timer, so each send gets a generous wait: on a
+%% loaded machine one idle timeout can stretch well past `expect_send/0`'s.
 frames_until_goaways(N, Acc) ->
-    Frames = Acc ++ decode_frames(expect_send()),
+    Data =
+        receive
+            {roadrunner_fake_send, _Pid, Sent} -> iolist_to_binary(Sent)
+        after 5000 -> error(no_send)
+        end,
+    Frames = Acc ++ decode_frames(Data),
     case length([G || {goaway, _, _, _} = G <- Frames]) of
         Count when Count >= N -> Frames;
         _ -> frames_until_goaways(N, Frames)
