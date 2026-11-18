@@ -118,7 +118,7 @@
     dispatch :: roadrunner_conn:dispatch() | undefined,
     middlewares = [] :: roadrunner_middleware:middlewares(),
     max_content_length = 0 :: non_neg_integer(),
-    max_keep_alive_requests = 1 :: pos_integer(),
+    max_keep_alive_requests = infinity :: infinity | pos_integer(),
     %% Read-phase deadlines: `request_timeout` for the first request on a
     %% fresh conn, `keep_alive_timeout` for keep-alive loop-backs. Picked
     %% by `phase_timeout/1` per `phase`.
@@ -1788,7 +1788,8 @@ with_close_if_closing(S, Req, Headers) ->
     close_at_ceiling(S, Req, Headers).
 
 %% The response that reaches `max_keep_alive_requests` is the
-%% connection's last.
+%% connection's last. An integer sorts below every atom, so `infinity` is
+%% never reached.
 -spec close_at_ceiling(#loop_state{}, roadrunner_req:request(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
 close_at_ceiling(
@@ -2068,7 +2069,7 @@ buffered_finish(S0, Req, Headers) ->
                     %% `ensure_close_signaled/3` added `Connection: close`
                     %% because this request tripped `max_keep_alive_requests`
                     %% — both land here, and both close the connection.
-                    exit_normal(S, normal);
+                    exit_closing(S, Req, ManualLeftover);
                 keep_alive ->
                     Leftover = pipelined_leftover(Req, S, ManualLeftover),
                     S1 = release_request_slot(S),
@@ -2082,6 +2083,34 @@ buffered_finish(S0, Req, Headers) ->
             %% broken) — close, lingering over what the client may still
             %% be sending.
             exit_lingering(S, normal)
+    end.
+
+%% Close after a response that said `Connection: close`. When the server
+%% chose to close, the client may already have pipelined more requests
+%% behind that response: closing with them unread would send a reset that
+%% can wipe the response before the client reads it, so the close lingers
+%% over them (RFC 9112 §9.6). At the request ceiling that is always a
+%% possibility. Below it, the close lingers only when pipelined bytes are
+%% already in hand, so a connection that served its one request closes at
+%% once; and not when the client asked to close, as it then had no business
+%% pipelining after that request.
+-spec exit_closing(#loop_state{}, roadrunner_req:request(), binary()) -> no_return().
+exit_closing(
+    #loop_state{requests_served = Served, max_keep_alive_requests = Max} = S, _Req, _ManualLeftover
+) when
+    Served >= Max
+->
+    exit_lingering(S, normal);
+exit_closing(S, Req, ManualLeftover) ->
+    case pipelined_leftover(Req, S, ManualLeftover) of
+        <<>> ->
+            exit_normal(S, normal);
+        _Pipelined ->
+            %% With no response headers, the decision is the client's alone.
+            case roadrunner_conn:keep_alive_decision(Req, []) of
+                keep_alive -> exit_lingering(S, normal);
+                close -> exit_normal(S, normal)
+            end
     end.
 
 %% The close path a WebSocket session runs in this process once it ends:
