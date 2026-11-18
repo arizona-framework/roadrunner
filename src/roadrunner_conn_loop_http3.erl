@@ -2,6 +2,7 @@
 -moduledoc false.
 
 -include("roadrunner_proto_opts.hrl").
+-include("roadrunner_http3_control.hrl").
 
 %% HTTP/3 connection owner loop (RFC 9114) — the h3 analogue of
 %% `roadrunner_conn_loop_http2`. One process per QUIC connection,
@@ -116,6 +117,7 @@
 -define(H3_REQUEST_REJECTED, 16#010B).
 -define(H3_REQUEST_CANCELLED, 16#010C).
 -define(H3_MESSAGE_ERROR, 16#010E).
+-define(H3_ID_ERROR, 16#0108).
 -define(H3_QPACK_DECOMPRESSION_FAILED, 16#0200).
 -define(H3_QPACK_ENCODER_STREAM_ERROR, 16#0201).
 -define(H3_QPACK_DECODER_STREAM_ERROR, 16#0202).
@@ -165,7 +167,7 @@
 %% read and discard.
 -type uni_state() ::
     {pending, binary()}
-    | {control, binary(), PeerSettings :: false | map()}
+    | {control, binary(), #h3_control{}}
     | {qpack_encoder, binary()}
     | {qpack_decoder, qpack_continuation()}
     | drain.
@@ -1217,7 +1219,7 @@ handle_uni_stream(#h3{uni = Uni, critical = Critical} = State, StreamId, Data, F
             State#h3{uni = maps:remove(StreamId, Uni), critical = Critical1};
         {{qpack_encoder, Instructions}, Critical1} ->
             encoder_stream_in(State#h3{critical = Critical1}, StreamId, Instructions);
-        {{control, _, PeerSettings} = UniState1, Critical1} ->
+        {{control, _, #h3_control{settings = PeerSettings}} = UniState1, Critical1} ->
             State#h3{
                 uni = Uni#{StreamId => UniState1},
                 critical = Critical1,
@@ -1847,8 +1849,8 @@ route_body_cap(
 -spec uni_event(uni_state(), critical_set(), binary(), boolean()) -> uni_result().
 uni_event({pending, Buf}, Critical, Data, Fin) ->
     uni_classify(<<Buf/binary, Data/binary>>, Critical, Fin);
-uni_event({control, Buf, PeerSettings}, Critical, Data, Fin) ->
-    uni_control(<<Buf/binary, Data/binary>>, PeerSettings, Critical, Fin);
+uni_event({control, Buf, Control}, Critical, Data, Fin) ->
+    uni_control(<<Buf/binary, Data/binary>>, Control, Critical, Fin);
 uni_event({qpack_encoder, Pending}, Critical, Data, Fin) ->
     qpack_stream_open({qpack_encoder, <<Pending/binary, Data/binary>>}, Critical, Fin);
 uni_event({qpack_decoder, Continuation}, Critical, Data, Fin) ->
@@ -1867,7 +1869,7 @@ uni_classify(Buf, Critical, Fin) ->
                 {error, dup} ->
                     {conn_error, ?H3_STREAM_CREATION_ERROR, ~"duplicate control stream"};
                 {ok, Critical1} ->
-                    uni_control(Rest, false, Critical1, Fin)
+                    uni_control(Rest, #h3_control{}, Critical1, Fin)
             end;
         {ok, qpack_encoder, Rest} ->
             uni_qpack(Critical, qpack_encoder, Rest, Fin);
@@ -1946,20 +1948,20 @@ qpack_stream_open(UniState, Critical, false) ->
 
 %% Validate buffered bytes of the peer control stream against the
 %% control-frame sequence rules, then (if not closed) keep the leftover
-%% partial frame and the peer's SETTINGS (`false` until they arrive).
--spec uni_control(binary(), false | map(), critical_set(), boolean()) -> uni_result().
-uni_control(Buf, PeerSettings, Critical, Fin) ->
-    case validate_control_frames(Buf, PeerSettings) of
+%% partial frame and what the frames set (`#h3_control{}`).
+-spec uni_control(binary(), #h3_control{}, critical_set(), boolean()) -> uni_result().
+uni_control(Buf, Control, Critical, Fin) ->
+    case validate_control_frames(Buf, Control) of
         {conn_error, _, _} = ConnError ->
             ConnError;
-        {ok, Leftover, PeerSettings1} ->
+        {ok, Leftover, Control1} ->
             case Fin of
                 true ->
                     %% RFC 9114 §6.2.1: the control stream is critical and
                     %% MUST NOT be closed.
                     {conn_error, ?H3_CLOSED_CRITICAL_STREAM, ~"peer closed the control stream"};
                 false ->
-                    {{control, Leftover, PeerSettings1}, Critical}
+                    {{control, Leftover, Control1}, Critical}
             end
     end.
 
@@ -1982,19 +1984,19 @@ claim(Critical, Role) ->
 %% buffer holds (RFC 9114 §7.2). SETTINGS MUST be the first frame and
 %% MUST appear only once; request frames (DATA / HEADERS / PUSH_PROMISE)
 %% are forbidden; other frames (GOAWAY / MAX_PUSH_ID / CANCEL_PUSH /
-%% reserved) are allowed. The undecoded remainder is returned to be
-%% buffered for the next chunk.
--spec validate_control_frames(binary(), false | map()) ->
-    {ok, binary(), false | map()} | {conn_error, non_neg_integer(), binary()}.
-validate_control_frames(Buf, PeerSettings) ->
+%% reserved) are allowed, the IDs they carry checked (`control_frame/2`).
+%% The undecoded remainder is returned to be buffered for the next chunk.
+-spec validate_control_frames(binary(), #h3_control{}) ->
+    {ok, binary(), #h3_control{}} | {conn_error, non_neg_integer(), binary()}.
+validate_control_frames(Buf, Control) ->
     case roadrunner_quic_h3_frame:decode(Buf) of
         {ok, Frame, Rest} ->
-            case control_frame(Frame, PeerSettings) of
-                {ok, PeerSettings1} -> validate_control_frames(Rest, PeerSettings1);
+            case control_frame(Frame, Control) of
+                {ok, Control1} -> validate_control_frames(Rest, Control1);
                 {conn_error, _, _} = ConnError -> ConnError
             end;
         {more, _} ->
-            {ok, Buf, PeerSettings};
+            {ok, Buf, Control};
         {error, {frame_error, settings, malformed_varint}} ->
             %% RFC 9114 §7.1: a SETTINGS payload that ends inside an
             %% identifier / value pair → H3_FRAME_ERROR.
@@ -2011,20 +2013,39 @@ validate_control_frames(Buf, PeerSettings) ->
             {conn_error, frame_error_code(Reason), ~"control frame error"}
     end.
 
--spec control_frame(roadrunner_quic_h3_frame:frame(), false | map()) ->
-    {ok, map()} | {conn_error, non_neg_integer(), binary()}.
-control_frame({settings, PeerSettings}, false) ->
-    {ok, PeerSettings};
-control_frame(_Frame, false) ->
+%% One control frame against what the earlier ones set. The client's
+%% MAX_PUSH_ID MUST NOT go down (RFC 9114 §7.2.7) and its GOAWAY MUST NOT
+%% name an ID above its last one (§5.2). A CANCEL_PUSH MUST name a push ID
+%% a PUSH_PROMISE has mentioned (§7.2.3), and roadrunner never sends one,
+%% so every CANCEL_PUSH breaks that rule. Each is H3_ID_ERROR.
+-spec control_frame(roadrunner_quic_h3_frame:frame(), #h3_control{}) ->
+    {ok, #h3_control{}} | {conn_error, non_neg_integer(), binary()}.
+control_frame({settings, PeerSettings}, #h3_control{settings = false} = Control) ->
+    {ok, Control#h3_control{settings = PeerSettings}};
+control_frame(_Frame, #h3_control{settings = false}) ->
     %% RFC 9114 §6.2.1: SETTINGS MUST be the first frame on the control
     %% stream — anything before it is H3_MISSING_SETTINGS.
     {conn_error, ?H3_MISSING_SETTINGS, ~"SETTINGS expected as first control frame"};
-control_frame({settings, _}, _PeerSettings) ->
+control_frame({settings, _}, _Control) ->
     %% RFC 9114 §7.2.4: SETTINGS occurs at most once.
     {conn_error, ?H3_FRAME_UNEXPECTED, ~"duplicate SETTINGS on control stream"};
-control_frame(Frame, PeerSettings) ->
+control_frame({max_push_id, Id}, #h3_control{max_push_id = Max}) when
+    Max =/= undefined, Id < Max
+->
+    {conn_error, ?H3_ID_ERROR, ~"MAX_PUSH_ID went down"};
+control_frame({max_push_id, Id}, Control) ->
+    {ok, Control#h3_control{max_push_id = Id}};
+control_frame({cancel_push, _Id}, _Control) ->
+    {conn_error, ?H3_ID_ERROR, ~"CANCEL_PUSH for a push never promised"};
+control_frame({goaway, Id}, #h3_control{goaway_id = Last}) when
+    Last =/= undefined, Id > Last
+->
+    {conn_error, ?H3_ID_ERROR, ~"GOAWAY ID went up"};
+control_frame({goaway, Id}, Control) ->
+    {ok, Control#h3_control{goaway_id = Id}};
+control_frame(Frame, Control) ->
     case is_control_allowed(Frame) of
-        true -> {ok, PeerSettings};
+        true -> {ok, Control};
         false -> {conn_error, ?H3_FRAME_UNEXPECTED, ~"request frame on control stream"}
     end.
 

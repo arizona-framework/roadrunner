@@ -8,10 +8,11 @@ Connection-error codes asserted here are RFC 9114 §8.1 values:
 `16#0103` = H3_STREAM_CREATION_ERROR, `16#0104` = H3_CLOSED_CRITICAL_STREAM,
 `16#0105` = H3_FRAME_UNEXPECTED, `16#0106` = H3_FRAME_ERROR,
 `16#0107` = H3_EXCESSIVE_LOAD, `16#0109` = H3_SETTINGS_ERROR,
-`16#010A` = H3_MISSING_SETTINGS; and the RFC 9204 §8.3 value `16#0202` =
+`16#0108` = H3_ID_ERROR, `16#010A` = H3_MISSING_SETTINGS; and the RFC 9204 §8.3 value `16#0202` =
 QPACK_DECODER_STREAM_ERROR.
 """.
 -include_lib("eunit/include/eunit.hrl").
+-include("../include/roadrunner_http3_control.hrl").
 
 ev(UniState, Critical, Data, Fin) ->
     roadrunner_conn_loop_http3:uni_event(UniState, Critical, Data, Fin).
@@ -24,7 +25,19 @@ ev(UniState, Critical, Data, Fin) ->
 t(Type) -> roadrunner_quic_h3_frame:encode_stream_type(Type).
 settings() ->
     iolist_to_binary(roadrunner_quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0})).
-goaway() -> iolist_to_binary(roadrunner_quic_h3_frame:encode_goaway(0)).
+goaway() -> goaway(0).
+goaway(Id) -> iolist_to_binary(roadrunner_quic_h3_frame:encode_goaway(Id)).
+%% MAX_PUSH_ID (0x0d) and CANCEL_PUSH (0x03): only a client sends them, so
+%% the native h3 codec has no encoder; build the wire frames directly.
+max_push_id(Id) -> id_frame(16#0d, Id).
+cancel_push(Id) -> id_frame(16#03, Id).
+id_frame(Type, Id) ->
+    Payload = roadrunner_quic_varint:encode(Id),
+    iolist_to_binary([
+        roadrunner_quic_varint:encode(Type),
+        roadrunner_quic_varint:encode(iolist_size(Payload)),
+        Payload
+    ]).
 data() -> iolist_to_binary(roadrunner_quic_h3_frame:encode_data(~"x")).
 headers() -> iolist_to_binary(roadrunner_quic_h3_frame:encode_headers(~"blk")).
 %% PUSH_PROMISE (type 0x05): a server never sends one, so the native h3
@@ -51,7 +64,9 @@ pending_type_incomplete_fin_test() ->
 control_stream_claimed_test() ->
     %% Control type + SETTINGS as the first (and only buffered) frame.
     ?assertEqual(
-        {{control, <<>>, #{qpack_max_table_capacity => 0}}, #{control => true}},
+        {{control, <<>>, #h3_control{settings = #{qpack_max_table_capacity => 0}}}, #{
+            control => true
+        }},
         ev({pending, <<>>}, #{}, <<(t(control))/binary, (settings())/binary>>, false)
     ).
 
@@ -105,8 +120,8 @@ control_settings_first_test() ->
     %% The peer's SETTINGS are kept on the stream state, so the conn loop
     %% can read its limits (SETTINGS_MAX_FIELD_SECTION_SIZE) from them.
     ?assertEqual(
-        {{control, <<>>, #{qpack_max_table_capacity => 0}}, #{}},
-        ev({control, <<>>, false}, #{}, settings(), false)
+        {{control, <<>>, #h3_control{settings = #{qpack_max_table_capacity => 0}}}, #{}},
+        ev({control, <<>>, #h3_control{}}, #{}, settings(), false)
     ).
 
 control_settings_kept_after_later_frames_test() ->
@@ -114,70 +129,194 @@ control_settings_kept_after_later_frames_test() ->
         roadrunner_quic_h3_frame:encode_settings(#{max_field_section_size => 4096})
     ),
     ?assertEqual(
-        {{control, <<>>, #{max_field_section_size => 4096}}, #{}},
-        ev({control, <<>>, false}, #{}, <<Settings/binary, (goaway())/binary>>, false)
+        {
+            {control, <<>>, #h3_control{
+                settings = #{max_field_section_size => 4096}, goaway_id = 0
+            }},
+            #{}
+        },
+        ev({control, <<>>, #h3_control{}}, #{}, <<Settings/binary, (goaway())/binary>>, false)
     ).
 
 control_missing_settings_test() ->
     %% A non-SETTINGS frame before SETTINGS → H3_MISSING_SETTINGS.
-    ?assertMatch({conn_error, 16#010A, _}, ev({control, <<>>, false}, #{}, goaway(), false)).
+    ?assertMatch(
+        {conn_error, 16#010A, _}, ev({control, <<>>, #h3_control{}}, #{}, goaway(), false)
+    ).
 
 control_duplicate_settings_test() ->
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, settings(), false)).
+    ?assertMatch(
+        {conn_error, 16#0105, _},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, settings(), false)
+    ).
 
 control_allowed_frame_after_settings_test() ->
     %% GOAWAY after SETTINGS is allowed.
-    ?assertEqual({{control, <<>>, #{}}, #{}}, ev({control, <<>>, #{}}, #{}, goaway(), false)).
+    ?assertEqual(
+        {{control, <<>>, #h3_control{settings = #{}, goaway_id = 0}}, #{}},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, goaway(), false)
+    ).
+
+control_reserved_frame_ignored_test() ->
+    %% A reserved (grease) frame type, 0x21 here, is ignored (RFC 9114 §7.2.8).
+    Control = #h3_control{settings = #{}},
+    ?assertEqual(
+        {{control, <<>>, Control}, #{}}, ev({control, <<>>, Control}, #{}, <<16#21, 0>>, false)
+    ).
 
 control_data_frame_rejected_test() ->
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, data(), false)).
+    ?assertMatch(
+        {conn_error, 16#0105, _},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, data(), false)
+    ).
 
 control_headers_frame_rejected_test() ->
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, headers(), false)).
+    ?assertMatch(
+        {conn_error, 16#0105, _},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, headers(), false)
+    ).
 
 control_push_promise_rejected_test() ->
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, push_promise(), false)).
+    ?assertMatch(
+        {conn_error, 16#0105, _},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, push_promise(), false)
+    ).
 
 control_partial_frame_buffered_test() ->
     %% A lone frame-type byte (incomplete frame) is buffered as-is.
-    ?assertEqual({{control, <<4>>, false}, #{}}, ev({control, <<>>, false}, #{}, <<4>>, false)).
+    ?assertEqual(
+        {{control, <<4>>, #h3_control{}}, #{}},
+        ev({control, <<>>, #h3_control{}}, #{}, <<4>>, false)
+    ).
 
 control_h2_reserved_frame_test() ->
     %% Frame type 0x02 is HTTP/2-reserved → H3_FRAME_UNEXPECTED.
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, <<2, 0>>, false)).
+    ?assertMatch(
+        {conn_error, 16#0105, _},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, <<2, 0>>, false)
+    ).
 
 control_oversized_frame_test() ->
     Oversized = iolist_to_binary([
         roadrunner_quic_varint:encode(0), roadrunner_quic_varint:encode(16#FFFFFFFF)
     ]),
-    ?assertMatch({conn_error, 16#0107, _}, ev({control, <<>>, #{}}, #{}, Oversized, false)).
+    ?assertMatch(
+        {conn_error, 16#0107, _},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, Oversized, false)
+    ).
 
 control_truncated_settings_test() ->
     %% RFC 9114 §7.1: a SETTINGS payload ending inside a pair (an
     %% identifier with no value) is H3_FRAME_ERROR, not H3_SETTINGS_ERROR.
-    ?assertMatch({conn_error, 16#0106, _}, ev({control, <<>>, false}, #{}, <<16#04, 1, 1>>, false)).
+    ?assertMatch(
+        {conn_error, 16#0106, _}, ev({control, <<>>, #h3_control{}}, #{}, <<16#04, 1, 1>>, false)
+    ).
 
 control_malformed_goaway_test() ->
     %% A GOAWAY (0x07) with a byte past its id is malformed (§7.1):
     %% H3_FRAME_ERROR.
     ?assertMatch(
-        {conn_error, 16#0106, _}, ev({control, <<>>, #{}}, #{}, <<16#07, 2, 0, 0>>, false)
+        {conn_error, 16#0106, _},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, <<16#07, 2, 0, 0>>, false)
     ).
 
 control_malformed_push_promise_test() ->
     %% PUSH_PROMISE (0x05) never belongs on the control stream, so even an
     %% empty (malformed) one is H3_FRAME_UNEXPECTED.
-    ?assertMatch({conn_error, 16#0105, _}, ev({control, <<>>, #{}}, #{}, <<16#05, 0>>, false)).
+    ?assertMatch(
+        {conn_error, 16#0105, _},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, <<16#05, 0>>, false)
+    ).
 
 control_forbidden_setting_test() ->
     %% An HTTP/2-only setting (MAX_CONCURRENT_STREAMS = 0x03) is
     %% forbidden in HTTP/3 → H3_SETTINGS_ERROR.
     Forbidden = iolist_to_binary(roadrunner_quic_h3_frame:encode_settings(#{16#03 => 100})),
-    ?assertMatch({conn_error, 16#0109, _}, ev({control, <<>>, false}, #{}, Forbidden, false)).
+    ?assertMatch(
+        {conn_error, 16#0109, _}, ev({control, <<>>, #h3_control{}}, #{}, Forbidden, false)
+    ).
 
 control_stream_closed_test() ->
     %% FIN on the control stream is a critical stream close.
-    ?assertMatch({conn_error, 16#0104, _}, ev({control, <<>>, #{}}, #{}, <<>>, true)).
+    ?assertMatch(
+        {conn_error, 16#0104, _}, ev({control, <<>>, #h3_control{settings = #{}}}, #{}, <<>>, true)
+    ).
+
+%% --- IDs the client's control frames carry ---
+
+control_max_push_id_kept_and_may_stay_or_grow_test() ->
+    Control = #h3_control{settings = #{}},
+    ?assertEqual(
+        {{control, <<>>, Control#h3_control{max_push_id = 5}}, #{}},
+        ev(
+            {control, <<>>, Control},
+            #{},
+            <<(max_push_id(3))/binary, (max_push_id(3))/binary, (max_push_id(5))/binary>>,
+            false
+        )
+    ).
+
+control_max_push_id_going_down_test() ->
+    %% RFC 9114 §7.2.7: a MAX_PUSH_ID below the last one → H3_ID_ERROR.
+    ?assertMatch(
+        {conn_error, 16#0108, _},
+        ev(
+            {control, <<>>, #h3_control{settings = #{}, max_push_id = 5}},
+            #{},
+            max_push_id(4),
+            false
+        )
+    ).
+
+control_cancel_push_within_max_push_id_test() ->
+    %% RFC 9114 §7.2.3: a CANCEL_PUSH for a push ID no PUSH_PROMISE has
+    %% mentioned → H3_ID_ERROR. Roadrunner never promises a push, so that
+    %% holds even for a push ID the client's MAX_PUSH_ID allows.
+    ?assertMatch(
+        {conn_error, 16#0108, _},
+        ev(
+            {control, <<>>, #h3_control{settings = #{}, max_push_id = 5}},
+            #{},
+            cancel_push(0),
+            false
+        )
+    ).
+
+control_cancel_push_beyond_max_push_id_test() ->
+    ?assertMatch(
+        {conn_error, 16#0108, _},
+        ev(
+            {control, <<>>, #h3_control{settings = #{}, max_push_id = 5}},
+            #{},
+            cancel_push(6),
+            false
+        )
+    ).
+
+control_cancel_push_before_max_push_id_test() ->
+    ?assertMatch(
+        {conn_error, 16#0108, _},
+        ev({control, <<>>, #h3_control{settings = #{}}}, #{}, cancel_push(0), false)
+    ).
+
+control_goaway_may_stay_or_go_down_test() ->
+    Control = #h3_control{settings = #{}},
+    ?assertEqual(
+        {{control, <<>>, Control#h3_control{goaway_id = 2}}, #{}},
+        ev(
+            {control, <<>>, Control},
+            #{},
+            <<(goaway(4))/binary, (goaway(4))/binary, (goaway(2))/binary>>,
+            false
+        )
+    ).
+
+control_goaway_going_up_test() ->
+    %% RFC 9114 §5.2: a GOAWAY ID above the last one → H3_ID_ERROR.
+    ?assertMatch(
+        {conn_error, 16#0108, _},
+        ev({control, <<>>, #h3_control{settings = #{}, goaway_id = 4}}, #{}, goaway(8), false)
+    ).
 
 %% --- draining an unknown stream type (from drain) ---
 
@@ -252,7 +391,9 @@ decoder_closed_test() ->
 %% --- reset classification ---
 
 reset_control_is_critical_test() ->
-    ?assertEqual(critical, roadrunner_conn_loop_http3:uni_reset({control, <<>>, #{}})).
+    ?assertEqual(
+        critical, roadrunner_conn_loop_http3:uni_reset({control, <<>>, #h3_control{settings = #{}}})
+    ).
 
 reset_qpack_is_critical_test() ->
     ?assertEqual(critical, roadrunner_conn_loop_http3:uni_reset({qpack_encoder, <<>>})),

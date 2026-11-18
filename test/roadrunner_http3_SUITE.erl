@@ -116,6 +116,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     peer_push_stream_closes_conn/1,
     peer_allows_no_uni_stream_closes_conn/1,
     peer_control_stream_closed/1,
+    peer_control_id_errors_close_conn/1,
     unknown_uni_stream_ignored/1,
     peer_control_stream_reset/1,
     peer_stops_our_control_stream/1,
@@ -240,6 +241,7 @@ all() ->
         peer_push_stream_closes_conn,
         peer_allows_no_uni_stream_closes_conn,
         peer_control_stream_closed,
+        peer_control_id_errors_close_conn,
         unknown_uni_stream_ignored,
         peer_control_stream_reset,
         peer_stops_our_control_stream,
@@ -2098,6 +2100,25 @@ peer_control_stream_closed(Config) ->
     _ = ll_open_uni(Conn, control_with_settings(), true),
     ll_await_closed(Conn).
 
+peer_control_id_errors_close_conn(Config) ->
+    %% A control frame whose ID breaks the rules closes the connection with
+    %% H3_ID_ERROR: any CANCEL_PUSH, in or beyond MAX_PUSH_ID, as roadrunner
+    %% never promises a push (RFC 9114 §7.2.3), a MAX_PUSH_ID that goes down
+    %% (§7.2.7), a GOAWAY ID that goes up (§5.2).
+    lists:foreach(
+        fun(Frames) ->
+            Conn = ll_connect(?config(port, Config)),
+            _ = ll_open_uni(Conn, [control_with_settings() | Frames], false),
+            ?assertEqual(16#0108, ll_await_close_code(Conn))
+        end,
+        [
+            [id_frame(16#0d, 2), id_frame(16#03, 1)],
+            [id_frame(16#0d, 2), id_frame(16#03, 3)],
+            [id_frame(16#0d, 2), id_frame(16#0d, 1)],
+            [roadrunner_quic_h3_frame:encode_goaway(0), roadrunner_quic_h3_frame:encode_goaway(4)]
+        ]
+    ).
+
 unknown_uni_stream_ignored(Config) ->
     %% RFC 9114 §6.2.3: an unknown unidirectional stream type is ignored
     %% (read and discarded); the connection keeps serving.
@@ -2615,6 +2636,16 @@ control_with_settings() ->
         roadrunner_quic_h3_frame:encode_stream_type(control),
         roadrunner_quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0})
     ]).
+
+%% A frame whose payload is one varint ID, for the client-only frames the
+%% native h3 codec has no encoder for (MAX_PUSH_ID 0x0d, CANCEL_PUSH 0x03).
+id_frame(Type, Id) ->
+    Payload = roadrunner_quic_varint:encode(Id),
+    [
+        roadrunner_quic_varint:encode(Type),
+        roadrunner_quic_varint:encode(iolist_size(Payload)),
+        Payload
+    ].
 
 ll_get(Conn, Path) ->
     Frame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(headers(~"GET", Path))),
