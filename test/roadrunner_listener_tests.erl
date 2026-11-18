@@ -848,6 +848,16 @@ listener_rejects_invalid_proxy_protocol_test() ->
     }),
     ?assertMatch({error, {{invalid_listener_opt, proxy_protocol, yes_please}, _Stack}}, R).
 
+listener_rejects_invalid_accept_priority_test() ->
+    %% `accept_priority` must be `high` or `normal`.
+    process_flag(trap_exit, true),
+    R = roadrunner_listener:start_link(listener_test_accept_priority_invalid, #{
+        port => 0,
+        accept_priority => low,
+        routes => roadrunner_hello_handler
+    }),
+    ?assertMatch({error, {{invalid_listener_opt, accept_priority, low}, _Stack}}, R).
+
 listener_rejects_proxy_protocol_on_http3_only_test() ->
     %% PROXY protocol is a TCP-stream feature (an L4 balancer prepends it before
     %% the first byte); enabling it on an HTTP/3-only (UDP) listener conflicts.

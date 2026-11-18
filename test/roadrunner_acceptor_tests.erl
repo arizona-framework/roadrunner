@@ -227,7 +227,123 @@ acceptor_hands_tls_sockets_off_before_the_handshake_test() ->
     end,
     ok = telemetry:detach(HandlerId).
 
+priority_after_test() ->
+    %% Exhaustive over the transition table: a rejection at `max_clients`
+    %% drops to `normal`, the next admitted connection goes back to `high`,
+    %% and `fixed` (accept_priority => normal) never moves.
+    ?assertEqual(high, roadrunner_acceptor:priority_after(admitted, high)),
+    ?assertEqual(high, roadrunner_acceptor:priority_after(admitted, normal)),
+    ?assertEqual(normal, roadrunner_acceptor:priority_after(rejected, high)),
+    ?assertEqual(normal, roadrunner_acceptor:priority_after(rejected, normal)),
+    ?assertEqual(fixed, roadrunner_acceptor:priority_after(admitted, fixed)),
+    ?assertEqual(fixed, roadrunner_acceptor:priority_after(rejected, fixed)).
+
+acceptor_priority_follows_the_max_clients_cap_test_() ->
+    %% The acceptor sets its priority before it starts or closes a
+    %% connection, so each client-visible step below (a response, a close)
+    %% is the sync point for the priority check that follows it.
+    {setup,
+        fun() ->
+            {ok, _} = roadrunner_listener:start_link(acceptor_test_priority_cap, #{
+                port => 0,
+                num_acceptors => 1,
+                max_clients => 1,
+                routes => roadrunner_keepalive_handler
+            }),
+            acceptor_test_priority_cap
+        end,
+        fun(Name) -> ok = roadrunner_listener:stop(Name) end, fun(Name) ->
+            {"high while admitting, normal after a rejection at the cap, high again", fun() ->
+                Port = roadrunner_listener:port(Name),
+                [Acceptor] = acceptor_pids(Name),
+                %% Admitted: served, and the acceptor runs at high priority.
+                First = connect_and_get(Port),
+                ?assertEqual({priority, high}, process_info(Acceptor, priority)),
+                %% Over the cap: closed without a response, and the
+                %% acceptor dropped to normal priority.
+                {ok, Over} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ?assertEqual({error, closed}, gen_tcp:recv(Over, 0, 2000)),
+                ?assertEqual({priority, normal}, process_info(Acceptor, priority)),
+                ?assertMatch(#{rejected := 1}, roadrunner_listener:info(Name)),
+                %% Free the slot: the first conn exits on close.
+                [Conn] = conn_pids(Name),
+                MRef = erlang:monitor(process, Conn),
+                ok = gen_tcp:close(First),
+                receive
+                    {'DOWN', MRef, process, Conn, _} -> ok
+                after 2000 -> error(conn_did_not_exit)
+                end,
+                %% Admitted again: back at high priority.
+                Next = connect_and_get(Port),
+                ?assertEqual({priority, high}, process_info(Acceptor, priority)),
+                ok = gen_tcp:close(Next),
+                ok = gen_tcp:close(Over)
+            end}
+        end}.
+
+acceptor_priority_normal_stays_normal_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = roadrunner_listener:start_link(acceptor_test_priority_normal, #{
+                port => 0,
+                num_acceptors => 1,
+                max_clients => 1,
+                accept_priority => normal,
+                routes => roadrunner_keepalive_handler
+            }),
+            acceptor_test_priority_normal
+        end,
+        fun(Name) -> ok = roadrunner_listener:stop(Name) end, fun(Name) ->
+            {"accept_priority => normal stays normal through admits and rejections", fun() ->
+                Port = roadrunner_listener:port(Name),
+                [Acceptor] = acceptor_pids(Name),
+                First = connect_and_get(Port),
+                ?assertEqual({priority, normal}, process_info(Acceptor, priority)),
+                {ok, Over} = gen_tcp:connect(
+                    {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
+                ),
+                ?assertEqual({error, closed}, gen_tcp:recv(Over, 0, 2000)),
+                ?assertEqual({priority, normal}, process_info(Acceptor, priority)),
+                ?assertMatch(#{rejected := 1}, roadrunner_listener:info(Name)),
+                ok = gen_tcp:close(First),
+                ok = gen_tcp:close(Over)
+            end}
+        end}.
+
 %% --- helpers ---
+
+%% Connect, send one keep-alive GET and read the response head, leaving
+%% the connection open (it holds its `max_clients` slot).
+connect_and_get(Port) ->
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+    {ok, <<"HTTP/1.1 200", _/binary>>} = gen_tcp:recv(Sock, 0, 2000),
+    Sock.
+
+conn_pids(Name) ->
+    [
+        P
+     || P <- processes(),
+        L <- [proc_lib:get_label(P)],
+        is_tuple(L),
+        element(1, L) =:= roadrunner_conn,
+        tuple_size(L) >= 2,
+        element(2, L) =:= Name
+    ].
+
+%% The acceptors are the listener's links labelled `roadrunner_acceptor`.
+acceptor_pids(Name) ->
+    {links, Links} = process_info(whereis(Name), links),
+    [
+        P
+     || P <- Links,
+        is_pid(P),
+        L <- [proc_lib:get_label(P)],
+        is_tuple(L),
+        element(1, L) =:= roadrunner_acceptor
+    ].
 
 %% Poll the live-connection counter until it reads `Expected`; the slot
 %% release runs after the accept_error event, so the first read can race it.
