@@ -113,6 +113,24 @@ need.
   rather than the handshake's samples, and its first probe timeouts run
   long — small
 
+### QUIC frames that serve no request — medium
+
+**What:** HTTP/2's `control_frame_policy` bounds the frames that make the
+server work without serving anything. HTTP/3 has no such frames of its
+own worth a budget: SETTINGS may come once, there is no PING,
+WINDOW_UPDATE, PRIORITY or RST_STREAM at its layer, and unknown or empty
+frames are dropped with no answer, each paid for with stream data the
+client sends in an encrypted packet. The QUIC layer below has some (RFC
+9000 §21.9): each PATH_CHALLENGE is answered with a PATH_RESPONSE, and
+PING, empty STREAM frames and repeated MAX_DATA or MAX_STREAM_DATA frames
+cost a little work each. A budget per connection, counted the same way
+and closing the connection past it, would match HTTP/2.
+
+**Why deferred:** a QUIC flood costs the client one encrypted packet per
+1200 bytes or so of frames, every answer is as large as what it answers,
+and acknowledgments are already sent per packet, not per frame, so the
+work stays in proportion to the bytes received.
+
 ### Throughput levers identified by profiling
 
 All-scope eprof on current `main` over a steady-state download (`scripts/bench.escript
