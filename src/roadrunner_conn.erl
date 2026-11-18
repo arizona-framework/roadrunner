@@ -1193,9 +1193,7 @@ allow_header_value(Allowed) ->
 %% answers it without coming here.
 -doc false.
 -spec read_body(
-    chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding},
+    roadrunner_http1:framing(),
     binary(),
     fun(() -> {ok, binary()} | {error, term()}),
     non_neg_integer(),
@@ -1246,7 +1244,7 @@ expects_continue(Req) ->
 
 -doc false.
 -spec make_body_reader(
-    none | chunked | {content_length, non_neg_integer()},
+    roadrunner_http1:body_framing(),
     binary(),
     fun((roadrunner_req:deadline()) -> {ok, binary()} | {error, term()}),
     roadrunner_router:body_limit(),
@@ -1530,10 +1528,7 @@ drop_delivered(StreamId) ->
 
 -doc false.
 -spec body_framing(roadrunner_req:request()) ->
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding}.
+    roadrunner_http1:framing().
 body_framing(#{cached_decisions := Decisions} = Req) ->
     version_framing(roadrunner_http1:framing(Decisions), Req);
 body_framing(#{headers := Headers} = Req) ->
@@ -1553,16 +1548,10 @@ body_framing(#{headers := Headers} = Req) ->
 %% after an unsupported coding, which HTTP/1.1 answers 501. Any other
 %% Transfer-Encoding is already a 400 on every version.
 -spec version_framing(
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding},
+    roadrunner_http1:framing(),
     roadrunner_req:request()
 ) ->
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding}.
+    roadrunner_http1:framing().
 version_framing(chunked, #{version := {1, 1}}) -> chunked;
 version_framing({error, unsupported_transfer_coding} = Err, #{version := {1, 1}}) -> Err;
 version_framing(chunked, _Req) -> {error, bad_transfer_encoding};

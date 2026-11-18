@@ -1191,10 +1191,7 @@ release_request_slot(S) ->
     #loop_state{},
     429 | 503,
     pos_integer(),
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding}
+    roadrunner_http1:framing()
 ) -> no_return().
 refuse_retry_later(#loop_state{socket = Socket} = S, Status, RetryAfter, Framing) ->
     S1 = flush_out(S),
@@ -1267,10 +1264,7 @@ head_grown(Head, Max) -> {Head, Max}.
 
 -spec grow_buffer(
     #loop_state{},
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding}
+    roadrunner_http1:framing()
 ) -> #loop_state{}.
 grow_buffer(#loop_state{grow_buffer = undefined} = S, _Framing) ->
     S;
@@ -1284,10 +1278,7 @@ grow_buffer(#loop_state{grow_buffer = {Idle, Max}, buffered = Buffered} = S, Fra
     end.
 
 -spec large_body(
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding},
+    roadrunner_http1:framing(),
     non_neg_integer(),
     pos_integer()
 ) -> boolean().
@@ -1390,10 +1381,7 @@ reset_heap_floor(S) ->
 -spec expect_answer(
     #loop_state{},
     roadrunner_req:request(),
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding},
+    roadrunner_http1:framing(),
     roadrunner_router:body_limit()
 ) -> continue | too_large | none.
 expect_answer(#loop_state{buffered = ~""}, Req, Framing, MaxCL) ->
@@ -1427,10 +1415,7 @@ expect_answer(_S, _Req, _Framing, _MaxCL) ->
     continue | none,
     #loop_state{},
     roadrunner_req:request(),
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding},
+    roadrunner_http1:framing(),
     roadrunner_router:body_limit(),
     roadrunner_conn:resolved(),
     integer()
@@ -1468,9 +1453,7 @@ read_body(manual, Answer, S, Req, Framing, MaxCL, Resolved, Deadline) ->
 -spec read_auto_body(
     #loop_state{},
     roadrunner_req:request(),
-    chunked
-    | {content_length, non_neg_integer()}
-    | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding},
+    roadrunner_http1:framing(),
     non_neg_integer(),
     roadrunner_conn:resolved(),
     integer()

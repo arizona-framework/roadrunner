@@ -82,11 +82,12 @@
 %% walk. `has_host` and `has_content_type` only feed `parse_request/2`'s
 %% checks; the rest is read through `framing/1`, `expectation/1` and
 %% `connection_lower/1`.
+%% How a well-framed request body is delimited.
+-type body_framing() :: none | chunked | {content_length, non_neg_integer()}.
+
 %% A request body's framing, as `framing/1` reports it.
 -type framing() ::
-    none
-    | chunked
-    | {content_length, non_neg_integer()}
+    body_framing()
     | {error, bad_content_length | bad_transfer_encoding | unsupported_transfer_coding}.
 
 %% The request's Transfer-Encoding list so far: absent, `chunked` alone,
@@ -102,7 +103,7 @@
     has_content_type :: boolean() | multiple
 }).
 -opaque cached_decisions() :: #cached_decisions{}.
--export_type([cached_decisions/0, framing/0]).
+-export_type([cached_decisions/0, framing/0, body_framing/0]).
 
 -doc """
 Parse the HTTP/1.1 request line.
