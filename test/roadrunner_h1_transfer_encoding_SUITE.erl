@@ -4,6 +4,8 @@ HTTP/1.1 request framing by `Transfer-Encoding` over a real socket. The
 field's lines combine into one list (RFC 9110 §5.3), and a list that is not
 `chunked` alone is answered 400 and the connection closed (RFC 9112 §6.3),
 so a body framed differently by a proxy in front cannot smuggle a request.
+An HTTP/1.0 request with any `Transfer-Encoding` is answered the same way
+(RFC 9112 §6.1).
 """.
 -behaviour(ct_suite).
 
@@ -16,7 +18,9 @@ so a body framed differently by a proxy in front cannot smuggle a request.
     chunked_then_gzip_lines_rejected/1,
     gzip_then_chunked_lines_rejected/1,
     chunked_twice_across_lines_rejected/1,
-    chunked_with_empty_elements_accepted/1
+    chunked_with_empty_elements_accepted/1,
+    http10_chunked_rejected/1,
+    http10_chunked_with_content_length_rejected/1
 ]).
 
 suite() ->
@@ -30,7 +34,9 @@ groups() ->
         chunked_then_gzip_lines_rejected,
         gzip_then_chunked_lines_rejected,
         chunked_twice_across_lines_rejected,
-        chunked_with_empty_elements_accepted
+        chunked_with_empty_elements_accepted,
+        http10_chunked_rejected,
+        http10_chunked_with_content_length_rejected
     ],
     [{auto, [], Cases}, {manual, [], Cases}].
 
@@ -65,16 +71,16 @@ end_per_testcase(_Case, Config) ->
 chunked_then_gzip_lines_rejected(Config) ->
     %% Combined, the list is `chunked, gzip`: chunked is not the final
     %% coding, so the body's length is unknown.
-    assert_rejected(?config(sock, Config), [~"chunked", ~"gzip"]).
+    assert_rejected(?config(sock, Config), request([~"chunked", ~"gzip"])).
 
 gzip_then_chunked_lines_rejected(Config) ->
     %% `gzip, chunked` ends in chunked, but gzip is not a coding roadrunner
     %% decodes.
-    assert_rejected(?config(sock, Config), [~"gzip", ~"chunked"]).
+    assert_rejected(?config(sock, Config), request([~"gzip", ~"chunked"])).
 
 chunked_twice_across_lines_rejected(Config) ->
     %% RFC 9112 §6.1: chunked is applied at most once.
-    assert_rejected(?config(sock, Config), [~"chunked", ~"Chunked"]).
+    assert_rejected(?config(sock, Config), request([~"chunked", ~"Chunked"])).
 
 chunked_with_empty_elements_accepted(Config) ->
     %% RFC 9110 §5.6.1: empty list elements are ignored, so `, chunked ,`
@@ -85,21 +91,37 @@ chunked_with_empty_elements_accepted(Config) ->
     ok = gen_tcp:send(Sock, request([~"chunked"])),
     ?assertEqual({200, ~"hello"}, recv_response(Sock)).
 
+http10_chunked_rejected(Config) ->
+    %% RFC 9112 §6.1: an HTTP/1.0 request with Transfer-Encoding has faulty
+    %% framing, even with `chunked` alone.
+    assert_rejected(?config(sock, Config), request(~"HTTP/1.0", [~"chunked"], [])).
+
+http10_chunked_with_content_length_rejected(Config) ->
+    %% "even if a Content-Length is present".
+    assert_rejected(
+        ?config(sock, Config),
+        request(~"HTTP/1.0", [~"chunked"], [~"Content-Length: 15\r\n"])
+    ).
+
 %% --- helpers ---
 
 %% The request carries a chunked body and, behind it, a second request a
 %% chunked reading would take as pipelined: neither must be answered past
 %% the 400, and the server closes.
-assert_rejected(Sock, Lines) ->
-    ok = gen_tcp:send(Sock, [request(Lines), ~"GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n"]),
+assert_rejected(Sock, Request) ->
+    ok = gen_tcp:send(Sock, [Request, ~"GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n"]),
     Reply = recv_until_closed(Sock, <<>>),
     ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, Reply),
     ?assertEqual(nomatch, binary:match(Reply, ~"HTTP/1.1 ", [{scope, {1, byte_size(Reply) - 1}}])).
 
 request(Lines) ->
+    request(~"HTTP/1.1", Lines, []).
+
+request(Version, Lines, Extra) ->
     [
-        ~"POST /echo-keepalive HTTP/1.1\r\nHost: x\r\n",
+        [~"POST /echo-keepalive ", Version, ~"\r\nHost: x\r\n"],
         [[~"Transfer-Encoding: ", L, ~"\r\n"] || L <- Lines],
+        Extra,
         ~"\r\n5\r\nhello\r\n0\r\n\r\n"
     ].
 

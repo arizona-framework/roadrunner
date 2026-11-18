@@ -1534,12 +1534,37 @@ drop_delivered(StreamId) ->
     | chunked
     | {content_length, non_neg_integer()}
     | {error, bad_content_length | bad_transfer_encoding}.
-body_framing(#{cached_decisions := Decisions}) ->
-    roadrunner_http1:framing(Decisions);
-body_framing(#{headers := Headers}) ->
+body_framing(#{cached_decisions := Decisions} = Req) ->
+    version_framing(roadrunner_http1:framing(Decisions), Req);
+body_framing(#{headers := Headers} = Req) ->
     %% Manually-built request maps without cached_decisions: compute them
     %% so both paths frame the body by the same rules.
-    roadrunner_http1:framing(roadrunner_http1:compute_cached_decisions(Headers)).
+    version_framing(
+        roadrunner_http1:framing(roadrunner_http1:compute_cached_decisions(Headers)), Req
+    ).
+
+%% RFC 9112 §6.1: an HTTP/1.0 message with Transfer-Encoding MUST be
+%% treated as if its framing is faulty and the connection closed after it.
+%% An HTTP/1.0 peer may not know chunked at all, and a proxy on its path may
+%% frame the body by Content-Length or by close instead, so its length
+%% cannot be determined reliably: answer it as RFC 9112 §6.3 answers a
+%% request whose length is unreliable, 400 and close, rather than read a
+%% body the hops may disagree on. Any other Transfer-Encoding is already an
+%% error on every version, so only `chunked` needs the version check.
+-spec version_framing(
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding},
+    roadrunner_req:request()
+) ->
+    none
+    | chunked
+    | {content_length, non_neg_integer()}
+    | {error, bad_content_length | bad_transfer_encoding}.
+version_framing(chunked, #{version := {1, 1}}) -> chunked;
+version_framing(chunked, _Req) -> {error, bad_transfer_encoding};
+version_framing(Framing, _Req) -> Framing.
 
 -spec read_body_until(
     non_neg_integer(),

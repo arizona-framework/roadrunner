@@ -61,6 +61,19 @@ body_framing_combines_transfer_encoding_lines_test_() ->
         ]
     ].
 
+body_framing_http10_transfer_encoding_test_() ->
+    %% RFC 9112 §6.1: an HTTP/1.0 request with Transfer-Encoding has faulty
+    %% framing, `chunked` included; without one it frames as before.
+    [
+        ?_assertEqual(Want, roadrunner_conn:body_framing(Req))
+     || {Req, Want} <- [
+            {req_v10([{~"transfer-encoding", ~"chunked"}]), {error, bad_transfer_encoding}},
+            {req_v10([{~"transfer-encoding", ~"gzip"}]), {error, bad_transfer_encoding}},
+            {req_v10([{~"content-length", ~"3"}]), {content_length, 3}},
+            {req_v10([]), none}
+        ]
+    ].
+
 read_body_cl_within_buffer_test() ->
     Req = req_with_headers([{~"content-length", ~"5"}]),
     NoRecv = fun() -> error(should_not_be_called) end,
