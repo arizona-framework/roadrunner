@@ -139,6 +139,7 @@ are advertised to the peer in the initial `SETTINGS` frame.
 | Stream receive window (`stream_window`) | 16 MB | yes |
 | Unread socket reads per connection (`active`) | 16 | yes |
 | Client PINGs (`ping_policy`) | 1 s apart, 2 closer ones forgiven | yes (`false` disables) |
+| Frames that serve no request (`control_frame_policy`) | 1000, then 1000 per 10 s, less 4 per HEADERS or DATA frame sent | yes (`false` disables) |
 | Connection lifetime (`connection_age`) | none | opt-in |
 
 A frame whose declared length exceeds the negotiated max frame size is
@@ -177,6 +178,35 @@ PINGs without a call, which a listener for gRPC alone can match (see
 [gRPC keepalive](grpc.md#keepalive)). The connection closes with the
 reason `too_many_pings` in `listener_conn_close`.
 
+Some frames make the server work without serving anything (RFC 9113
+§10.5): SETTINGS (each one answered with an ACK), WINDOW_UPDATE,
+PRIORITY, frames of an unknown type, DATA frames that carry nothing and
+do not end their stream, RST_STREAM or DATA frames on a stream already
+closed, a request reset while no handler runs for it, a request the
+server refuses, and header blocks on a stream the server reset. DATA the
+client sent on a stream before it saw the server reset it is not
+counted, up to the receive window the stream had left, as that much may
+have been on its way (each frame is charged at least 16 KB of it, so a
+window sent a byte at a time is not free), nor is a WINDOW_UPDATE that
+lets out DATA the server was holding back. `control_frame_policy`
+bounds these frames, against the SETTINGS, empty frames
+(CVE-2019-9518), WINDOW_UPDATE and PRIORITY (CVE-2019-9513) floods. Each
+HEADERS or DATA frame the server sends takes 4 off the count. The first
+`max` frames are free; past them a client may send `max` more per
+`window` milliseconds, and one more within the window closes the
+connection with `GOAWAY(ENHANCE_YOUR_CALM)` and the reason
+`{protocol_error, enhance_your_calm}` in `listener_conn_close`. A
+browser sends a handful of these as it connects (its SETTINGS, a
+WINDOW_UPDATE, the ACK of the server's SETTINGS, maybe a few PRIORITY
+frames), and a client reading a response sends a WINDOW_UPDATE or two
+per DATA frame it reads, which the 4 that frame takes off covers, so the
+default (1000, then 1000 per 10 s) is far above what clients send. A
+flood with no response in between is closed at its 2001st frame, and a
+client that buys the response a byte at a time to earn credit gains no
+more than 4 frames per DATA frame. PINGs are left to `ping_policy`. An
+empty CONTINUATION frame that does not end its header block closes the
+connection at once (see the CONTINUATION flood below).
+
 A connection lives as long as it is used unless `connection_age` sets
 how long it may: at that age (drawn within 10% of `max` for each
 connection, so connections opened together do not close together) it
@@ -203,8 +233,8 @@ are, so a block of those can pass it, which the advisory list size
 (RFC 9113 §6.5.2) allows. The
 concurrency and header caps are tuned under `{http2, #{...}}` in the
 `protocols` list, with the keys `max_concurrent_streams`,
-`max_header_block`, `max_header_list_size`, `ping_policy` and
-`connection_age`.
+`max_header_block`, `max_header_list_size`, `ping_policy`,
+`control_frame_policy` and `connection_age`.
 
 `active` sets how many socket reads a connection takes before it asks
 the socket for more (`once` asks after every read). On TLS each ask is a

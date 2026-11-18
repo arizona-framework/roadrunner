@@ -635,6 +635,62 @@ listener_http2_ping_policy_threads_into_proto_opts_test() ->
         ]
     ).
 
+listener_http2_control_frame_policy_threads_into_proto_opts_test() ->
+    %% The default policy, a partial map over it, and `false` (both
+    %% `http2_control_frame_*` fields `undefined`).
+    lists:foreach(
+        fun({Http2, Expected}) ->
+            Name = listener_test_h2_control_frame_policy,
+            {ok, Pid} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                protocols => [Http2],
+                routes => roadrunner_hello_handler
+            }),
+            ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(Pid))),
+            ?assertEqual(
+                Expected,
+                maps:with([http2_control_frame_max, http2_control_frame_window], ProtoOpts)
+            ),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        [
+            {http2, #{http2_control_frame_max => 1000, http2_control_frame_window => 10_000}},
+            {{http2, #{control_frame_policy => #{max => 50}}}, #{
+                http2_control_frame_max => 50, http2_control_frame_window => 10_000
+            }},
+            {{http2, #{control_frame_policy => #{max => 1, window => 16#FFFFFFFF}}}, #{
+                http2_control_frame_max => 1, http2_control_frame_window => 16#FFFFFFFF
+            }},
+            {{http2, #{control_frame_policy => false}}, #{
+                http2_control_frame_max => undefined, http2_control_frame_window => undefined
+            }}
+        ]
+    ).
+
+listener_rejects_invalid_http2_control_frame_policy_test() ->
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_h2_control_frame_policy_invalid, #{
+                port => 0,
+                protocols => [{http2, #{control_frame_policy => Bad}}],
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
+        end,
+        [
+            true,
+            1000,
+            #{max => 0},
+            #{max => 16#80000000},
+            #{max => infinity},
+            #{window => 0},
+            #{window => 16#100000000},
+            #{window => infinity},
+            #{max => 10, per => 1000}
+        ]
+    ).
+
 listener_http2_connection_age_threads_into_proto_opts_test() ->
     %% Off by default (both `http2_connection_age_*` fields `undefined`);
     %% `grace` is `infinity` unless set.

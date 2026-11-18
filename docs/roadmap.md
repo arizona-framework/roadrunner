@@ -207,24 +207,6 @@ piece of its own:
 **Why deferred:** the client was built for roadrunner's own tests and
 tools; these matter only once it carries production traffic.
 
-### HTTP/2 control-frame flood guard — medium
-
-**What:** `ping_policy` bounds PINGs, and the idle timeout no longer
-lets frames without a request keep a connection open, but the other
-frames that make the server work without serving anything have no
-budget of their own (RFC 9113 §10.5): SETTINGS (each one answered),
-WINDOW_UPDATE, PRIORITY, empty DATA and CONTINUATION frames, frames of
-unknown types. A general guard would count those frames per connection
-over a window, as nghttp2, h2o and Go's `x/net/http2` do, and close the
-connection with `GOAWAY(ENHANCE_YOUR_CALM)` past a limit, with no timer
-per frame. The work is in deciding what counts (a WINDOW_UPDATE is
-useful while the server sends; an empty DATA frame can end a stream),
-a default no real client meets, and the tests.
-
-**Why deferred:** the cost of such a flood is CPU on one connection,
-bounded by the client's own sending rate and by `max_clients`, and none
-of these frames holds memory or keeps an idle connection open now.
-
 ### CI performance regression check — medium
 
 **What:** a CI job that catches a performance regression before merge.
