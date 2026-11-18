@@ -315,6 +315,9 @@
     %% its own workers' `DOWN` messages, so a blocked loop would wait on
     %% something only it can deliver.
     awaiting_slot = #{} :: #{non_neg_integer() => roadrunner_req:request()},
+    %% Whether a request ever parked here: a grant may then still be on its
+    %% way when the loop ends, which `hand_off_slots/1` gives back.
+    parked = false :: boolean(),
     %% Per-peer rate-limit guard resolved from proto_opts + peer at conn start
     %% (`undefined` when off). Checked in `dispatch_decoded/5`.
     rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
@@ -2199,7 +2202,8 @@ dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
             %% the grant arrives as a message.
             State1#h3{
                 streams = dispatched(Streams, StreamId),
-                awaiting_slot = (State1#h3.awaiting_slot)#{StreamId => Req}
+                awaiting_slot = (State1#h3.awaiting_slot)#{StreamId => Req},
+                parked = true
             };
         false ->
             %% Listener-wide in-flight ceiling reached — refuse the
@@ -2416,25 +2420,33 @@ discard_stream(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream) ->
     },
     State#h3{streams = Streams#{StreamId := Discarding}}.
 
+%% The in-flight slots the loop still holds as it ends, one per worker not
+%% yet seen ending (`worker_pids`). A worker still running keeps its slot
+%% after the connection is gone: every one is handed to the listener's slot
+%% keeper, which releases it when the worker ends, or at once for one
+%% already gone (`roadrunner_conn:hand_off_request_slots/5`). Releasing them
+%% here instead would let a client that drops its connection and opens
+%% another run handlers past `max_concurrent_requests`. A loop taken down
+%% with its QUIC connection never gets here: its workers' slots stay
+%% counted, erring on the side of the ceiling, until the listener restarts.
+-spec hand_off_slots(#h3{}) -> ok.
+hand_off_slots(#h3{proto_opts = #proto_opts{slot_keeper = undefined}}) ->
+    ok;
+hand_off_slots(#h3{worker_pids = Pids, parked = false}) when map_size(Pids) =:= 0 ->
+    ok;
+hand_off_slots(#h3{
+    proto_opts = #proto_opts{slot_keeper = Keeper},
+    worker_pids = Pids,
+    max_concurrent_requests = Max,
+    inflight_counter = Counter,
+    overload = Overload
+}) ->
+    roadrunner_conn:hand_off_request_slots(Keeper, maps:values(Pids), Max, Counter, Overload).
+
 -spec terminate(#h3{}, roadrunner_event_handler:close_reason()) -> ok.
-terminate(
-    #h3{
-        proto_opts = ProtoOpts,
-        conn_span = ConnSpan,
-        worker_refs = Refs,
-        max_concurrent_requests = MaxConcReq,
-        inflight_counter = InflightCounter,
-        overload = Overload
-    },
-    Reason
-) ->
+terminate(#h3{proto_opts = ProtoOpts, conn_span = ConnSpan} = State, Reason) ->
+    ok = hand_off_slots(State),
     ok = roadrunner_event:listener_conn_close(ConnSpan, 0, Reason),
-    %% Account for any stream workers still live at teardown (each holds one
-    %% in-flight slot); workers whose `DOWN` already fired were removed from
-    %% `worker_refs`, so this releases each remaining worker exactly once.
-    ok = roadrunner_conn:release_request_slots(
-        MaxConcReq, InflightCounter, map_size(Refs), Overload
-    ),
     Close = roadrunner_conn:close_opts(ProtoOpts),
     ok = roadrunner_conn:unregister_for_drain(Close),
     ok = roadrunner_conn:release_slot(Close).

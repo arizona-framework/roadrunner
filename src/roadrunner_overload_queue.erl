@@ -4,16 +4,30 @@
 -behaviour(gen_server).
 
 %% One per listener, started and linked by `roadrunner_listener` when
-%% `overload_mode` is a queue. Parks requests that arrive over the
-%% listener-wide `max_concurrent_requests` ceiling until a slot frees,
-%% instead of refusing them.
+%% `max_concurrent_requests` is finite. It has two jobs.
 %%
-%% Everything here is asynchronous, and that is the whole point. A
+%% In queue mode (`overload_mode` is a queue) it parks requests that
+%% arrive over the listener-wide ceiling until a slot frees, instead of
+%% refusing them.
+%%
+%% In every mode it keeps counting the handlers a connection leaves
+%% behind. A slot is held from dispatch until the handler's process ends,
+%% and the connection releases it on the worker's `DOWN`. Workers are
+%% monitored, not linked, so they can outlive their connection (the client
+%% went away, or a drain ended it). A closing connection hands the workers
+%% still running to this process (`adopt/2`), which monitors them and
+%% releases each slot as its worker ends. Without that, a client could fill
+%% the ceiling with slow handlers, drop the connection, reconnect and
+%% repeat, running any number of handlers past it.
+%%
+%% Admission is asynchronous, and that is the whole point. A
 %% multiplexed connection releases in-flight slots by processing its own
 %% workers' `DOWN` messages, so a loop that blocked waiting for a slot
 %% would stop reading the very messages that free one and park forever.
 %% Callers therefore `enqueue/3` and go back to their frame loop; the
-%% grant arrives later as a message.
+%% grant arrives later as a message. Only `adopt/2` waits for a reply,
+%% and only from a connection on its way out, which frees no slot by
+%% reading its mailbox any more.
 %%
 %% The queue sits on the slow path only. Taking a slot is a plain
 %% `counters` operation in the caller, and this process is consulted
@@ -26,7 +40,8 @@
     cancel/2,
     note_release/1,
     waiting/1,
-    waiters_ref/1
+    waiters_ref/1,
+    adopt/2
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -50,7 +65,10 @@
     %% removed from `live` but left here, so the order queue is drained
     %% lazily on the next pop rather than searched on every removal.
     order = queue:new() :: queue:queue(key()),
-    live = #{} :: #{key() => #entry{}}
+    live = #{} :: #{key() => #entry{}},
+    %% The monitors of workers whose connection closed while they ran
+    %% (`adopt/2`). Each holds one slot, released on its `DOWN`.
+    adopted = #{} :: #{reference() => []}
 }).
 
 -type key() :: {pid(), term()}.
@@ -89,6 +107,33 @@ waiting(Ref) ->
 -spec waiters_ref(pid()) -> atomics:atomics_ref().
 waiters_ref(Pid) ->
     gen_server:call(Pid, waiters_ref, infinity).
+
+%% Hand the in-flight slots of `Workers`, the handlers still running as the
+%% calling connection closes, to the keeper at `Pid`, which releases each
+%% one when its worker ends, and withdraw every request the caller has
+%% parked. A worker already gone is released at once. Synchronous, so once
+%% it returns no grant is still on its way to the caller: the grants that
+%% raced it are already in the caller's mailbox, and their number is
+%% returned for the caller to give back. A keeper already gone went down
+%% with its listener, whose counter nothing reads any more.
+-spec adopt(pid(), [pid()]) -> non_neg_integer().
+adopt(Pid, Workers) ->
+    Mon = erlang:monitor(process, Pid),
+    _ = erlang:send(Pid, {adopt, self(), Mon, Workers}),
+    receive
+        {Mon, adopted} ->
+            true = erlang:demonitor(Mon, [flush]),
+            stale_grants(0);
+        {'DOWN', Mon, process, Pid, _Reason} ->
+            0
+    end.
+
+-spec stale_grants(non_neg_integer()) -> non_neg_integer().
+stale_grants(N) ->
+    receive
+        {roadrunner_slot, _Token, granted} -> stale_grants(N + 1)
+    after 0 -> N
+    end.
 
 -spec init({pos_integer(), counters:counters_ref(), pos_integer()}) -> {ok, #state{}}.
 init({Max, Counter, MaxQueued}) ->
@@ -143,6 +188,23 @@ handle_info(slot_freed, State) ->
     {noreply, serve(State)};
 handle_info({expire, Key}, State) ->
     {noreply, resolve(Key, timeout, State)};
+handle_info({adopt, Conn, Ref, Workers}, #state{adopted = Adopted, live = Live} = State) ->
+    Adopted1 = lists:foldl(
+        fun(Worker, Acc) -> Acc#{erlang:monitor(process, Worker) => []} end, Adopted, Workers
+    ),
+    %% The connection's parked requests have no stream left to serve.
+    Parked = [Key || {ConnPid, _Token} = Key <- maps:keys(Live), ConnPid =:= Conn],
+    State1 = lists:foldl(fun forget/2, State#state{adopted = Adopted1}, Parked),
+    _ = erlang:send(Conn, {Ref, adopted}),
+    {noreply, State1};
+handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{adopted = Adopted} = State) when
+    is_map_key(Mon, Adopted)
+->
+    %% A handler that outlived its connection ended: its slot is free, and
+    %% the oldest parked request may take it.
+    #state{counter = Counter} = State,
+    ok = counters:sub(Counter, 1, 1),
+    {noreply, serve(State#state{adopted = maps:remove(Mon, Adopted)})};
 handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{live = Live} = State) ->
     %% A parked connection died. Drop everything it was waiting on; no
     %% slot was taken for those entries, so nothing leaks.

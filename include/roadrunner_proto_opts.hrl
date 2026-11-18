@@ -64,13 +64,19 @@
     %% cap on concurrent live stream-worker processes across the whole
     %% listener, independent of `max_clients` and `max_concurrent_streams`.
     %% `infinity` disables it. `inflight_counter` is the live gauge
-    %% (acquired before a worker spawns, released on its `DOWN`);
+    %% (acquired before a worker spawns, released on its `DOWN`, by the
+    %% `slot_keeper` once the worker's connection has closed);
     %% `throttled_counter` is the cumulative count of streams refused at the
     %% ceiling. h1 is bounded by `max_clients` and uses these only in shed
     %% mode, where the ceiling is one budget across every protocol.
     max_concurrent_requests = infinity :: infinity | pos_integer(),
     %% What happens to a request over that ceiling.
     overload = refuse :: roadrunner_conn:overload(),
+    %% The listener's slot keeper (`roadrunner_overload_queue`), started
+    %% when the ceiling is finite: a closing h2/h3 conn hands it the slots
+    %% of the workers still running, so they stay counted until those
+    %% workers end. `undefined` with no ceiling.
+    slot_keeper = undefined :: pid() | undefined,
     inflight_counter = undefined :: counters:counters_ref() | undefined,
     throttled_counter :: atomics:atomics_ref(),
     %% Per-peer request-rate guard (off by default). `rate_limit` carries the

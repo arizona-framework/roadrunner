@@ -195,6 +195,82 @@ late_expire_for_a_served_entry_is_ignored_test_() ->
         ?assertEqual(granted, recv_slot(s1))
     end}.
 
+%% =============================================================================
+%% Adopting the slots of handlers whose connection closed.
+%% =============================================================================
+
+%% An adopted worker keeps its slot until it ends, then the keeper
+%% releases it and hands it to the oldest parked request.
+adopted_worker_keeps_its_slot_until_it_ends_test_() ->
+    {spawn, fun() ->
+        {Pid, Counter} = saturated(8),
+        Worker = spawn(fun() ->
+            receive
+                stop -> ok
+            end
+        end),
+        Conn = spawn(fun() -> exit(roadrunner_overload_queue:adopt(Pid, [Worker])) end),
+        Mon = monitor(process, Conn),
+        receive
+            {'DOWN', Mon, process, Conn, Granted} -> ?assertEqual(0, Granted)
+        end,
+        ?assertEqual(1, counters:get(Counter, 1)),
+        ok = roadrunner_overload_queue:enqueue(Pid, s1, 5000),
+        ok = sync(Pid),
+        Worker ! stop,
+        ?assertEqual(granted, recv_slot(s1)),
+        ?assertEqual(1, counters:get(Counter, 1))
+    end}.
+
+%% A worker that ended before the hand-off is released at once.
+adopted_dead_worker_is_released_at_once_test_() ->
+    {spawn, fun() ->
+        {Pid, Counter} = saturated(8),
+        {Dead, Mon} = spawn_monitor(fun() -> ok end),
+        receive
+            {'DOWN', Mon, process, Dead, _} -> ok
+        end,
+        ?assertEqual(0, roadrunner_overload_queue:adopt(Pid, [Dead])),
+        ok = sync(Pid),
+        ?assertEqual(0, counters:get(Counter, 1))
+    end}.
+
+%% Adopting withdraws the caller's parked requests: a slot that frees later
+%% is not granted to a connection that is gone.
+adopt_withdraws_the_callers_parked_requests_test_() ->
+    {spawn, fun() ->
+        {Pid, Counter} = saturated(8),
+        ok = roadrunner_overload_queue:enqueue(Pid, s1, 5000),
+        ok = sync(Pid),
+        ?assertEqual(0, roadrunner_overload_queue:adopt(Pid, [])),
+        ?assertNot(roadrunner_overload_queue:waiting(roadrunner_overload_queue:waiters_ref(Pid))),
+        release(Counter, Pid),
+        ok = sync(Pid),
+        ?assertEqual(0, counters:get(Counter, 1))
+    end}.
+
+%% A grant sent before the hand-off is already in the caller's mailbox when
+%% it returns, and counted for the caller to give back.
+adopt_counts_the_grants_that_raced_it_test_() ->
+    {spawn, fun() ->
+        {Pid, Counter} = saturated(8),
+        ok = roadrunner_overload_queue:enqueue(Pid, s1, 5000),
+        ok = sync(Pid),
+        release(Counter, Pid),
+        ok = sync(Pid),
+        ?assertEqual(1, roadrunner_overload_queue:adopt(Pid, []))
+    end}.
+
+%% A keeper that is gone went down with its listener: nothing to hand over.
+adopt_with_the_keeper_gone_test_() ->
+    {spawn, fun() ->
+        {Gone, Mon} = spawn_monitor(fun() -> ok end),
+        receive
+            {'DOWN', Mon, process, Gone, _} -> ok
+        end,
+        ?assertEqual(0, roadrunner_overload_queue:adopt(Gone, [self()]))
+    end}.
+
 wait_until(Fun) ->
     wait_until(Fun, 100).
 

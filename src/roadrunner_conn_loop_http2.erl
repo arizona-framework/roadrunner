@@ -21,8 +21,8 @@
 %%   shared across all streams),
 %% - the connection-level flow-control windows and per-stream
 %%   windows / pending-send queues,
-%% - a `streams` map keyed by stream id, and `worker_refs` mapping
-%%   monitor refs back to stream ids for `'DOWN'` correlation.
+%% - a `streams` map keyed by stream id, and `workers` mapping
+%%   worker pids back to stream ids for `'DOWN'` correlation.
 %%
 %% Once a request stream finishes receiving (HEADERS + body +
 %% END_STREAM), the conn spawns a `roadrunner_http2_stream_worker`
@@ -456,6 +456,9 @@
     %% releases slots by processing its own workers' `DOWN` messages, so
     %% a blocked loop would wait on something only it can deliver.
     awaiting_slot = #{} :: #{stream_id() => roadrunner_req:request()},
+    %% Whether a stream ever parked here: a grant may then still be on its
+    %% way when the conn exits, which `hand_off_slots/1` gives back.
+    parked = false :: boolean(),
     %% Per-peer rate-limit guard resolved from proto_opts + peer at `enter/6`
     %% (`undefined` when off). Checked in `dispatch_stream/2`.
     rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
@@ -465,8 +468,9 @@
     real_ip = undefined :: undefined | roadrunner_real_ip:config(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => #stream{}},
-    %% Worker monitor ref → stream id, for DOWN correlation.
-    worker_refs = #{} :: #{reference() => stream_id()},
+    %% Worker pid → stream id, for DOWN correlation: the workers that hold
+    %% an in-flight slot, until their `DOWN` is handled.
+    workers = #{} :: #{pid() => stream_id()},
     %% Whether a liveness PING (`recv_idle_expired/1`) waits for its ACK.
     liveness_ping = false :: boolean(),
     %% Streams this conn reset, oldest first, so frames the peer sent
@@ -848,8 +852,8 @@ recv_more(
             recv_more(skip_continue(State, StreamId));
         {roadrunner_cancel_stream, StreamId} ->
             recv_more(maybe_exit_when_drained(cancel_stream(State, StreamId)));
-        {'DOWN', MonRef, process, _Pid, Reason} ->
-            recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Reason)));
+        {'DOWN', MonRef, process, Pid, Reason} ->
+            recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Pid, Reason)));
         {roadrunner_slot, StreamId, Outcome} ->
             %% A refused park drops its stream, which may be the last one
             %% a draining conn was waiting on.
@@ -927,7 +931,7 @@ recv_idle_expired(State) ->
 %% closes with every stream on it, a quiet one still at work included: a
 %% client that holds a window shut that long has stopped reading.
 -spec serving(#loop{}) -> boolean().
-serving(#loop{worker_refs = Refs}) when map_size(Refs) =:= 0 ->
+serving(#loop{workers = Workers}) when map_size(Workers) =:= 0 ->
     false;
 serving(#loop{streams = Streams}) ->
     no_blocked_sends(maps:iterator(Streams)).
@@ -951,16 +955,16 @@ idle_goaway(State, Reason) ->
     _ = send_goaway(State, no_error),
     exit_clean(State, Reason).
 
-%% The `idle_deadline` once `Streams` and `Refs` are what the conn holds:
+%% The `idle_deadline` once `Streams` and `Workers` are what the conn holds:
 %% the idle timeout from now when they leave it with no stream and no
 %% worker, the deadline it already has otherwise. Set as the last stream
 %% or worker goes, in the update that drops it: every path that drops a
 %% stream (`remove_stream/3`, `drop_reset_stream/2`, `abort_stream/3`) or
-%% a worker whose stream is gone (`handle_worker_down/3`) asks it.
+%% a worker whose stream is gone (`handle_worker_down/4`) asks it.
 -spec idle_deadline(#{stream_id() => #stream{}}, #{reference() => stream_id()}, #loop{}) ->
     integer() | undefined.
-idle_deadline(Streams, Refs, #loop{idle_deadline = undefined, idle_timeout = T}) when
-    map_size(Streams) =:= 0, map_size(Refs) =:= 0
+idle_deadline(Streams, Workers, #loop{idle_deadline = undefined, idle_timeout = T}) when
+    map_size(Streams) =:= 0, map_size(Workers) =:= 0
 ->
     erlang:monotonic_time(millisecond) + T;
 idle_deadline(_Streams, _Refs, #loop{idle_deadline = Deadline}) ->
@@ -2265,7 +2269,7 @@ dispatch_request(
                             frame_loop(State#loop{
                                 req_id_buffer = NewBuf,
                                 streams = Streams#{StreamId := Stream1},
-                                worker_refs = (State#loop.worker_refs)#{MonRef => StreamId}
+                                workers = (State#loop.workers)#{WorkerPid => StreamId}
                             });
                         queued ->
                             %% Over the ceiling, but this listener
@@ -2277,7 +2281,8 @@ dispatch_request(
                             frame_loop(State#loop{
                                 req_id_buffer = NewBuf,
                                 streams = Streams#{StreamId := Stream},
-                                awaiting_slot = Awaiting#{StreamId => Req}
+                                awaiting_slot = Awaiting#{StreamId => Req},
+                                parked = true
                             });
                         false ->
                             %% Listener-wide in-flight ceiling reached —
@@ -2419,9 +2424,9 @@ handle_send_trailers(State, From, Ref, StreamId, Trailers) ->
             State1
     end.
 
-handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
-    case Refs of
-        #{MonRef := StreamId} ->
+handle_worker_down(#loop{workers = Workers} = State, MonRef, Pid, Reason) ->
+    case Workers of
+        #{Pid := StreamId} ->
             %% Release the in-flight slot exactly once, tied to removing the
             %% worker ref so a worker is accounted for by its `DOWN` here or
             %% by the conn's clean exit, never both.
@@ -2430,10 +2435,10 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
                 State#loop.inflight_counter,
                 State#loop.overload
             ),
-            Refs1 = maps:remove(MonRef, Refs),
+            Workers1 = maps:remove(Pid, Workers),
             case State#loop.streams of
                 #{StreamId := #stream{worker_ref = MonRef}} ->
-                    worker_ended(State, StreamId, Refs1, Reason);
+                    worker_ended(State, StreamId, Workers1, Reason);
                 #{} ->
                     %% Its stream was reset while it ran (`drop_reset_stream/2`),
                     %% gone or left as a placeholder for a header block
@@ -2442,8 +2447,8 @@ handle_worker_down(#loop{worker_refs = Refs} = State, MonRef, Reason) ->
                     %% `max_concurrent_streams` is free.
                     reset_worker_ended(
                         State#loop{
-                            worker_refs = Refs1,
-                            idle_deadline = idle_deadline(State#loop.streams, Refs1, State)
+                            workers = Workers1,
+                            idle_deadline = idle_deadline(State#loop.streams, Workers1, State)
                         },
                         MonRef
                     )
@@ -2466,26 +2471,26 @@ reset_worker_ended(#loop{reset_workers = Reset} = State, MonRef) ->
 
 %% The stream of a worker that exited, by how it exited.
 -spec worker_ended(#loop{}, stream_id(), #{reference() => stream_id()}, term()) -> #loop{}.
-worker_ended(State, StreamId, Refs, normal) ->
-    finish_stream(State, StreamId, Refs);
-worker_ended(State, StreamId, Refs, stream_reset) ->
+worker_ended(State, StreamId, Workers, normal) ->
+    finish_stream(State, StreamId, Workers);
+worker_ended(State, StreamId, Workers, stream_reset) ->
     %% The worker wrote to a stream whose response had already ended (a
     %% stream fun sending after its `fin`): `stream_open/2` told it the
     %% stream was reset, so it stopped. The response on the wire is
     %% complete, so the stream ends as for a normal exit, never with an
     %% RST_STREAM after its END_STREAM (RFC 9113 §5.1: no frames on a
     %% closed stream).
-    finish_stream(State, StreamId, Refs);
-worker_ended(#loop{streams = Streams} = State, StreamId, Refs, _Reason) ->
+    finish_stream(State, StreamId, Workers);
+worker_ended(#loop{streams = Streams} = State, StreamId, Workers, _Reason) ->
     case Streams of
         #{StreamId := #stream{state = closed}} ->
             %% It ended abnormally after its response was complete
             %% (killed, or taken down by a linked process): the stream
             %% ends as for a normal exit, with no RST_STREAM on a stream
             %% closed both ways (RFC 9113 §5.1).
-            worker_ended(State, StreamId, Refs, normal);
+            worker_ended(State, StreamId, Workers, normal);
         #{} ->
-            abort_stream(State#loop{worker_refs = Refs}, StreamId, internal_error)
+            abort_stream(State#loop{workers = Workers}, StreamId, internal_error)
     end.
 
 %% A worker exited normally. Its response is complete once our END_STREAM
@@ -2499,28 +2504,28 @@ worker_ended(#loop{streams = Streams} = State, StreamId, Refs, _Reason) ->
 %% a loop worker stopped by `sys:terminate/2`), so the stream is reset
 %% with INTERNAL_ERROR, as for a crash, instead of left open with the
 %% client waiting for an end that never comes. A stream reset while its
-%% worker ran is gone by then, and `handle_worker_down/3` only gives the
+%% worker ran is gone by then, and `handle_worker_down/4` only gives the
 %% slot back. In manual body mode the response
 %% can end before the client's body does (a handler answering without
 %% reading it all); RFC 9113 §8.1 lets the server then ask the client to
 %% stop sending with RST_STREAM(NO_ERROR).
 %%
-%% `Refs` is the worker-ref map without this worker's monitor; the common
+%% `Workers` is the worker map without this worker's monitor; the common
 %% end (closed both ways, nothing queued) stores it in the same update
 %% that drops the stream.
 -spec finish_stream(#loop{}, stream_id(), #{reference() => stream_id()}) -> #loop{}.
-finish_stream(#loop{streams = Streams} = State, StreamId, Refs) ->
+finish_stream(#loop{streams = Streams} = State, StreamId, Workers) ->
     #{StreamId := #stream{pending_sends = Pending} = Stream} = Streams,
     case {queue:is_empty(Pending), Stream} of
         {true, #stream{state = closed, end_stream_seen = true}} ->
-            remove_stream(State, StreamId, Refs);
+            remove_stream(State, StreamId, Workers);
         {true, #stream{state = closed}} ->
             _ = send_rst_stream(State, StreamId, no_error),
-            remove_stream(remember_reset(State, StreamId), StreamId, Refs);
+            remove_stream(remember_reset(State, StreamId), StreamId, Workers);
         {true, _} ->
-            abort_stream(State#loop{worker_refs = Refs}, StreamId, internal_error);
+            abort_stream(State#loop{workers = Workers}, StreamId, internal_error);
         {false, _} ->
-            update_stream(State#loop{worker_refs = Refs}, StreamId, Stream#stream{
+            update_stream(State#loop{workers = Workers}, StreamId, Stream#stream{
                 worker_pid = undefined, worker_ref = undefined
             })
     end.
@@ -2918,7 +2923,7 @@ cancel_stream(#loop{streams = Streams} = State, StreamId) ->
 %% notifications so workers waiting on `h2_send_ack` unwind, as does a
 %% worker waiting on a manual-mode body read. A worker still computing
 %% learns of it at its next write or read; until it exits
-%% (`handle_worker_down/3`) it keeps its in-flight slot and counts as a
+%% (`handle_worker_down/4`) it keeps its in-flight slot and counts as a
 %% stream toward `max_concurrent_streams` (`reset_workers`), so work a
 %% client abandons still counts against both limits while it runs.
 reset_stream(State, StreamId) ->
@@ -2954,7 +2959,7 @@ drop_reset_stream(#loop{streams = Streams0} = State0, StreamId) ->
         State#loop{
             streams = Streams1,
             reset_workers = Reset,
-            idle_deadline = idle_deadline(Streams1, State#loop.worker_refs, State)
+            idle_deadline = idle_deadline(Streams1, State#loop.workers, State)
         },
         StreamId
     ).
@@ -2967,7 +2972,7 @@ drop_reset_stream(#loop{streams = Streams0} = State0, StreamId) ->
 hold_reset_slot(Reset, MonRef, true) -> Reset#{MonRef => []};
 hold_reset_slot(Reset, _MonRef, false) -> Reset.
 
-%% Called by `handle_worker_down/3` when a worker dies abnormally.
+%% Called by `handle_worker_down/4` when a worker dies abnormally.
 %% Send RST_STREAM(error_code) to the peer and drop our state.
 abort_stream(State0, StreamId, ErrorCode) ->
     #loop{streams = Streams} = State = uncount_stream(State0, StreamId),
@@ -2979,7 +2984,7 @@ abort_stream(State0, StreamId, ErrorCode) ->
         remember_reset(
             State#loop{
                 streams = Streams1,
-                idle_deadline = idle_deadline(Streams1, State#loop.worker_refs, State)
+                idle_deadline = idle_deadline(Streams1, State#loop.workers, State)
             },
             StreamId
         ),
@@ -3008,23 +3013,23 @@ remember_reset(#loop{reset_ids = {Queue, Ids}} = State, StreamId) ->
 %% Drop a stream that needs no RST_STREAM: its response is complete
 %% (`finish_stream/2`, `retire_drained/2`), or the caller already sent
 %% one. Just drop state.
-remove_stream(#loop{worker_refs = Refs} = State, StreamId) ->
-    remove_stream(State, StreamId, Refs).
+remove_stream(#loop{workers = Workers} = State, StreamId) ->
+    remove_stream(State, StreamId, Workers).
 
 %% Drop a stream we just reset, remembering it (`remember_reset/2`).
 -spec remove_reset_stream(#loop{}, stream_id()) -> #loop{}.
 remove_reset_stream(State, StreamId) ->
     remove_stream(remember_reset(State, StreamId), StreamId).
 
-%% Drop a stream and store `Refs` as the worker-ref map in the same update.
+%% Drop a stream and store `Workers` as the worker map in the same update.
 -spec remove_stream(#loop{}, stream_id(), #{reference() => stream_id()}) -> #loop{}.
-remove_stream(State0, StreamId, Refs) ->
+remove_stream(State0, StreamId, Workers) ->
     #loop{streams = Streams} = State = withdraw_parked(uncount_stream(State0, StreamId), StreamId),
     Streams1 = forget_stream(State, StreamId, Streams),
     State#loop{
         streams = Streams1,
-        worker_refs = Refs,
-        idle_deadline = idle_deadline(Streams1, Refs, State)
+        workers = Workers,
+        idle_deadline = idle_deadline(Streams1, Workers, State)
     }.
 
 %% Drop a stream's entry, unless its header block (trailers) is still
@@ -3098,7 +3103,7 @@ spawn_parked(#loop{streams = Streams} = State, StreamId, Req) ->
     {WorkerPid, MonRef} = start_worker(State, StreamId, Req),
     State#loop{
         streams = Streams#{StreamId := Stream#stream{worker_pid = WorkerPid, worker_ref = MonRef}},
-        worker_refs = (State#loop.worker_refs)#{MonRef => StreamId}
+        workers = (State#loop.workers)#{WorkerPid => StreamId}
     }.
 
 -spec give_back_slot(#loop{}) -> #loop{}.
@@ -3300,27 +3305,34 @@ goaway_exit(State, ErrorCode) ->
     exit_clean(State, {protocol_error, ErrorCode}).
 
 -spec exit_clean(#loop{}, roadrunner_event_handler:close_reason()) -> no_return().
-exit_clean(
-    #loop{
-        socket = Socket,
-        proto_opts = ProtoOpts,
-        conn_span = ConnSpan,
-        worker_refs = Refs,
-        max_concurrent_requests = MaxConcReq,
-        inflight_counter = InflightCounter,
-        overload = Overload
-    },
-    Reason
-) ->
+exit_clean(#loop{socket = Socket, proto_opts = ProtoOpts, conn_span = ConnSpan} = State, Reason) ->
+    ok = hand_off_slots(State),
     ok = roadrunner_event:listener_conn_close(ConnSpan, 0, Reason),
-    %% Account for any stream workers still live at teardown (each holds one
-    %% in-flight slot). Workers whose `DOWN` already fired were removed from
-    %% `worker_refs`, so this releases each remaining worker exactly once.
-    ok = roadrunner_conn:release_request_slots(
-        MaxConcReq, InflightCounter, map_size(Refs), Overload
-    ),
     Close = roadrunner_conn:close_opts(ProtoOpts),
     ok = roadrunner_conn:unregister_for_drain(Close),
     ok = roadrunner_conn:release_slot(Close),
     ok = roadrunner_transport:close(Socket),
     exit(normal).
+
+%% The in-flight slots the conn still holds as it exits, one per worker not
+%% yet seen ending (`workers`). A worker still running keeps its slot after
+%% the conn is gone: every one is handed to the listener's slot keeper,
+%% which releases it when the worker ends, or at once for one already gone
+%% (`roadrunner_conn:hand_off_request_slots/5`). Releasing them here instead
+%% would let a client that drops its connection and opens another run
+%% handlers past `max_concurrent_requests`. A conn that crashes or is killed
+%% never gets here: its workers' slots stay counted, erring on the side of
+%% the ceiling, until the listener restarts.
+-spec hand_off_slots(#loop{}) -> ok.
+hand_off_slots(#loop{proto_opts = #proto_opts{slot_keeper = undefined}}) ->
+    ok;
+hand_off_slots(#loop{workers = Workers, parked = false}) when map_size(Workers) =:= 0 ->
+    ok;
+hand_off_slots(#loop{
+    proto_opts = #proto_opts{slot_keeper = Keeper},
+    workers = Workers,
+    max_concurrent_requests = Max,
+    inflight_counter = Counter,
+    overload = Overload
+}) ->
+    roadrunner_conn:hand_off_request_slots(Keeper, maps:keys(Workers), Max, Counter, Overload).

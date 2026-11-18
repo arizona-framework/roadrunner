@@ -82,6 +82,7 @@ init_per_testcase(Case, Config) ->
     [{port, roadrunner_listener:port(?MODULE)} | Config].
 
 end_per_testcase(_Case, _Config) ->
+    ok = roadrunner_h2_slot_handler:stop_all(),
     ok = roadrunner_listener:stop(?MODULE),
     true = unregister(?COLLECTOR),
     ok.

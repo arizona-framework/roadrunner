@@ -346,7 +346,11 @@ just this listener — on top of unbounded handler memory.
 `max_concurrent_requests` caps that product directly: a listener-wide
 ceiling on live handler processes for the multiplexed protocols. Like
 the per-connection stream limits, it counts a handler still running
-after its client reset the stream. Over the
+after its client reset the stream. It also counts one still running
+after its connection closed (the client went away, or a drain ended
+it): the slot is released when the handler ends, not with the
+connection, so a client that fills the ceiling, drops the connection
+and reconnects cannot run more handlers than it allows. Over the
 ceiling, a new HTTP/2 or HTTP/3 stream is refused with `REFUSED_STREAM` /
 `H3_REQUEST_REJECTED` (both retry-safe per RFC 9113 §8.7) before any
 handler runs, and the refusal emits `request_throttled` and

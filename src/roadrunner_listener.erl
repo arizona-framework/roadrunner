@@ -279,7 +279,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   process table (failing spawns everywhere, not just this listener) on
   top of unbounded handler memory. This caps the product directly; set it
   to a finite value when enabling HTTP/2 or HTTP/3 under a high
-  `max_clients`. Over-limit streams
+  `max_clients`. A handler still running when its connection closes
+  keeps counting until it ends. Over-limit streams
   are refused with `REFUSED_STREAM` (h2) / `H3_REQUEST_REJECTED` (h3),
   which RFC 9113 §8.7 marks safe to retry; each refusal emits
   `request_throttled` and increments the `throttled`
@@ -328,9 +329,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   `connection: close`, before any of its body is read (the close lingers
   over a body the client may still be sending). A shed request is
   counted like a refused one: it emits `request_throttled` and
-  increments the `throttled` count from `info/1`. A long-lived response
-  (WebSocket, loop, stream) holds its slot until it ends, on every
-  protocol. Requires a finite `max_concurrent_requests`.
+  increments the `throttled` count from `info/1`. A loop or stream
+  response holds its slot until it ends, on every protocol. An HTTP/1
+  WebSocket upgrade holds it only until the `101` is out: the session
+  after it is a connection, which `max_clients` bounds. Requires a
+  finite `max_concurrent_requests`.
 
   Shedding applies to the request ceiling only. A connection over
   `max_clients` is still closed without a response: answering it would
@@ -1897,6 +1900,11 @@ validate_overload_mode({shed, Shed}, _Max, _RequestTimeout) when is_map(Shed) ->
 validate_overload_mode(Other, _Max, _RequestTimeout) ->
     error({invalid_listener_opt, overload_mode, Other}).
 
+%% The overload mode as the conns carry it, and the listener's slot keeper.
+%% A finite ceiling gets a keeper in every mode: a closing conn hands it the
+%% slots of the workers still running, so they stay counted until those
+%% workers end. In queue mode the same process parks waiters.
+%%
 %% `refuse` costs nothing at all on the release path; the queue form
 %% carries the process, the atomic that says whether anyone is parked,
 %% and the wait deadline, so the hot path never reads proto_opts again.
@@ -1908,14 +1916,22 @@ validate_overload_mode(Other, _Max, _RequestTimeout) ->
     | {shed, #{retry_after := pos_integer()}},
     infinity | pos_integer(),
     counters:counters_ref()
-) -> roadrunner_conn:overload().
-setup_overload(refuse, _Max, _Counter) ->
-    refuse;
+) -> {roadrunner_conn:overload(), pid() | undefined}.
+setup_overload(refuse, infinity, _Counter) ->
+    {refuse, undefined};
+setup_overload(refuse, Max, Counter) ->
+    {refuse, start_slot_keeper(Max, Counter, Max)};
 setup_overload({queue, #{max_queued := MaxQueued, timeout := Timeout}}, Max, Counter) ->
+    Pid = start_slot_keeper(Max, Counter, MaxQueued),
+    {{queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout}, Pid};
+setup_overload({shed, #{retry_after := RetryAfter}}, Max, Counter) ->
+    {{shed, RetryAfter}, start_slot_keeper(Max, Counter, Max)}.
+
+%% `MaxQueued` matters in queue mode only; nothing parks otherwise.
+-spec start_slot_keeper(pos_integer(), counters:counters_ref(), pos_integer()) -> pid().
+start_slot_keeper(Max, Counter, MaxQueued) ->
     {ok, Pid} = roadrunner_overload_queue:start_link(Max, Counter, MaxQueued),
-    {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout};
-setup_overload({shed, #{retry_after := RetryAfter}}, _Max, _Counter) ->
-    {shed, RetryAfter}.
+    Pid.
 
 %% A TLS listener that also reads the PROXY protocol cannot hand its
 %% sockets out through `ssl:listen`: the header arrives in plaintext before
@@ -2028,9 +2044,10 @@ build_proto_opts(Opts, ListenerName) ->
     MaxConcurrentRequests =
         maps:get(max_concurrent_requests, Opts, ?DEFAULT_MAX_CONCURRENT_REQUESTS),
     %% `overload_mode` decides what happens to a request that arrives over
-    %% the ceiling. Queue mode needs a process to park waiters in; it is
-    %% started here so it is linked to the listener and dies with it.
-    Overload = setup_overload(
+    %% the ceiling. A finite ceiling needs the slot keeper (queue mode parks
+    %% waiters in it too); it is started here, linked to the listener, and
+    %% stopped with it in `terminate/2`.
+    {Overload, SlotKeeper} = setup_overload(
         validate_overload_mode(
             maps:get(overload_mode, Opts, refuse),
             MaxConcurrentRequests,
@@ -2082,6 +2099,7 @@ build_proto_opts(Opts, ListenerName) ->
         accept_priority = validate_accept_priority(maps:get(accept_priority, Opts, high)),
         max_concurrent_requests = MaxConcurrentRequests,
         overload = Overload,
+        slot_keeper = SlotKeeper,
         client_counter = ClientCounter,
         drain_table = DrainTable,
         requests_counter = RequestsCounter,
@@ -3167,6 +3185,7 @@ terminate(_Reason, #state{
 }) ->
     erase_routes(ProtoOpts),
     ok = stop_quic(QuicListener),
+    ok = stop_slot_keeper(ProtoOpts),
     %% `drain/2` already closed the TCP socket on its way out
     %% (`closed`), and an HTTP/3-only listener never had one (`none`).
     close_tcp(LSocket).
@@ -3179,6 +3198,16 @@ stop_quic(QuicPool) ->
     %% doesn't deliver a teardown EXIT back to this gen_server.
     true = unlink(QuicPool),
     roadrunner_quic_listener_sup:stop(QuicPool).
+
+%% A link stops the keeper when the listener crashes, but not on a normal
+%% stop. Its counter goes with the listener, so nothing it keeps counting
+%% is read any more. Asynchronous, as the keeper may be what stopped us.
+-spec stop_slot_keeper(roadrunner_conn:proto_opts()) -> ok.
+stop_slot_keeper(#proto_opts{slot_keeper = undefined}) ->
+    ok;
+stop_slot_keeper(#proto_opts{slot_keeper = Pid}) ->
+    true = exit(Pid, shutdown),
+    ok.
 
 -spec erase_routes(roadrunner_conn:proto_opts()) -> ok.
 erase_routes(#proto_opts{dispatch = {router, Name}}) ->

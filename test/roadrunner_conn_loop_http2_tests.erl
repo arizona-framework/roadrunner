@@ -3573,7 +3573,7 @@ rst_during_stream_response_unwinds_worker() ->
     %% the worker; the worker is parked in `sync/2` waiting for
     %% the next ack — the `{h2_stream_reset, _}` arm fires and the
     %% worker exits with reason `stream_reset`. Conn's
-    %% `handle_worker_down/3` observes the non-normal exit and
+    %% `handle_worker_down/4` observes the non-normal exit and
     %% emits `RST_STREAM(internal_error)` (no-op for the peer
     %% since they already cancelled, but exercises that branch).
     {ok, _} = roadrunner_test_event_handler:start(),

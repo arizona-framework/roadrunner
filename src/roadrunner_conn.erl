@@ -42,6 +42,7 @@
     cancel_slot_wait/2,
     release_request_slot/3,
     release_request_slots/4,
+    hand_off_request_slots/5,
     consume_body_reader/2,
     register_for_drain/2,
     unregister_for_drain/1
@@ -329,7 +330,8 @@ Same eventually-consistent overshoot contract as `try_acquire_slot/1`: the
 cap is possible before rollbacks reconcile, bounded by in-flight admissions.
 Paired with `release_request_slot/3`, which must run exactly once per
 successfully-acquired worker (tie it to the worker monitor-ref removal so a
-worker is released by its `DOWN` or by the conn's clean exit, never both).
+worker is released by its `DOWN`, or by the listener's slot keeper once the
+conn has handed it over at its clean exit, never both).
 
 The `Max` and `Counter` are cached on the connection loop record at setup so
 the per-stream path passes them directly instead of re-reading `proto_opts`.
@@ -578,10 +580,9 @@ notify_release(_NeverParks) ->
     ok.
 
 -doc """
-Release `N` in-flight slots at once. Used by the conn clean-exit path to
-account for stream workers still live at teardown (each held one slot), so
-their slots are not leaked until the listener restarts. `N = 0` and
-`infinity` are no-ops.
+Release `N` in-flight slots at once: the grants that raced a conn's exit
+(`hand_off_request_slots/5`), taken on its behalf for requests it no
+longer has. `N = 0` and `infinity` are no-ops.
 """.
 -spec release_request_slots(
     infinity | pos_integer(), counters:counters_ref() | undefined, non_neg_integer(), overload()
@@ -593,6 +594,22 @@ release_request_slots(infinity, _Counter, _N, _Overload) ->
 release_request_slots(_Max, Counter, N, Overload) ->
     ok = counters:sub(Counter, 1, N),
     notify_release(Overload).
+
+-doc """
+Hand the in-flight slots of `Workers`, the stream workers still running as
+an HTTP/2 or HTTP/3 connection closes, to the listener's slot `Keeper`,
+which releases each one when its worker ends. Workers are monitored, not
+linked, so they can outlive their connection; releasing their slots with it
+would let a client that drops and reopens connections run handlers past
+`max_concurrent_requests`. It also withdraws the requests the connection
+parked, and gives back the grants that raced its exit.
+""".
+-spec hand_off_request_slots(
+    pid(), [pid()], pos_integer(), counters:counters_ref(), overload()
+) -> ok.
+hand_off_request_slots(Keeper, Workers, Max, Counter, Overload) ->
+    Granted = roadrunner_overload_queue:adopt(Keeper, Workers),
+    release_request_slots(Max, Counter, Granted, Overload).
 
 -doc false.
 -spec refine_conn_label(
