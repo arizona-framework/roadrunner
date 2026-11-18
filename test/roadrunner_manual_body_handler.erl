@@ -31,6 +31,9 @@ picks what the handler does with the body:
   replies `200` itself
 - `answer_unread`: give the reads no deadline, then answer `400`
   without reading the body
+- `{unbounded, Pid}`: give the reads no deadline, then `{report, Pid}`
+- `{spawned_report, Pid}`: read the body in a process the handler spawns,
+  then send `Pid` the outcome, `{read_result, _}`
 """.
 
 -behaviour(roadrunner_handler).
@@ -73,6 +76,24 @@ behave({retimed_send, Pid}, Req) ->
     {{send, [], Fun}, Req};
 behave({retimed, Pid}, Req) ->
     behave({report, Pid}, roadrunner_req:set_body_timeout(0, Req));
+behave({spawned_report, Pid}, Req) ->
+    Self = self(),
+    Reader = spawn_link(fun() ->
+        Result =
+            case roadrunner_req:read_body(Req) of
+                {ok, Body, _} -> {ok, iolist_size(Body)};
+                {error, _} = E -> E
+            end,
+        Self ! {self(), Result}
+    end),
+    Result =
+        receive
+            {Reader, R} -> R
+        end,
+    Pid ! {read_result, Result},
+    {roadrunner_resp:text(200, ~"ok"), Req};
+behave({unbounded, Pid}, Req) ->
+    behave({report, Pid}, roadrunner_req:set_body_timeout(infinity, Req));
 behave(answer_unread, Req) ->
     {roadrunner_resp:text(400, ~"no"), roadrunner_req:set_body_timeout(infinity, Req)};
 behave({stream_after_read, Pid}, Req) ->

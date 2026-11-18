@@ -1653,7 +1653,7 @@ until(Fun, N) ->
             until(Fun, N - 1)
     end.
 
-%% --- make_recv/3 — pure unit tests ---
+%% --- make_recv/4 — pure unit tests ---
 
 %% A queued drain is reported before the socket is touched, and ONLY the
 %% drain is taken. `manual` body buffering runs these reads from inside
@@ -1664,7 +1664,7 @@ make_recv_reports_drain_and_spares_other_messages_test_() ->
     {spawn, fun() ->
         Deadline = erlang:monotonic_time(millisecond) + 5000,
         %% The socket is never read — the drain short-circuits ahead of it.
-        Recv = roadrunner_conn:make_recv({fake, self()}, Deadline, 0),
+        Recv = roadrunner_conn:make_recv({fake, self()}, Deadline, 0, 0),
         self() ! {push, ~"for the handler"},
         self() ! {roadrunner_drain, infinity},
         ?assertEqual({error, drained}, Recv()),
@@ -1691,7 +1691,7 @@ make_recv_armed_reads_socket_messages_test_() ->
     Far = fun() -> erlang:monotonic_time(millisecond) + 5000 end,
     Armed = fun(Deadline, MinRate) ->
         ok = roadrunner_conn:armed(4),
-        roadrunner_conn:make_recv({fake, self()}, Deadline, MinRate)
+        roadrunner_conn:make_recv({fake, self()}, Deadline, MinRate, 0)
     end,
     [
         {spawn, fun() ->
@@ -1742,7 +1742,7 @@ make_recv_armed_reads_socket_messages_test_() ->
                 {'DOWN', Ref, process, Dead, _} -> ok
             end,
             ok = roadrunner_conn:armed(4),
-            Recv = roadrunner_conn:make_recv({fake, Dead}, Far(), 0),
+            Recv = roadrunner_conn:make_recv({fake, Dead}, Far(), 0, 0),
             self() ! {roadrunner_fake_passive, x},
             ?assertEqual({error, einval}, Recv())
         end}
@@ -1785,7 +1785,7 @@ h1_reader() ->
     roadrunner_conn:make_body_reader(
         {content_length, 4},
         <<>>,
-        roadrunner_conn:make_reader_recv({fake, self()}, 0),
+        roadrunner_conn:make_reader_recv({fake, self()}, 0, 0),
         100,
         {8192, 10240, 100},
         erlang:monotonic_time(millisecond)
@@ -1798,7 +1798,7 @@ make_recv_disarmed_reads_queued_then_socket_test_() ->
         Sink = spawn(fun() -> script_sink(undefined, [{recv, ~"third"}]) end),
         ok = roadrunner_conn:disarmed(),
         Recv = roadrunner_conn:make_recv(
-            {fake, Sink}, erlang:monotonic_time(millisecond) + 5000, 0
+            {fake, Sink}, erlang:monotonic_time(millisecond) + 5000, 0, 0
         ),
         self() ! {roadrunner_fake_data, x, ~"first"},
         self() ! {roadrunner_fake_data, x, ~"second"},
@@ -2475,8 +2475,10 @@ conn_min_bytes_per_second_drops_slow_client_test_() ->
                     {ok, Sock} = gen_tcp:connect(
                         {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
                     ),
+                    %% Gaps shorter than the silence check's tick: the
+                    %% read that brings a byte is what fails the rate.
                     ok = gen_tcp:send(Sock, ~"GET"),
-                    trickle_bytes(Sock, ~" / HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+                    trickle_bytes(Sock, ~" / HTTP/1.1\r\nHost: x\r\n\r\n", 50),
                     ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 2000)),
                     ok = gen_tcp:close(Sock)
                 end},
@@ -2485,14 +2487,16 @@ conn_min_bytes_per_second_drops_slow_client_test_() ->
                         {127, 0, 0, 1}, Port, [binary, {active, false}], 1000
                     ),
                     %% Headers complete instantly — Content-Length promises
-                    %% 50 bytes but we send them one-per-200ms, well under
-                    %% the 1 MB/s minimum.
+                    %% 50 bytes but we send them one-per-50ms, well under
+                    %% the 1 MB/s minimum. Each gap is shorter than the
+                    %% silence check's tick, so the read that brings a byte
+                    %% is what fails the rate.
                     ok = gen_tcp:send(
                         Sock,
                         ~"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\n"
                     ),
                     Body = binary:copy(~"a", 50),
-                    trickle_bytes(Sock, Body, 200),
+                    trickle_bytes(Sock, Body, 50),
                     ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 2000)),
                     ok = gen_tcp:close(Sock)
                 end}

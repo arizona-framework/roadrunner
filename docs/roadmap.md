@@ -305,7 +305,7 @@ grammar enforcement is callers-write-bugs ergonomics, not security.
 
 ### Anchor the manual-mode body rate window at the first body byte — small
 
-**What:** `make_reader_recv/2` (`roadrunner_conn.erl`) captures its rate-window
+**What:** `make_reader_recv/3` (`roadrunner_conn.erl`) captures its rate-window
 start at closure creation (`read_body_phase/3`), so in manual body-buffering mode a
 handler that delays before calling `roadrunner_req:read_body/1,2` has its
 think-time counted toward the body's minimum-byte-rate average. Auto mode has no
