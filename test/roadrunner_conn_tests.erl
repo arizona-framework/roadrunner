@@ -1,6 +1,7 @@
 -module(roadrunner_conn_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("../include/roadrunner_body_reader.hrl").
 
 %% ======================================================================
 %% parse_loop/2 — pure unit tests with a mock recv fun
@@ -1815,44 +1816,47 @@ consume_state_no_framing_returns_empty_test() ->
     %% `buffered` bytes are pipelined-leftover, not body — preserved
     %% in the body_reader so `roadrunner_conn_loop`'s finishing phase can
     %% thread them into the next reading_request parse.
-    State = #{
-        framing => none,
-        buffered => ~"hi",
-        bytes_read => 0,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> error(unused) end,
-        max => 1000,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    State = #h1_body_reader{
+        framing = none,
+        buffered = ~"hi",
+        bytes_read = 0,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> error(unused) end,
+        max = 1000,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
-    ?assertMatch({ok, <<>>, #{buffered := ~"hi"}}, roadrunner_conn:consume_body_reader(State, all)).
+    ?assertMatch(
+        {ok, <<>>, #h1_body_reader{buffered = ~"hi"}},
+        roadrunner_conn:consume_body_reader(State, all)
+    ).
 
 consume_state_already_drained_returns_empty_test() ->
-    State = #{
-        framing => {content_length, 5},
-        buffered => <<>>,
-        bytes_read => 5,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> error(unused) end,
-        max => 1000,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    State = #h1_body_reader{
+        framing = {content_length, 5},
+        buffered = <<>>,
+        bytes_read = 5,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> error(unused) end,
+        max = 1000,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
     ?assertMatch({ok, <<>>, _}, roadrunner_conn:consume_body_reader(State, all)).
 
 consume_state_length_returns_more_then_ok_test() ->
-    State0 = #{
-        framing => {content_length, 6},
-        buffered => ~"abcdef",
-        bytes_read => 0,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> error(unused) end,
-        max => 1000,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    State0 = #h1_body_reader{
+        framing = {content_length, 6},
+        buffered = ~"abcdef",
+        bytes_read = 0,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> error(unused) end,
+        max = 1000,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
     {more, First, State1} = roadrunner_conn:consume_body_reader(State0, {length, 4}),
     ?assertEqual(~"abcd", First),
@@ -1860,16 +1864,16 @@ consume_state_length_returns_more_then_ok_test() ->
     ?assertEqual(~"ef", Last).
 
 consume_state_length_recv_error_propagates_test() ->
-    State = #{
-        framing => {content_length, 100},
-        buffered => <<>>,
-        bytes_read => 0,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> {error, closed} end,
-        max => 1000,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    State = #h1_body_reader{
+        framing = {content_length, 100},
+        buffered = <<>>,
+        bytes_read = 0,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> {error, closed} end,
+        max = 1000,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
     ?assertEqual({error, closed}, roadrunner_conn:consume_body_reader(State, all)).
 
@@ -1891,21 +1895,21 @@ consume_state_length_multi_recv_test() ->
             _ -> error(unused)
         end
     end,
-    State0 = #{
-        framing => {content_length, 100},
-        buffered => <<>>,
-        bytes_read => 0,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> Recv() end,
-        max => 1000,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    State0 = #h1_body_reader{
+        framing = {content_length, 100},
+        buffered = <<>>,
+        bytes_read = 0,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> Recv() end,
+        max = 1000,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
     {more, Bytes, State1} = roadrunner_conn:consume_body_reader(State0, {length, 8}),
     ?assertEqual(~"abcdefgh", iolist_to_binary(Bytes)),
     %% State1's buffered should now hold the leftover "ij".
-    ?assertMatch(#{buffered := ~"ij"}, State1).
+    ?assertMatch(#h1_body_reader{buffered = ~"ij"}, State1).
 
 %% Exercise `fill_iolist`'s recursive error branch — first recv
 %% delivers SOME bytes, the second recv fails. The error should
@@ -1920,16 +1924,16 @@ consume_state_length_multi_recv_error_test() ->
             _ -> {error, closed}
         end
     end,
-    State = #{
-        framing => {content_length, 100},
-        buffered => <<>>,
-        bytes_read => 0,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> Recv() end,
-        max => 1000,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    State = #h1_body_reader{
+        framing = {content_length, 100},
+        buffered = <<>>,
+        bytes_read = 0,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> Recv() end,
+        max = 1000,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
     ?assertEqual(
         {error, closed},
@@ -1937,16 +1941,16 @@ consume_state_length_multi_recv_error_test() ->
     ).
 
 consume_state_request_too_large_test() ->
-    State = #{
-        framing => {content_length, 100},
-        buffered => <<>>,
-        bytes_read => 0,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> error(unused) end,
-        max => 10,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    State = #h1_body_reader{
+        framing = {content_length, 100},
+        buffered = <<>>,
+        bytes_read = 0,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> error(unused) end,
+        max = 10,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
     ?assertEqual(
         {error, content_length_too_large},
@@ -1956,16 +1960,16 @@ consume_state_request_too_large_test() ->
 consume_state_request_too_large_in_pieces_test() ->
     %% Each piece is under the cap, but the declared body is not: the first
     %% read already fails, with the whole body in hand.
-    State = #{
-        framing => {content_length, 100},
-        buffered => binary:copy(~"x", 100),
-        bytes_read => 0,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> error(unused) end,
-        max => 10,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    State = #h1_body_reader{
+        framing = {content_length, 100},
+        buffered = binary:copy(~"x", 100),
+        bytes_read = 0,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> error(unused) end,
+        max = 10,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
     ?assertEqual(
         {error, content_length_too_large},
@@ -2043,8 +2047,8 @@ consume_state_next_chunk_returns_one_chunk_test() ->
 consume_state_next_chunk_drains_pending_first_test() ->
     %% Pending non-empty (e.g. left over from a length-bounded read) is
     %% returned as the next "chunk" before another wire chunk is parsed.
-    State = (chunked_state(~"3\r\nfoo\r\n0\r\n\r\n", fun() -> error(unused) end))#{
-        pending := ~"leftover"
+    State = (chunked_state(~"3\r\nfoo\r\n0\r\n\r\n", fun() -> error(unused) end))#h1_body_reader{
+        pending = ~"leftover"
     },
     {more, B, _S} = roadrunner_conn:consume_body_reader(State, next_chunk),
     ?assertEqual(~"leftover", B).
@@ -2067,8 +2071,8 @@ consume_state_next_chunk_recv_error_test() ->
     ?assertEqual({error, closed}, roadrunner_conn:consume_body_reader(State, next_chunk)).
 
 consume_state_next_chunk_exceeds_max_test() ->
-    State = (chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end))#{
-        max := 2
+    State = (chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end))#h1_body_reader{
+        max = 2
     },
     ?assertEqual(
         {error, content_length_too_large},
@@ -2144,31 +2148,31 @@ unregister_for_drain_after_listener_gone_is_noop_test() ->
 consume_state_next_chunk_for_content_length_drains_fully_test() ->
     %% Non-chunked framing: `next_chunk` drains the full body in one
     %% shot — there are no chunk boundaries to honor.
-    State = #{
-        framing => {content_length, 5},
-        buffered => ~"hello",
-        bytes_read => 0,
-        pending => <<>>,
-        done => false,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> error(unused) end,
-        max => 1000,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    State = #h1_body_reader{
+        framing = {content_length, 5},
+        buffered = ~"hello",
+        bytes_read = 0,
+        pending = <<>>,
+        done = false,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> error(unused) end,
+        max = 1000,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
     ?assertMatch({ok, ~"hello", _}, roadrunner_conn:consume_body_reader(State, next_chunk)).
 
 consume_state_next_chunk_after_done_returns_empty_test() ->
     %% Calling next_chunk on a state where the size-0 last chunk has
     %% already been seen returns `{ok, <<>>, _}` without parsing more.
-    State = (chunked_state(<<>>, fun() -> error(unused) end))#{done := true},
+    State = (chunked_state(<<>>, fun() -> error(unused) end))#h1_body_reader{done = true},
     ?assertMatch({ok, <<>>, _}, roadrunner_conn:consume_body_reader(State, next_chunk)).
 
 consume_state_chunked_exceeds_max_test() ->
     %% Single chunk of 5 bytes, max=2 — must reject before pending swells.
-    State = (chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end))#{
-        max := 2
+    State = (chunked_state(~"5\r\nhello\r\n0\r\n\r\n", fun() -> error(unused) end))#h1_body_reader{
+        max = 2
     },
     ?assertEqual(
         {error, content_length_too_large},
@@ -2176,37 +2180,37 @@ consume_state_chunked_exceeds_max_test() ->
     ).
 
 chunked_state(Buf, Recv) ->
-    #{
-        framing => chunked,
-        buffered => Buf,
-        bytes_read => 0,
-        pending => <<>>,
-        done => false,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) -> Recv() end,
-        max => 1000,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    #h1_body_reader{
+        framing = chunked,
+        buffered = Buf,
+        bytes_read = 0,
+        pending = <<>>,
+        done = false,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) -> Recv() end,
+        max = 1000,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     }.
 
 consume_state_recvs_more_when_buffer_short_test() ->
     %% Buffer has only 2 bytes, content-length is 5 — fill_n must recv
     %% more. Exercises the success path of the recv loop.
     Self = self(),
-    State = #{
-        framing => {content_length, 5},
-        buffered => ~"he",
-        bytes_read => 0,
-        deadline => infinity,
-        id => make_ref(),
-        recv => fun(_Deadline) ->
+    State = #h1_body_reader{
+        framing = {content_length, 5},
+        buffered = ~"he",
+        bytes_read = 0,
+        deadline = infinity,
+        id = make_ref(),
+        recv = fun(_Deadline) ->
             Self ! recv_called,
             {ok, ~"llo"}
         end,
-        max => 1000,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+        max = 1000,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     },
     {ok, Bytes, _} = roadrunner_conn:consume_body_reader(State, all),
     ?assertEqual(~"hello", iolist_to_binary(Bytes)),
