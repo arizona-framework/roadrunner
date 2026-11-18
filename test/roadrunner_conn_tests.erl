@@ -1546,14 +1546,15 @@ conn_handler_crash_returns_500_test_() ->
 %% turn into REFUSED_STREAM / H3_REQUEST_REJECTED.
 slot_refuse_mode_is_pure_counters_test() ->
     Counter = counters:new(1, [write_concurrency]),
-    ?assert(roadrunner_conn:acquire_request_slot(1, Counter, refuse, s1)),
-    ?assertNot(roadrunner_conn:acquire_request_slot(1, Counter, refuse, s2)),
+    Cell = atomics:new(1, []),
+    ?assert(roadrunner_conn:acquire_request_slot(1, Counter, Cell, refuse, s1)),
+    ?assertNot(roadrunner_conn:acquire_request_slot(1, Counter, Cell, refuse, s2)),
     ok = roadrunner_conn:cancel_slot_wait(refuse, s2),
-    ok = roadrunner_conn:release_request_slot(1, Counter, refuse),
+    ok = roadrunner_conn:release_request_slot(1, Counter, Cell, refuse),
     ?assertEqual(0, counters:get(Counter, 1)),
     %% `infinity` short-circuits both directions.
-    ?assert(roadrunner_conn:acquire_request_slot(infinity, Counter, refuse, s3)),
-    ok = roadrunner_conn:release_request_slot(infinity, Counter, refuse),
+    ?assert(roadrunner_conn:acquire_request_slot(infinity, Counter, undefined, refuse, s3)),
+    ok = roadrunner_conn:release_request_slot(infinity, Counter, undefined, refuse),
     ?assertEqual(0, counters:get(Counter, 1)).
 
 %% `shed` is the same counters path with a different answer at the
@@ -1561,18 +1562,20 @@ slot_refuse_mode_is_pure_counters_test() ->
 %% parks, so withdrawing and releasing never message anyone.
 slot_shed_mode_answers_with_its_retry_after_test() ->
     Counter = counters:new(1, [write_concurrency]),
+    Cell = atomics:new(1, []),
     Shed = {shed, 7},
-    ?assert(roadrunner_conn:acquire_request_slot(1, Counter, Shed, s1)),
-    ?assertEqual({shed, 7}, roadrunner_conn:acquire_request_slot(1, Counter, Shed, s2)),
+    ?assert(roadrunner_conn:acquire_request_slot(1, Counter, Cell, Shed, s1)),
+    ?assertEqual({shed, 7}, roadrunner_conn:acquire_request_slot(1, Counter, Cell, Shed, s2)),
     ?assertEqual(1, counters:get(Counter, 1)),
     ok = roadrunner_conn:cancel_slot_wait(Shed, s2),
-    ok = roadrunner_conn:release_request_slot(1, Counter, Shed),
+    ok = roadrunner_conn:release_request_slot(1, Counter, Cell, Shed),
     ?assertEqual(0, counters:get(Counter, 1)).
 
 slot_release_many_test() ->
     Counter = counters:new(1, [write_concurrency]),
-    true = roadrunner_conn:acquire_request_slot(3, Counter, refuse, a),
-    true = roadrunner_conn:acquire_request_slot(3, Counter, refuse, b),
+    Cell = atomics:new(1, []),
+    true = roadrunner_conn:acquire_request_slot(3, Counter, Cell, refuse, a),
+    true = roadrunner_conn:acquire_request_slot(3, Counter, Cell, refuse, b),
     ok = roadrunner_conn:release_request_slots(3, Counter, 0, refuse),
     ?assertEqual(2, counters:get(Counter, 1)),
     ok = roadrunner_conn:release_request_slots(infinity, Counter, 2, refuse),
@@ -1586,12 +1589,13 @@ slot_release_many_test() ->
 slot_queue_mode_parks_and_wakes_test_() ->
     {spawn, fun() ->
         Counter = counters:new(1, [write_concurrency]),
+        Cell = atomics:new(1, []),
         {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8),
         Waiters = roadrunner_overload_queue:waiters_ref(Pid),
         Overload = {queue, Pid, Waiters, 5000},
-        ?assert(roadrunner_conn:acquire_request_slot(1, Counter, Overload, s1)),
-        ?assertEqual(queued, roadrunner_conn:acquire_request_slot(1, Counter, Overload, s2)),
-        ok = roadrunner_conn:release_request_slot(1, Counter, Overload),
+        ?assert(roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s1)),
+        ?assertEqual(queued, roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s2)),
+        ok = roadrunner_conn:release_request_slot(1, Counter, Cell, Overload),
         Outcome =
             receive
                 {roadrunner_slot, s2, O} -> O
@@ -1605,10 +1609,11 @@ slot_queue_mode_parks_and_wakes_test_() ->
 slot_queue_mode_release_without_waiters_test_() ->
     {spawn, fun() ->
         Counter = counters:new(1, [write_concurrency]),
+        Cell = atomics:new(1, []),
         {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8),
         Overload = {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), 5000},
-        true = roadrunner_conn:acquire_request_slot(1, Counter, Overload, s1),
-        ok = roadrunner_conn:release_request_slot(1, Counter, Overload),
+        true = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s1),
+        ok = roadrunner_conn:release_request_slot(1, Counter, Cell, Overload),
         ok = roadrunner_conn:release_request_slots(1, Counter, 0, Overload),
         ?assertEqual(0, counters:get(Counter, 1)),
         ?assert(is_process_alive(Pid))
@@ -1617,18 +1622,19 @@ slot_queue_mode_release_without_waiters_test_() ->
 slot_queue_mode_cancel_test_() ->
     {spawn, fun() ->
         Counter = counters:new(1, [write_concurrency]),
+        Cell = atomics:new(1, []),
         {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8),
         Overload = {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), 5000},
         Waiters = roadrunner_overload_queue:waiters_ref(Pid),
-        true = roadrunner_conn:acquire_request_slot(1, Counter, Overload, s1),
-        queued = roadrunner_conn:acquire_request_slot(1, Counter, Overload, s2),
+        true = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s1),
+        queued = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s2),
         %% Wait for the park to land before cancelling. A cancel that
         %% races an in-flight grant is legal and the caller has to give
         %% that slot back, but this test is about the ordered case.
         ?assert(until(fun() -> roadrunner_overload_queue:waiting(Waiters) end)),
         ok = roadrunner_conn:cancel_slot_wait(Overload, s2),
         ?assert(until(fun() -> not roadrunner_overload_queue:waiting(Waiters) end)),
-        ok = roadrunner_conn:release_request_slot(1, Counter, Overload),
+        ok = roadrunner_conn:release_request_slot(1, Counter, Cell, Overload),
         %% Withdrawn before the slot freed, so no grant arrives.
         Got =
             receive
@@ -2090,7 +2096,7 @@ register_for_drain_registers_pid_test() ->
     Table = ets:new(register_for_drain, [set, public]),
     ProtoOpts = roadrunner_test_proto_opts:new(#{drain_table => Table}),
     ?assertEqual(ok, roadrunner_conn:register_for_drain(self(), ProtoOpts)),
-    ?assertEqual([{self()}], ets:tab2list(Table)),
+    ?assertEqual([{self(), undefined}], ets:tab2list(Table)),
     ?assertEqual(
         ok, roadrunner_conn:unregister_for_drain(roadrunner_conn:close_opts(ProtoOpts))
     ),
@@ -2804,7 +2810,7 @@ request_slot_infinity_is_noop_test() ->
     %% no-op.
     ?assert(roadrunner_conn:try_acquire_request_slot(infinity, undefined)),
     ?assert(roadrunner_conn:try_acquire_request_slot(infinity, undefined)),
-    ?assertEqual(ok, roadrunner_conn:release_request_slot(infinity, undefined, refuse)),
+    ?assertEqual(ok, roadrunner_conn:release_request_slot(infinity, undefined, undefined, refuse)),
     ?assertEqual(ok, roadrunner_conn:release_request_slots(infinity, undefined, 5, refuse)).
 
 request_slot_admits_up_to_cap_then_refuses_test() ->
@@ -2816,7 +2822,7 @@ request_slot_admits_up_to_cap_then_refuses_test() ->
     ?assertNot(roadrunner_conn:try_acquire_request_slot(2, Ref)),
     ?assertEqual(2, counters:get(Ref, 1)),
     %% Releasing one frees a slot; the next acquire succeeds again.
-    ?assertEqual(ok, roadrunner_conn:release_request_slot(2, Ref, refuse)),
+    ?assertEqual(ok, roadrunner_conn:release_request_slot(2, Ref, atomics:new(1, []), refuse)),
     ?assertEqual(1, counters:get(Ref, 1)),
     ?assert(roadrunner_conn:try_acquire_request_slot(2, Ref)),
     ?assertEqual(2, counters:get(Ref, 1)).

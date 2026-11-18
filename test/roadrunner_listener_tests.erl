@@ -300,7 +300,9 @@ slot_reconciliation_only_reaps_excess_over_live_members_test() ->
     timer:sleep(200),
     ?assertEqual(2, counters:get(Counter, 1)),
     Table = maps:get(drain_table, ProtoOpts),
-    ?assertEqual(lists:sort([{Stub1}, {Stub2}]), lists:sort(ets:tab2list(Table))),
+    ?assertEqual(
+        lists:sort([{Stub1, undefined}, {Stub2, undefined}]), lists:sort(ets:tab2list(Table))
+    ),
     Stub1 ! stop,
     Stub2 ! stop,
     ok = roadrunner_listener:stop(Name).

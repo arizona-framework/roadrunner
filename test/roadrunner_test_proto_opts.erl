@@ -6,7 +6,7 @@
 
 -include("../include/roadrunner_proto_opts.hrl").
 
--export([new/1, set/2, get/2, to_map/1]).
+-export([new/1, set/2, get/2, to_map/1, with_slot_keeper/1]).
 
 -spec new(#{atom() => term()}) -> #proto_opts{}.
 new(Fields) ->
@@ -32,3 +32,15 @@ index(Field) ->
 index(Field, [Field | _], I) -> I;
 index(Field, [_ | Rest], I) -> index(Field, Rest, I + 1);
 index(Field, [], _I) -> error({unknown_proto_opts_field, Field}).
+
+%% A finite ceiling comes with the listener's slot keeper and the conn's own
+%% in-flight cell, as `roadrunner_listener` and `roadrunner_conn_loop:start/2`
+%% set them up for a conn that a test enters directly.
+-spec with_slot_keeper(#{atom() => term()}) -> #{atom() => term()}.
+with_slot_keeper(#{max_concurrent_requests := Max, inflight_counter := Counter} = Fields) when
+    is_integer(Max)
+->
+    {ok, Keeper} = roadrunner_overload_queue:start_link(Max, Counter, Max),
+    Fields#{slot_keeper => Keeper, slot_cell => atomics:new(1, [])};
+with_slot_keeper(Fields) ->
+    Fields.

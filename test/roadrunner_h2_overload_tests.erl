@@ -38,6 +38,7 @@ queue_mode_serves_a_parked_stream_test_() ->
                 ?assertEqual(0, Refused),
                 ok = gen_tcp:close(Sock)
             after
+                ok = roadrunner_h2_slot_handler:stop_all(),
                 ok = roadrunner_listener:stop(Name)
             end
         end}}.
@@ -61,6 +62,7 @@ queue_mode_refuses_after_the_deadline_test_() ->
                 First ! release,
                 ok = gen_tcp:close(Sock)
             after
+                ok = roadrunner_h2_slot_handler:stop_all(),
                 ok = roadrunner_listener:stop(Name)
             end
         end}}.
@@ -80,6 +82,7 @@ refuse_mode_is_unchanged_test_() ->
                 First ! release,
                 ok = gen_tcp:close(Sock)
             after
+                ok = roadrunner_h2_slot_handler:stop_all(),
                 ok = roadrunner_listener:stop(Name)
             end
         end}}.
@@ -113,6 +116,7 @@ queue_mode_reset_withdraws_a_parked_stream_test_() ->
                 ?assertMatch({1, _}, collect(Sock, 1, 0, 0)),
                 ok = gen_tcp:close(Sock)
             after
+                ok = roadrunner_h2_slot_handler:stop_all(),
                 ok = roadrunner_listener:stop(Name)
             end
         end}}.
@@ -140,6 +144,7 @@ queue_mode_hands_back_a_stale_grant_test_() ->
                 ?assert(is_process_alive(Conn)),
                 ok = gen_tcp:close(Sock)
             after
+                ok = roadrunner_h2_slot_handler:stop_all(),
                 ok = roadrunner_listener:stop(Name)
             end
         end}}.
@@ -171,6 +176,7 @@ queue_mode_draining_conn_exits_after_its_park_is_refused_test_() ->
                 First ! release,
                 ok = gen_tcp:close(Holder)
             after
+                ok = roadrunner_h2_slot_handler:stop_all(),
                 ok = roadrunner_listener:stop(Name)
             end
         end}}.
@@ -214,7 +220,7 @@ await_ping_ack(Sock, Buf) ->
 
 conn_pid(Name) ->
     ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(whereis(Name)))),
-    [{Pid}] = ets:tab2list(maps:get(drain_table, ProtoOpts)),
+    [{Pid, _Cell}] = ets:tab2list(maps:get(drain_table, ProtoOpts)),
     Pid.
 
 %% --- harness ---

@@ -279,7 +279,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   process table (failing spawns everywhere, not just this listener) on
   top of unbounded handler memory. This caps the product directly; set it
   to a finite value when enabling HTTP/2 or HTTP/3 under a high
-  `max_clients`. Over-limit streams
+  `max_clients`. A handler still running when its connection closes
+  keeps counting until it ends. A connection that dies without closing
+  (killed, or crashed) has its slots reclaimed by `slot_reconciliation`,
+  and the handlers it leaves running stop counting then. Over-limit
+  streams
   are refused with `REFUSED_STREAM` (h2) / `H3_REQUEST_REJECTED` (h3),
   which RFC 9113 §8.7 marks safe to retry; each refusal emits
   `request_throttled` and increments the `throttled`
@@ -328,9 +332,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   `connection: close`, before any of its body is read (the close lingers
   over a body the client may still be sending). A shed request is
   counted like a refused one: it emits `request_throttled` and
-  increments the `throttled` count from `info/1`. A long-lived response
-  (WebSocket, loop, stream) holds its slot until it ends, on every
-  protocol. Requires a finite `max_concurrent_requests`.
+  increments the `throttled` count from `info/1`. A loop or stream
+  response holds its slot until it ends, on every protocol. An HTTP/1
+  WebSocket upgrade holds it only until the `101` is out: the session
+  after it is a connection, which `max_clients` bounds. Requires a
+  finite `max_concurrent_requests`.
 
   Shedding applies to the request ceiling only. A connection over
   `max_clients` is still closed without a response: answering it would
@@ -398,9 +404,12 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `slot_reconciliation`: `#{interval := Ms}` (default 60000) for the
   periodic reaper that releases slots orphaned by brutal-kill exits,
   and with them the killed conns' rows in the drain registry, or
-  `disabled` to turn it off. A `graceful_drain => false` listener keeps
-  no registry to compare against, so the reaper is off there; asking
-  for both is a configuration conflict.
+  `disabled` to turn it off. It also releases, on the tick that finds a
+  killed conn gone, the `max_concurrent_requests` slots that conn still
+  held. A `graceful_drain => false` listener keeps no registry to
+  compare against, so the reaper is off there, and a killed conn's
+  request slots stay counted until the listener restarts; asking for
+  both is a configuration conflict.
 - `graceful_drain`: opt out of the per-conn drain registry
   (`true` default; `false` trades drain notification for a little
   less per-conn work on short-lived workloads).
@@ -1897,6 +1906,11 @@ validate_overload_mode({shed, Shed}, _Max, _RequestTimeout) when is_map(Shed) ->
 validate_overload_mode(Other, _Max, _RequestTimeout) ->
     error({invalid_listener_opt, overload_mode, Other}).
 
+%% The overload mode as the conns carry it, and the listener's slot keeper.
+%% A finite ceiling gets a keeper in every mode: a closing conn hands it the
+%% slots of the workers still running, so they stay counted until those
+%% workers end. In queue mode the same process parks waiters.
+%%
 %% `refuse` costs nothing at all on the release path; the queue form
 %% carries the process, the atomic that says whether anyone is parked,
 %% and the wait deadline, so the hot path never reads proto_opts again.
@@ -1908,14 +1922,22 @@ validate_overload_mode(Other, _Max, _RequestTimeout) ->
     | {shed, #{retry_after := pos_integer()}},
     infinity | pos_integer(),
     counters:counters_ref()
-) -> roadrunner_conn:overload().
-setup_overload(refuse, _Max, _Counter) ->
-    refuse;
+) -> {roadrunner_conn:overload(), pid() | undefined}.
+setup_overload(refuse, infinity, _Counter) ->
+    {refuse, undefined};
+setup_overload(refuse, Max, Counter) ->
+    {refuse, start_slot_keeper(Max, Counter, Max)};
 setup_overload({queue, #{max_queued := MaxQueued, timeout := Timeout}}, Max, Counter) ->
+    Pid = start_slot_keeper(Max, Counter, MaxQueued),
+    {{queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout}, Pid};
+setup_overload({shed, #{retry_after := RetryAfter}}, Max, Counter) ->
+    {{shed, RetryAfter}, start_slot_keeper(Max, Counter, Max)}.
+
+%% `MaxQueued` matters in queue mode only; nothing parks otherwise.
+-spec start_slot_keeper(pos_integer(), counters:counters_ref(), pos_integer()) -> pid().
+start_slot_keeper(Max, Counter, MaxQueued) ->
     {ok, Pid} = roadrunner_overload_queue:start_link(Max, Counter, MaxQueued),
-    {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout};
-setup_overload({shed, #{retry_after := RetryAfter}}, _Max, _Counter) ->
-    {shed, RetryAfter}.
+    Pid.
 
 %% A TLS listener that also reads the PROXY protocol cannot hand its
 %% sockets out through `ssl:listen`: the header arrives in plaintext before
@@ -2028,9 +2050,10 @@ build_proto_opts(Opts, ListenerName) ->
     MaxConcurrentRequests =
         maps:get(max_concurrent_requests, Opts, ?DEFAULT_MAX_CONCURRENT_REQUESTS),
     %% `overload_mode` decides what happens to a request that arrives over
-    %% the ceiling. Queue mode needs a process to park waiters in; it is
-    %% started here so it is linked to the listener and dies with it.
-    Overload = setup_overload(
+    %% the ceiling. A finite ceiling needs the slot keeper (queue mode parks
+    %% waiters in it too); it is started here, linked to the listener, and
+    %% stopped with it in `terminate/2`.
+    {Overload, SlotKeeper} = setup_overload(
         validate_overload_mode(
             maps:get(overload_mode, Opts, refuse),
             MaxConcurrentRequests,
@@ -2082,6 +2105,7 @@ build_proto_opts(Opts, ListenerName) ->
         accept_priority = validate_accept_priority(maps:get(accept_priority, Opts, high)),
         max_concurrent_requests = MaxConcurrentRequests,
         overload = Overload,
+        slot_keeper = SlotKeeper,
         client_counter = ClientCounter,
         drain_table = DrainTable,
         requests_counter = RequestsCounter,
@@ -2898,7 +2922,7 @@ handle_call(
 handle_call(
     {register_for_drain, Pid}, _From, #state{proto_opts = #proto_opts{drain_table = Table}} = State
 ) ->
-    true = ets:insert(Table, {Pid}),
+    true = ets:insert(Table, {Pid, undefined}),
     {reply, ok, State};
 handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     #proto_opts{
@@ -3021,7 +3045,7 @@ check_drain(
             Remaining = Deadline - erlang:monotonic_time(millisecond),
             case Remaining =< 0 of
                 true ->
-                    _ = [exit(Pid, kill) || {Pid} <- ets:tab2list(Table)],
+                    _ = [exit(Pid, kill) || {Pid, _Cell} <- ets:tab2list(Table)],
                     finish_drain({timeout, N}, State);
                 false ->
                     _ = erlang:send_after(min(50, Remaining), self(), drain_check),
@@ -3048,7 +3072,7 @@ finish_drain(Reply, #state{quic_listener = QuicListener, drain = #{waiters := Wa
 %% to the mailbox check at the next keep-alive boundary.
 -spec notify_conns(ets:table(), integer()) -> ok.
 notify_conns(Table, Deadline) ->
-    _ = [Pid ! {roadrunner_drain, Deadline} || {Pid} <- ets:tab2list(Table)],
+    _ = [Pid ! {roadrunner_drain, Deadline} || {Pid, _Cell} <- ets:tab2list(Table)],
     ok.
 
 -doc false.
@@ -3079,7 +3103,7 @@ handle_info(
     %% a bounded count short-circuits at the counter so the alive checks
     %% per tick are capped at `min(members, counter)`.
     Counter0 = counters:get(Counter, 1),
-    LiveBounded = count_live_up_to(Table, Counter0),
+    LiveBounded = count_live_up_to(Table, Counter0, State#state.proto_opts),
     NewDiff = Counter0 - LiveBounded,
     %% Only release slots that have been orphaned for two consecutive
     %% ticks — filters out the spawn-time race where a fresh conn has
@@ -3140,25 +3164,49 @@ handle_info(_Msg, State) ->
 %% alive checks are bounded by the counter rather than by the registry
 %% size. A conn that was `kill`ed never ran its exit path, so its pid is
 %% still registered: it is dropped here, the same reaping this tick does
-%% for its slot.
--spec count_live_up_to(ets:table(), non_neg_integer()) -> non_neg_integer().
-count_live_up_to(Table, Cap) ->
-    count_live_up_to(ets:tab2list(Table), Table, Cap, 0).
-
--spec count_live_up_to([{pid()}], ets:table(), non_neg_integer(), non_neg_integer()) ->
+%% for its slot, and the in-flight request slots in its cell are released
+%% at once. A listener with a request ceiling checks every row, so no dead
+%% conn's request slots wait behind the short-circuit.
+-spec count_live_up_to(ets:table(), non_neg_integer(), roadrunner_conn:proto_opts()) ->
     non_neg_integer().
-count_live_up_to(_, _Table, Cap, N) when N >= Cap ->
+count_live_up_to(Table, Cap, #proto_opts{slot_keeper = undefined} = ProtoOpts) ->
+    count_live_up_to(ets:tab2list(Table), Table, Cap, 0, ProtoOpts);
+count_live_up_to(Table, Cap, ProtoOpts) ->
+    %% With a request ceiling every row is checked: a dead conn's row is
+    %% the only record of the in-flight slots it still holds.
+    min(Cap, count_live_up_to(ets:tab2list(Table), Table, infinity, 0, ProtoOpts)).
+
+-spec count_live_up_to(
+    [{pid(), roadrunner_conn:slot_cell()}],
+    ets:table(),
+    non_neg_integer() | infinity,
+    non_neg_integer(),
+    roadrunner_conn:proto_opts()
+) ->
+    non_neg_integer().
+count_live_up_to(_, _Table, Cap, N, _ProtoOpts) when N >= Cap ->
     Cap;
-count_live_up_to([], _Table, _Cap, N) ->
+count_live_up_to([], _Table, _Cap, N, _ProtoOpts) ->
     N;
-count_live_up_to([{Pid} | T], Table, Cap, N) ->
+count_live_up_to([{Pid, Cell} | T], Table, Cap, N, ProtoOpts) ->
     case is_process_alive(Pid) of
         true ->
-            count_live_up_to(T, Table, Cap, N + 1);
+            count_live_up_to(T, Table, Cap, N + 1, ProtoOpts);
         false ->
             true = ets:delete(Table, Pid),
-            count_live_up_to(T, Table, Cap, N)
+            ok = reclaim_request_slots(Cell, ProtoOpts),
+            count_live_up_to(T, Table, Cap, N, ProtoOpts)
     end.
+
+%% The in-flight slots a conn that died without its exit path still held
+%% (its running workers', and grants it never read). Its cell is emptied,
+%% so the slot keeper cannot release them again; its workers still
+%% running stop counting from here.
+-spec reclaim_request_slots(roadrunner_conn:slot_cell(), roadrunner_conn:proto_opts()) -> ok.
+reclaim_request_slots(Cell, #proto_opts{
+    max_concurrent_requests = Max, inflight_counter = Counter, overload = Overload
+}) ->
+    roadrunner_conn:reclaim_request_slots(Cell, Max, Counter, Overload).
 
 -doc false.
 -spec terminate(term(), #state{}) -> ok.
@@ -3167,6 +3215,7 @@ terminate(_Reason, #state{
 }) ->
     erase_routes(ProtoOpts),
     ok = stop_quic(QuicListener),
+    ok = stop_slot_keeper(ProtoOpts),
     %% `drain/2` already closed the TCP socket on its way out
     %% (`closed`), and an HTTP/3-only listener never had one (`none`).
     close_tcp(LSocket).
@@ -3179,6 +3228,16 @@ stop_quic(QuicPool) ->
     %% doesn't deliver a teardown EXIT back to this gen_server.
     true = unlink(QuicPool),
     roadrunner_quic_listener_sup:stop(QuicPool).
+
+%% A link stops the keeper when the listener crashes, but not on a normal
+%% stop. Its counter goes with the listener, so nothing it keeps counting
+%% is read any more. Asynchronous, as the keeper may be what stopped us.
+-spec stop_slot_keeper(roadrunner_conn:proto_opts()) -> ok.
+stop_slot_keeper(#proto_opts{slot_keeper = undefined}) ->
+    ok;
+stop_slot_keeper(#proto_opts{slot_keeper = Pid}) ->
+    true = exit(Pid, shutdown),
+    ok.
 
 -spec erase_routes(roadrunner_conn:proto_opts()) -> ok.
 erase_routes(#proto_opts{dispatch = {router, Name}}) ->
