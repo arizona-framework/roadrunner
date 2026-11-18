@@ -1,6 +1,7 @@
 -module(roadrunner_stream_body_reader_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("../include/roadrunner_body_reader.hrl").
 
 %% The stream body reader of an HTTP/2 manual-mode request
 %% (`roadrunner_conn:stream_body_reader/5`), read through
@@ -156,7 +157,9 @@ failed_read_ends_the_body_test_() ->
 set_body_timeout_from_now_test() ->
     Req = #{body_reader => roadrunner_conn:stream_body_reader(self(), 7, deadline(0), 64, false)},
     Before = erlang:monotonic_time(millisecond),
-    #{body_reader := #{deadline := Deadline}} = roadrunner_req:set_body_timeout(1000, Req),
+    #{body_reader := #stream_body_reader{deadline = Deadline}} = roadrunner_req:set_body_timeout(
+        1000, Req
+    ),
     ?assert(Deadline >= Before + 1000).
 
 %% Without a reader (`auto` mode) the body is already read: nothing moves.
@@ -169,7 +172,9 @@ set_body_timeout_without_a_reader_test() ->
 %% shape, rather than when a later read arms its wait.
 set_body_timeout_over_the_receive_limit_test() ->
     Req = #{body_reader => roadrunner_conn:stream_body_reader(self(), 7, deadline(0), 64, false)},
-    #{body_reader := #{deadline := _}} = roadrunner_req:set_body_timeout(16#FFFFFFFF, Req),
+    #{body_reader := #stream_body_reader{deadline = _}} = roadrunner_req:set_body_timeout(
+        16#FFFFFFFF, Req
+    ),
     ?assertError(function_clause, roadrunner_req:set_body_timeout(16#100000000, Req)),
     ?assertError(function_clause, roadrunner_req:set_body_timeout(16#100000000, #{body => ~""})).
 
@@ -303,15 +308,14 @@ req(Script, Max) ->
         end
     end,
     #{
-        body_reader => #{
-            framing => stream,
-            buffered => <<>>,
-            bytes_read => 0,
-            done => false,
-            deadline => infinity,
-            id => make_ref(),
-            recv => fun(_Deadline) -> Recv() end,
-            max => Max
+        body_reader => #stream_body_reader{
+            buffered = <<>>,
+            bytes_read = 0,
+            done = false,
+            deadline = infinity,
+            id = make_ref(),
+            recv = fun(_Deadline) -> Recv() end,
+            max = Max
         }
     }.
 
@@ -357,5 +361,5 @@ continue_before_stream_when_the_conn_is_gone_test() ->
     receive
         {'DOWN', MRef, process, Dead, _} -> ok
     end,
-    Req = #{body_reader => #{continue => {Dead, 1}}},
+    Req = #{body_reader => #stream_body_reader{continue = {Dead, 1}}},
     ?assertEqual(ok, roadrunner_conn:continue_before_stream(Req)).

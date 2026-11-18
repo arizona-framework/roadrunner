@@ -2,6 +2,7 @@
 -moduledoc false.
 
 -include("roadrunner_proto_opts.hrl").
+-include("roadrunner_body_reader.hrl").
 
 %% Tail-recursive per-connection process for HTTP/1.1.
 %%
@@ -1554,7 +1555,7 @@ read_body(manual, Answer, S, Req, Framing, MaxCL, Resolved, Deadline) ->
     case Answer of
         continue ->
             Owed = atomics:new(1, []),
-            Reader = BodyState#{continue => {Socket, MinRate, Owed}},
+            Reader = BodyState#h1_body_reader{continue = {Socket, MinRate, Owed}},
             dispatch_phase(flush_out(S), Req#{body_reader => Reader}, Resolved);
         none ->
             dispatch_phase(S, Req#{body_reader => BodyState}, Resolved)
@@ -1872,17 +1873,21 @@ ensure_close_signaled(_S, _Req, Response) ->
 -spec with_close_if_closing(#loop_state{}, roadrunner_req:request(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
 with_close_if_closing(
-    #loop_state{body_buffering = manual}, #{body_reader := #{continue := _}} = Req, Headers
+    #loop_state{body_buffering = manual},
+    #{body_reader := #h1_body_reader{continue = {_, _, _}}} = Req,
+    Headers
 ) ->
     with_close(Req, Headers);
 with_close_if_closing(
     #loop_state{body_buffering = manual},
-    #{body_reader := #{framing := {content_length, N}, max := Max}} = Req,
+    #{body_reader := #h1_body_reader{framing = {content_length, N}, max = Max}} = Req,
     Headers
 ) when N > Max ->
     with_close(Req, Headers);
 with_close_if_closing(
-    #loop_state{body_buffering = manual} = S, #{body_reader := #{framing := none}} = Req, Headers
+    #loop_state{body_buffering = manual} = S,
+    #{body_reader := #h1_body_reader{framing = none}} = Req,
+    Headers
 ) ->
     %% No body, so no read to fail: the common bodyless request skips the
     %% lookup below.
@@ -2165,12 +2170,12 @@ buffered_finish(S0, Req, Headers) ->
     %% is about to be drained, and the drain can read the socket — the
     %% just-queued response goes out first so a client that watches for
     %% it while still uploading isn't kept waiting on its own upload.
-    %% Bodyless manual requests (`framing := none`, the pipelined-GET
+    %% Bodyless manual requests (framing `none`, the pipelined-GET
     %% hot path) and auto mode (body consumed pre-dispatch) skip the
     %% flush and keep coalescing.
     S =
         case Req of
-            #{body_reader := #{framing := none}} -> S0;
+            #{body_reader := #h1_body_reader{framing = none}} -> S0;
             #{body_reader := _} -> flush_out(S0);
             _ -> S0
         end,
@@ -2290,29 +2295,29 @@ drain_body_if_manual(_Req) ->
     {ok, <<>>}.
 
 %% Drain a manual-mode body reader; `none` is a request without one.
--spec drain_reader(roadrunner_req:body_reader() | none) -> {ok, binary()} | {error, term()}.
+-spec drain_reader(roadrunner_conn:h1_body_reader() | none) -> {ok, binary()} | {error, term()}.
 drain_reader(none) ->
     {ok, <<>>};
 drain_reader(Reader) ->
     drain_latest(roadrunner_conn:latest_reader(Reader)).
 
--spec drain_latest(roadrunner_req:body_reader() | {failed, term()}) ->
+-spec drain_latest(roadrunner_conn:h1_body_reader() | {failed, term()}) ->
     {ok, binary()} | {error, term()}.
 drain_latest({failed, Reason}) ->
     %% A read of the body failed: where the rest of it starts is unknown,
     %% so the connection closes instead of draining it.
     {error, Reason};
-drain_latest(#{continue := _}) ->
+drain_latest(#h1_body_reader{continue = {_, _, _}}) ->
     %% The handler answered without asking for the body (`read_body/8`):
     %% no 100 went out and the client is holding the body back, so there is
     %% nothing to drain, and the connection closes.
     {error, body_not_requested};
-drain_latest(#{deadline := Deadline, request_deadline := RequestDeadline} = Reader) ->
+drain_latest(#h1_body_reader{deadline = Deadline, request_deadline = RequestDeadline} = Reader) ->
     %% Not past the request's own deadline, whatever the handler moved its
     %% reads to (`roadrunner_req:set_body_timeout/2`): a client that stops
     %% sending the rest of a body nobody wants must not hold the
     %% connection.
-    roadrunner_conn:drain_reader(Reader#{deadline := min(Deadline, RequestDeadline)}).
+    roadrunner_conn:drain_reader(Reader#h1_body_reader{deadline = min(Deadline, RequestDeadline)}).
 
 %% 413 + close for a body over its cap, after any queued pipelined
 %% responses, lingering over the body the client may be sending.
@@ -2340,7 +2345,7 @@ exit_lingering(
 %% manual-mode body the request frames may still be on its way, so the
 %% close lingers. An auto-mode body was read before dispatch.
 -spec exit_unread(#loop_state{}, roadrunner_req:request()) -> no_return().
-exit_unread(S, #{body_reader := #{framing := Framing}}) when Framing =/= none ->
+exit_unread(S, #{body_reader := #h1_body_reader{framing = Framing}}) when Framing =/= none ->
     exit_lingering(S, normal);
 exit_unread(S, _Req) ->
     exit_normal(S, normal).

@@ -2,6 +2,7 @@
 -moduledoc false.
 
 -include("roadrunner_proto_opts.hrl").
+-include("roadrunner_body_reader.hrl").
 
 %% Runs one HTTP/2 or HTTP/3 request inside its stream worker: route it,
 %% run the handler pipeline, send the response and emit the request
@@ -316,8 +317,8 @@ route_body(Max, #{body := Body} = Req) ->
         true -> too_large;
         false -> Req
     end;
-route_body(Max, #{body_reader := Reader} = Req) ->
-    Req#{body_reader := Reader#{max := Max}}.
+route_body(Max, #{body_reader := #stream_body_reader{} = Reader} = Req) ->
+    Req#{body_reader := Reader#stream_body_reader{max = Max}}.
 
 -spec invoke(
     module(),

@@ -8,6 +8,7 @@
 %% after a collection.
 
 -include_lib("eunit/include/eunit.hrl").
+-include("../include/roadrunner_body_reader.hrl").
 
 -define(PIECE, 16384).
 -define(PIECES, 2000).
@@ -51,7 +52,8 @@ parts_keep_the_framing_test() ->
     {more, B, R2} = roadrunner_conn:consume_body_reader(R1, next_chunk),
     {more, ~"abc", R3} = roadrunner_conn:consume_body_reader(R2, next_chunk),
     ?assertMatch(
-        {ok, <<>>, #{buffered := ~"NEXT"}}, roadrunner_conn:consume_body_reader(R3, next_chunk)
+        {ok, <<>>, #h1_body_reader{buffered = ~"NEXT"}},
+        roadrunner_conn:consume_body_reader(R3, next_chunk)
     ),
     {ok, All, _} = roadrunner_conn:consume_body_reader(reader(chunked, infinity, Next, 4), all),
     ?assertEqual(<<A/binary, B/binary, "abc">>, iolist_to_binary(All)),
@@ -113,19 +115,19 @@ held(Read, Framing, Max, Piece) ->
     end.
 
 reader(Framing, Max, Piece, Pieces) ->
-    #{
-        framing => Framing,
-        buffered => <<>>,
-        bytes_read => 0,
-        pending => <<>>,
-        done => false,
-        deadline => infinity,
-        request_deadline => infinity,
-        id => make_ref(),
-        recv => recv(Piece, Pieces),
-        max => Max,
-        trailer_limits => {8192, 10240, 100},
-        chunk_left => 0
+    #h1_body_reader{
+        framing = Framing,
+        buffered = <<>>,
+        bytes_read = 0,
+        pending = <<>>,
+        done = false,
+        deadline = infinity,
+        request_deadline = infinity,
+        id = make_ref(),
+        recv = recv(Piece, Pieces),
+        max = Max,
+        trailer_limits = {8192, 10240, 100},
+        chunk_left = 0
     }.
 
 %% Piece by piece, a fresh binary each, then the connection closes. At

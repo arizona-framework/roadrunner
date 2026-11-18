@@ -20,6 +20,7 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 -define(QUOTE_CP_KEY, {?MODULE, quote_cp}).
 
 -include("roadrunner_swar.hrl").
+-include("roadrunner_body_reader.hrl").
 
 -export_type([request/0, body_reader/0, deadline/0, cached_decisions/0, private/0, conn_info/0]).
 
@@ -92,9 +93,10 @@ care which protocol delivered the bytes.
     %% single-handler form). `undefined` when no state was attached.
     state => term(),
     %% Body-read state attached by `roadrunner_conn` in
-    %% `body_buffering => manual` mode. Threaded through
-    %% `roadrunner_req:read_body/1,2`. Never present in `auto` mode
-    %% or in manually-constructed request maps.
+    %% `body_buffering => manual` mode, internal to roadrunner (see
+    %% `body_reader()`). Threaded through `roadrunner_req:read_body/1,2`.
+    %% Never present in `auto` mode or in manually-constructed request
+    %% maps.
     body_reader => body_reader(),
     %% When the request's header block was decoded, in
     %% `erlang:monotonic_time(millisecond)`, set on every HTTP/2 and
@@ -161,73 +163,14 @@ re-lowercasing headers on the dispatch hot path.
 -type cached_decisions() :: term().
 
 -doc """
-Body-read envelope attached to the request in `body_buffering =>
-manual` mode. `read_body/1,2` consumes from it; the conn owns the
-recv closure and tracks how much remains.
-
-On HTTP/1.1 the reader parses the body's framing off the socket.
-`pending` holds decoded body bytes that have been parsed off the
-wire but not yet handed to the caller — used for chunked framing
-to absorb a chunk's payload across multiple length-bounded calls.
-`done` flips true once the size-0 last chunk is parsed.
-
-On HTTP/2 and HTTP/3 (`framing => stream`) the request's DATA is
-delimited by the stream itself: the recv closure asks the connection for
-what has arrived, `buffered` keeps what a length-bounded read left over,
-and `done` flips true with the stream's end.
-
-`deadline` is when reading the body times out, in
-`erlang:monotonic_time(millisecond)` units, or `infinity`. The recv
-closure takes it, so `set_body_timeout/2` can move it.
+The body reader attached to the request under `body_reader` in
+`body_buffering => manual` mode. Internal to roadrunner: an opaque term
+whose shape may change in any release, so neither match on it nor build
+it. Read the body through `read_body/1,2` and `read_body_chunked/1`, ask
+whether there is one with `has_body/1`, and move its deadline with
+`set_body_timeout/2`.
 """.
--type body_reader() :: h1_body_reader() | stream_body_reader().
-
--type stream_body_reader() :: #{
-    framing := stream,
-    buffered := iodata(),
-    bytes_read := non_neg_integer(),
-    done := boolean(),
-    recv := fun((deadline()) -> {ok, iodata(), boolean()} | {error, term()}),
-    deadline := deadline(),
-    %% Tells this reader apart, so a failed read ends this body only.
-    id := reference(),
-    max := roadrunner_router:body_limit(),
-    %% Present while a 100 Continue is owed to a client holding its body
-    %% back: the connection process and stream a streaming response asks
-    %% for it before it starts.
-    continue => {pid(), pos_integer()},
-    %% The connection process and stream a read asks for DATA, on a body
-    %% still arriving (`roadrunner_conn:demand_body/1`).
-    source => {pid(), non_neg_integer()}
-}.
-
--type h1_body_reader() :: #{
-    framing := none | chunked | {content_length, non_neg_integer()},
-    buffered := binary(),
-    bytes_read := non_neg_integer(),
-    pending := binary(),
-    done := boolean(),
-    recv := fun((deadline()) -> {ok, binary()} | {error, term()}),
-    deadline := deadline(),
-    %% The request's own deadline, which `set_body_timeout/2` leaves alone:
-    %% what is left of the body once the response is out is drained by
-    %% then at the latest.
-    request_deadline := integer(),
-    %% Tells this reader apart, so a failed read ends this body only.
-    id := reference(),
-    max := roadrunner_router:body_limit(),
-    %% Trailer-header limits `{max_header_line, max_header_block,
-    %% max_header_count}` threaded to `roadrunner_http1:parse_chunk/2`.
-    trailer_limits := {pos_integer(), pos_integer(), pos_integer()},
-    %% What the chunk a chunked body is partway through still lacks, `0`
-    %% between chunks (`roadrunner_http1:parse_chunk_part/4`).
-    chunk_left := non_neg_integer(),
-    %% Present while a 100 Continue is owed to a client holding its body
-    %% back: the transport socket the first read sends it on, the minimum
-    %% byte rate of the recv that read then starts, and the flag that has it
-    %% sent once, by that read or by a streaming response starting first.
-    continue => {term(), non_neg_integer(), atomics:atomics_ref()}
-}.
+-type body_reader() :: term().
 
 -doc """
 When a body read times out: an `erlang:monotonic_time(millisecond)`
@@ -458,11 +401,11 @@ hand). Handlers can use this as a short-circuit before doing any
 body-aware work.
 """.
 -spec has_body(request()) -> boolean().
-has_body(#{body_reader := #{framing := none}}) -> false;
-has_body(#{body_reader := #{framing := {content_length, N}}}) -> N > 0;
-has_body(#{body_reader := #{framing := chunked}}) -> true;
-has_body(#{body_reader := #{framing := stream, done := true, bytes_read := 0}}) -> false;
-has_body(#{body_reader := #{framing := stream}}) -> true;
+has_body(#{body_reader := #h1_body_reader{framing = none}}) -> false;
+has_body(#{body_reader := #h1_body_reader{framing = {content_length, N}}}) -> N > 0;
+has_body(#{body_reader := #h1_body_reader{framing = chunked}}) -> true;
+has_body(#{body_reader := #stream_body_reader{done = true, bytes_read = 0}}) -> false;
+has_body(#{body_reader := #stream_body_reader{}}) -> true;
 has_body(#{body := B}) -> iolist_size(B) > 0;
 has_body(_) -> false.
 
@@ -590,7 +533,10 @@ withdraw_body(#{body_reader := BS}) ->
 
 %% A read's result, its reader put back in the request.
 -spec with_reader(
-    {ok, iodata(), body_reader()} | {more, iodata(), body_reader()} | {error, term()}, request()
+    {ok, iodata(), roadrunner_conn:body_reader()}
+    | {more, iodata(), roadrunner_conn:body_reader()}
+    | {error, term()},
+    request()
 ) ->
     {ok, iodata(), request()} | {more, iodata(), request()} | {error, term()}.
 with_reader({ok, Bytes, BS}, Req) ->
@@ -637,8 +583,10 @@ handle(Req0) ->
 ```
 """.
 -spec set_body_timeout(infinity | 0..16#FFFFFFFF, request()) -> request().
-set_body_timeout(Timeout, #{body_reader := BS} = Req) ->
-    Req#{body_reader := BS#{deadline := deadline(Timeout)}};
+set_body_timeout(Timeout, #{body_reader := #h1_body_reader{} = BS} = Req) ->
+    Req#{body_reader := BS#h1_body_reader{deadline = deadline(Timeout)}};
+set_body_timeout(Timeout, #{body_reader := #stream_body_reader{} = BS} = Req) ->
+    Req#{body_reader := BS#stream_body_reader{deadline = deadline(Timeout)}};
 set_body_timeout(Timeout, Req) when
     Timeout =:= infinity; is_integer(Timeout), Timeout >= 0, Timeout =< 16#FFFFFFFF
 ->

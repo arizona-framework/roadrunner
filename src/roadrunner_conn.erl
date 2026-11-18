@@ -2,6 +2,7 @@
 -moduledoc false.
 
 -include("roadrunner_proto_opts.hrl").
+-include("roadrunner_body_reader.hrl").
 
 %% Public connection-process API and pure helpers.
 %%
@@ -120,7 +121,10 @@
     rate_limit/0,
     rate_limit_state/0,
     overload/0,
-    resolved/0
+    resolved/0,
+    body_reader/0,
+    h1_body_reader/0,
+    stream_body_reader/0
 ]).
 
 %% The part of `proto_opts()` a connection's close path reads
@@ -157,6 +161,14 @@ deadline in milliseconds. The shed form answers it `503` with the
 -type dispatch() ::
     {handler, module(), roadrunner_middleware:next(), State :: term()}
     | {router, ListenerName :: atom()}.
+
+%% A request's body reader in manual body mode (`roadrunner_body_reader.hrl`),
+%% carried on the request under `body_reader`: HTTP/1.1 parses the body's
+%% framing off the socket, HTTP/2 and HTTP/3 pull the stream's DATA from
+%% the connection process.
+-type body_reader() :: h1_body_reader() | stream_body_reader().
+-type h1_body_reader() :: #h1_body_reader{}.
+-type stream_body_reader() :: #stream_body_reader{}.
 
 %% The connection options (`#proto_opts{}`, `roadrunner_proto_opts.hrl`),
 %% built once per listener by `roadrunner_listener:build_proto_opts/2`.
@@ -1151,22 +1163,22 @@ expects_continue(Req) ->
     roadrunner_router:body_limit(),
     {pos_integer(), pos_integer(), pos_integer()},
     integer()
-) -> roadrunner_req:body_reader().
+) -> h1_body_reader().
 make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits, Deadline) ->
     _ = erase(?READER_PDKEY),
-    #{
-        framing => Framing,
-        buffered => Buffered,
-        bytes_read => 0,
-        pending => <<>>,
-        done => false,
-        recv => Recv,
-        deadline => Deadline,
-        request_deadline => Deadline,
-        id => make_ref(),
-        max => Max,
-        trailer_limits => TrailerLimits,
-        chunk_left => 0
+    #h1_body_reader{
+        framing = Framing,
+        buffered = Buffered,
+        bytes_read = 0,
+        pending = <<>>,
+        done = false,
+        recv = Recv,
+        deadline = Deadline,
+        request_deadline = Deadline,
+        id = make_ref(),
+        max = Max,
+        trailer_limits = TrailerLimits,
+        chunk_left = 0
     }.
 
 %% The body reader of an HTTP/2 request in manual body mode: its DATA is
@@ -1176,18 +1188,17 @@ make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits, Deadline) ->
 %% body to pull (`Done`).
 -doc false.
 -spec stream_body_reader(pid(), pos_integer(), integer(), non_neg_integer(), boolean()) ->
-    roadrunner_req:body_reader().
+    stream_body_reader().
 stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
-    #{
-        framing => stream,
-        buffered => <<>>,
-        bytes_read => 0,
-        done => Done,
-        recv => stream_recv(Conn, StreamId),
-        deadline => Deadline,
-        id => make_ref(),
-        max => Max,
-        source => {Conn, StreamId}
+    #stream_body_reader{
+        buffered = <<>>,
+        bytes_read = 0,
+        done = Done,
+        recv = stream_recv(Conn, StreamId),
+        deadline = Deadline,
+        id = make_ref(),
+        max = Max,
+        source = {Conn, StreamId}
     }.
 
 %% A manual-mode request whose body arrived whole before dispatch (an
@@ -1203,15 +1214,14 @@ stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
 ) ->
     roadrunner_req:request().
 with_arrived_body_reader(Req, Body, Len, Max) ->
-    Reader = #{
-        framing => stream,
-        buffered => <<>>,
-        bytes_read => 0,
-        done => Len =:= 0,
-        recv => fun(_Deadline) -> {ok, Body, true} end,
-        deadline => infinity,
-        id => make_ref(),
-        max => Max
+    Reader = #stream_body_reader{
+        buffered = <<>>,
+        bytes_read = 0,
+        done = Len =:= 0,
+        recv = fun(_Deadline) -> {ok, Body, true} end,
+        deadline = infinity,
+        id = make_ref(),
+        max = Max
     },
     (maps:remove(body, Req))#{body_reader => Reader}.
 
@@ -1231,7 +1241,7 @@ with_body_reader(Req, StreamId, Timeout, Max, ContinueOwed) ->
     Reader0 = stream_body_reader(self(), StreamId, Deadline, Max, false),
     Reader =
         case ContinueOwed of
-            true -> Reader0#{continue => {self(), StreamId}};
+            true -> Reader0#stream_body_reader{continue = {self(), StreamId}};
             false -> Reader0
         end,
     (maps:remove(body, Req))#{body_reader => Reader}.
@@ -1246,9 +1256,9 @@ with_body_reader(Req, StreamId, Timeout, Max, ContinueOwed) ->
 %% a body no handler reads is never asked for.
 -doc false.
 -spec continue_before_stream(roadrunner_req:request()) -> ok.
-continue_before_stream(#{body_reader := #{continue := {Socket, _MinRate, Owed}}}) ->
+continue_before_stream(#{body_reader := #h1_body_reader{continue = {Socket, _MinRate, Owed}}}) ->
     send_continue_once(Owed, Socket);
-continue_before_stream(#{body_reader := #{continue := {Conn, StreamId}}}) ->
+continue_before_stream(#{body_reader := #stream_body_reader{continue = {Conn, StreamId}}}) ->
     MRef = monitor(process, Conn),
     Conn ! {roadrunner_continue, self(), StreamId},
     receive
@@ -1267,9 +1277,9 @@ continue_before_stream(_Req) ->
 %% HTTP/3 the connection is told, ahead of the reads it orders after it.
 -doc false.
 -spec skip_continue(roadrunner_req:request()) -> ok.
-skip_continue(#{body_reader := #{continue := {_Socket, _MinRate, Owed}}}) ->
+skip_continue(#{body_reader := #h1_body_reader{continue = {_Socket, _MinRate, Owed}}}) ->
     atomics:put(Owed, 1, 1);
-skip_continue(#{body_reader := #{continue := {Conn, StreamId}}}) ->
+skip_continue(#{body_reader := #stream_body_reader{continue = {Conn, StreamId}}}) ->
     _ = Conn ! {roadrunner_skip_continue, StreamId},
     ok;
 skip_continue(_Req) ->
@@ -1342,8 +1352,10 @@ await_reply(Conn, StreamId, MRef, Deadline) ->
 %% watches the connection itself; `await_body/1` waits for the answer
 %% instead, and `withdraw_body/1` takes the demand back.
 -doc false.
--spec demand_body(roadrunner_req:body_reader()) -> demanded | ready.
-demand_body(#{source := {Conn, StreamId}, buffered := Buf, done := false} = BS) ->
+-spec demand_body(body_reader()) -> demanded | ready.
+demand_body(
+    #stream_body_reader{source = {Conn, StreamId}, buffered = Buf, done = false} = BS
+) ->
     case iolist_size(Buf) =:= 0 andalso not read_failed(BS) of
         true ->
             _ = Conn ! {roadrunner_body_demand, self(), StreamId},
@@ -1358,14 +1370,19 @@ demand_body(_BS) ->
 %% read returns it, or `ignore` for any other message. An empty DATA that
 %% does not end the body comes back as `more` with no bytes.
 -doc false.
--spec body_message(term(), roadrunner_req:body_reader()) ->
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+-spec body_message(term(), body_reader()) ->
+    {ok, iodata(), body_reader()}
+    | {more, iodata(), body_reader()}
     | {error, term()}
     | ignore.
-body_message({roadrunner_body, StreamId, Data, Fin}, #{source := {_Conn, StreamId}} = BS) ->
+body_message(
+    {roadrunner_body, StreamId, Data, Fin}, #stream_body_reader{source = {_Conn, StreamId}} = BS
+) ->
     delivered(BS, {ok, Data, Fin});
-body_message({roadrunner_body_error, StreamId, Reason}, #{source := {_Conn, StreamId}} = BS) ->
+body_message(
+    {roadrunner_body_error, StreamId, Reason},
+    #stream_body_reader{source = {_Conn, StreamId}} = BS
+) ->
     delivered(BS, {error, Reason});
 body_message(_Message, _BS) ->
     ignore.
@@ -1373,35 +1390,38 @@ body_message(_Message, _BS) ->
 %% Wait for the answer to `demand_body/1`'s demand, until the reader's
 %% deadline, as a `next_chunk` read would.
 -doc false.
--spec await_body(roadrunner_req:body_reader()) ->
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+-spec await_body(body_reader()) ->
+    {ok, iodata(), body_reader()}
+    | {more, iodata(), body_reader()}
     | {error, term()}.
-await_body(#{source := {Conn, StreamId}, deadline := Deadline} = BS) ->
+await_body(#stream_body_reader{source = {Conn, StreamId}, deadline = Deadline} = BS) ->
     MRef = monitor(process, Conn),
     delivered(BS, await_reply(Conn, StreamId, MRef, Deadline)).
 
 %% Take `demand_body/1`'s demand back, as a read that timed out does: the
 %% body ends with `request_timeout`, and DATA handed over before is dropped.
 -doc false.
--spec withdraw_body(roadrunner_req:body_reader()) -> {error, request_timeout}.
-withdraw_body(#{source := {Conn, StreamId}} = BS) ->
+-spec withdraw_body(body_reader()) -> {error, request_timeout}.
+withdraw_body(#stream_body_reader{source = {Conn, StreamId}} = BS) ->
     MRef = monitor(process, Conn),
     Result = withdraw_demand(Conn, StreamId, MRef),
     true = demonitor(MRef, [flush]),
     delivered(BS, Result).
 
 %% The connection's answer taken into the reader, all of it handed out.
--spec delivered(roadrunner_req:body_reader(), {ok, iodata(), boolean()} | {error, term()}) ->
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+-spec delivered(stream_body_reader(), {ok, iodata(), boolean()} | {error, term()}) ->
+    {ok, iodata(), stream_body_reader()}
+    | {more, iodata(), stream_body_reader()}
     | {error, term()}.
 delivered(BS, Answer) ->
     Result =
         case pulled(BS, Answer) of
-            {ok, #{buffered := Data, done := true} = BS1} -> {ok, Data, BS1#{buffered := <<>>}};
-            {ok, #{buffered := Data} = BS1} -> {more, Data, BS1#{buffered := <<>>}};
-            {error, _} = E -> E
+            {ok, #stream_body_reader{buffered = Data, done = true} = BS1} ->
+                {ok, Data, BS1#stream_body_reader{buffered = <<>>}};
+            {ok, #stream_body_reader{buffered = Data} = BS1} ->
+                {more, Data, BS1#stream_body_reader{buffered = <<>>}};
+            {error, _} = E ->
+                E
         end,
     remember_reader(BS, Result).
 
@@ -1555,14 +1575,14 @@ read_chunked(Buf, RecvFun, MaxCL, Body, TrailerLimits) ->
 %% pipelined clients get their N+1 request seen; a WebSocket session's
 %% close path, which keeps the reader but not the request, drains it too.
 -doc false.
--spec drain_reader(roadrunner_req:body_reader()) -> {ok, binary()} | {error, term()}.
+-spec drain_reader(h1_body_reader()) -> {ok, binary()} | {error, term()}.
 drain_reader(BS) ->
     %% A step at a time, each dropped before the next: the body may be as
     %% large as its cap allows, or have none (`max_content_length =>
     %% infinity`), and only its end is wanted.
     case consume_reader(BS, {length, ?DRAIN_STEP}) of
         {more, _Bytes, BS1} -> drain_reader(BS1);
-        {ok, _Bytes, #{buffered := Leftover}} -> {ok, Leftover};
+        {ok, _Bytes, #h1_body_reader{buffered = Leftover}} -> {ok, Leftover};
         {error, _} = E -> E
     end.
 
@@ -1573,12 +1593,12 @@ drain_reader(BS) ->
 %% taken. `{failed, Reason}` once a read failed: what is left of the body
 %% is unknown, so it cannot be drained.
 -doc false.
--spec latest_reader(roadrunner_req:body_reader()) ->
-    roadrunner_req:body_reader() | {failed, term()}.
+-spec latest_reader(body_reader()) ->
+    body_reader() | {failed, term()}.
 latest_reader(BS) ->
-    case {erase(?READER_PDKEY), BS} of
+    case {erase(?READER_PDKEY), reader_id(BS)} of
         {undefined, _} -> BS;
-        {{failed, Id, Reason}, #{id := Id}} -> {failed, Reason};
+        {{failed, Id, Reason}, Id} -> {failed, Reason};
         {{failed, _OtherId, _Reason}, _} -> BS;
         {Latest, _} -> Latest
     end.
@@ -1586,15 +1606,16 @@ latest_reader(BS) ->
 %% Whether a read of this reader's body failed (`remember_reader/2`), which
 %% ends the body: the connection then closes after its response.
 -doc false.
--spec read_failed(roadrunner_req:body_reader()) -> boolean().
-read_failed(#{id := Id}) ->
+-spec read_failed(body_reader()) -> boolean().
+read_failed(BS) ->
+    Id = reader_id(BS),
     case get(?READER_PDKEY) of
         {failed, Id, _Reason} -> true;
         _ -> false
     end.
 
 -doc """
-Consume bytes from a manual-mode `roadrunner_req:body_reader()`. Returns either the
+Consume bytes from a manual-mode `body_reader()`. Returns either the
 final tail (`{ok, Bytes, NewState}` — the body has been fully drained)
 or a partial chunk (`{more, Bytes, NewState}` — more is still pending).
 Used by `roadrunner_req:read_body/1,2`; not part of the public API.
@@ -1604,16 +1625,21 @@ bytes — content-length framing only; chunked falls through to a
 full read).
 """.
 -spec consume_body_reader(
-    roadrunner_req:body_reader(), all | next_chunk | {length, non_neg_integer()}
+    body_reader(), all | next_chunk | {length, non_neg_integer()}
 ) ->
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+    {ok, iodata(), body_reader()}
+    | {more, iodata(), body_reader()}
     | {error, term()}.
 consume_body_reader(BS, Mode) ->
-    case {get(?READER_PDKEY), BS} of
-        {{failed, Id, Reason}, #{id := Id}} -> {error, Reason};
+    case {get(?READER_PDKEY), reader_id(BS)} of
+        {{failed, Id, Reason}, Id} -> {error, Reason};
         _ -> remember_reader(BS, consume_reader(BS, Mode))
     end.
+
+%% What tells a body reader apart from the readers of other bodies.
+-spec reader_id(body_reader()) -> reference().
+reader_id(#h1_body_reader{id = Id}) -> Id;
+reader_id(#stream_body_reader{id = Id}) -> Id.
 
 %% The reader as the handler last left it, so the connection drains from
 %% there (`latest_reader/1`) even when the request the handler hands
@@ -1625,42 +1651,44 @@ consume_body_reader(BS, Mode) ->
 %% so every later read of that body fails the same way
 %% (`consume_body_reader/2`) instead of reading on from the wrong place.
 -spec remember_reader(
-    roadrunner_req:body_reader(),
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+    body_reader(),
+    {ok, iodata(), body_reader()}
+    | {more, iodata(), body_reader()}
     | {error, term()}
 ) ->
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+    {ok, iodata(), body_reader()}
+    | {more, iodata(), body_reader()}
     | {error, term()}.
-remember_reader(#{id := Id}, {error, Reason} = E) ->
-    _ = put(?READER_PDKEY, {failed, Id, Reason}),
+remember_reader(BS, {error, Reason} = E) ->
+    _ = put(?READER_PDKEY, {failed, reader_id(BS), Reason}),
     E;
 remember_reader(_BS, {_, _Bytes, BS} = Result) ->
     _ = put(?READER_PDKEY, BS),
     Result.
 
 -spec consume_reader(
-    roadrunner_req:body_reader(), all | next_chunk | {length, non_neg_integer()}
+    body_reader(), all | next_chunk | {length, non_neg_integer()}
 ) ->
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+    {ok, iodata(), body_reader()}
+    | {more, iodata(), body_reader()}
     | {error, term()}.
-consume_reader(#{continue := {Socket, MinRate, Owed}, buffered := Buffered} = BS, Mode) ->
+consume_reader(
+    #h1_body_reader{continue = {Socket, MinRate, Owed}, buffered = Buffered} = BS, Mode
+) ->
     %% The client is holding its body back for a 100 Continue the conn left
     %% to this first read (`roadrunner_conn_loop:read_body/8`): send it,
     %% then read with a recv whose slow-client rate window starts now, as the
     %% client can only start sending now.
     ok = send_continue_once(Owed, Socket),
     Recv = make_reader_recv(Socket, MinRate, byte_size(Buffered)),
-    consume_reader(maps:remove(continue, BS#{recv := Recv}), Mode);
-consume_reader(#{framing := stream} = BS, all) ->
+    consume_reader(BS#h1_body_reader{recv = Recv, continue = undefined}, Mode);
+consume_reader(#stream_body_reader{} = BS, all) ->
     stream_collect(BS, infinity, [], 0);
-consume_reader(#{framing := stream} = BS, {length, N}) ->
+consume_reader(#stream_body_reader{} = BS, {length, N}) ->
     stream_collect(BS, N, [], 0);
-consume_reader(#{framing := stream} = BS, next_chunk) ->
+consume_reader(#stream_body_reader{} = BS, next_chunk) ->
     stream_next(BS);
-consume_reader(#{framing := none} = BS, _Mode) ->
+consume_reader(#h1_body_reader{framing = none} = BS, _Mode) ->
     %% Per RFC 9112 §6.3: no framing means the body is empty.
     %% Any `buffered` bytes are pipelined-next-request leftovers —
     %% preserve them in the body_reader's `buffered` field so
@@ -1668,20 +1696,20 @@ consume_reader(#{framing := none} = BS, _Mode) ->
     %% the next `reading_request` parse for full pipelining support.
     {ok, <<>>, BS};
 consume_reader(
-    #{framing := {content_length, N}, bytes_read := Read} = BS, _Mode
+    #h1_body_reader{framing = {content_length, N}, bytes_read = Read} = BS, _Mode
 ) when Read >= N ->
     {ok, <<>>, BS};
-consume_reader(#{framing := {content_length, N}, max := Max}, _Mode) when N > Max ->
+consume_reader(#h1_body_reader{framing = {content_length, N}, max = Max}, _Mode) when N > Max ->
     %% A declared length over the cap fails every read, one of a piece as
     %% much as one of the whole body, before any of it is read.
     {error, content_length_too_large};
 consume_reader(
-    #{
-        framing := {content_length, N},
-        bytes_read := Read,
-        buffered := Buf,
-        recv := Recv,
-        deadline := Deadline
+    #h1_body_reader{
+        framing = {content_length, N},
+        bytes_read = Read,
+        buffered = Buf,
+        recv = Recv,
+        deadline = Deadline
     } = BS,
     Mode
 ) ->
@@ -1695,7 +1723,7 @@ consume_reader(
     case fill_n(Want, Buf, fun() -> Recv(Deadline) end) of
         {ok, Bytes, NewBuf} ->
             NewRead = Read + iolist_size(Bytes),
-            NewState = BS#{buffered := NewBuf, bytes_read := NewRead},
+            NewState = BS#h1_body_reader{buffered = NewBuf, bytes_read = NewRead},
             case NewRead >= N of
                 true -> {ok, Bytes, NewState};
                 false -> {more, Bytes, NewState}
@@ -1703,15 +1731,15 @@ consume_reader(
         {error, _} = E ->
             E
     end;
-consume_reader(#{framing := chunked} = BS, all) ->
+consume_reader(#h1_body_reader{framing = chunked} = BS, all) ->
     %% Drain everything left: any pending decoded bytes plus all
     %% remaining chunks, accumulated in one return. Iodata stays unflattened
     %% so callers that only need `iolist_size/1` or want to forward via
     %% `gen_tcp:send/2` skip a flatten.
     chunked_collect(BS, infinity);
-consume_reader(#{framing := chunked} = BS, {length, N}) ->
+consume_reader(#h1_body_reader{framing = chunked} = BS, {length, N}) ->
     chunked_collect(BS, N);
-consume_reader(#{framing := chunked} = BS, next_chunk) ->
+consume_reader(#h1_body_reader{framing = chunked} = BS, next_chunk) ->
     next_chunk(BS).
 %% Non-chunked framing (none, content_length) is handled by the
 %% earlier clauses above — `next_chunk` is treated as a full drain
@@ -1723,16 +1751,16 @@ consume_reader(#{framing := chunked} = BS, next_chunk) ->
 %% The result is `ok` once the body has ended with nothing left over, else
 %% `more`.
 -spec stream_collect(
-    roadrunner_req:body_reader(), infinity | non_neg_integer(), iodata(), non_neg_integer()
+    stream_body_reader(), infinity | non_neg_integer(), iodata(), non_neg_integer()
 ) ->
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+    {ok, iodata(), stream_body_reader()}
+    | {more, iodata(), stream_body_reader()}
     | {error, term()}.
-stream_collect(#{buffered := Buf, done := Done} = BS, Want, Acc, Got) ->
+stream_collect(#stream_body_reader{buffered = Buf, done = Done} = BS, Want, Acc, Got) ->
     Size = iolist_size(Buf),
     case Want of
         infinity when Done ->
-            {ok, [Acc, Buf], BS#{buffered := <<>>}};
+            {ok, [Acc, Buf], BS#stream_body_reader{buffered = <<>>}};
         _ when is_integer(Want), Got + Size >= Want ->
             Take = Want - Got,
             <<Head:Take/binary, Rest/binary>> = iolist_to_binary(Buf),
@@ -1741,9 +1769,9 @@ stream_collect(#{buffered := Buf, done := Done} = BS, Want, Acc, Got) ->
                     true -> ok;
                     false -> more
                 end,
-            {Status, [Acc, Head], BS#{buffered := Rest}};
+            {Status, [Acc, Head], BS#stream_body_reader{buffered = Rest}};
         _ when Done ->
-            {ok, [Acc, Buf], BS#{buffered := <<>>}};
+            {ok, [Acc, Buf], BS#stream_body_reader{buffered = <<>>}};
         _ ->
             case stream_pull(BS) of
                 {ok, BS1} -> stream_collect(BS1, Want, [Acc, Buf], Got + Size);
@@ -1753,42 +1781,42 @@ stream_collect(#{buffered := Buf, done := Done} = BS, Want, Acc, Got) ->
 
 %% The next piece of a stream body: what an earlier read left over, else the
 %% next DATA the connection hands over.
--spec stream_next(roadrunner_req:body_reader()) ->
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+-spec stream_next(stream_body_reader()) ->
+    {ok, iodata(), stream_body_reader()}
+    | {more, iodata(), stream_body_reader()}
     | {error, term()}.
-stream_next(#{buffered := Buf, done := Done} = BS) ->
+stream_next(#stream_body_reader{buffered = Buf, done = Done} = BS) ->
     case iolist_size(Buf) of
         0 when Done ->
             {ok, <<>>, BS};
         0 ->
-            case stream_pull(BS#{buffered := <<>>}) of
+            case stream_pull(BS#stream_body_reader{buffered = <<>>}) of
                 {ok, BS1} -> stream_next(BS1);
                 {error, _} = E -> E
             end;
         _ when Done ->
-            {ok, Buf, BS#{buffered := <<>>}};
+            {ok, Buf, BS#stream_body_reader{buffered = <<>>}};
         _ ->
-            {more, Buf, BS#{buffered := <<>>}}
+            {more, Buf, BS#stream_body_reader{buffered = <<>>}}
     end.
 
 %% One round with the connection: its DATA becomes `buffered` (empty
 %% before), held to the reader's `max`.
--spec stream_pull(roadrunner_req:body_reader()) ->
-    {ok, roadrunner_req:body_reader()} | {error, term()}.
-stream_pull(#{recv := Recv, deadline := Deadline} = BS) ->
+-spec stream_pull(stream_body_reader()) ->
+    {ok, stream_body_reader()} | {error, term()}.
+stream_pull(#stream_body_reader{recv = Recv, deadline = Deadline} = BS) ->
     pulled(BS, Recv(Deadline)).
 
 %% A round's answer: its DATA becomes `buffered`, held to the reader's
 %% `max`.
--spec pulled(roadrunner_req:body_reader(), {ok, iodata(), boolean()} | {error, term()}) ->
-    {ok, roadrunner_req:body_reader()} | {error, term()}.
-pulled(#{bytes_read := Read, max := Max} = BS, {ok, Data, Fin}) ->
+-spec pulled(stream_body_reader(), {ok, iodata(), boolean()} | {error, term()}) ->
+    {ok, stream_body_reader()} | {error, term()}.
+pulled(#stream_body_reader{bytes_read = Read, max = Max} = BS, {ok, Data, Fin}) ->
     case Read + iolist_size(Data) of
         Total when Total > Max ->
             {error, content_length_too_large};
         Total ->
-            {ok, BS#{buffered := Data, bytes_read := Total, done := Fin}}
+            {ok, BS#stream_body_reader{buffered = Data, bytes_read = Total, done = Fin}}
     end;
 pulled(_BS, {error, _} = E) ->
     E.
@@ -1799,11 +1827,11 @@ pulled(_BS, {error, _} = E) ->
 %% integer (caller asked for `{length, N}`). Returns
 %% `{ok | more, Bytes, BS2}` with Bytes as iodata (propagated through
 %% `consume_body_reader` to the public API unflattened).
--spec chunked_collect(roadrunner_req:body_reader(), infinity | non_neg_integer()) ->
-    {ok, iodata(), roadrunner_req:body_reader()}
-    | {more, iodata(), roadrunner_req:body_reader()}
+-spec chunked_collect(h1_body_reader(), infinity | non_neg_integer()) ->
+    {ok, iodata(), h1_body_reader()}
+    | {more, iodata(), h1_body_reader()}
     | {error, term()}.
-chunked_collect(#{pending := Pending} = BS, Want) when
+chunked_collect(#h1_body_reader{pending = Pending} = BS, Want) when
     Want =/= infinity, byte_size(Pending) >= Want
 ->
     %% Pending alone satisfies the request — no need to look at the
@@ -1811,8 +1839,8 @@ chunked_collect(#{pending := Pending} = BS, Want) when
     %% `more` here and let the next call detect end-of-body via the
     %% `done` clause below.
     <<Take:Want/binary, RestPending/binary>> = Pending,
-    {more, [Take], BS#{pending := RestPending}};
-chunked_collect(#{pending := Pending} = BS, Want) when byte_size(Pending) > 0 ->
+    {more, [Take], BS#h1_body_reader{pending = RestPending}};
+chunked_collect(#h1_body_reader{pending = Pending} = BS, Want) when byte_size(Pending) > 0 ->
     %% Take everything pending, then try to fill more from the wire.
     %% Cons `Pending` in front of the recursion's result on the way
     %% out — body recursion replaces the old `[Pending | Acc]` /
@@ -1822,44 +1850,52 @@ chunked_collect(#{pending := Pending} = BS, Want) when byte_size(Pending) > 0 ->
             infinity -> infinity;
             N -> N - byte_size(Pending)
         end,
-    case chunked_collect(BS#{pending := <<>>}, NewWant) of
+    case chunked_collect(BS#h1_body_reader{pending = <<>>}, NewWant) of
         {Tag, RestIo, BS2} -> {Tag, [Pending | RestIo], BS2};
         {error, _} = E -> E
     end;
-chunked_collect(#{done := true} = BS, _Want) ->
+chunked_collect(#h1_body_reader{done = true} = BS, _Want) ->
     {ok, [], BS};
 chunked_collect(
-    #{
-        buffered := Buf,
-        recv := Recv,
-        deadline := Deadline,
-        max := Max,
-        bytes_read := Read,
-        trailer_limits := TrailerLimits,
-        chunk_left := Left0
+    #h1_body_reader{
+        buffered = Buf,
+        recv = Recv,
+        deadline = Deadline,
+        max = Max,
+        bytes_read = Read,
+        trailer_limits = TrailerLimits,
+        chunk_left = Left0
     } = BS,
     Want
 ) ->
     case roadrunner_http1:parse_chunk_part(Buf, TrailerLimits, budget(Max, Read), Left0) of
         {ok, Data, Rest} ->
             NewRead = Read + byte_size(Data),
-            BS2 = BS#{buffered := Rest, bytes_read := NewRead, pending := Data, chunk_left := 0},
+            BS2 = BS#h1_body_reader{
+                buffered = Rest, bytes_read = NewRead, pending = Data, chunk_left = 0
+            },
             chunked_collect(BS2, Want);
         {part, <<>>, Left} ->
             case Recv(Deadline) of
-                {ok, More} -> chunked_collect(BS#{buffered := More, chunk_left := Left}, Want);
-                {error, _} = E -> E
+                {ok, More} ->
+                    chunked_collect(BS#h1_body_reader{buffered = More, chunk_left = Left}, Want);
+                {error, _} = E ->
+                    E
             end;
         {part, Data, Left} ->
             NewRead = Read + byte_size(Data),
-            BS2 = BS#{buffered := <<>>, bytes_read := NewRead, pending := Data, chunk_left := Left},
+            BS2 = BS#h1_body_reader{
+                buffered = <<>>, bytes_read = NewRead, pending = Data, chunk_left = Left
+            },
             chunked_collect(BS2, Want);
         {ok, last, _Trailers, Rest} ->
-            chunked_collect(BS#{buffered := Rest, done := true}, Want);
+            chunked_collect(BS#h1_body_reader{buffered = Rest, done = true}, Want);
         {more, _} ->
             case Recv(Deadline) of
                 {ok, More} ->
-                    chunked_collect(BS#{buffered := roadrunner_bin:append(Buf, More)}, Want);
+                    chunked_collect(
+                        BS#h1_body_reader{buffered = roadrunner_bin:append(Buf, More)}, Want
+                    );
                 {error, _} = E ->
                     E
             end;
@@ -1877,43 +1913,45 @@ budget(Max, Read) -> Max - Read.
 %% bytes (left over from a length-bounded read) are returned first; if
 %% pending is empty, parse the next wire chunk. End-of-body returns
 %% `{ok, <<>>, BS}`.
--spec next_chunk(roadrunner_req:body_reader()) ->
-    {ok, binary(), roadrunner_req:body_reader()}
-    | {more, binary(), roadrunner_req:body_reader()}
+-spec next_chunk(h1_body_reader()) ->
+    {ok, binary(), h1_body_reader()}
+    | {more, binary(), h1_body_reader()}
     | {error, term()}.
-next_chunk(#{pending := Pending} = BS) when byte_size(Pending) > 0 ->
-    {more, Pending, BS#{pending := <<>>}};
-next_chunk(#{done := true} = BS) ->
+next_chunk(#h1_body_reader{pending = Pending} = BS) when byte_size(Pending) > 0 ->
+    {more, Pending, BS#h1_body_reader{pending = <<>>}};
+next_chunk(#h1_body_reader{done = true} = BS) ->
     {ok, <<>>, BS};
 next_chunk(
-    #{
-        buffered := Buf,
-        recv := Recv,
-        deadline := Deadline,
-        max := Max,
-        bytes_read := Read,
-        trailer_limits := TrailerLimits,
-        chunk_left := Left0
+    #h1_body_reader{
+        buffered = Buf,
+        recv = Recv,
+        deadline = Deadline,
+        max = Max,
+        bytes_read = Read,
+        trailer_limits = TrailerLimits,
+        chunk_left = Left0
     } = BS
 ) ->
     case roadrunner_http1:parse_chunk_part(Buf, TrailerLimits, budget(Max, Read), Left0) of
         {ok, Data, Rest} ->
             NewRead = Read + byte_size(Data),
-            {more, Data, BS#{buffered := Rest, bytes_read := NewRead, chunk_left := 0}};
+            {more, Data, BS#h1_body_reader{buffered = Rest, bytes_read = NewRead, chunk_left = 0}};
         {part, <<>>, Left} ->
             case Recv(Deadline) of
-                {ok, More} -> next_chunk(BS#{buffered := More, chunk_left := Left});
+                {ok, More} -> next_chunk(BS#h1_body_reader{buffered = More, chunk_left = Left});
                 {error, _} = E -> E
             end;
         {part, Data, Left} ->
             NewRead = Read + byte_size(Data),
-            {more, Data, BS#{buffered := <<>>, bytes_read := NewRead, chunk_left := Left}};
+            {more, Data, BS#h1_body_reader{
+                buffered = <<>>, bytes_read = NewRead, chunk_left = Left
+            }};
         {ok, last, _Trailers, Rest} ->
-            {ok, <<>>, BS#{buffered := Rest, done := true}};
+            {ok, <<>>, BS#h1_body_reader{buffered = Rest, done = true}};
         {more, _} ->
             case Recv(Deadline) of
                 {ok, More} ->
-                    next_chunk(BS#{buffered := roadrunner_bin:append(Buf, More)});
+                    next_chunk(BS#h1_body_reader{buffered = roadrunner_bin:append(Buf, More)});
                 {error, _} = E ->
                     E
             end;
