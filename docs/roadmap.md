@@ -62,30 +62,6 @@ fast as it is, checked by an A/B on the WS bench.
 
 **Source:** Arizona handoff R-h2-1.
 
-## Pre-SETTINGS stream leniency — small effort
-
-**What:** Do not refuse streams a client opened before it could have
-seen our advertised `max_concurrent_streams`. With prior-knowledge h2c a
-client sends its preface and a burst of HEADERS in the same flight;
-RFC 9113 §6.5.2 makes `SETTINGS_MAX_CONCURRENT_STREAMS` *initially
-unlimited*, so the burst is compliant and refusing it sheds real
-requests at every connection setup.
-
-**Most of it is already handled.** Admitting the burst outright is how
-the multi-GiB blowup that took `json-h2c` to zero happened, so leniency
-needed somewhere to put the excess. `overload_mode` queueing is that
-somewhere and has shipped: with a listener-wide ceiling in queue mode an
-opening burst waits instead of being refused. What remains is only
-whether to keep admitting past the advertised per-connection limit until
-the client's SETTINGS ack arrives, which is a smaller question than it
-was.
-
-**HTTP/3 does not need this.** h3 has no
-`SETTINGS_MAX_CONCURRENT_STREAMS`; stream concurrency is QUIC's, via the
-`initial_max_streams_bidi` transport parameter and `MAX_STREAMS` frames.
-The client learns the limit during the handshake, before it can open a
-stream, so there is no burst to be lenient about.
-
 ## HTTP/3 follow-ups
 
 h3 is served with `protocols => [http3]` (QPACK decodes the client's
