@@ -451,6 +451,9 @@ rate_limit => #{rate => 100, period => 1}
   (CL + TE, conflicting `Content-Length`) and CR / LF injection in headers
 - TLS 1.2 / 1.3 only with AEAD ciphers, and post-quantum hybrid key exchange
   first on HTTP/1.1 and HTTP/2 when your OTP and OpenSSL support it
+- Guards against the known HTTP/2 and HTTP/3 denial-of-service attacks:
+  rapid reset, PING, SETTINGS, empty-frame and CONTINUATION floods, each
+  with a safe default (see [Resource limits](https://github.com/arizona-framework/roadrunner/blob/main/docs/resource_limits.md))
 - Bounds on connections, concurrent HTTP/2 and HTTP/3 requests, body size,
   slow clients, and header size, all listed in [Configuration](#configuration)
 
