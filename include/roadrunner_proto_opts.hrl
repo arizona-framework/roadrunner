@@ -148,6 +148,10 @@
     %% `false`.
     http2_control_frame_max = undefined :: 1..16#7FFFFFFF | undefined,
     http2_control_frame_window = undefined :: 1..16#FFFFFFFF | undefined,
+    %% How long, in milliseconds, a stream's response may wait for the
+    %% client's flow-control window with nothing sent before it is reset
+    %% (the HTTP/2 `send_stall_timeout`), `infinity` for no limit.
+    http2_send_stall_timeout = 60000 :: 1..16#FFFFFFFF | infinity,
     %% The HTTP/2 `connection_age`, both fields `undefined` when it is
     %% `false`.
     http2_connection_age_max = undefined :: 1..16#FFFFFFFF | undefined,

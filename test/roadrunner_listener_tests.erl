@@ -691,6 +691,42 @@ listener_rejects_invalid_http2_control_frame_policy_test() ->
         ]
     ).
 
+listener_http2_send_stall_timeout_threads_into_proto_opts_test() ->
+    %% 60 s unless set; milliseconds or `infinity`.
+    lists:foreach(
+        fun({Http2, Expected}) ->
+            Name = listener_test_h2_send_stall_timeout,
+            {ok, Pid} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                protocols => [Http2],
+                routes => roadrunner_hello_handler
+            }),
+            ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(Pid))),
+            ?assertEqual(Expected, maps:get(http2_send_stall_timeout, ProtoOpts)),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        [
+            {http2, 60_000},
+            {{http2, #{send_stall_timeout => 1}}, 1},
+            {{http2, #{send_stall_timeout => 16#FFFFFFFF}}, 16#FFFFFFFF},
+            {{http2, #{send_stall_timeout => infinity}}, infinity}
+        ]
+    ).
+
+listener_rejects_invalid_http2_send_stall_timeout_test() ->
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(listener_test_h2_send_stall_timeout_invalid, #{
+                port => 0,
+                protocols => [{http2, #{send_stall_timeout => Bad}}],
+                routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, protocols, _}, _Stack}}, R)
+        end,
+        [0, -1, 16#100000000, false, 1.5, ~"60000"]
+    ).
+
 listener_http2_connection_age_threads_into_proto_opts_test() ->
     %% Off by default (both `http2_connection_age_*` fields `undefined`);
     %% `grace` is `infinity` unless set.

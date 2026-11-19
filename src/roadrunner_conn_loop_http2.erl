@@ -240,9 +240,9 @@
 %% type it as a list to leave room for future enrichment without
 %% reshaping callers. A buffered response's body has no worker
 %% waiting on it, so its entry carries `undefined` for both the ack
-%% ref and the worker.
+%% ref and the worker. The data is held as one binary (`hold_back/4`).
 -type pending_send() ::
-    {data, reference() | undefined, pid() | undefined, iodata(), boolean()}.
+    {data, reference() | undefined, pid() | undefined, binary(), boolean()}.
 
 %% An HTTP/2 stream's state, held in the conn's `streams` map by stream id.
 -record(stream, {
@@ -280,6 +280,14 @@
     worker_pid :: undefined | pid(),
     worker_ref :: undefined | reference(),
     pending_sends :: queue:queue(pending_send()),
+    %% What the DATA the stream holds back waits for (`hold_back/4`):
+    %% `{stream, Since}` its own send window, closed since `Since`
+    %% (`erlang:monotonic_time(millisecond)`) with nothing sent on the
+    %% stream; `conn` the connection window, timed by the conn's
+    %% `conn_stalled_at`; `undefined` once DATA goes out
+    %% (`consume_send_window/4`). Past the `send_stall_timeout` the stream
+    %% is reset (`reset_stalled/1`).
+    stalled = undefined :: undefined | conn | {stream, integer()},
     %% Set on a stream we are resetting with this code until its field
     %% block, possibly still arriving in CONTINUATION frames, is complete
     %% and decoded for its HPACK side effects (`reset_refused/4`); `ignore`
@@ -451,6 +459,17 @@
     %% count since `Mark`, when (in milliseconds) the conn last read the
     %% clock for them.
     control_frames = 0 :: control_frames(),
+    %% How long a stream may hold DATA back for its flow-control window
+    %% with nothing sent before it is reset (the `send_stall_timeout`), and
+    %% the one timer that checks it, armed while a stream holds DATA back
+    %% (`arm_stall_timer/1`). Read from proto_opts at `enter/6`.
+    send_stall_timeout = infinity :: pos_integer() | infinity,
+    stall_timer = undefined :: reference() | undefined,
+    %% Since when a stream has held DATA back for the connection window
+    %% with no DATA sent on the connection at all, or `undefined` once
+    %% some goes out: a client that reads one stream keeps the others
+    %% waiting for the connection window from being reset.
+    conn_stalled_at = undefined :: integer() | undefined,
     %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
     %% Prepended to every response by `roadrunner_http:auto_headers/2`.
     %% Read from proto_opts at `enter/6`.
@@ -569,6 +588,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         http2_max_header_block = MaxHeaderBlock,
         http2_max_header_list_size = MaxHeaderListSize,
         http2_active = Active,
+        http2_send_stall_timeout = SendStallTimeout,
         max_content_length = MaxContentLength,
         hibernate_after = HibernateAfter,
         alt_svc = AltSvc,
@@ -624,7 +644,8 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout,
         idle_deadline = erlang:monotonic_time(millisecond) + IdleTimeout,
-        ping_policy = ping_policy(ProtoOpts)
+        ping_policy = ping_policy(ProtoOpts),
+        send_stall_timeout = SendStallTimeout
     },
     ok = start_connection_age(ProtoOpts),
     handshake(State).
@@ -1200,7 +1221,10 @@ final_goaway(State, Reason) ->
 -spec handle_timer(
     #loop{},
     reference(),
-    goaway_ping | {connection_age, non_neg_integer() | infinity} | connection_age_grace
+    goaway_ping
+    | {connection_age, non_neg_integer() | infinity}
+    | connection_age_grace
+    | send_stall
 ) -> #loop{}.
 handle_timer(#loop{goaway = {announced, TRef, Reason}} = State, TRef, goaway_ping) ->
     final_goaway(State, Reason);
@@ -1209,6 +1233,8 @@ handle_timer(State, _TRef, {connection_age, Grace}) ->
     announce_goaway(State, connection_age);
 handle_timer(State, _TRef, connection_age_grace) ->
     grace_expired(State);
+handle_timer(State, _TRef, send_stall) ->
+    maybe_exit_when_drained(reset_stalled(State#loop{stall_timer = undefined}));
 handle_timer(State, _TRef, goaway_ping) ->
     State.
 
@@ -2794,6 +2820,7 @@ encode_and_send_response_atomic(
     State#loop{
         hpack_enc = Enc1,
         conn_send_window = ConnW - BodyLen,
+        conn_stalled_at = undefined,
         streams = Streams#{StreamId := Closed},
         live_streams = Live,
         ping_clock = undefined,
@@ -2890,8 +2917,7 @@ send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream) ->
     case min(Total, Available) of
         0 ->
             %% Window closed mid-body — queue the remainder.
-            Stream1 = enqueue_pending(Stream, {data, Ref, From, Data, EndStream}),
-            update_stream(State, StreamId, Stream1);
+            hold_back(State, StreamId, Stream, {data, Ref, From, Data, EndStream});
         Total when Total =< ?MAX_FRAME_SIZE ->
             %% Whole body fits the window in a single DATA frame: ship
             %% iodata straight through. The frame encoder accepts iodata
@@ -2935,8 +2961,7 @@ send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream) ->
                     %% remainder and defer the ack until a WINDOW_UPDATE
                     %% drains it (unchanged back-pressure contract).
                     #{StreamId := Stream1} = State1#loop.streams,
-                    Stream2 = enqueue_pending(Stream1, {data, Ref, From, Rest, EndStream}),
-                    update_stream(State1, StreamId, Stream2)
+                    hold_back(State1, StreamId, Stream1, {data, Ref, From, Rest, EndStream})
             end
     end.
 
@@ -2973,16 +2998,109 @@ consume_send_window(
     N
 ) ->
     #stream{send_window = SW} = Stream,
-    Stream1 = Stream#stream{send_window = SW - N},
+    Stream1 = Stream#stream{send_window = SW - N, stalled = undefined},
     State#loop{
         conn_send_window = ConnW - N,
+        conn_stalled_at = undefined,
         streams = Streams#{StreamId := Stream1},
         ping_clock = undefined,
         control_frames = data_credit(Count, N)
     }.
 
-enqueue_pending(#stream{pending_sends = Pending} = Stream, Entry) ->
-    Stream#stream{pending_sends = queue:in(Entry, Pending)}.
+%% Queue the DATA flow control holds back, as one binary: a handler's
+%% iolist (a JSON encoding, say) can take many times its byte size on the
+%% heap, and it may wait here for as long as the client grants no window.
+%% A stream whose own window is closed waits on its own clock, kept while
+%% it sends nothing; one held by the connection window waits on the
+%% connection's, kept while no DATA goes out on the connection. Either way
+%% the stall timer is armed if it is not already.
+-spec hold_back(
+    #loop{},
+    stream_id(),
+    #stream{},
+    {data, reference() | undefined, pid() | undefined, iodata(), boolean()}
+) ->
+    #loop{}.
+hold_back(
+    #loop{conn_stalled_at = ConnStalledAt} = State,
+    StreamId,
+    #stream{pending_sends = Pending, send_window = SW, stalled = Stalled} = Stream,
+    {data, Ref, From, Data, EndStream}
+) ->
+    Entry = {data, Ref, From, iolist_to_binary(Data), EndStream},
+    case SW > 0 of
+        true ->
+            Held = Stream#stream{pending_sends = queue:in(Entry, Pending), stalled = conn},
+            arm_stall_timer(
+                update_stream(
+                    State#loop{conn_stalled_at = stalled_since(ConnStalledAt)}, StreamId, Held
+                )
+            );
+        false ->
+            Held = Stream#stream{
+                pending_sends = queue:in(Entry, Pending), stalled = stream_stall(Stalled)
+            },
+            arm_stall_timer(update_stream(State, StreamId, Held))
+    end.
+
+-spec stalled_since(integer() | undefined) -> integer().
+stalled_since(undefined) -> erlang:monotonic_time(millisecond);
+stalled_since(StalledAt) -> StalledAt.
+
+%% A stream whose own window is closed keeps the time it started waiting
+%% on it, and starts now if it was not.
+-spec stream_stall(undefined | conn | {stream, integer()}) -> {stream, integer()}.
+stream_stall({stream, _Since} = Stalled) -> Stalled;
+stream_stall(_Stalled) -> {stream, erlang:monotonic_time(millisecond)}.
+
+%% One timer for the conn, armed as a stream starts to hold DATA back
+%% unless one is already: it checks every stream when it fires
+%% (`reset_stalled/1`), and is armed again for the next to run out.
+-spec arm_stall_timer(#loop{}) -> #loop{}.
+arm_stall_timer(#loop{stall_timer = undefined, send_stall_timeout = Timeout} = State) when
+    is_integer(Timeout)
+->
+    State#loop{stall_timer = erlang:start_timer(Timeout, self(), {?MODULE, send_stall})};
+arm_stall_timer(State) ->
+    State.
+
+%% The stall timer fired: reset with CANCEL (`cancel_stream/2`) every
+%% stream that has held DATA back for the whole `send_stall_timeout`, so a
+%% client that grants no window cannot keep responses waiting in the
+%% server: one waiting on its own window with nothing sent on it, one
+%% waiting on the connection window with no DATA sent on the connection.
+%% Its worker, if one still waits to send, is told the stream was reset,
+%% and keeps its in-flight slot until it exits. The timer is armed again
+%% for the first of the other streams still waiting.
+-spec reset_stalled(#loop{}) -> #loop{}.
+reset_stalled(
+    #loop{streams = Streams, send_stall_timeout = Timeout, conn_stalled_at = ConnStalledAt} =
+        State
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    {Expired, Next} = maps:fold(
+        fun
+            (StreamId, #stream{stalled = {stream, Since}}, Acc) ->
+                stall_left(StreamId, Since + Timeout - Now, Acc);
+            (StreamId, #stream{stalled = conn}, Acc) when is_integer(ConnStalledAt) ->
+                stall_left(StreamId, ConnStalledAt + Timeout - Now, Acc);
+            (_StreamId, _Stream, Acc) ->
+                Acc
+        end,
+        {[], infinity},
+        Streams
+    ),
+    State1 = lists:foldl(fun(StreamId, Acc) -> cancel_stream(Acc, StreamId) end, State, Expired),
+    case Next of
+        infinity -> State1;
+        Left -> State1#loop{stall_timer = erlang:start_timer(Left, self(), {?MODULE, send_stall})}
+    end.
+
+%% A waiting stream with `Left` ms of its timeout to go: expired at 0.
+-spec stall_left(stream_id(), integer(), {[stream_id()], integer() | infinity}) ->
+    {[stream_id()], integer() | infinity}.
+stall_left(StreamId, Left, {Ids, Min}) when Left =< 0 -> {[StreamId | Ids], Min};
+stall_left(_StreamId, Left, {Ids, Min}) -> {Ids, min(Left, Min)}.
 
 %% Wake the worker blocked on a send once its data is on the wire. A
 %% buffered response's body has no worker waiting (`handle_send_response/6`).
@@ -3236,7 +3354,8 @@ forget_stream(#loop{awaiting_continuation = StreamId}, StreamId, Streams) ->
             reader = undefined,
             worker_pid = undefined,
             worker_ref = undefined,
-            pending_sends = queue:new()
+            pending_sends = queue:new(),
+            stalled = undefined
         }
     };
 forget_stream(_State, StreamId, Streams) ->
