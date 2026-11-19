@@ -140,6 +140,7 @@ are advertised to the peer in the initial `SETTINGS` frame.
 | Unread socket reads per connection (`active`) | 16 | yes |
 | Client PINGs (`ping_policy`) | 1 s apart, 2 closer ones forgiven | yes (`false` disables) |
 | Frames that serve no request (`control_frame_policy`) | 1000, then 1000 per 10 s, less 4 per HEADERS or DATA frame sent | yes (`false` disables) |
+| Response waiting for the client's window (`send_stall_timeout`) | 60 s with nothing sent | yes (`infinity` disables) |
 | Connection lifetime (`connection_age`) | none | opt-in |
 
 A frame whose declared length exceeds the negotiated max frame size is
@@ -207,6 +208,29 @@ more than 4 frames per DATA frame. PINGs are left to `ping_policy`. An
 empty CONTINUATION frame that does not end its header block closes the
 connection at once (see the CONTINUATION flood below).
 
+A response goes out as fast as the client's flow-control windows allow
+(RFC 9113 §5.2), and what they hold back waits in the server: a buffered
+body in full, a streamed one a chunk at a time, its handler waiting for
+each chunk to go out before it sends the next. The body waits as one
+binary, its byte size and no more, so a stream holds at most its
+response body back and a connection at most `max_concurrent_streams`
+of them. A client that never opens its windows (a
+`SETTINGS_INITIAL_WINDOW_SIZE` of 0 and no WINDOW_UPDATE) would keep
+them waiting for as long as it holds the connection, so a stream whose
+response has waited `send_stall_timeout` milliseconds (60 s unless set)
+is reset with `CANCEL`, and its body dropped. A stream waiting for its
+own window counts from when nothing more was sent on it; one waiting
+for the connection window counts from when no DATA at all went out on
+the connection, so the streams queued behind one the client is reading
+are not reset. Its handler, if it is still sending, stops as on a client
+reset, and keeps its in-flight slot until it ends. Each DATA frame sent
+starts the wait over, so a slow client that keeps reading is not reset,
+nor is a stream with nothing to send, such as an event stream between
+events. A minute with nothing read is far longer than a client that is
+reading takes; a gRPC client that holds a server stream's window shut on
+purpose while it is busy for longer needs a higher timeout, or
+`infinity`.
+
 A connection lives as long as it is used unless `connection_age` sets
 how long it may: at that age (drawn within 10% of `max` for each
 connection, so connections opened together do not close together) it
@@ -234,7 +258,7 @@ are, so a block of those can pass it, which the advisory list size
 concurrency and header caps are tuned under `{http2, #{...}}` in the
 `protocols` list, with the keys `max_concurrent_streams`,
 `max_header_block`, `max_header_list_size`, `ping_policy`,
-`control_frame_policy` and `connection_age`.
+`control_frame_policy`, `send_stall_timeout` and `connection_age`.
 
 `active` sets how many socket reads a connection takes before it asks
 the socket for more (`once` asks after every read). On TLS each ask is a

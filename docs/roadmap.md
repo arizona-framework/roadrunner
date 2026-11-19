@@ -89,6 +89,17 @@ dynamic table, responses use the static table). Remaining work:
   (`keep_alive_timeout`) closes idle connections and a QUIC PING costs
   the server only an ACK it sends anyway, so there is no PING policy to
   enforce
+- `send_stall_timeout` on h3 (medium): an HTTP/2 stream whose response
+  waits for the client's flow-control window is reset after
+  `send_stall_timeout`, while an HTTP/3 response waits for the client's
+  stream and connection credit (MAX_STREAM_DATA, MAX_DATA) with no such
+  limit, the QUIC idle timeout not firing while the client acknowledges
+  packets. It crosses the QUIC connection's send buffers and flow credit
+  (`roadrunner_quic_connection`) and the h3 loop: a stall clock per
+  stream for its own credit and one for the connection's (so the streams
+  queued behind one the client reads are not reset), a reset with
+  `H3_REQUEST_CANCELLED`, an `{http3, #{send_stall_timeout => ...}}` opt
+  and its tests
 
 ## Native QUIC transport follow-ups
 

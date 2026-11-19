@@ -83,6 +83,9 @@
 %% SETTINGS_MAX_HEADER_LIST_SIZE and the conn's `alt-svc` value (both
 %% needed to size a response's field section), absent when it set none.
 -define(PEER_LIMIT_KEY, '$roadrunner_http2_peer_max_header_list_size').
+%% RFC 9113 §6.5.2 default `MAX_FRAME_SIZE`, the largest DATA frame the conn
+%% sends (`roadrunner_conn_loop_http2`).
+-define(MAX_FRAME_SIZE, 16384).
 
 -doc """
 Spawn a new worker for `StreamId`, monitored by the calling conn
@@ -390,8 +393,21 @@ send_response(ConnPid, StreamId, Status, Headers, Body) ->
     %% worker, so the conn resets just its stream instead of crashing on it
     %% with every stream it carries, and the conn reads the size instead of
     %% walking the body again.
-    _ = (ConnPid ! {h2_send_response, StreamId, Status, Headers, Body, iolist_size(Body)}),
-    ok.
+    case iolist_size(Body) of
+        Size when Size > ?MAX_FRAME_SIZE ->
+            %% A body over one DATA frame is cut into frames from one
+            %% binary, so make that binary here: the message then carries
+            %% it by reference instead of copying an iolist (which can take
+            %% many times its byte size, a JSON encoding say) onto the
+            %% conn's heap, where it waits as long as flow control holds it.
+            _ =
+                (ConnPid !
+                    {h2_send_response, StreamId, Status, Headers, iolist_to_binary(Body), Size}),
+            ok;
+        Size ->
+            _ = (ConnPid ! {h2_send_response, StreamId, Status, Headers, Body, Size}),
+            ok
+    end.
 
 %% Trailers over the client's header limit (RFC 9113 §6.5.2) go out after
 %% the status, so they cannot become a 500: crash, so the conn resets the

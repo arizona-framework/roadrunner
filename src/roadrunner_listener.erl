@@ -905,6 +905,26 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   per DATA frame they read, so no usual client comes near it. A flood
   with no response in between is closed at its 2001st frame. PINGs are
   left to `ping_policy`.
+- `send_stall_timeout`: how long, in milliseconds, a response may wait
+  for the client's flow-control window with nothing sent, or `infinity`
+  for no limit. A client opens its window as it reads (RFC 9113 §5.2);
+  one that opens none (a `SETTINGS_INITIAL_WINDOW_SIZE` of 0 and no
+  WINDOW_UPDATE) leaves the response waiting in the server. A stream
+  whose response has waited this long is reset with
+  `RST_STREAM(CANCEL)`: the rest of its body is dropped, and its handler,
+  if it is still sending, stops as on a client reset. A stream waiting
+  for its own window counts from when nothing more was sent on it; one
+  waiting for the connection window counts from when no DATA at all went
+  out on the connection, so a client reading one stream does not get the
+  streams queued behind it reset. Each DATA frame sent starts the wait
+  over, so a client that keeps reading, however slowly, is never reset
+  for it, nor is a stream with nothing to send (an event stream waiting
+  for its next event). Default `60000`
+  (60 s), the default `keep_alive_timeout`: a client that reads nothing
+  of a waiting response for a minute has stopped reading it. Raise it,
+  or set `infinity`, for clients that stop reading for longer on purpose
+  (a gRPC client that holds a server stream's window shut while it is
+  busy).
 - `connection_age`: how long a connection may live, as gRPC servers
   bound it (`MaxConnectionAge`), so long-lived clients spread over new
   servers as they come (behind a load balancer, say), or `false` (the
@@ -938,6 +958,7 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
         },
     control_frame_policy =>
         false | #{max => 1..16#7FFFFFFF, window => 1..16#FFFFFFFF},
+    send_stall_timeout => 1..16#FFFFFFFF | infinity,
     connection_age =>
         false | #{max := 1..16#FFFFFFFF, grace => 0..16#FFFFFFFF | infinity}
 }.
@@ -2439,6 +2460,7 @@ flatten_protocol_entry(
             active := Active,
             ping_policy := PingPolicy,
             control_frame_policy := ControlFramePolicy,
+            send_stall_timeout := SendStallTimeout,
             connection_age := Age
         } = Http2},
     ProtoOpts
@@ -2454,7 +2476,8 @@ flatten_protocol_entry(
             http2_max_concurrent_streams = MaxStreams,
             http2_max_header_block = MaxHeaderBlock,
             http2_max_header_list_size = MaxHeaderListSize,
-            http2_active = Active
+            http2_active = Active,
+            http2_send_stall_timeout = SendStallTimeout
         })
     );
 flatten_protocol_entry(
@@ -2490,6 +2513,7 @@ http2_defaults() ->
         active => 16,
         ping_policy => ?DEFAULT_PING_POLICY,
         control_frame_policy => ?DEFAULT_CONTROL_FRAME_POLICY,
+        send_stall_timeout => 60000,
         connection_age => false
     }.
 
@@ -2508,6 +2532,8 @@ validate_http2_opts(Opts, Raw) ->
                 true when K =:= control_frame_policy ->
                     Acc#{K => validate_control_frame_policy(V, Raw)};
                 true when K =:= connection_age -> Acc#{K => validate_connection_age(V, Raw)};
+                true when K =:= send_stall_timeout ->
+                    Acc#{K => validate_send_stall_timeout(V, Raw)};
                 true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true ->
                     error({invalid_listener_opt, protocols, Raw})
@@ -2534,6 +2560,17 @@ validate_ping_policy(Policy, Raw) when is_map(Policy) ->
         Policy
     );
 validate_ping_policy(_Policy, Raw) ->
+    error({invalid_listener_opt, protocols, Raw}).
+
+%% Milliseconds, or `infinity` for no limit.
+-spec validate_send_stall_timeout(term(), term()) -> 1..16#FFFFFFFF | infinity.
+validate_send_stall_timeout(infinity, _Raw) ->
+    infinity;
+validate_send_stall_timeout(Timeout, _Raw) when
+    is_integer(Timeout), Timeout >= 1, Timeout =< 16#FFFFFFFF
+->
+    Timeout;
+validate_send_stall_timeout(_Timeout, Raw) ->
     error({invalid_listener_opt, protocols, Raw}).
 
 %% `false`, or a map whose keys left out take the default's.
