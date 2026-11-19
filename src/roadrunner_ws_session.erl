@@ -168,11 +168,21 @@
     %% this state.
     %%
     %% `msg_acc = undefined` means no fragmented message is in
-    %% progress. While in progress, the iodata accumulates fragment
-    %% payloads (still compressed when `msg_compressed` is true);
-    %% `msg_opcode` is the leading frame's opcode (text | binary)
-    %% used to dispatch the complete message.
+    %% progress. While in progress, the payload bytes so far (still
+    %% compressed when `msg_compressed` is true) are `msg_acc`, an iolist
+    %% of exact-size chunks, followed by `msg_pieces`, the unmasked
+    %% payloads received since the last chunk (`msg_pieces_size` bytes in
+    %% `msg_pieces_count` payloads). Pieces are joined into a chunk once
+    %% they reach `?WS_REASSEMBLY_CHUNK` bytes or
+    %% `?WS_REASSEMBLY_PIECES` payloads (`add_piece/2`): each unmasked
+    %% payload carries a header and spare capacity of its own, which for a
+    %% long message of small fragments came to several times the bytes
+    %% received. `msg_opcode` is the leading frame's opcode
+    %% (text | binary) used to dispatch the complete message.
     msg_acc :: undefined | iodata(),
+    msg_pieces = [] :: iodata(),
+    msg_pieces_size = 0 :: non_neg_integer(),
+    msg_pieces_count = 0 :: non_neg_integer(),
     msg_opcode :: undefined | text | binary,
     msg_compressed :: boolean(),
     %% Inbound size caps (from listener `proto_opts`, set once in
@@ -266,14 +276,23 @@
 %% terminate the deflate block.
 -define(PMD_TAIL, <<0, 0, 16#FF, 16#FF>>).
 
-%% Per-fragment charge (bytes) added to the running message size on top
-%% of the payload. Each accumulated fragment costs ~32 bytes of cons
-%% cells in `msg_acc` regardless of its payload, so without a floor a
-%% flood of empty/tiny continuation frames would grow the heap while
-%% the payload-byte total stayed under `max_message_size`. Charging at
-%% least this much per fragment keeps real reassembly memory bounded by
-%% the cap (this is ~2x the actual cons-cell cost, a safe over-estimate).
+%% Least charge (bytes) a fragment adds to the running message size.
+%% Without a floor a flood of empty continuation frames would never
+%% reach `max_message_size` and would keep the session busy for as long
+%% as the peer likes.
 -define(WS_FRAGMENT_OVERHEAD, 64).
+%% When a fragmented message's pieces are joined into one exact-size
+%% chunk (`add_piece/2`): at this many bytes (or an eighth of
+%% `max_message_size`, when that is less), or this many payloads. An
+%% unmasked payload holds up to half its size again in spare capacity,
+%% and a small one costs more in headers than in bytes, so joining bounds
+%% that overhead to one chunk's worth. A message within both limits is
+%% joined once, when it completes, as before. 1 MB is above the binary
+%% allocator's default single-block carrier threshold (512 KB), so each
+%% chunk gets a carrier of its own that goes back whole when the message
+%% ends, instead of leaving holes in shared carriers.
+-define(WS_REASSEMBLY_CHUNK, 1048576).
+-define(WS_REASSEMBLY_PIECES, 1024).
 %% Events between relearning the heap floor (`raise_heap_floor/1`), and
 %% the process dictionary key that counts them down.
 -define(HEAP_FLOOR_RELEARN, 16).
@@ -967,6 +986,12 @@ process_partial(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
     end.
 
 -spec process_parsed_frame(#data{}, binary(), map(), boolean()) -> finished.
+process_parsed_frame(
+    #data{msg_acc = Acc} = Data1, Buf, #{opcode := continuation} = Header, HibernateAcc
+) when
+    Acc =/= undefined
+->
+    continuation_frame(Data1, Buf, Header, HibernateAcc);
 process_parsed_frame(Data1, Buf, Header, HibernateAcc) ->
     %% `Header` was decoded by the peek in `early_validate_text/3`;
     %% `parse_frame_known` reuses it (no second decode) and only needs to
@@ -977,11 +1002,11 @@ process_parsed_frame(Data1, Buf, Header, HibernateAcc) ->
             ok = roadrunner_event:ws_frame_in(
                 Data1#data.span, Opcode, payload_size(Frame)
             ),
-            %% Frame parsed. Carry `frame_validated` into handle_frame
-            %% so accumulate_fragment can skip redundant per-fragment
-            %% UTF-8 validation. The reset happens AFTER fragment-level
-            %% dispatch (in `reset_msg/1`), so the next frame's
-            %% wire-level cursor starts from zero.
+            %% Frame parsed. The start of a fragmented text message was
+            %% already validated as it arrived (`early_validate_text`),
+            %% so `start_message/3` does not validate it again. The
+            %% reset happens after dispatch (in `reset_msg/1`), so the
+            %% next frame's wire-level cursor starts from zero.
             handle_frame(
                 Frame,
                 Data1#data{buffer = NewBuffer},
@@ -989,6 +1014,110 @@ process_parsed_frame(Data1, Buf, Header, HibernateAcc) ->
             );
         {more, _} ->
             arm_and_recv(Data1, HibernateAcc)
+    end.
+
+%% A continuation frame of the message in progress. The message cap is
+%% checked on the header alone, so a frame that would take the message
+%% past `max_message_size` closes with 1009 before its body is read.
+%% Otherwise, once the whole frame is buffered, its payload is unmasked,
+%% checked as UTF-8 for an uncompressed text message, and added to the
+%% message, the final frame completing it.
+-spec continuation_frame(#data{}, binary(), map(), boolean()) -> finished.
+continuation_frame(Data, Buf, #{total_payload_len := Len} = Header, Hibernate) ->
+    #data{msg_size = Size, max_message_size = MaxMsg} = Data,
+    case Size + max(Len, ?WS_FRAGMENT_OVERHEAD) of
+        NewSize when NewSize > MaxMsg ->
+            close_oversize(max_message_size, NewSize, Data);
+        NewSize ->
+            #{payload_offset := Off, mask_key := <<MaskKey:32>>, fin := Fin} = Header,
+            case Buf of
+                <<_:Off/binary, Masked:Len/binary, Rest/binary>> ->
+                    ok = roadrunner_event:ws_frame_in(Data#data.span, continuation, Len),
+                    add_continuation(
+                        Fin,
+                        roadrunner_ws:unmask_words(Masked, MaskKey),
+                        Data#data{buffer = Rest, msg_size = NewSize},
+                        Hibernate
+                    );
+                _ ->
+                    arm_and_recv(Data, Hibernate)
+            end
+    end.
+
+%% Take a continuation frame's unmasked payload: check it, then either
+%% wait for the next fragment or hand the complete message on.
+-spec add_continuation(boolean(), binary(), #data{}, boolean()) -> finished.
+add_continuation(false, P, Data, Hibernate) ->
+    #data{msg_opcode = Op, msg_compressed = Compressed, utf8_pending = Pending} = Data,
+    case validate_piece(Op, Compressed, Pending, P) of
+        {ok, NewPending} ->
+            process_buffer(add_piece(P, Data#data{utf8_pending = NewPending}), Hibernate);
+        invalid_utf8 ->
+            close_with(close_invalid_payload(), reset_msg(Data))
+    end;
+add_continuation(true, P, Data, Hibernate) ->
+    #data{
+        msg_acc = Acc,
+        msg_pieces = Pieces,
+        msg_opcode = Op,
+        msg_compressed = Compressed,
+        utf8_pending = Pending
+    } = Data,
+    case validate_piece(Op, Compressed, Pending, P) of
+        {ok, <<>>} ->
+            Reset = reset_msg(Data),
+            case complete_message(Op, Compressed, [Acc, Pieces, P], Reset) of
+                {ok, Payload} ->
+                    Synthesized = #{fin => true, rsv1 => false, opcode => Op, payload => Payload},
+                    dispatch_data_frame(Synthesized, Reset, Hibernate);
+                finished ->
+                    finished
+            end;
+        _ ->
+            %% Bad UTF-8, or a multi-byte sequence the message ends inside
+            %% (RFC 6455 §8.1).
+            close_with(close_invalid_payload(), reset_msg(Data))
+    end.
+
+%% UTF-8 check of a continuation's payload for an uncompressed text
+%% message (`validate_incremental/2`). Binary and compressed messages
+%% have nothing to check here.
+-spec validate_piece(text | binary, boolean(), binary(), binary()) ->
+    {ok, binary()} | invalid_utf8.
+validate_piece(text, false, Pending, P) ->
+    validate_incremental(Pending, P);
+validate_piece(_Op, _Compressed, _Pending, _P) ->
+    {ok, <<>>}.
+
+%% Add a fragment's unmasked payload to the message, joining the pieces
+%% into one exact-size chunk once they reach `?WS_REASSEMBLY_CHUNK` bytes
+%% (or an eighth of `max_message_size`) or `?WS_REASSEMBLY_PIECES`
+%% payloads.
+-spec add_piece(binary(), #data{}) -> #data{}.
+add_piece(P, Data) ->
+    #data{
+        msg_acc = Acc,
+        msg_pieces = Pieces,
+        msg_pieces_size = Size,
+        msg_pieces_count = Count,
+        max_message_size = MaxMsg
+    } = Data,
+    case {Size + byte_size(P), Count + 1} of
+        {NewSize, NewCount} when
+            NewSize >= ?WS_REASSEMBLY_CHUNK;
+            NewSize >= MaxMsg div 8;
+            NewCount >= ?WS_REASSEMBLY_PIECES
+        ->
+            Data#data{
+                msg_acc = [Acc, iolist_to_binary([Pieces, P])],
+                msg_pieces = [],
+                msg_pieces_size = 0,
+                msg_pieces_count = 0
+            };
+        {NewSize, NewCount} ->
+            Data#data{
+                msg_pieces = [Pieces, P], msg_pieces_size = NewSize, msg_pieces_count = NewCount
+            }
     end.
 
 %% Hand the cached unmasked payload to `parse_frame_known` when (and only
@@ -1056,7 +1185,7 @@ early_validate_text(Data, Buf, Opts) ->
                 true ->
                     Slice = binary:part(Buf, Off + AlreadyValidated, ToValidate),
                     Unmasked = unmask_slice(Slice, MaskKey, AlreadyValidated),
-                    case validate_incremental(text, false, Pending, Unmasked) of
+                    case validate_incremental(Pending, Unmasked) of
                         {ok, NewPending} ->
                             {frame, Header, Data#data{
                                 utf8_pending = NewPending,
@@ -1342,7 +1471,7 @@ handle_frame(
     %% UTF-8 ran incrementally; FIN only adds "no trailing incomplete
     %% sequence". Oversized (> `max_message_size`), compressed (RSV1) and
     %% mid-fragmentation frames fall through to the reassembly path below.
-    case fragment_validate_fin(Op, false, Pending, P, Data) of
+    case fin_utf8(Op, Pending) of
         ok ->
             dispatch_data_frame(Frame, reset_msg(Data), Hibernate);
         invalid_utf8 ->
@@ -1354,12 +1483,12 @@ handle_frame(Frame, Data, Hibernate) ->
     %% level; the session reassembles them and dispatches the COMPLETE
     %% message to the user handler. Per RFC 7692, the first fragment
     %% of a compressed message has RSV1=1 — we track that flag for the
-    %% whole message so the FIN handler knows to inflate.
+    %% whole message so the FIN handler knows to inflate. The message's
+    %% continuation frames take `continuation_frame/4` and never reach
+    %% here.
     case classify_data_frame(Frame, Data) of
         {message_start, NewData} ->
-            accumulate_fragment(Frame, NewData, Hibernate);
-        message_continuation ->
-            accumulate_fragment(Frame, Data, Hibernate);
+            start_message(Frame, NewData, Hibernate);
         protocol_error ->
             %% Continuation arrived without a non-FIN start frame, OR
             %% a new data frame arrived mid-message. RFC 6455 §5.4
@@ -1374,11 +1503,9 @@ handle_frame(Frame, Data, Hibernate) ->
 %%   - Once a non-FIN message has started, NO new text/binary may
 %%     arrive until FIN; only continuations are valid mid-message.
 -spec classify_data_frame(roadrunner_ws:frame(), #data{}) ->
-    {message_start, #data{}} | message_continuation | protocol_error.
-classify_data_frame(#{opcode := continuation}, #data{msg_acc = undefined}) ->
-    protocol_error;
+    {message_start, #data{}} | protocol_error.
 classify_data_frame(#{opcode := continuation}, _Data) ->
-    message_continuation;
+    protocol_error;
 classify_data_frame(#{opcode := Op}, #data{msg_acc = Acc}) when
     Acc =/= undefined, (Op =:= text orelse Op =:= binary)
 ->
@@ -1386,90 +1513,48 @@ classify_data_frame(#{opcode := Op}, #data{msg_acc = Acc}) when
 classify_data_frame(#{rsv1 := Rsv1, opcode := Op}, Data) when Op =:= text orelse Op =:= binary ->
     {message_start, Data#data{msg_opcode = Op, msg_compressed = Rsv1}}.
 
--spec accumulate_fragment(roadrunner_ws:frame(), #data{}, boolean()) -> finished.
-accumulate_fragment(
-    #{fin := false, payload := P} = _Frame,
-    #data{
-        msg_acc = Acc,
-        msg_opcode = Op,
-        msg_compressed = Compressed,
-        msg_size = Size,
-        max_message_size = MaxMsg
-    } = Data,
+%% The first frame of a message that missed the direct dispatch: one with
+%% FIN=0 that more fragments will follow, or a whole message that is
+%% compressed or over `max_message_size`.
+-spec start_message(roadrunner_ws:frame(), #data{}, boolean()) -> finished.
+start_message(#{payload := P}, #data{max_message_size = MaxMsg} = Data, _Hibernate) when
+    max(byte_size(P), ?WS_FRAGMENT_OVERHEAD) > MaxMsg
+->
+    %% The frame alone takes the charged message size over
+    %% `max_message_size`: close with 1009. (For compressed messages
+    %% this bounds the wire-level payload.)
+    close_oversize(max_message_size, max(byte_size(P), ?WS_FRAGMENT_OVERHEAD), Data);
+start_message(#{fin := false, payload := P}, Data, Hibernate) ->
+    %% The payload is the message's first piece. Its UTF-8, for
+    %% uncompressed text, was checked as it arrived
+    %% (`early_validate_text/3`), which left any unfinished multi-byte
+    %% sequence in `utf8_pending` for the next fragment to complete.
+    process_buffer(
+        add_piece(P, Data#data{
+            msg_acc = [],
+            msg_size = max(byte_size(P), ?WS_FRAGMENT_OVERHEAD),
+            %% Reset the wire-level cursor and unmasked buffer so the
+            %% NEXT frame starts from scratch.
+            frame_validated = 0,
+            unmasked_buf = <<>>
+        }),
+        Hibernate
+    );
+start_message(
+    #{fin := true, payload := P},
+    #data{msg_opcode = Op, msg_compressed = Compressed} = Data,
     Hibernate
 ) ->
-    NewSize = Size + max(byte_size(P), ?WS_FRAGMENT_OVERHEAD),
-    case NewSize > MaxMsg of
-        true ->
-            %% Charged message size exceeds `max_message_size`. Close
-            %% with 1009 instead of buffering more — this stops a
-            %% continuation flood that never sets fin=1, including one
-            %% built from empty/tiny frames (each charged the per-
-            %% fragment overhead so the cap bounds real memory).
-            close_oversize(max_message_size, NewSize, Data);
-        false ->
-            case fragment_validate(Op, Compressed, Data#data.utf8_pending, P, Data) of
-                {ok, NewPending} ->
-                    NewAcc =
-                        case Acc of
-                            undefined -> [P];
-                            _ -> [Acc, P]
-                        end,
-                    process_buffer(
-                        Data#data{
-                            msg_acc = NewAcc,
-                            msg_size = NewSize,
-                            utf8_pending = NewPending,
-                            %% Reset wire-level cursor + unmasked-buffer so
-                            %% the NEXT frame's bytes are validated and
-                            %% accumulated from scratch when they arrive.
-                            frame_validated = 0,
-                            unmasked_buf = <<>>
-                        },
-                        Hibernate
-                    );
-                invalid_utf8 ->
-                    %% RFC 6455 §8.1: close 1007 on the first invalid
-                    %% UTF-8 byte sequence — don't wait for FIN.
-                    close_with(close_invalid_payload(), reset_msg(Data))
-            end
-    end;
-accumulate_fragment(
-    #{fin := true, payload := P} = _Frame,
-    #data{msg_size = Size, max_message_size = MaxMsg} = Data,
-    _Hibernate
-) when Size + max(byte_size(P), ?WS_FRAGMENT_OVERHEAD) > MaxMsg ->
-    %% The final fragment pushes the charged message size over
-    %% `max_message_size` — close with 1009. (For compressed messages
-    %% this bounds the wire-level accumulated payload.)
-    close_oversize(max_message_size, Size + max(byte_size(P), ?WS_FRAGMENT_OVERHEAD), Data);
-accumulate_fragment(
-    #{fin := true, payload := P} = _Frame,
-    #data{
-        msg_acc = Acc,
-        msg_opcode = Op,
-        msg_compressed = Compressed,
-        utf8_pending = Pending
-    } = Data,
-    Hibernate
-) ->
-    case fragment_validate_fin(Op, Compressed, Pending, P, Data) of
-        ok ->
-            AssembledIolist =
-                case Acc of
-                    undefined -> [P];
-                    _ -> [Acc, P]
-                end,
-            Reset = reset_msg(Data),
-            case complete_message(Op, Compressed, AssembledIolist, Reset) of
-                {ok, Payload} ->
-                    Synthesized = #{fin => true, rsv1 => false, opcode => Op, payload => Payload},
-                    dispatch_data_frame(Synthesized, Reset, Hibernate);
-                finished ->
-                    finished
-            end;
-        invalid_utf8 ->
-            close_with(close_invalid_payload(), reset_msg(Data))
+    %% A whole compressed message (an uncompressed one within the cap
+    %% took the direct dispatch in `handle_frame/3`); its UTF-8 is checked
+    %% once inflated.
+    Reset = reset_msg(Data),
+    case complete_message(Op, Compressed, P, Reset) of
+        {ok, Payload} ->
+            Synthesized = #{fin => true, rsv1 => false, opcode => Op, payload => Payload},
+            dispatch_data_frame(Synthesized, Reset, Hibernate);
+        finished ->
+            finished
     end.
 
 %% Assemble a complete message's payload: inflate it when compressed and
@@ -1493,56 +1578,13 @@ complete_message(Op, Compressed, Iolist, Data) ->
             close_with(close_protocol_error(), Data)
     end.
 
-%% Validate the FIN fragment's bytes against the carried pending
-%% prefix. For text messages, the fragment must complete any
-%% in-progress sequence — incomplete UTF-8 trailing the message is
-%% invalid. Compressed messages defer validation to post_finalize
-%% because the wire bytes are deflate, not UTF-8.
--spec validate_fin_fragment(text | binary, boolean(), binary(), binary()) ->
-    ok | invalid_utf8.
-validate_fin_fragment(binary, _Compressed, _Pending, _Bytes) ->
-    ok;
-validate_fin_fragment(text, true, _Pending, _Bytes) ->
-    ok;
-validate_fin_fragment(text, false, Pending, Bytes) ->
-    %% `roadrunner_bin:append/2` hands back the bare binary when nothing
-    %% is pending, which lets the UTF-8 BIF take its fast binary path
-    %% (measured well ahead of a pre-concat copy or an iodata list).
-    case unicode:characters_to_binary(roadrunner_bin:append(Pending, Bytes), utf8, utf8) of
-        Bin when is_binary(Bin) -> ok;
-        %% Trailing bytes that didn't form a complete sequence are
-        %% invalid at FIN time per RFC 6455 §8.1.
-        {incomplete, _, _} -> invalid_utf8;
-        {error, _, _} -> invalid_utf8
-    end.
-
-%% Skip fragment-level UTF-8 validation when the wire-level
-%% `early_validate_text` already processed every byte of this
-%% fragment (or the fragment is empty / non-text where validation is
-%% a no-op anyway).
--spec fragment_validate(text | binary, boolean(), binary(), binary(), #data{}) ->
-    {ok, binary()} | invalid_utf8.
-fragment_validate(_Op, _Compressed, Pending, P, #data{frame_validated = Cursor}) when
-    Cursor >= byte_size(P)
-->
-    {ok, Pending};
-fragment_validate(Op, Compressed, Pending, P, _Data) ->
-    validate_incremental(Op, Compressed, Pending, P).
-
-%% Same idea for FIN: wire-level already validated, but FIN brings
-%% the additional constraint that no incomplete sequence may trail
-%% the message.
--spec fragment_validate_fin(text | binary, boolean(), binary(), binary(), #data{}) ->
-    ok | invalid_utf8.
-fragment_validate_fin(Op, Compressed, Pending, P, #data{frame_validated = Cursor}) when
-    Cursor >= byte_size(P)
-->
-    case {Op, Compressed} of
-        {text, false} when Pending =/= <<>> -> invalid_utf8;
-        _ -> ok
-    end;
-fragment_validate_fin(Op, Compressed, Pending, P, _Data) ->
-    validate_fin_fragment(Op, Compressed, Pending, P).
+%% A text message whose bytes were all checked as they arrived is valid
+%% only if no multi-byte sequence is left open at its end (RFC 6455
+%% §8.1): `Pending` holds what was left over. Binary messages have no
+%% such constraint.
+-spec fin_utf8(text | binary, binary()) -> ok | invalid_utf8.
+fin_utf8(text, <<_, _/binary>>) -> invalid_utf8;
+fin_utf8(_Op, _Pending) -> ok.
 
 %% Compressed messages need their inflated payload validated; their
 %% wire bytes are deflate, so per-fragment UTF-8 validation was
@@ -1568,7 +1610,10 @@ reset_msg(Data) ->
         msg_size = 0,
         utf8_pending = <<>>,
         frame_validated = 0,
-        unmasked_buf = <<>>
+        unmasked_buf = <<>>,
+        msg_pieces = [],
+        msg_pieces_size = 0,
+        msg_pieces_count = 0
     }.
 
 %% RFC 6455 §8.1 strict UTF-8 validation: validate each text-fragment
@@ -1577,16 +1622,12 @@ reset_msg(Data) ->
 %% continuation bytes will arrive in the next fragment) but rejects
 %% any **invalid** sequence immediately.
 %%
-%% Skipped for binary messages (no encoding requirement) and for
-%% compressed messages (the wire bytes are deflate-compressed, not
-%% UTF-8; the inflated payload is validated at FIN time instead).
--spec validate_incremental(text | binary, boolean(), binary(), binary()) ->
-    {ok, NewPending :: binary()} | invalid_utf8.
-validate_incremental(binary, _Compressed, _Pending, _Bytes) ->
-    {ok, <<>>};
-validate_incremental(text, true, _Pending, _Bytes) ->
-    {ok, <<>>};
-validate_incremental(text, false, Pending, Bytes) ->
+%% Only uncompressed text is checked this way: binary messages have no
+%% encoding requirement, and the wire bytes of a compressed message are
+%% deflate, not UTF-8 (the inflated payload is validated at FIN time
+%% instead).
+-spec validate_incremental(binary(), binary()) -> {ok, NewPending :: binary()} | invalid_utf8.
+validate_incremental(Pending, Bytes) ->
     %% Empty `Pending` (the common case) hands the validator the payload
     %% binary as-is — the BIF's fast binary path beats a pre-concat copy
     %% and an iodata list alike.
