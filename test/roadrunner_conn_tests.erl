@@ -153,6 +153,20 @@ linger_reads_until_the_peer_closes_test() ->
     ),
     ?assertEqual(3, recv_calls(0)).
 
+linger_collects_what_it_drops_test_() ->
+    %% A large read is dropped and collected as the linger goes on, not
+    %% held until the process next collects on its own. Its own process:
+    %% the binaries it holds are process state.
+    {spawn, fun() ->
+        Sink = spawn(fun() ->
+            script_sink(undefined, [{recv, binary:copy(~"a", 65536)}, {recv, ~"x"}])
+        end),
+        ok = roadrunner_conn:linger({fake, Sink}, 5000),
+        Sink ! stop,
+        {binary, Held} = erlang:process_info(self(), binary),
+        ?assertEqual([], [Size || {_, Size, _} <- Held, Size >= 65536])
+    end}.
+
 linger_disarms_an_armed_socket_test_() ->
     %% An HTTP/1 socket armed with `{active, N}` goes passive before the
     %% reads, which would otherwise fail at once and close with input

@@ -2258,6 +2258,25 @@ large_body_grows_the_socket_buffer_once_test() ->
     Pid ! {roadrunner_fake_closed, x},
     ok = await_normal_exit(Ref, Pid).
 
+over_cap_body_leaves_the_socket_buffer_small_test() ->
+    %% A declared length over the body cap is refused without a read of
+    %% the body, so the socket keeps its idle buffer for the linger.
+    Tag = make_ref(),
+    {Pid, Ref} = start_active_n(
+        Tag,
+        size_opts(#{
+            http1_active => 4,
+            grow_recv_buffer => {8, 64},
+            max_content_length => 10,
+            http1_linger_timeout => 0
+        })
+    ),
+    [{active, 4}] = expect_setopts(Tag),
+    Pid ! {roadrunner_fake_data, x, post_head(20, <<>>)},
+    ?assertMatch(<<"HTTP/1.1 413 ", _/binary>>, expect_sent(Tag)),
+    ok = await_normal_exit(Ref, Pid),
+    ?assertEqual([], all_setopts(Tag)).
+
 large_head_grows_the_socket_buffer_test() ->
     %% A head that fills the idle buffer and is still incomplete grows the
     %% socket to 16 KB, once: the next large head reads as it is, and a

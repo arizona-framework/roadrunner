@@ -132,7 +132,7 @@
     body_buffering = auto :: roadrunner_listener:body_buffering(),
     %% `{Idle, Max}` while the socket still reads with its small
     %% `idle_recv_buffer`: the first body with more than `Idle` bytes still
-    %% to come grows it to `Max` for good (`grow_buffer/2`), and a request
+    %% to come grows it to `Max` for good (`grow_buffer/3`), and a request
     %% head larger than `Idle` grows it to `?HEAD_RECV_BUFFER`
     %% (`grow_for_head/1`), which becomes the new `Idle`. `undefined` once
     %% grown to `Max`, or when the listener has nothing to grow.
@@ -1357,7 +1357,7 @@ route_and_read(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S, 
                     read_body(
                         BodyMode,
                         Answer,
-                        grow_buffer(S, Framing),
+                        grow_buffer(S, Framing, MaxCL),
                         Req,
                         Framing,
                         MaxCL,
@@ -1374,11 +1374,14 @@ route_and_read(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S, 
 %% hands a freed buffer back to the next read that fits in it, so shrinking
 %% again would not release it. Chunked bodies grow it too, as their size
 %% is not known up front.
+%% A declared length over the body cap `MaxCL` leaves it small: that body is
+%% refused (413) without a read of it, and the reads that linger over it
+%% are dropped.
 %% A request head that filled the idle buffer and is still incomplete:
 %% a client with large heads (many cookies) sends them on every request,
 %% and a head split across reads costs about half a request again, so the
 %% socket reads heads with `?HEAD_RECV_BUFFER` from here on. Bodies still
-%% grow it to `Max` (`grow_buffer/2`).
+%% grow it to `Max` (`grow_buffer/3`).
 -spec grow_for_head(#loop_state{}) -> #loop_state{}.
 grow_for_head(#loop_state{grow_buffer = {Idle, Max}, buffered = Buffered} = S) when
     byte_size(Buffered) >= Idle, Idle < ?HEAD_RECV_BUFFER
@@ -1395,12 +1398,13 @@ head_grown(Head, Max) -> {Head, Max}.
 
 -spec grow_buffer(
     #loop_state{},
-    roadrunner_http1:framing()
+    roadrunner_http1:framing(),
+    roadrunner_router:body_limit()
 ) -> #loop_state{}.
-grow_buffer(#loop_state{grow_buffer = undefined} = S, _Framing) ->
+grow_buffer(#loop_state{grow_buffer = undefined} = S, _Framing, _MaxCL) ->
     S;
-grow_buffer(#loop_state{grow_buffer = {Idle, Max}, buffered = Buffered} = S, Framing) ->
-    case large_body(Framing, byte_size(Buffered), Idle) of
+grow_buffer(#loop_state{grow_buffer = {Idle, Max}, buffered = Buffered} = S, Framing, MaxCL) ->
+    case large_body(Framing, byte_size(Buffered), Idle, MaxCL) of
         true ->
             _ = roadrunner_transport:setopts(S#loop_state.socket, [{buffer, Max}]),
             S#loop_state{grow_buffer = undefined};
@@ -1411,12 +1415,14 @@ grow_buffer(#loop_state{grow_buffer = {Idle, Max}, buffered = Buffered} = S, Fra
 -spec large_body(
     roadrunner_http1:framing(),
     non_neg_integer(),
-    pos_integer()
+    pos_integer(),
+    roadrunner_router:body_limit()
 ) -> boolean().
-large_body(none, _Buffered, _Idle) -> false;
-large_body(chunked, _Buffered, _Idle) -> true;
-large_body({content_length, N}, Buffered, Idle) -> N - Buffered > Idle;
-large_body({error, _}, _Buffered, _Idle) -> false.
+large_body(none, _Buffered, _Idle, _MaxCL) -> false;
+large_body(chunked, _Buffered, _Idle, _MaxCL) -> true;
+large_body({content_length, N}, _Buffered, _Idle, MaxCL) when N > MaxCL -> false;
+large_body({content_length, N}, Buffered, Idle, _MaxCL) -> N - Buffered > Idle;
+large_body({error, _}, _Buffered, _Idle, _MaxCL) -> false.
 
 %% Under full sweeps (the default `fullsweep_after, 0`) a connection's heap
 %% starts each request small and grows over several collections to what the

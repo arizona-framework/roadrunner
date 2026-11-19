@@ -1806,7 +1806,7 @@ base_listen_opts(Opts, Buffer) ->
     %% read. A plain-TCP HTTP/1.1 socket therefore starts at
     %% `idle_recv_buffer` (4 KB), which holds a typical request head, and
     %% grows to `recv_buffer` (64 KB) for good the first time a larger body
-    %% is on its way (`roadrunner_conn_loop:grow_buffer/2`): a connection
+    %% is on its way (`roadrunner_conn_loop:grow_buffer/3`): a connection
     %% that only sees small requests holds 4 KB instead of 64 KB while it
     %% waits, and uploads read as before. A connection whose request head
     %% did not fit grows to 16 KB for the heads that follow
@@ -1815,7 +1815,7 @@ base_listen_opts(Opts, Buffer) ->
     %% on a streamed upload: the driver hands nothing over until the
     %% whole length is in. A prior-knowledge h2c socket, which reads
     %% `{active, N}`, starts small too and grows at its first DATA
-    %% payload (`roadrunner_conn_loop_http2:grow_buffer/2`): a fixed 16 KB
+    %% payload (`roadrunner_conn_loop_http2:grow_buffer/3`): a fixed 16 KB
     %% cut HTTP/2 upload throughput by about a quarter. A TLS socket keeps
     %% `recv_buffer`: its TLS connection process leaves it unarmed while
     %% idle, so an idle TLS connection holds no read buffer anyway. See
