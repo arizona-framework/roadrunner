@@ -1474,7 +1474,7 @@ handle_frame({unknown, _Type, _StreamId}, State) ->
 %% grows it to `recv_buffer` for the rest of the connection, so large
 %% bodies are not read in small pieces. A small body sent whole in one
 %% frame, as an API client's JSON usually is, leaves it small, like the
-%% HTTP/1.1 threshold in `roadrunner_conn_loop:grow_buffer/2`. It stays
+%% HTTP/1.1 threshold in `roadrunner_conn_loop:grow_buffer/3`. It stays
 %% grown: the driver hands a freed buffer back to the next read that fits
 %% in it, so shrinking would not release it.
 -spec grow_buffer(non_neg_integer(), binary(), #loop{}) -> #loop{}.

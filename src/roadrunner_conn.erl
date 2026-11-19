@@ -777,6 +777,9 @@ disarmed() ->
 %% How much of an unread body a drain reads before it drops it and reads on
 %% (`drain_reader/1`).
 -define(DRAIN_STEP, 65536).
+%% How many dropped bytes a linger lets pile up before it collects them
+%% (`linger/2`).
+-define(LINGER_COLLECT_BYTES, 65536).
 
 %% Drain-detection cap when in passive recv. Each recv call is bounded
 %% to at most this many ms so the conn re-checks its mailbox for
@@ -2348,6 +2351,10 @@ parse_error_status(_) -> 400.
 %% is complete, and what still comes is read and dropped until the client
 %% closes or `Timeout` ms pass, a bound a client sending on cannot stretch.
 %% `0` skips it, for the close to follow at once.
+%% What is dropped is collected every `?LINGER_COLLECT_BYTES`: each read
+%% hands the process a fresh binary, and a client that sends as fast as it
+%% can would otherwise pile up garbage until the process next collects,
+%% hundreds of kilobytes per lingering connection.
 -doc false.
 -spec linger(roadrunner_transport:socket(), non_neg_integer()) -> ok.
 linger(_Socket, 0) ->
@@ -2361,19 +2368,30 @@ linger(Socket, Timeout) ->
             N when is_integer(N) -> roadrunner_transport:setopts(Socket, [{active, false}]);
             _Passive -> ok
         end,
-    linger_until(Socket, erlang:monotonic_time(millisecond) + Timeout).
+    linger_until(Socket, erlang:monotonic_time(millisecond) + Timeout, 0).
 
--spec linger_until(roadrunner_transport:socket(), integer()) -> ok.
-linger_until(Socket, Deadline) ->
+-spec linger_until(roadrunner_transport:socket(), integer(), non_neg_integer()) -> ok.
+linger_until(Socket, Deadline, Dropped) ->
     case Deadline - erlang:monotonic_time(millisecond) of
         Left when Left > 0 ->
             case roadrunner_transport:recv(Socket, 0, Left) of
-                {ok, _Dropped} -> linger_until(Socket, Deadline);
-                {error, _} -> ok
+                {ok, Data} ->
+                    linger_until(Socket, Deadline, collect_dropped(Dropped + byte_size(Data)));
+                {error, _} ->
+                    ok
             end;
         _ ->
             ok
     end.
+
+%% The bytes dropped since the last collection, collecting once they reach
+%% `?LINGER_COLLECT_BYTES`.
+-spec collect_dropped(non_neg_integer()) -> non_neg_integer().
+collect_dropped(Dropped) when Dropped >= ?LINGER_COLLECT_BYTES ->
+    true = erlang:garbage_collect(),
+    0;
+collect_dropped(Dropped) ->
+    Dropped.
 
 -spec send_payload_too_large(roadrunner_transport:socket()) -> ok | {error, term()}.
 send_payload_too_large(Socket) ->
