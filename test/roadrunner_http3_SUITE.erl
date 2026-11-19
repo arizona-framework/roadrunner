@@ -29,6 +29,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     large_post/1,
     not_found/1,
     method_not_allowed/1,
+    options_star/1,
+    star_with_other_method_is_malformed/1,
     crash_500/1,
     interim_response_500/1,
     rate_limited/1,
@@ -114,6 +116,7 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     peer_push_stream_closes_conn/1,
     peer_allows_no_uni_stream_closes_conn/1,
     peer_control_stream_closed/1,
+    peer_control_id_errors_close_conn/1,
     unknown_uni_stream_ignored/1,
     peer_control_stream_reset/1,
     peer_stops_our_control_stream/1,
@@ -151,6 +154,8 @@ all() ->
         large_post,
         not_found,
         method_not_allowed,
+        options_star,
+        star_with_other_method_is_malformed,
         crash_500,
         interim_response_500,
         rate_limited,
@@ -236,6 +241,7 @@ all() ->
         peer_push_stream_closes_conn,
         peer_allows_no_uni_stream_closes_conn,
         peer_control_stream_closed,
+        peer_control_id_errors_close_conn,
         unknown_uni_stream_ignored,
         peer_control_stream_reset,
         peer_stops_our_control_stream,
@@ -268,6 +274,7 @@ end_per_suite(_Config) ->
 init_per_testcase(Case, Config) when
     Case =:= not_found;
     Case =:= method_not_allowed;
+    Case =:= options_star;
     Case =:= rate_limited;
     Case =:= oversized_413;
     Case =:= real_ip_resolves_client_behind_trusted_proxy;
@@ -434,6 +441,35 @@ method_not_allowed(_Config) ->
         close(Conn),
         roadrunner_listener:stop(Name)
     end.
+
+options_star(_Config) ->
+    %% `OPTIONS *` is about the server, not a resource (RFC 9110 §9.3.7):
+    %% a listener with routes answers it itself, a 200 with no body,
+    %% without reaching the `/*path` route that would match `*`, and the
+    %% connection serves the next request.
+    Name = listener_name(options_star),
+    {ok, _} = start_h3(Name, #{
+        routes => [{~"/", roadrunner_h3_test_handler}, {~"/*path", roadrunner_test_handler}]
+    }),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"OPTIONS", ~"*")),
+        ?assertMatch({200, _, ~""}, collect(Conn, StreamId)),
+        ?assertMatch({200, _}, status_body(get(Conn, ~"/")))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+star_with_other_method_is_malformed(Config) ->
+    %% `*` is a `:path` only for OPTIONS (RFC 9114 §4.3.1): with any other
+    %% method the request is malformed, its stream reset with
+    %% H3_MESSAGE_ERROR, and the connection lives on.
+    Conn = connect(?config(port, Config)),
+    {ok, StreamId} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"*")),
+    ?assertEqual({error, {stream_reset, 16#10e}}, collect(Conn, StreamId)),
+    ?assertEqual({200, ~"ok"}, status_body(get(Conn, ~"/"))),
+    close(Conn).
 
 crash_500(Config) ->
     %% The crash also emits `request_exception`, with the handler's
@@ -2064,6 +2100,25 @@ peer_control_stream_closed(Config) ->
     _ = ll_open_uni(Conn, control_with_settings(), true),
     ll_await_closed(Conn).
 
+peer_control_id_errors_close_conn(Config) ->
+    %% A control frame whose ID breaks the rules closes the connection with
+    %% H3_ID_ERROR: any CANCEL_PUSH, in or beyond MAX_PUSH_ID, as roadrunner
+    %% never promises a push (RFC 9114 §7.2.3), a MAX_PUSH_ID that goes down
+    %% (§7.2.7), a GOAWAY ID that goes up (§5.2).
+    lists:foreach(
+        fun(Frames) ->
+            Conn = ll_connect(?config(port, Config)),
+            _ = ll_open_uni(Conn, [control_with_settings() | Frames], false),
+            ?assertEqual(16#0108, ll_await_close_code(Conn))
+        end,
+        [
+            [id_frame(16#0d, 2), id_frame(16#03, 1)],
+            [id_frame(16#0d, 2), id_frame(16#03, 3)],
+            [id_frame(16#0d, 2), id_frame(16#0d, 1)],
+            [roadrunner_quic_h3_frame:encode_goaway(0), roadrunner_quic_h3_frame:encode_goaway(4)]
+        ]
+    ).
+
 unknown_uni_stream_ignored(Config) ->
     %% RFC 9114 §6.2.3: an unknown unidirectional stream type is ignored
     %% (read and discarded); the connection keeps serving.
@@ -2581,6 +2636,16 @@ control_with_settings() ->
         roadrunner_quic_h3_frame:encode_stream_type(control),
         roadrunner_quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0})
     ]).
+
+%% A frame whose payload is one varint ID, for the client-only frames the
+%% native h3 codec has no encoder for (MAX_PUSH_ID 0x0d, CANCEL_PUSH 0x03).
+id_frame(Type, Id) ->
+    Payload = roadrunner_quic_varint:encode(Id),
+    [
+        roadrunner_quic_varint:encode(Type),
+        roadrunner_quic_varint:encode(iolist_size(Payload)),
+        Payload
+    ].
 
 ll_get(Conn, Path) ->
     Frame = roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(headers(~"GET", Path))),

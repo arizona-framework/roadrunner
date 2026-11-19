@@ -530,8 +530,8 @@ Notable differences:
   is_integer(Status)`, and pass other responses (stream, loop, WebSocket)
   through
 - Middlewares never write to the socket; they always return a response
-- Middlewares run once a route matches. The router's own `404` and `405`
-  answers do not go through them
+- Middlewares run once a route matches. The router's own `404`, `405` and
+  `OPTIONS *` answers do not go through them
 - Other built-in middlewares: `roadrunner_etag`, `roadrunner_security_headers`,
   and `roadrunner_cors`
 - Real client IP and per-client rate limits are listener options

@@ -149,8 +149,8 @@ Required:
 
 Routing (pick one):
 - `routes => module()`: single-handler dispatch. Every request
-  goes to `Module:handle/1` and `roadrunner_req:state/1`
-  returns `undefined`.
+  goes to `Module:handle/1` (`OPTIONS *` too, with `*` as its path)
+  and `roadrunner_req:state/1` returns `undefined`.
 - `routes => {module(), term()}`: single-handler dispatch with
   per-handler state. The opaque second element is reachable from
   the handler via `roadrunner_req:state/1`.
@@ -164,7 +164,9 @@ Routing (pick one):
   middlewares => [...]}` map. First match wins, so the specific
   route goes above the general one; a route the entries above it
   already answer in full is a config error and raises at listener
-  start rather than turning into a runtime 404.
+  start rather than turning into a runtime 404. `OPTIONS *` reaches
+  no route: the listener answers it itself (see
+  `roadrunner_router:match/3`).
 
 Whichever form is used, a handler that exports the optional
 `roadrunner_handler` callback `init_route/1` has it run once per route

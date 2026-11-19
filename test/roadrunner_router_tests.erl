@@ -609,6 +609,32 @@ match_method_mismatch_with_no_path_match_is_not_found_test() ->
     ),
     ?assertEqual(not_found, roadrunner_router:match(~"GET", ~"/nope", Compiled)).
 
+match_options_star_is_answered_by_the_router_test() ->
+    %% `OPTIONS *` is about the server, not a resource: it never reaches a
+    %% route, not even a root param or wildcard one that would match `*`,
+    %% and resolves to the router's own 200 with an empty body.
+    Compiled = roadrunner_router:compile(
+        [{~"/:id", id_handler}, {~"/*path", rest_handler}], []
+    ),
+    {ok, roadrunner_router, #{}, Pipeline, undefined} =
+        roadrunner_router:match(~"OPTIONS", ~"*", Compiled),
+    Req = #{method => ~"OPTIONS", path => ~"*"},
+    ?assertEqual({{200, [], ~""}, Req}, Pipeline(Req)),
+    %% Matched as a path with any other method, which no request parser
+    %% lets through, `*` is one segment like any other.
+    ?assertEqual(
+        {ok, id_handler, #{~"id" => ~"*"}, #{}},
+        match_no_pipeline(~"GET", ~"*", Compiled)
+    ).
+
+match_path_without_leading_slash_test() ->
+    %% A path given without its leading `/` matches as if it had one.
+    Compiled = roadrunner_router:compile([{~"/users/:id", user_handler}], []),
+    ?assertEqual(
+        {ok, user_handler, #{~"id" => ~"7"}, #{}},
+        match_no_pipeline(~"GET", ~"users/7", Compiled)
+    ).
+
 compile_rejects_empty_methods_list_test() ->
     %% An empty `methods` (a route that answers nothing) is a config error.
     ?assertError(

@@ -798,6 +798,12 @@ path matched but none answered the method, returns
 de-duplicated union of those routes' methods (for a `405` `Allow`
 header). Returns `not_found` when no compiled route's path matches at
 all.
+
+`OPTIONS *` asks about the server as a whole, not about a resource
+(RFC 9110 §9.3.7), so it never reaches a route, not even a `/:param`
+or `/*wildcard` one: it resolves to the router's own answer, a `200`
+with an empty body, and `Handler` is `roadrunner_router`. No middleware
+runs for it, as for a `404` or a `405`.
 """.
 -spec match(Method :: binary(), Path :: binary(), compiled()) ->
     {ok, module(), bindings(), roadrunner_middleware:next(), term()}
@@ -818,8 +824,10 @@ match(Method, Path, Compiled) ->
     {ok, module(), bindings(), roadrunner_middleware:next(), term(), limits()}
     | {method_not_allowed, [binary()]}
     | not_found.
-resolve(Method, Path, {Tree, Entries}) when is_binary(Method), is_binary(Path) ->
-    case collect(Tree, path_segments(Path), Method, #{}, []) of
+resolve(Method, <<$/, Rest/binary>>, {Tree, Entries}) when is_binary(Method) ->
+    %% An origin-form path, what every request but `OPTIONS *` carries. The
+    %% leading `/` is matched here instead of by the segment split.
+    case collect(Tree, path_segments(Rest), Method, #{}, []) of
         [] ->
             not_found;
         [{Index, Bindings}] when is_integer(Index) ->
@@ -827,7 +835,23 @@ resolve(Method, Path, {Tree, Entries}) when is_binary(Method), is_binary(Path) -
             answer(Index, Bindings, Entries);
         Matches ->
             select(Matches, Entries)
-    end.
+    end;
+resolve(~"OPTIONS", ~"*", _Compiled) ->
+    %% The asterisk-form, about the server rather than a resource (RFC 9110
+    %% §9.3.7). Only `OPTIONS` may carry it (RFC 9112 §3.2.4, RFC 9113
+    %% §8.3.1, RFC 9114 §4.3.1), so the request parsers reject it with any
+    %% other method.
+    {ok, ?MODULE, #{}, fun server_options/1, undefined, undefined};
+resolve(Method, Path, Compiled) when is_binary(Method), is_binary(Path) ->
+    %% A path given to `match/3` without its leading `/`.
+    resolve(Method, <<$/, Path/binary>>, Compiled).
+
+%% The answer to `OPTIONS *`: the server is up and speaks HTTP. It names
+%% no methods (no `Allow`), as which methods a server answers depends on
+%% the resource.
+-spec server_options(roadrunner_req:request()) -> roadrunner_handler:result().
+server_options(Req) ->
+    {{200, [], ~""}, Req}.
 
 %% Every path match for the segments, in no particular order (see
 %% `path_match()`). Bindings are built as the walk goes and only kept
@@ -1014,7 +1038,7 @@ decode_segment(Segment) ->
         {error, badarg} -> Segment
     end.
 
-%% A path of up to 32 bytes is split by a byte walk: request paths are
+%% A path (past its leading `/`) of up to 32 bytes is split by a byte walk: request paths are
 %% usually that short, and there the walk is 1.3-5x faster than
 %% `binary:split/3` (no BIF call, no pattern lookup). Past that, the walk's
 %% per-segment cost overtakes the BIF's fixed one, so a longer path takes
