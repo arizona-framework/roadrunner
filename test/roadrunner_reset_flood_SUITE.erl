@@ -5,7 +5,8 @@ HTTP/2 rapid reset attack, CVE-2023-44487, and its HTTP/3 form) gets no
 more handlers running at once on a connection than the connection's stream
 limit. Before an HTTP/2 client acknowledges our SETTINGS that limit is not
 in force yet (RFC 9113 §6.5.2), so the streams it opens with its preface
-are served, up to a fixed bound held the same way. The handler
+are served, up to a fixed bound, but run no more at once than the limit:
+the rest wait their turn. The handler
 (`roadrunner_h2_slot_handler`) announces itself and runs until released,
 ignoring the reset, so each one stands for work a client abandons.
 """.
@@ -28,6 +29,10 @@ ignoring the reset, so each one stands for work a client abandons.
     h2_over_limit_after_settings_ack_is_refused/1,
     h2_burst_past_the_pre_settings_bound_is_refused/1,
     h2_reset_flood_before_settings_ack_gets_goaway/1,
+    h2_queued_stream_reset_is_dropped/1,
+    h2_queued_stream_gets_its_body/1,
+    h2_queued_manual_stream_reads_its_body/1,
+    h2_drain_serves_queued_streams/1,
     h3_reset_handlers_hold_the_stream_credit/1,
     h3_credit_frees_when_a_reset_handler_ends/1,
     h3_reset_at_a_normal_rate_is_served/1,
@@ -61,6 +66,10 @@ all() ->
         h2_over_limit_after_settings_ack_is_refused,
         h2_burst_past_the_pre_settings_bound_is_refused,
         h2_reset_flood_before_settings_ack_gets_goaway,
+        h2_queued_stream_reset_is_dropped,
+        h2_queued_stream_gets_its_body,
+        h2_queued_manual_stream_reads_its_body,
+        h2_drain_serves_queued_streams,
         h3_reset_handlers_hold_the_stream_credit,
         h3_credit_frees_when_a_reset_handler_ends,
         h3_reset_at_a_normal_rate_is_served,
@@ -71,14 +80,20 @@ all() ->
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
     {ok, _} = application:ensure_all_started(ssl),
-    Config.
+    %% Stream workers other suites left running, which this one does not
+    %% count (`stream_workers/0`).
+    [{other_workers, stream_workers()} | Config].
 
 end_per_suite(_Config) ->
     ok.
 
 init_per_testcase(Case, Config) ->
+    %% `stop_all/0` kills the previous case's handlers without waiting:
+    %% start once their workers are gone, so none is counted here.
+    _ = put(other_workers, ?config(other_workers, Config)),
+    ok = await_down([monitor(process, P) || P <- stream_workers()]),
     true = register(?COLLECTOR, self()),
-    {ok, _} = roadrunner_listener:start_link(?MODULE, listener_opts(protocol(Case))),
+    {ok, _} = roadrunner_listener:start_link(?MODULE, listener_opts(Case, protocol(Case))),
     [{port, roadrunner_listener:port(?MODULE)} | Config].
 
 end_per_testcase(_Case, _Config) ->
@@ -93,7 +108,16 @@ protocol(Case) ->
         <<"h3_", _/binary>> -> http3
     end.
 
-listener_opts(http2) ->
+listener_opts(h2_queued_manual_stream_reads_its_body, http2) ->
+    Opts = listener_opts(any, http2),
+    Opts#{
+        body_buffering => manual,
+        routes => [
+            {~"/", roadrunner_h2_slot_handler},
+            {~"/echo", roadrunner_manual_body_handler, read}
+        ]
+    };
+listener_opts(_Case, http2) ->
     #{
         port => 0,
         %% The client syncs on PINGs (`ping_sync/1`) after frames that
@@ -101,10 +125,11 @@ listener_opts(http2) ->
         protocols => [{http2, #{max_concurrent_streams => ?MAX_STREAMS, ping_policy => false}}],
         routes => [
             {~"/", roadrunner_h2_slot_handler},
-            {~"/answered", roadrunner_answer_then_hold_handler}
+            {~"/answered", roadrunner_answer_then_hold_handler},
+            {~"/echo", roadrunner_echo_body_handler}
         ]
     };
-listener_opts(http3) ->
+listener_opts(_Case, http3) ->
     #{
         port => 0,
         protocols => [{http3, #{max_streams_bidi => ?MAX_STREAMS}}],
@@ -238,54 +263,50 @@ h2_reset_of_an_answered_stream_frees_it(Config) ->
     {_, _} = ping_sync(C2).
 
 h2_burst_before_settings_ack_is_served(Config) ->
-    %% The preface, SETTINGS and twice the limit's worth of requests in one
-    %% write, before the client could have read our SETTINGS: the limit is
-    %% not in force yet (RFC 9113 §6.5.2), so every request is served.
-    Ids = stream_ids(1, 2 * ?MAX_STREAMS),
-    C0 = burst(Config, Ids, false),
-    Handlers = handlers_started(2 * ?MAX_STREAMS),
-    {Frames, C1} = ping_sync(C0),
+    %% The preface, SETTINGS and eight times the limit's worth of requests
+    %% in one write, before the client could have read our SETTINGS: the
+    %% limit is not in force yet (RFC 9113 §6.5.2), so every request is
+    %% served, but no more run at once than the limit: the rest wait and
+    %% start, oldest first, as running ones end.
+    Ids = stream_ids(1, 8 * ?MAX_STREAMS),
+    {Frames, C1} = ping_sync(burst(Config, Ids, false)),
     ?assertEqual([], [F || {rst_stream, _, _} = F <- Frames]),
-    release(Handlers),
-    ?assertEqual([{Id, 200} || Id <- Ids], lists:sort(responses(C1, length(Ids)))).
+    _ = serve_in_turn(C1, Ids).
 
 h2_over_limit_after_settings_ack_is_refused(Config) ->
     %% Once the client acknowledges our SETTINGS the limit is in force: the
-    %% streams it opened before stay and are served, and a new one over the
-    %% limit is refused.
+    %% streams it opened before stay and are served in turn, and a new one
+    %% is refused while they are open.
     Ids = stream_ids(1, 2 * ?MAX_STREAMS),
     C0 = settings_ack(burst(Config, Ids, false)),
-    Handlers = handlers_started(2 * ?MAX_STREAMS),
     Over = 4 * ?MAX_STREAMS + 1,
     {Frames, C1} = ping_sync(send_headers(C0, Over)),
     ?assertEqual([{rst_stream, Over, refused_stream}], [F || {rst_stream, _, _} = F <- Frames]),
-    release(Handlers),
-    ?assertEqual([{Id, 200} || Id <- Ids], lists:sort(responses(C1, length(Ids)))).
+    _ = serve_in_turn(C1, Ids).
 
 h2_burst_past_the_pre_settings_bound_is_refused(Config) ->
-    %% Before the ACK the streams a client may open are still bounded: past
-    %% the bound, the next one is refused (retry-safe, RFC 9113 §8.7).
+    %% Before the ACK the streams a client may open, running or waiting,
+    %% are still bounded: past the bound, the next one is refused
+    %% (retry-safe, RFC 9113 §8.7), and the ones within it are served.
     Ids = stream_ids(1, ?PRE_SETTINGS_STREAMS + 1),
-    C0 = burst(Config, Ids, false),
-    Handlers = handlers_started(?PRE_SETTINGS_STREAMS),
-    {Frames, _C1} = ping_sync(C0),
+    {Frames, C1} = ping_sync(burst(Config, Ids, false)),
     ?assertEqual(
         [{rst_stream, lists:last(Ids), refused_stream}],
         [F || {rst_stream, _, _} = F <- Frames]
     ),
-    release(Handlers).
+    _ = serve_in_turn(C1, lists:droplast(Ids)).
 
 h2_reset_flood_before_settings_ack_gets_goaway(Config) ->
     %% A rapid reset sent with the preface: the handlers of the reset
-    %% streams hold the pre-SETTINGS bound, the streams after it are
-    %% refused, and a client that keeps opening them is told to calm down.
-    Reset = stream_ids(1, ?PRE_SETTINGS_STREAMS),
-    C0 = burst(Config, Reset, true),
-    Handlers = handlers_started(?PRE_SETTINGS_STREAMS),
-    Refused = stream_ids(2 * ?PRE_SETTINGS_STREAMS + 1, ?PRE_SETTINGS_STREAMS),
-    Over = 4 * ?PRE_SETTINGS_STREAMS + 1,
-    C1 = lists:foldl(fun(Id, C) -> send_headers(C, Id) end, C0, Refused ++ [Over]),
-    {Frames, _C2} = until(C1, fun
+    %% streams hold the limit, so the streams after them are refused rather
+    %% than left waiting on work the client abandoned, and a client that
+    %% keeps opening them is told to calm down.
+    Reset = stream_ids(1, ?MAX_STREAMS),
+    Refused = stream_ids(2 * ?MAX_STREAMS + 1, ?MAX_STREAMS),
+    Over = 4 * ?MAX_STREAMS + 1,
+    C0 = burst(Config, Reset ++ Refused ++ [Over], true),
+    Handlers = handlers_started(?MAX_STREAMS),
+    {Frames, _C1} = until(C0, fun
         ({goaway, _, _, _}) -> true;
         (_) -> false
     end),
@@ -293,8 +314,63 @@ h2_reset_flood_before_settings_ack_gets_goaway(Config) ->
         [{rst_stream, Id, refused_stream} || Id <- Refused],
         [F || {rst_stream, _, _} = F <- Frames]
     ),
-    ?assertMatch({goaway, 2 * ?PRE_SETTINGS_STREAMS - 1, enhance_your_calm, _}, lists:last(Frames)),
+    ?assertMatch({goaway, 2 * ?MAX_STREAMS - 1, enhance_your_calm, _}, lists:last(Frames)),
     release(Handlers).
+
+h2_queued_stream_reset_is_dropped(Config) ->
+    %% A stream waiting its turn that the client resets is dropped: it
+    %% never starts a handler, and the next one waiting takes its turn.
+    Ids = stream_ids(1, 2 * ?MAX_STREAMS),
+    {Running, [Dropped | Waiting]} = lists:split(?MAX_STREAMS, Ids),
+    {Frames, C1} = ping_sync(send_rst(burst(Config, Ids, false), Dropped)),
+    ?assertEqual([], [F || {rst_stream, _, _} = F <- Frames]),
+    C2 = serve_in_turn(C1, Running, ?MAX_STREAMS),
+    _ = serve_in_turn(C2, Waiting, ?MAX_STREAMS).
+
+h2_queued_stream_gets_its_body(Config) ->
+    %% A request with a body sent while the limit is full waits its turn
+    %% with its whole body, and its handler gets it once it runs.
+    Ids = stream_ids(1, ?MAX_STREAMS),
+    Id = 2 * ?MAX_STREAMS + 1,
+    C0 = send_post(burst(Config, Ids, false), Id, ~"queued body"),
+    {[], C1} = rst_frames(ping_sync(C0)),
+    Handlers = handlers_started(?MAX_STREAMS),
+    workers_running(?MAX_STREAMS),
+    release(Handlers),
+    ?assertEqual({200, ~"queued body"}, echoed(C1, Id)).
+
+h2_queued_manual_stream_reads_its_body(Config) ->
+    %% In manual body mode a request waiting its turn has no handler to
+    %% read its body yet: the DATA it gets stays with the stream, within
+    %% its receive window, and is read once its handler runs.
+    Ids = stream_ids(1, ?MAX_STREAMS),
+    Id = 2 * ?MAX_STREAMS + 1,
+    C0 = send_post(burst(Config, Ids, false), Id, ~"queued body"),
+    {[], C1} = rst_frames(ping_sync(C0)),
+    Handlers = handlers_started(?MAX_STREAMS),
+    release(Handlers),
+    ?assertEqual({200, ~"11"}, echoed(C1, Id)).
+
+h2_drain_serves_queued_streams(Config) ->
+    %% A drain started while streams wait their turn serves them too: they
+    %% were opened before the final GOAWAY, so they run as the running ones
+    %% end, and the connection closes after the last.
+    Ids = stream_ids(1, 2 * ?MAX_STREAMS),
+    {_, #{sock := Sock} = C0} = ping_sync(burst(Config, Ids, false)),
+    ok = roadrunner_listener:notify_drain(?MODULE, erlang:monotonic_time(millisecond) + 30_000),
+    {Announced, C1} = until(C0, fun
+        ({ping, 0, _}) -> true;
+        (_) -> false
+    end),
+    {ping, 0, Opaque} = lists:last(Announced),
+    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
+    {Final, C2} = until(C1, fun
+        ({goaway, _, _, _}) -> true;
+        (_) -> false
+    end),
+    ?assertEqual({goaway, lists:last(Ids), no_error, <<>>}, lists:last(Final)),
+    #{buf := <<>>} = serve_in_turn(C2, Ids),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 5000)).
 
 %% =============================================================================
 %% HTTP/3
@@ -423,6 +499,60 @@ admitted(C0, Id) ->
         [{rst_stream, Id, refused_stream}] -> admitted(C2, Id + 2)
     end.
 
+%% Serve `Ids`, opened in that order and with the first `?MAX_STREAMS` of
+%% them running, the rest waiting: each turn, exactly the next
+%% `?MAX_STREAMS` have handlers running and no other starts until they
+%% end, so the streams run oldest first and never more than the limit at
+%% once.
+serve_in_turn(C, Ids) ->
+    serve_in_turn(C, Ids, ?MAX_STREAMS).
+
+serve_in_turn(C, [], _Turn) ->
+    C;
+serve_in_turn(C0, Ids, Turn) ->
+    {Running, Rest} = lists:split(min(Turn, length(Ids)), Ids),
+    Handlers = handlers_started(length(Running)),
+    workers_running(length(Running)),
+    Refs = [monitor(process, H) || H <- Handlers],
+    release(Handlers),
+    {Ended, C1} = responses_and_conn(C0, length(Running)),
+    ?assertEqual([{Id, 200} || Id <- Running], lists:sort(Ended)),
+    %% A handler runs in its stream's worker, which may outlive its
+    %% response for a moment: the next turn counts workers once it is gone.
+    ok = await_down(Refs),
+    serve_in_turn(C1, Rest, Turn).
+
+await_down(Refs) ->
+    lists:foreach(
+        fun(Ref) ->
+            receive
+                {'DOWN', Ref, process, _, _} -> ok
+            end
+        end,
+        Refs
+    ).
+
+%% The stream workers of this suite alive now.
+stream_workers() ->
+    Others =
+        case get(other_workers) of
+            undefined -> [];
+            Pids -> Pids
+        end,
+    [
+        P
+     || P <- processes(),
+        process_info(P, initial_call) =:=
+            {initial_call, {roadrunner_http2_stream_worker, init, 6}},
+        not lists:member(P, Others)
+    ].
+
+%% No more stream workers run than `Count`, the handlers announced: a
+%% stream waiting its turn has none. Every earlier one is gone, as the
+%% connection dispatches a waiting stream only on a running one's end.
+workers_running(Count) ->
+    ?assertEqual(Count, length(stream_workers())).
+
 handlers_started(0) ->
     [];
 handlers_started(N) ->
@@ -511,6 +641,31 @@ headers_frame(#{enc := Enc} = C, StreamId, Path) ->
     {Block, Enc1} = roadrunner_http2_hpack:encode(Fields, Enc),
     {roadrunner_http2_frame:encode({headers, StreamId, 16#05, undefined, Block}), C#{enc := Enc1}}.
 
+%% A POST of `Body` to `/echo`: HEADERS, then the body in a DATA frame
+%% with END_STREAM.
+send_post(#{sock := Sock, enc := Enc} = C, StreamId, Body) ->
+    Fields = [
+        {~":method", ~"POST"},
+        {~":scheme", ~"http"},
+        {~":authority", ~"x"},
+        {~":path", ~"/echo"}
+    ],
+    {Block, Enc1} = roadrunner_http2_hpack:encode(Fields, Enc),
+    ok = gen_tcp:send(Sock, [
+        roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block}),
+        roadrunner_http2_frame:encode({data, StreamId, 16#01, Body})
+    ]),
+    C#{enc := Enc1}.
+
+%% The RST_STREAM frames among `Frames`.
+rst_frames({Frames, C}) ->
+    {[F || {rst_stream, _, _} = F <- Frames], C}.
+
+%% Stream `StreamId`'s status and body.
+echoed(C, StreamId) ->
+    {Status, Body, _C1} = response(C, StreamId),
+    {Status, Body}.
+
 send_rst(#{sock := Sock} = C, StreamId) ->
     ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({rst_stream, StreamId, cancel})),
     C.
@@ -549,12 +704,13 @@ response(C, StreamId, Status, Body) ->
     end.
 
 %% The `{StreamId, Status}` of each of the next `Count` responses to end,
-%% in the order they end, however their frames interleave.
-responses(C, Count) ->
+%% in the order they end, however their frames interleave, and the
+%% connection after them.
+responses_and_conn(C, Count) ->
     responses(C, Count, #{}).
 
-responses(_C, 0, _Statuses) ->
-    [];
+responses(C, 0, _Statuses) ->
+    {[], C};
 responses(C, Count, Statuses) ->
     case next_frame(C) of
         {{headers, StreamId, Flags, Headers}, C1} ->
@@ -569,7 +725,8 @@ responses(C, Count, Statuses) ->
 
 ended(C, Count, Statuses, StreamId, Flags) when Flags band 16#01 =/= 0 ->
     #{StreamId := Status} = Statuses,
-    [{StreamId, Status} | responses(C, Count - 1, Statuses)];
+    {Ended, C1} = responses(C, Count - 1, Statuses),
+    {[{StreamId, Status} | Ended], C1};
 ended(C, Count, Statuses, _StreamId, _Flags) ->
     responses(C, Count, Statuses).
 

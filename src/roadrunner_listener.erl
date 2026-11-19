@@ -835,10 +835,13 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   its response is complete still counts while its handler runs, and a
   client that keeps opening streams while such handlers alone fill the
   limit gets `GOAWAY(ENHANCE_YOUR_CALM)` (the HTTP/2 rapid reset
-  attack). The limit applies once the client acknowledges our
-  SETTINGS: streams it opens before then, as in a burst sent with its
-  preface, are held to 100 when the limit is lower (RFC 9113 §6.5.2).
-  Default `100`.
+  attack). The limit applies to new streams once the client
+  acknowledges our SETTINGS: streams it opens before then, as in a burst
+  sent with its preface, are held to 100 when the limit is lower (RFC
+  9113 §6.5.2), and those over the limit wait their turn instead of all
+  running, so at most the limit run at once while any wait (a handler
+  still finishing after its response may briefly go past it, as at any
+  time). Default `100`.
 - `max_header_block` — cumulative cap on a request's assembled
   HEADERS+CONTINUATION block; an over-cap request gets `431` +
   `RST_STREAM(NO_ERROR)` and the connection serves on. A block over the

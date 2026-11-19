@@ -63,9 +63,11 @@
 %% that sends a burst of requests along with its preface, before it has
 %% read our SETTINGS, is not refused for it. The streams it opens then are
 %% held to `?PRE_SETTINGS_STREAMS`, or the advertised limit when that is
-%% higher, the same way, rapid reset guard included; once the ACK
-%% arrives, new streams are held to the advertised limit and the ones
-%% already open run to their end.
+%% higher, but no more handlers run at once than the advertised limit: a
+%% stream over it waits, decoded but not dispatched, and is dispatched as
+%% a running one ends, oldest first (`queued`). Once the ACK arrives, new
+%% streams over the advertised limit are refused, and the ones already
+%% open run to their end.
 %%
 %% Client header limit (RFC 9113 §6.5.2): a client that sent
 %% SETTINGS_MAX_HEADER_LIST_SIZE may treat a larger header section as
@@ -219,9 +221,11 @@
 %% SETTINGS, when we advertise fewer (`stream_limit`). RFC 9113 §6.5.2
 %% recommends SETTINGS_MAX_CONCURRENT_STREAMS be no smaller than 100, so a
 %% client that starts sending before it has our SETTINGS typically allows
-%% itself 100 streams. A client that never acknowledges stays held to this
-%% many, and one that opens more is refused with the retry-safe
-%% REFUSED_STREAM (§8.7), so it bounds what a connection can hold.
+%% itself 100 streams. Those over `max_concurrent_streams` wait for a
+%% running one to end (`queued`). A client that never acknowledges stays
+%% held to this many, and one that opens more is refused with the
+%% retry-safe REFUSED_STREAM (§8.7), so it bounds what a connection can
+%% hold.
 -define(PRE_SETTINGS_STREAMS, 100).
 
 -define(GOAWAY(LastStreamId, ErrorCode),
@@ -382,7 +386,8 @@
     %% has acknowledged our SETTINGS, and until then at least
     %% `?PRE_SETTINGS_STREAMS` (RFC 9113 §6.5.2: the limit is initially
     %% unlimited), so streams a client opened before it could know our
-    %% limit are not refused for it.
+    %% limit are not refused for it. Those over `max_concurrent_streams`
+    %% wait their turn (`queued`).
     stream_limit = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
     %% Streams currently counting toward `max_concurrent_streams` — the
     %% entries whose `counted` flag is still set. Tracked separately from
@@ -401,7 +406,7 @@
     %% attack, CVE-2023-44487), and run any number of handlers at once.
     reset_workers = #{} :: #{reference() => []},
     %% Streams refused while `reset_workers` alone held the whole limit, since
-    %% the last one of those workers ended. Past `stream_limit` the
+    %% the last one of those workers ended. Past `max_concurrent_streams` the
     %% client is resetting far beyond the limit and gets
     %% GOAWAY(ENHANCE_YOUR_CALM) (`refuse_over_limit/5`).
     reset_refusals = 0 :: non_neg_integer(),
@@ -492,6 +497,12 @@
     %% releases slots by processing its own workers' `DOWN` messages, so
     %% a blocked loop would wait on something only it can deliver.
     awaiting_slot = #{} :: #{stream_id() => roadrunner_req:request()},
+    %% Streams ready to dispatch that wait for a handler to end, oldest
+    %% first, with the body each is dispatched with: ones the client opened
+    %% before it acknowledged our SETTINGS, over `max_concurrent_streams`
+    %% (`dispatch_request/5`). They hold no worker and no in-flight slot;
+    %% `run_queued/1` dispatches them as handlers end.
+    queued = queue:new() :: queue:queue({stream_id(), {body, iodata()} | reader}),
     %% Whether a request ever parked here: the conn's exit then goes through
     %% the slot keeper, which withdraws what it parked before emptying its
     %% cell, so a grant on its way is released rather than lost.
@@ -838,7 +849,9 @@ frame_loop(#loop{buffer = Buf} = State) ->
         {ok, Frame, Rest} ->
             handle_frame(Frame, State#loop{buffer = Rest});
         {more, _Need} ->
-            arm_and_recv(State);
+            %% A request parked for an in-flight slot that the frames just
+            %% read dropped may leave room for a queued stream.
+            arm_and_recv(run_queued(State));
         {error, _} ->
             goaway_exit(State, protocol_error)
     end.
@@ -898,11 +911,13 @@ recv_more(
         {roadrunner_cancel_stream, StreamId} ->
             recv_more(maybe_exit_when_drained(cancel_stream(State, StreamId)));
         {'DOWN', MonRef, process, Pid, Reason} ->
-            recv_more(maybe_exit_when_drained(handle_worker_down(State, MonRef, Pid, Reason)));
+            recv_more(
+                run_queued(maybe_exit_when_drained(handle_worker_down(State, MonRef, Pid, Reason)))
+            );
         {roadrunner_slot, StreamId, Outcome} ->
             %% A refused park drops its stream, which may be the last one
             %% a draining conn was waiting on.
-            recv_more(maybe_exit_when_drained(handle_slot(State, StreamId, Outcome)));
+            recv_more(run_queued(maybe_exit_when_drained(handle_slot(State, StreamId, Outcome))));
         {roadrunner_drain, Deadline} ->
             recv_more(start_drain(State, Deadline));
         {timeout, TRef, {?MODULE, Timer}} ->
@@ -1440,8 +1455,8 @@ handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
     case Streams of
         #{StreamId := #stream{worker_ref = undefined}} ->
             %% No handler runs for it (its body was still to come, it
-            %% waited for a slot, or its handler ended with DATA still
-            %% queued), so the rapid reset guard does not see it: the
+            %% waited for a slot or its turn in `queued`, or its handler
+            %% ended with DATA still queued), so the rapid reset guard does not see it: the
             %% reset serves nothing.
             frame_loop(drop_reset_stream(control_frame(State), StreamId));
         #{StreamId := _} ->
@@ -1594,11 +1609,20 @@ on_headers(
     Flags,
     _Priority,
     Fragment,
-    #loop{live_streams = Live, reset_workers = Reset, stream_limit = Limit} = State
+    #loop{
+        live_streams = Live,
+        reset_workers = Reset,
+        stream_limit = Limit,
+        max_concurrent_streams = Max
+    } = State
 ) when
-    Live + map_size(Reset) >= Limit
+    Live + map_size(Reset) >= Limit; map_size(Reset) >= Max
 ->
-    refuse_over_limit(StreamId, Flags, Fragment, map_size(Reset) >= Limit, State);
+    %% Before the client acknowledges our SETTINGS `Limit` may be above
+    %% `Max`, but the handlers of reset streams alone filling `Max` leave a
+    %% new stream nothing to run on: it would only wait behind work the
+    %% client abandoned, so it is refused as it would be after the ACK.
+    refuse_over_limit(StreamId, Flags, Fragment, map_size(Reset) >= Max, State);
 on_headers(StreamId, Flags, _Priority, Fragment, State) ->
     EndHeaders = (Flags band 16#04) =/= 0,
     EndStream = (Flags band 16#01) =/= 0,
@@ -1631,7 +1655,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
 %% the client may retry (RFC 9113 §8.7). When the handlers of reset streams
 %% fill the whole limit on their own (the `true` clauses), the client has no stream
 %% left that it waits on and nothing it opens can be admitted until one of
-%% those handlers ends. `stream_limit` refusals in that state,
+%% those handlers ends. `max_concurrent_streams` refusals in that state,
 %% with none of the handlers ending in between, mean it keeps opening
 %% streams far beyond the limit: the connection ends with
 %% GOAWAY(ENHANCE_YOUR_CALM), the code for a peer exhausting resources
@@ -1642,7 +1666,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
 -spec refuse_over_limit(stream_id(), non_neg_integer(), binary(), boolean(), #loop{}) ->
     no_return().
 refuse_over_limit(_StreamId, _Flags, _Fragment, true, #loop{reset_refusals = Refusals} = State) when
-    Refusals >= State#loop.stream_limit
+    Refusals >= State#loop.max_concurrent_streams
 ->
     goaway_exit(State, enhance_your_calm);
 refuse_over_limit(StreamId, Flags, Fragment, true, #loop{reset_refusals = Refusals} = State) ->
@@ -2396,15 +2420,78 @@ dispatch_reading(StreamId, ContinueOwed, #loop{streams = Streams} = State) ->
             dispatch_request(StreamId, Reading, Headers, reader, State)
     end.
 
-%% Build the request of `Stream` (already in the state it is dispatched
-%% in) and admit it: refused over its rate, then given a worker, parked for
-%% an in-flight slot, or refused over the ceiling. Its body is `{body, _}`
-%% (buffered) or `reader` (manual mode).
+%% Dispatch `Stream` (already in the state it is dispatched in), or queue
+%% it while the handlers running fill `max_concurrent_streams`
+%% (`must_wait/1`): a stream the client opened before it acknowledged our
+%% SETTINGS, over the limit, waits for its turn instead of running at once
+%% (`run_queued/1`). Its body is `{body, _}` (buffered) or `reader`
+%% (manual mode).
 -spec dispatch_request(
     stream_id(), #stream{}, roadrunner_http:headers(), {body, iodata()} | reader, #loop{}
 ) ->
     no_return().
-dispatch_request(
+dispatch_request(StreamId, Stream, Headers, Body, State) ->
+    case must_wait(State) of
+        false ->
+            frame_loop(start_request(StreamId, Stream, Headers, Body, State));
+        true ->
+            frame_loop(State#loop{
+                streams = (State#loop.streams)#{
+                    StreamId := Stream#stream{headers_at = headers_at(Stream)}
+                },
+                queued = queue:in({StreamId, Body}, State#loop.queued)
+            })
+    end.
+
+%% Whether a stream ready to dispatch waits in `queued`: behind the ones
+%% already there, or, before the client acknowledged our SETTINGS (the
+%% only time it may have more streams open than `max_concurrent_streams`),
+%% while the running handlers fill the limit. Workers count until their
+%% `DOWN`, reset ones included, as do requests parked for an in-flight slot,
+%% which start a handler once granted.
+-spec must_wait(#loop{}) -> boolean().
+must_wait(#loop{stream_limit = Max, max_concurrent_streams = Max, queued = Queued}) ->
+    not queue:is_empty(Queued);
+must_wait(#loop{queued = Queued} = State) ->
+    not queue:is_empty(Queued) orelse not has_room(State).
+
+%% Whether one more handler fits within `max_concurrent_streams`.
+-spec has_room(#loop{}) -> boolean().
+has_room(#loop{max_concurrent_streams = Max, workers = Workers, awaiting_slot = Awaiting}) ->
+    map_size(Workers) + map_size(Awaiting) < Max.
+
+%% Dispatch the queued streams, oldest first, while handlers fit. Called
+%% once a handler may have ended (a worker's `DOWN`, a parked request
+%% refused or withdrawn). A stream dispatched here may be refused (its
+%% rate, the in-flight ceiling), which may leave a draining conn done.
+-spec run_queued(#loop{}) -> #loop{}.
+run_queued(#loop{queued = Queued} = State) ->
+    case queue:is_empty(Queued) of
+        true -> State;
+        false -> maybe_exit_when_drained(dispatch_queued(State))
+    end.
+
+-spec dispatch_queued(#loop{}) -> #loop{}.
+dispatch_queued(#loop{queued = Queued, streams = Streams} = State) ->
+    %% Nothing more to dispatch with no room left, or none waiting.
+    case has_room(State) andalso queue:out(Queued) of
+        {{value, {StreamId, Body}}, Rest} ->
+            #{StreamId := #stream{headers = Headers} = Stream} = Streams,
+            dispatch_queued(
+                start_request(StreamId, Stream, Headers, Body, State#loop{queued = Rest})
+            );
+        _ ->
+            State
+    end.
+
+%% Build the request of `Stream` and admit it: refused over its rate, then
+%% given a worker, parked for an in-flight slot, or refused over the
+%% ceiling.
+-spec start_request(
+    stream_id(), #stream{}, roadrunner_http:headers(), {body, iodata()} | reader, #loop{}
+) ->
+    #loop{}.
+start_request(
     StreamId,
     Stream,
     Headers,
@@ -2443,9 +2530,7 @@ dispatch_request(
                     %% no worker spawned. 429 (not REFUSED_STREAM) so the
                     %% client backs off per Retry-After instead of
                     %% retrying the stream immediately.
-                    frame_loop(
-                        remove_reset_stream(State1#loop{req_id_buffer = NewBuf}, StreamId)
-                    );
+                    remove_reset_stream(State1#loop{req_id_buffer = NewBuf}, StreamId);
                 ok ->
                     case
                         roadrunner_conn:acquire_request_slot(
@@ -2458,11 +2543,11 @@ dispatch_request(
                                 worker_pid = WorkerPid,
                                 worker_ref = MonRef
                             },
-                            frame_loop(State#loop{
+                            State#loop{
                                 req_id_buffer = NewBuf,
                                 streams = Streams#{StreamId := Stream1},
                                 workers = (State#loop.workers)#{WorkerPid => StreamId}
-                            });
+                            };
                         queued ->
                             %% Over the ceiling, but this listener
                             %% parks rather than sheds. Keep the
@@ -2470,12 +2555,12 @@ dispatch_request(
                             %% frame loop; the grant arrives as a
                             %% message.
                             Awaiting = State#loop.awaiting_slot,
-                            frame_loop(State#loop{
+                            State#loop{
                                 req_id_buffer = NewBuf,
                                 streams = Streams#{StreamId := Stream},
                                 awaiting_slot = Awaiting#{StreamId => Req},
                                 parked = true
-                            });
+                            };
                         false ->
                             %% Listener-wide in-flight ceiling reached —
                             %% refuse with retry-safe REFUSED_STREAM, no
@@ -2483,7 +2568,7 @@ dispatch_request(
                             StateBuf = State#loop{req_id_buffer = NewBuf},
                             ok = throttle_stream(StateBuf, ListenerName),
                             _ = send_rst_stream(StateBuf, StreamId, refused_stream),
-                            frame_loop(remove_reset_stream(StateBuf, StreamId));
+                            remove_reset_stream(StateBuf, StreamId);
                         {shed, RetryAfter} ->
                             %% Over the ceiling on a shed listener: 503 +
                             %% Retry-After, no worker spawned, so the client
@@ -2491,7 +2576,7 @@ dispatch_request(
                             StateBuf = State#loop{req_id_buffer = NewBuf},
                             ok = throttle_stream(StateBuf, ListenerName),
                             State1 = retry_later(StateBuf, StreamId, 503, RetryAfter),
-                            frame_loop(remove_reset_stream(State1, StreamId))
+                            remove_reset_stream(State1, StreamId)
                     end
             end;
         {error, Reason} when Reason =:= not_implemented; Reason =:= unsupported_expectation ->
@@ -2501,10 +2586,10 @@ dispatch_request(
             Status = roadrunner_conn:parse_error_status(Reason),
             State1 = encode_and_send_response_atomic(State, StreamId, Status, [], ~"", 0),
             _ = send_rst_stream(State1, StreamId, no_error),
-            frame_loop(remove_reset_stream(State1#loop{req_id_buffer = NewBuf}, StreamId));
+            remove_reset_stream(State1#loop{req_id_buffer = NewBuf}, StreamId);
         {error, _Reason} ->
             _ = send_rst_stream(State, StreamId, protocol_error),
-            frame_loop(remove_reset_stream(State#loop{req_id_buffer = NewBuf}, StreamId))
+            remove_reset_stream(State#loop{req_id_buffer = NewBuf}, StreamId)
     end.
 
 %% When the request's header block was decoded: noted on a stream whose
@@ -3361,8 +3446,9 @@ forget_stream(#loop{awaiting_continuation = StreamId}, StreamId, Streams) ->
 forget_stream(_State, StreamId, Streams) ->
     maps:remove(StreamId, Streams).
 
-%% Withdraw a request parked for a slot. Every path that drops a stream
-%% goes through here, so `awaiting_slot` never outlives its stream entry
+%% Withdraw a request parked for a slot, or a stream waiting in `queued`.
+%% Every path that drops a stream goes through here, so neither
+%% `awaiting_slot` nor `queued` outlives its stream entry
 %% and a grant can always find the stream it was granted for. A grant
 %% already in flight still arrives; `handle_slot/3` gives that slot back.
 -spec withdraw_parked(#loop{}, stream_id()) -> #loop{}.
@@ -3372,7 +3458,20 @@ withdraw_parked(#loop{awaiting_slot = Awaiting, overload = Overload} = State, St
             ok = roadrunner_conn:cancel_slot_wait(Overload, StreamId),
             State#loop{awaiting_slot = maps:remove(StreamId, Awaiting)};
         _ ->
-            State
+            unqueue(State, StreamId)
+    end.
+
+%% Take a stream out of `queued`, so the queue never outlives its stream
+%% entry either. The queue is empty but for a connection whose client
+%% opened streams before it acknowledged our SETTINGS, and bounded by the
+%% streams it may hold then.
+-spec unqueue(#loop{}, stream_id()) -> #loop{}.
+unqueue(#loop{queued = Queued} = State, StreamId) ->
+    case queue:is_empty(Queued) of
+        true ->
+            State;
+        false ->
+            State#loop{queued = queue:filter(fun({Id, _Body}) -> Id =/= StreamId end, Queued)}
     end.
 
 %% A parked stream's admission resolved. `granted` means the queue has
