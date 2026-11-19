@@ -430,10 +430,14 @@ An HTTP/2 client may open streams before it has read the connection's
 SETTINGS, so it cannot know `max_concurrent_streams` yet (RFC 9113
 §6.5.2 makes the limit unlimited until then). Such a burst is served, up
 to 100 streams when the limit is lower, and the limit applies to new
-streams once the client acknowledges the SETTINGS. A small
-`max_concurrent_streams` therefore does not bound a connection below 100
-streams until its client acknowledges the SETTINGS, and a client that
-never does keeps that bound; `max_concurrent_requests` does.
+streams once the client acknowledges the SETTINGS. Streams of the burst
+over the limit wait their turn instead of all running: each is decoded
+but not dispatched until a running one ends, oldest first, so at most
+`max_concurrent_streams` handlers run at once while any wait (a handler
+still finishing after its response is sent may briefly go past it, as it
+may at any time). Before the acknowledgement a connection holds at most
+100 streams, running or waiting, or `max_concurrent_streams` when that is
+higher; streams past that are refused.
 
 `overload_mode` picks what a request over the ceiling gets. `refuse`, the
 default, is the refusal above. `{queue, #{max_queued => N, timeout =>
