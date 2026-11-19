@@ -28,7 +28,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-H3SPEC_VERSION="v0.1.14"
+H3SPEC_VERSION="v0.1.15"
 
 # Cases the server fails, empty when it passes them all. Each one is a
 # conformance gap, skipped so the run still gates every other case; list a
@@ -39,11 +39,11 @@ KNOWN_FAILURES=()
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)
         ASSET="h3spec-linux-x86_64"
-        SHA256="7f2e3232715a3f6ff5212d408b2a3e74d6aa3ca06f96efca9a4e5dc55f3c6860"
+        SHA256="c3c5f497153f4ba81f82023791ba7f9a4bc46d4141211e614196f141c5996830"
         ;;
     Darwin-arm64)
         ASSET="h3spec-mac-arm64"
-        SHA256="1d76372c74b5fbc28256229e01135f7c878045b8b0a1dc578eaa866e10df140a"
+        SHA256="a8ca5692abd82ffe09c9f8595b91b87a1700acd6900617b81d8434558006ac32"
         ;;
     *)
         echo "no h3spec release binary for $(uname -s)-$(uname -m)" >&2
