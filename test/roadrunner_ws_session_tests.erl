@@ -2247,8 +2247,8 @@ empty_text_frame_round_trips_test() ->
 continuation_with_invalid_utf8_at_fin_closes_1007_test() ->
     %% Multi-fragment text message; final continuation fragment
     %% contains an invalid UTF-8 byte. Wire-level skips continuation
-    %% frames (peek matches opcode=text only), so fragment-level
-    %% validate_fin_fragment runs and catches the error.
+    %% frames (peek matches opcode=text only), so the continuation's
+    %% own UTF-8 check runs and catches the error.
     Self = self(),
     Tag = make_ref(),
     F1 = uncompressed_fragment(text, ~"hello", false),
@@ -2401,8 +2401,7 @@ invalid_leader_f5_closes_immediately_test() ->
 incomplete_utf8_at_fin_closes_with_1007_test() ->
     %% A text message that ends with a partial multi-byte sequence
     %% (no continuation bytes following) is invalid at FIN per
-    %% RFC 6455 §8.1. Validates the validate_fin_fragment incomplete
-    %% branch.
+    %% RFC 6455 §8.1. Covers the incomplete-sequence check at FIN.
     Self = self(),
     Tag = make_ref(),
     %% Single-fragment, FIN=1, payload ends mid-codepoint.

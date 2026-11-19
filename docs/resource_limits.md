@@ -92,9 +92,18 @@ Notes:
   buffer is fixed
 - `max_message_size` must be `>= max_frame_size`; a listener configured
   otherwise refuses to start
+- a fragmented message is held in about as many bytes as it has
+  received, so the most one connection holds for an unfinished message
+  is close to `max_message_size`. Plan memory for connections ×
+  `max_message_size` (10 MB × 1,000 connections is 10 GB), or lower the
+  cap when messages are small: 1 MB or less suits most chat and
+  live-update traffic
+- a continuation frame that would take its message over
+  `max_message_size` closes the connection on its header, before its
+  payload is read
 - each fragment is charged at least a small fixed overhead toward
-  `max_message_size`, so a flood of empty or tiny continuation frames is
-  bounded by the cap, not just the total payload bytes
+  `max_message_size`, so a flood of empty or tiny continuation frames
+  still reaches the cap
 - permessage-deflate is inflated in bounded chunks against
   `max_message_size`, so a small high-ratio frame cannot expand into
   gigabytes before the cap fires
