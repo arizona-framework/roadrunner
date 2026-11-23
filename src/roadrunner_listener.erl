@@ -461,6 +461,19 @@ Optional middleware and timing knobs (durations in milliseconds):
   Values above `recv_buffer` are lowered to it. An idle TLS connection
   holds no read buffer, so TLS listeners do not use it. See the
   `buffer` note in `base_listen_opts/2`.
+- `kernel_recv_buffer`: the kernel receive buffer (`SO_RCVBUF`) of
+  every TCP connection, in bytes; Linux doubles the value for its own
+  bookkeeping. Unset (the default), the operating system sizes it and
+  grows it for a client sending faster than the server reads, up to its
+  own maximum (`net.ipv4.tcp_rmem` on Linux). That memory lives outside
+  the Erlang VM, so it does not show in `erlang:memory/0` but counts
+  against a container's limit. A fixed size caps it per connection, at
+  the cost of upload speed: a connection receives at most the buffer
+  per round trip (64 KB on a 50 ms link is about 1.3 MB/s), and large
+  uploads are measurably slower even on a local link. Set it only for
+  many connections sending small requests, where memory matters more
+  than upload speed. Unlike `recv_buffer`, which sizes the Erlang VM's
+  own read buffer, this is the kernel's.
 - `min_bytes_per_second`: slow-loris guard on HTTP/1.1 request
   heads and bodies (0 disables). Default 100. After a 1 s grace from a
   request's first byte, the head's bytes so far must average at least
@@ -650,6 +663,7 @@ ops-tuning rationale.
     ipv6_v6only => boolean(),
     recv_buffer => pos_integer(),
     idle_recv_buffer => pos_integer(),
+    kernel_recv_buffer => positive_limit(),
     min_bytes_per_second => non_neg_integer(),
     body_buffering => body_buffering(),
     slot_reconciliation => disabled | #{interval := pos_integer()},
@@ -1952,13 +1966,28 @@ base_listen_opts(Opts, Buffer) ->
         {reuseaddr, true},
         {packet, raw},
         {nodelay, true},
-        {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)},
-        {buffer, Buffer}
+        {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)}
+        | kernel_recv_buffer(Opts, [{buffer, Buffer}])
     ],
     %% Both `gen_tcp:listen/2` and `ssl:listen/2` accept the bind
     %% options, and the TLS path builds on this list, so a loopback bind
     %% covers HTTP and HTTPS alike.
     bind_opts(Opts, Base).
+
+%% `SocketOpts` with the `recbuf` the `kernel_recv_buffer` opt sets, when
+%% set; every accepted socket inherits it from the listen socket. The inet
+%% `buffer` keeps its size: `recbuf` raises it only on a socket whose
+%% `buffer` was never set, and these listen options always set it.
+-spec kernel_recv_buffer(opts(), [Opt]) -> [Opt | {recbuf, positive_limit()}].
+kernel_recv_buffer(Opts, SocketOpts) ->
+    case Opts of
+        #{kernel_recv_buffer := N} when is_integer(N), N >= 1, N =< ?MAX_LIMIT ->
+            [{recbuf, N} | SocketOpts];
+        #{kernel_recv_buffer := Bad} ->
+            error({invalid_listener_opt, kernel_recv_buffer, Bad});
+        #{} ->
+            SocketOpts
+    end.
 
 %% `SocketOpts` with the options for the address a listener binds,
 %% `{ip, IP}` and `{ipv6_v6only, Bool}`, each only when the caller set it,

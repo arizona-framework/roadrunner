@@ -390,6 +390,7 @@ table.
 | `accept_priority` | `high` | yes | how quickly new connections leave the kernel queue under load (TCP only); see [Accepting connections](#accepting-connections) |
 | `recv_buffer` | 64 KB | yes | the most one read takes: every read on TLS, a plain-TCP connection once a large request body comes in, a large WebSocket frame |
 | `idle_recv_buffer` | 4 KB | yes | the read buffer a plain-TCP connection starts with, and what it holds while it waits for the next request or message |
+| `kernel_recv_buffer` | unset (the operating system sizes it) | yes | the kernel receive buffer (`SO_RCVBUF`) of every TCP connection: less kernel memory per connection, slower large uploads |
 | `max_clients` | 16384 | yes | concurrent connection cap per listener |
 | `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3, every protocol in `shed` mode) |
 | `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |
