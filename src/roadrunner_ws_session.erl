@@ -239,11 +239,12 @@
     %% About how many bytes `out` holds (its payloads), so its send does not
     %% measure it again (`roadrunner_transport:send/3`).
     out_size = 0 :: non_neg_integer(),
-    %% Pongs queued on `out` since the last flush. Past `?MAX_PONGS`, a
-    %% ping read before the flush is answered only by the pong for the
-    %% latest one (RFC 6455 §5.5.3): `pong` holds its payload, and
-    %% `flush_out/1` writes it ahead of `out`. A client that floods pings
-    %% and reads nothing queues a few pongs per flush, not one per ping.
+    %% Pongs queued on `out` since the last flush. Past `?MAX_PONGS`, the
+    %% pings read before the flush are answered only by the pong for the
+    %% latest one (RFC 6455 §5.5.3): `pong` holds its payload until
+    %% `release_pong/1` queues it last. A client that floods pings and
+    %% reads nothing queues at most 17 pongs per flush, not one per ping
+    %% (`queue_pong/2`).
     pongs = 0 :: non_neg_integer(),
     pong = undefined :: binary() | undefined,
     %% How the socket is read: `once` re-arms after every message, `N`
@@ -1937,6 +1938,10 @@ payload_size(#{payload := P}) -> byte_size(P).
 %% RSV1 even inside a compressed message (we never emit a
 %% multi-fragment outbound message anyway, so the question is moot).
 -spec queue_frame(#data{}, roadrunner_ws:opcode(), iodata()) -> #data{}.
+queue_frame(#data{pong = Pong} = Data, close, Payload) when is_binary(Pong) ->
+    %% The held pong goes out before the close, after which nothing may
+    %% be sent (RFC 6455 §5.5.1).
+    queue_frame(release_pong(Data), close, Payload);
 queue_frame(#data{span = Span, out = Out, out_size = OutSize} = Data, Opcode, Payload) ->
     Size = iolist_size(Payload),
     ok = roadrunner_event:ws_frame_out(Span, Opcode, Size),
@@ -1979,23 +1984,33 @@ flush_out(#data{out = [], pong = undefined} = Data) ->
 flush_out(#data{socket = Socket, out = Out, out_size = OutSize, pong = undefined} = Data) ->
     _ = roadrunner_transport:send(Socket, Out, OutSize),
     Data#data{out = [], out_size = 0, pongs = 0};
-flush_out(#data{socket = Socket, span = Span, out = Out, out_size = OutSize, pong = Pong} = Data) ->
-    %% The pong goes ahead of the rest: `out` may end in a close frame,
-    %% after which nothing may be sent (RFC 6455 §5.5.1).
-    Size = byte_size(Pong),
-    ok = roadrunner_event:ws_frame_out(Span, pong, Size),
-    _ = roadrunner_transport:send(
-        Socket, [encode_outbound(Data, pong, Pong, Size) | Out], OutSize + Size
-    ),
-    Data#data{out = [], out_size = 0, pongs = 0, pong = undefined}.
+flush_out(Data) ->
+    %% A held pong goes last: a close frame, which must end the write,
+    %% released it already (`queue_frame/3`).
+    flush_out(release_pong(Data)).
 
-%% Queue the pong for a ping in dispatch order, or past `?MAX_PONGS` since
-%% the last flush keep only its payload for `flush_out/1`.
+%% Pongs keep the order of their pings: each ping's pong is queued as it
+%% is read, up to `?MAX_PONGS` since the last flush. Past that only the
+%% latest ping is answered (RFC 6455 §5.5.3): its payload is held, each
+%% later ping replacing it, and `release_pong/1` queues its pong after
+%% everything queued so far, when the session flushes or queues a close.
+%% A write thus carries at most `?MAX_PONGS + 1` pongs, each a whole frame
+%% between whole frames (the session never fragments what it sends).
 -spec queue_pong(#data{}, binary()) -> #data{}.
 queue_pong(#data{pongs = N} = Data, Payload) when N < ?MAX_PONGS ->
     queue_frame(Data#data{pongs = N + 1}, pong, Payload);
 queue_pong(Data, Payload) ->
     Data#data{pong = Payload}.
+
+-spec release_pong(#data{}) -> #data{}.
+release_pong(#data{span = Span, out = Out, out_size = OutSize, pong = Pong} = Data) ->
+    Size = byte_size(Pong),
+    ok = roadrunner_event:ws_frame_out(Span, pong, Size),
+    Data#data{
+        out = [Out | encode_outbound(Data, pong, Pong, Size)],
+        out_size = OutSize + Size,
+        pong = undefined
+    }.
 
 %% Flush pending frames (typically ending in a just-queued close) and
 %% end the session.

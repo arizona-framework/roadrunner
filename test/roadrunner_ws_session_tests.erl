@@ -2696,13 +2696,124 @@ pings_read_together_each_get_a_pong_test() ->
         [<<16#8A, 2, "p1", 16#8A, 2, "p2", 16#8A, 2, "p3">>], echo_sends([{recv, Pings}])
     ).
 
-%% RFC 6455 §5.5.3: past 16 pongs between two writes, only the latest
-%% ping is answered, ahead of the rest, so a client that floods pings and
-%% reads nothing queues a few pongs per write instead of one per ping.
+%% Pong payloads are echoed exactly, the empty one and the 125-byte
+%% maximum included, in the order of their pings.
+pongs_echo_payloads_exactly_test() ->
+    Max = binary:copy(~"m", 125),
+    Pings = <<(ping_frame(<<>>))/binary, (ping_frame(~"p"))/binary, (ping_frame(Max))/binary>>,
+    ?assertEqual(
+        [<<16#8A, 0, 16#8A, 1, "p", 16#8A, 125, Max/binary>>], echo_sends([{recv, Pings}])
+    ).
+
+%% RFC 6455 §5.5.3: past 16 pongs between two writes only the latest
+%% ping is answered, after the others, so a client that floods pings and
+%% reads nothing has at most 17 pongs queued per write.
 ping_flood_gets_the_latest_pong_test() ->
-    Pings = <<<<(ping_frame(integer_to_binary(I + 10)))/binary>> || I <- lists:seq(1, 20)>>,
-    Pongs = <<<<16#8A, 2, (integer_to_binary(I + 10))/binary>> || I <- lists:seq(1, 16)>>,
-    ?assertEqual([<<16#8A, 2, "30", Pongs/binary>>], echo_sends([{recv, Pings}])).
+    ?assertEqual(
+        [<<(pongs(11, 26))/binary, (pong(30))/binary>>], echo_sends([{recv, pings(11, 30)}])
+    ).
+
+%% The cap counts per write: each read's pings get their own 16 pongs
+%% and the latest.
+ping_flood_cap_resets_per_write_test() ->
+    ?assertEqual(
+        [
+            <<(pongs(11, 26))/binary, (pong(30))/binary>>,
+            <<(pongs(31, 46))/binary, (pong(50))/binary>>
+        ],
+        echo_sends([{recv, pings(11, 30)}, {recv, pings(31, 50)}])
+    ).
+
+%% A close read after a flood ends the write, after every pong.
+ping_flood_then_close_ends_with_the_close_test() ->
+    In = <<(pings(11, 30))/binary, (frame(close, <<1000:16>>))/binary>>,
+    ?assertEqual(
+        [<<(pongs(11, 26))/binary, (pong(30))/binary, 16#88, 2, 1000:16>>],
+        echo_sends([{recv, In}])
+    ).
+
+%% A ping after the client's close is not answered.
+ping_after_close_gets_no_pong_test() ->
+    In = <<(frame(close, <<1000:16>>))/binary, (ping_frame(~"p1"))/binary>>,
+    ?assertEqual([<<16#88, 2, 1000:16>>], echo_sends([{recv, In}])).
+
+%% A ping between the fragments of a message is answered, and the
+%% message arrives whole after it (RFC 6455 §5.4).
+ping_inside_a_fragmented_message_test() ->
+    In = <<
+        (uncompressed_fragment(text, ~"ab", false))/binary,
+        (ping_frame(~"p1"))/binary,
+        (uncompressed_fragment(continuation, ~"cd", true))/binary
+    >>,
+    ?assertEqual([<<16#8A, 2, "p1", 16#81, 4, "abcd">>], echo_sends([{recv, In}])).
+
+%% A ping between two messages: replies and the pong keep the order they
+%% were produced in, none lost or repeated.
+ping_between_replies_keeps_their_order_test() ->
+    In = <<(frame(text, ~"a"))/binary, (ping_frame(~"p1"))/binary, (frame(text, ~"b"))/binary>>,
+    ?assertEqual(
+        [<<16#81, 1, "a", 16#8A, 2, "p1", 16#81, 1, "b">>], echo_sends([{recv, In}])
+    ).
+
+%% With permessage-deflate negotiated, pongs go out uncompressed (RFC
+%% 7692 §6.1) with their payloads exact.
+pmd_pongs_are_uncompressed_and_exact_test() ->
+    Tag = make_ref(),
+    Sink = spawn_active_sink(self(), Tag, [
+        {recv, <<(ping_frame(~"hi"))/binary, (ping_frame(~"yo"))/binary>>}
+    ]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false,
+                mem_level => 8
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    Sends = [iolist_to_binary(Send) || Send <- collect_sends(Tag, 1000)],
+    ok = stop_ws_session(Pid),
+    Sink ! stop,
+    ?assertEqual([<<16#8A, 2, "hi", 16#8A, 2, "yo">>], Sends).
+
+%% `handle_control/2` sees every ping, those past the cap included, while
+%% the pongs stop at 16 and the latest.
+handle_control_sees_every_ping_of_a_flood_test() ->
+    Sends = control_sends([{recv, pings(11, 30)}]),
+    Seen = <<16#81, 4, "seen">>,
+    Answered = <<<<(pong(I))/binary, Seen/binary>> || I <- lists:seq(11, 26)>>,
+    Rest = binary:copy(Seen, 4),
+    ?assertEqual([<<Answered/binary, Rest/binary, (pong(30))/binary>>], Sends),
+    ?assertEqual(
+        [{control, ping, integer_to_binary(I)} || I <- lists:seq(11, 30)],
+        [receive_control() || _ <- lists:seq(11, 30)]
+    ).
+
+%% Masked pings carrying `From`..`To`, two-digit payloads.
+pings(From, To) ->
+    <<<<(ping_frame(integer_to_binary(I)))/binary>> || I <- lists:seq(From, To)>>.
+
+%% The pongs the session writes for `pings(From, To)`.
+pongs(From, To) ->
+    <<<<(pong(I))/binary>> || I <- lists:seq(From, To)>>.
+
+pong(I) ->
+    <<16#8A, 2, (integer_to_binary(I))/binary>>.
 
 %% The pong goes out ahead of the frames queued with it, so a close the
 %% same read brings stays last.
