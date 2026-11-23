@@ -390,7 +390,7 @@ table.
 | `accept_priority` | `high` | yes | how quickly new connections leave the kernel queue under load (TCP only); see [Accepting connections](#accepting-connections) |
 | `recv_buffer` | 64 KB | yes | the most one read takes: every read on TLS, a plain-TCP connection once a large request body comes in, a large WebSocket frame |
 | `idle_recv_buffer` | 4 KB | yes | the read buffer a plain-TCP connection starts with, and what it holds while it waits for the next request or message |
-| `kernel_recv_buffer` | unset (the operating system sizes it) | yes | the kernel receive buffer (`SO_RCVBUF`) of every TCP connection: less kernel memory per connection, slower large uploads |
+| `kernel_recv_buffer` | unset (the operating system sizes it) | yes | the kernel receive buffer (`SO_RCVBUF`) of every TCP connection: less kernel memory per connection, slower large uploads; see [Bounding total memory](#bounding-total-memory) |
 | `max_clients` | 16384 | yes | concurrent connection cap per listener |
 | `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3, every protocol in `shed` mode) |
 | `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |
@@ -628,6 +628,82 @@ it counts HTTP/1.1 requests too, but it answers the ones over the
 ceiling with a `503`. It does not keep their connections out. See
 [Connection and slow-client guards](#connection-and-slow-client-guards)
 for these options.
+
+## Bounding total memory
+
+Every limit above bounds one connection. What a server needs in the worst
+case is that bound times the connections it holds at once, `max_clients`.
+On a small box, or one that holds many connections, work out the total
+before an attack does it for you.
+
+What one connection can hold, layer by layer, at the defaults:
+
+| Layer | Per connection | Set by |
+|---|---|---|
+| Kernel receive buffer | what the operating system gives a socket; Linux grows it on its own up to `net.ipv4.tcp_rmem`'s maximum (several MB) for a client that sends faster than the server reads | `kernel_recv_buffer` |
+| Kernel send buffer | the response bytes the client has not yet acknowledged, up to `net.ipv4.tcp_wmem`'s maximum | the operating system |
+| Read buffer (inet `buffer`) | `idle_recv_buffer` (4 KB) while waiting; 16 KB after a large request head; `recv_buffer` (64 KB) once a large body comes in, and from the start on TLS | `idle_recv_buffer`, `recv_buffer` |
+| Request head | the header caps: up to `max_header_block` (10 KB) plus the request line | `{http1, #{...}}`, `{http2, #{...}}`, `{http3, #{...}}` |
+| Request body | up to `max_content_length` (10 MB) when the listener reads it whole (`body_buffering => auto`) | `max_content_length`, per-route `max_content_length` |
+| Lingering close | the read buffer plus what the client pushed since the last collection, for up to `linger_timeout` (1 s) | `max_lingering`, `linger_timeout` |
+| Handler | whatever the handler builds from the request: a decoded JSON document, a parsed form, a response | your code, bounded by the caps on its input |
+
+The body is the largest term by far: `max_clients × max_content_length`,
+16384 bodies of 10 MB at the defaults. Nothing makes every connection
+send a full body at once except a client that wants to, so bound it in
+one of two ways: lower `max_content_length` (globally, and raise it only on the
+routes that take uploads), or cap how many requests run at once.
+
+Two settings bound the total without lowering what a single client may
+send:
+
+- `max_concurrent_requests` with `overload_mode => {shed, #{}}` caps
+  the requests in flight across every protocol. A request over the
+  ceiling gets a `503` with `Retry-After` before any of its body is
+  read, so only that many bodies and handlers hold memory at once,
+  whatever `max_clients` is.
+- `max_lingering` caps the connections lingering after a refusal. A
+  flood of oversized heads or bodies is answered `431` or `413`, and
+  without a cap every one of those connections would linger, holding
+  its buffers and reading what the client keeps pushing. The default
+  grows with `max_clients`; lower it on a small box.
+
+The kernel receive buffer is the memory a connection holds outside the
+Erlang VM: it does not show in `erlang:memory/0`, but it counts against
+a container's memory limit. By default the operating system sizes it and
+grows it for a client that sends faster than the server reads, which is
+what gives large uploads their speed. `kernel_recv_buffer` fixes it per
+connection instead. That caps the kernel memory each connection can
+hold, but it also caps how fast one connection can receive: at most the
+buffer per round trip, so 64 KB on a 50 ms link is about 1.3 MB/s, and
+large uploads are measurably slower even on a local link. Leave it unset
+unless the workload is many connections sending small requests, where
+that kernel memory matters more than upload speed.
+
+For a small box (say 1-2 GB) facing the internet:
+
+```erlang
+roadrunner:start_listener(api, #{
+    port => 8080,
+    routes => my_handler,
+    max_clients => 8192,
+    max_content_length => 1_048_576,
+    max_concurrent_requests => 256,
+    overload_mode => {shed, #{}},
+    max_lingering => 128
+}).
+```
+
+Then the request side is bounded by about 256 bodies of 1 MB plus the
+handlers working on them, the lingering side by 128 connections, and the
+idle side by `max_clients` times the small read buffer, the kernel buffer
+and the connection process. Only if the connections are many and their
+requests small, add `kernel_recv_buffer` to cap the kernel side too.
+
+Watch `roadrunner_listener:info/1` to see which bound is working:
+`rejected` counts connections turned away at `max_clients`, `throttled`
+requests shed at `max_concurrent_requests`, and `lingers_skipped` closes
+that skipped their linger at `max_lingering`.
 
 ## Configuring
 
