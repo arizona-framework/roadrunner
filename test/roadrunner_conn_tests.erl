@@ -128,7 +128,7 @@ linger_zero_closes_at_once_test() ->
     %% No shutdown, no read: the close follows at once.
     Self = self(),
     Sink = spawn(fun() -> script_sink(Self, []) end),
-    ok = roadrunner_conn:linger({fake, Sink}, 0),
+    ok = roadrunner_conn:linger({fake, Sink}, 0, roadrunner_conn:new_linger_budget(1)),
     Sink ! stop,
     ?assertEqual(0, recv_calls(0)),
     receive
@@ -142,7 +142,7 @@ linger_reads_until_the_peer_closes_test() ->
     Self = self(),
     Script = [{recv, ~"rest of"}, {recv, ~" the body"}, {error, closed}],
     Sink = spawn(fun() -> shutdown_sink(Self, Script) end),
-    ok = roadrunner_conn:linger({fake, Sink}, 5000),
+    ok = roadrunner_conn:linger({fake, Sink}, 5000, roadrunner_conn:new_linger_budget(1)),
     Sink ! stop,
     ?assertEqual(
         write,
@@ -161,7 +161,7 @@ linger_collects_what_it_drops_test_() ->
         Sink = spawn(fun() ->
             script_sink(undefined, [{recv, binary:copy(~"a", 65536)}, {recv, ~"x"}])
         end),
-        ok = roadrunner_conn:linger({fake, Sink}, 5000),
+        ok = roadrunner_conn:linger({fake, Sink}, 5000, roadrunner_conn:new_linger_budget(1)),
         Sink ! stop,
         {binary, Held} = erlang:process_info(self(), binary),
         ?assertEqual([], [Size || {_, Size, _} <- Held, Size >= 65536])
@@ -175,7 +175,7 @@ linger_disarms_an_armed_socket_test_() ->
         Self = self(),
         Sink = spawn(fun() -> setopts_sink(Self, [{recv, ~"rest"}, {error, closed}]) end),
         ok = roadrunner_conn:armed(16),
-        ok = roadrunner_conn:linger({fake, Sink}, 5000),
+        ok = roadrunner_conn:linger({fake, Sink}, 5000, roadrunner_conn:new_linger_budget(1)),
         Sink ! stop,
         ?assertEqual(
             [{active, false}],
@@ -187,10 +187,48 @@ linger_disarms_an_armed_socket_test_() ->
         ?assertEqual(2, recv_calls(0))
     end}.
 
+linger_over_the_budget_closes_at_once_test() ->
+    %% With the budget full, the close follows at once: no shutdown, no
+    %% read, and the skip is counted.
+    Self = self(),
+    Sink = spawn(fun() -> script_sink(Self, []) end),
+    {Table, _, 1} = Budget = roadrunner_conn:new_linger_budget(1),
+    Other = spawn(fun() -> ok end),
+    true = ets:insert(Table, {Other}),
+    ok = roadrunner_conn:linger({fake, Sink}, 5000, Budget),
+    Sink ! stop,
+    ?assertEqual(0, recv_calls(0)),
+    ?assertEqual({1, 1}, roadrunner_conn:linger_counts(Budget)).
+
+linger_gives_its_budget_back_test() ->
+    %% A linger counts while it reads and gives its count back as it ends.
+    Self = self(),
+    Sink = spawn(fun() -> shutdown_sink(Self, [{error, closed}]) end),
+    Budget = roadrunner_conn:new_linger_budget(1),
+    ok = roadrunner_conn:linger({fake, Sink}, 5000, Budget),
+    Sink ! stop,
+    ?assertEqual(1, recv_calls(0)),
+    ?assertEqual({0, 0}, roadrunner_conn:linger_counts(Budget)).
+
+prune_lingering_drops_dead_conns_test() ->
+    %% A conn killed while it lingers left its row; pruning drops it and
+    %% keeps the live ones.
+    {Table, _, _} = Budget = roadrunner_conn:new_linger_budget(4),
+    Dead = spawn(fun() -> ok end),
+    Ref = monitor(process, Dead),
+    receive
+        {'DOWN', Ref, process, Dead, _} -> ok
+    end,
+    true = ets:insert(Table, [{Dead}, {self()}]),
+    ok = roadrunner_conn:prune_lingering(Budget),
+    ?assertEqual({1, 0}, roadrunner_conn:linger_counts(Budget)).
+
 linger_ends_at_its_deadline_test() ->
     %% A peer that never stops sending is cut off by the deadline.
     Sink = spawn(fun() -> endless_sink() end),
-    ?assertEqual(ok, roadrunner_conn:linger({fake, Sink}, 20)),
+    ?assertEqual(
+        ok, roadrunner_conn:linger({fake, Sink}, 20, roadrunner_conn:new_linger_budget(1))
+    ),
     Sink ! stop.
 
 script_sink(Reporter, Script) ->

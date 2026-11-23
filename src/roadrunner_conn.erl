@@ -101,7 +101,10 @@
     rate_limit_spend/7,
     throttled_telemetry/3,
     rate_limit_evict_full/4,
-    linger/2,
+    new_linger_budget/1,
+    linger_counts/1,
+    prune_lingering/1,
+    linger/3,
     send_internal_error/1,
     send_not_found/1,
     send_method_not_allowed/2,
@@ -125,6 +128,7 @@
     rate_limit_state/0,
     overload/0,
     slot_cell/0,
+    linger_budget/0,
     resolved/0,
     body_reader/0,
     h1_body_reader/0,
@@ -164,6 +168,11 @@ deadline in milliseconds. The shed form answers it `503` with the
 %% A conn's own count of the in-flight slots it holds (`with_slot_cell/1`),
 %% or `undefined` when the listener has no ceiling.
 -type slot_cell() :: atomics:atomics_ref() | undefined.
+
+%% The listener's cap on connections lingering at once (`linger/3`): a
+%% table with a row per connection lingering now, the cumulative count of
+%% closes that skipped their linger over the cap, and the cap.
+-type linger_budget() :: {ets:table(), atomics:atomics_ref(), pos_integer()}.
 
 -type overload() ::
     refuse | {queue, pid(), atomics:atomics_ref(), pos_integer()} | {shed, pos_integer()}.
@@ -778,8 +787,9 @@ disarmed() ->
 %% (`drain_reader/1`).
 -define(DRAIN_STEP, 65536).
 %% How many dropped bytes a linger lets pile up before it collects them
-%% (`linger/2`).
--define(LINGER_COLLECT_BYTES, 65536).
+%% (`linger/3`). Under a header flood, 16 KB measured about 14% less
+%% memory per lingering connection than 64 KB.
+-define(LINGER_COLLECT_BYTES, 16384).
 
 %% Drain-detection cap when in passive recv. Each recv call is bounded
 %% to at most this many ms so the conn re-checks its mailbox for
@@ -2351,15 +2361,76 @@ parse_error_status(_) -> 400.
 %% is complete, and what still comes is read and dropped until the client
 %% closes or `Timeout` ms pass, a bound a client sending on cannot stretch.
 %% `0` skips it, for the close to follow at once.
+%% A lingering connection holds its process, its socket and what the client
+%% keeps sending, so the listener caps how many linger at once (`Budget`,
+%% its `max_lingering`): over the cap the close follows at once, and the
+%% skip is counted for `roadrunner_listener:info/1`. A normal close never
+%% lingers, so the cap binds only when many clients are refused at once,
+%% as in a flood of oversized requests.
 %% What is dropped is collected every `?LINGER_COLLECT_BYTES`: each read
 %% hands the process a fresh binary, and a client that sends as fast as it
 %% can would otherwise pile up garbage until the process next collects,
 %% hundreds of kilobytes per lingering connection.
 -doc false.
--spec linger(roadrunner_transport:socket(), non_neg_integer()) -> ok.
-linger(_Socket, 0) ->
+-spec linger(roadrunner_transport:socket(), non_neg_integer(), linger_budget()) -> ok.
+linger(_Socket, 0, _Budget) ->
     ok;
-linger(Socket, Timeout) ->
+linger(Socket, Timeout, {Table, Skipped, Max}) ->
+    %% The connection's row is what counts it, so one killed while it
+    %% lingers, which skips the `after` below, leaves a row for a dead
+    %% process, and the listener's slot reaper drops it
+    %% (`prune_lingering/1`).
+    true = ets:insert(Table, {self()}),
+    case ets:info(Table, size) of
+        Lingering when Lingering > Max ->
+            true = ets:delete(Table, self()),
+            atomics:add(Skipped, 1, 1);
+        _ ->
+            try
+                linger_read(Socket, Timeout)
+            after
+                true = ets:delete(Table, self())
+            end
+    end.
+
+%% A new budget of `Max` connections lingering at once, none lingering yet.
+%% Its table is owned by the caller, the listener.
+-doc false.
+-spec new_linger_budget(pos_integer()) -> linger_budget().
+new_linger_budget(Max) ->
+    Table = ets:new(roadrunner_lingering, [
+        set, public, {write_concurrency, true}, {decentralized_counters, false}
+    ]),
+    {Table, atomics:new(1, []), Max}.
+
+%% How many connections linger now, and how many closes skipped their
+%% linger over the cap so far.
+-doc false.
+-spec linger_counts(linger_budget()) -> {non_neg_integer(), non_neg_integer()}.
+linger_counts({Table, Skipped, _Max}) ->
+    {ets:info(Table, size), atomics:get(Skipped, 1)}.
+
+%% Drop the rows of connections that died lingering without their exit
+%% path (killed), so the cap does not shrink by one for each of them.
+-doc false.
+-spec prune_lingering(linger_budget()) -> ok.
+prune_lingering({Table, _Skipped, _Max}) ->
+    ets:foldl(
+        fun({Pid}, ok) ->
+            case is_process_alive(Pid) of
+                true ->
+                    ok;
+                false ->
+                    true = ets:delete(Table, Pid),
+                    ok
+            end
+        end,
+        ok,
+        Table
+    ).
+
+-spec linger_read(roadrunner_transport:socket(), pos_integer()) -> ok.
+linger_read(Socket, Timeout) ->
     _ = roadrunner_transport:shutdown(Socket, write),
     %% The reads below are passive: a socket armed with `{active, N}`
     %% would fail them at once and close with input still unread.

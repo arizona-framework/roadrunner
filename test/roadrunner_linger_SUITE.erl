@@ -20,7 +20,9 @@ the reset a close with unread input sends.
     oversized_header_gets_its_431/1,
     rate_limited_request_answered_before_its_body/1,
     linger_ends_when_the_client_closes/1,
-    linger_ends_at_its_timeout/1
+    linger_ends_at_its_timeout/1,
+    linger_over_the_cap_closes_at_once/1,
+    killed_lingering_conn_stops_counting/1
 ]).
 
 -define(H, roadrunner_manual_body_handler).
@@ -44,7 +46,9 @@ all() ->
         oversized_header_gets_its_431,
         rate_limited_request_answered_before_its_body,
         linger_ends_when_the_client_closes,
-        linger_ends_at_its_timeout
+        linger_ends_at_its_timeout,
+        linger_over_the_cap_closes_at_once,
+        killed_lingering_conn_stops_counting
     ].
 
 init_per_suite(Config) ->
@@ -84,6 +88,10 @@ opts(linger_ends_when_the_client_closes) ->
     #{protocols => [{http1, #{linger_timeout => 60000}}]};
 opts(linger_ends_at_its_timeout) ->
     #{protocols => [{http1, #{linger_timeout => 200}}]};
+opts(Case) when
+    Case =:= linger_over_the_cap_closes_at_once; Case =:= killed_lingering_conn_stops_counting
+->
+    #{max_lingering => 1, protocols => [{http1, #{linger_timeout => 60000}}]};
 opts(_Case) ->
     #{}.
 
@@ -144,6 +152,62 @@ linger_ends_at_its_timeout(Config) ->
     ok = send_until_refused(Sock, binary:copy(~"x", 65536)),
     ok = conn_closed(Ref),
     ok = gen_tcp:close(Sock).
+
+linger_over_the_cap_closes_at_once(Config) ->
+    %% `max_lingering => 1`: a connection lingering over its refused upload
+    %% for up to 60 s fills the budget, so the next refused one closes at
+    %% once, and the count comes back when the first ends.
+    {ok, Held} = gen_tcp:connect(
+        {127, 0, 0, 1},
+        ?config(port, Config),
+        [binary, {active, false}, {exit_on_close, false}],
+        5000
+    ),
+    ok = gen_tcp:send(Held, head(1000000000)),
+    %% The 413 ends where the server shuts its write side, which it does
+    %% once the connection counts as lingering.
+    ?assertMatch(<<"HTTP/1.1 413 ", _/binary>>, recv_until_closed(gen_tcp, Held, <<>>)),
+    ?assertMatch(
+        #{max_lingering := 1, lingering := 1, lingers_skipped := 0},
+        roadrunner_listener:info(?MODULE)
+    ),
+    Skipped = attach_conn_close(),
+    {ok, Sock} = connect(gen_tcp, Config),
+    ok = gen_tcp:send(Sock, head(1000000000)),
+    ok = conn_closed(Skipped),
+    ok = gen_tcp:close(Sock),
+    ?assertMatch(#{lingering := 1, lingers_skipped := 1}, roadrunner_listener:info(?MODULE)),
+    Ended = attach_conn_close(),
+    ok = gen_tcp:close(Held),
+    ok = conn_closed(Ended),
+    ?assertMatch(#{lingering := 0, lingers_skipped := 1}, roadrunner_listener:info(?MODULE)).
+
+killed_lingering_conn_stops_counting(Config) ->
+    %% A conn killed while it lingers skips its exit path; the listener's
+    %% slot reaper drops its count, so the cap is whole again.
+    {ok, Held} = gen_tcp:connect(
+        {127, 0, 0, 1},
+        ?config(port, Config),
+        [binary, {active, false}, {exit_on_close, false}],
+        5000
+    ),
+    ok = gen_tcp:send(Held, head(1000000000)),
+    ?assertMatch(<<"HTTP/1.1 413 ", _/binary>>, recv_until_closed(gen_tcp, Held, <<>>)),
+    ?assertMatch(#{lingering := 1}, roadrunner_listener:info(?MODULE)),
+    Listener = whereis(?MODULE),
+    ProtoOpts = element(4, sys:get_state(Listener)),
+    [{Conn}] = ets:tab2list(element(1, roadrunner_test_proto_opts:get(linger_budget, ProtoOpts))),
+    Ref = monitor(process, Conn),
+    exit(Conn, kill),
+    receive
+        {'DOWN', Ref, process, Conn, killed} -> ok
+    end,
+    ?assertMatch(#{lingering := 1}, roadrunner_listener:info(?MODULE)),
+    %% A reaper tick, run now rather than waiting for its interval; the
+    %% `info/1` call after it is served once the tick is.
+    Listener ! reconcile_slots,
+    ?assertMatch(#{lingering := 0, lingers_skipped := 0}, roadrunner_listener:info(?MODULE)),
+    ok = gen_tcp:close(Held).
 
 %% --- helpers ---
 

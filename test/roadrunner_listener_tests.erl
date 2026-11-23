@@ -372,6 +372,41 @@ listener_threads_ws_compress_into_proto_opts_test() ->
         Cases
     ).
 
+listener_resolves_max_lingering_test() ->
+    %% `auto` grows with `max_clients` above a floor of 256; a number is
+    %% taken as is.
+    lists:foreach(
+        fun({Extra, Expected}) ->
+            Name = listener_test_max_lingering,
+            {ok, _} = roadrunner_listener:start_link(
+                Name, Extra#{port => 0, routes => roadrunner_hello_handler}
+            ),
+            ?assertMatch(
+                #{max_lingering := Expected, lingering := 0, lingers_skipped := 0},
+                roadrunner_listener:info(Name)
+            ),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        [
+            {#{}, 512},
+            {#{max_clients => 100}, 256},
+            {#{max_clients => 65536, max_lingering => auto}, 2048},
+            {#{max_lingering => 3}, 3}
+        ]
+    ).
+
+listener_rejects_invalid_max_lingering_test() ->
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Max) ->
+            R = roadrunner_listener:start_link(listener_test_max_lingering_invalid, #{
+                port => 0, max_lingering => Max, routes => roadrunner_hello_handler
+            }),
+            ?assertMatch({error, {{invalid_listener_opt, max_lingering, Max}, _Stack}}, R)
+        end,
+        [0, -1, 16#80000000, infinity]
+    ).
+
 listener_rejects_invalid_ws_compress_test() ->
     %% zlib's raw deflate takes windows 9..15, raw inflate 8..15, and
     %% memLevel 1..9; anything else, or an unknown key, refuses to start.

@@ -3777,7 +3777,7 @@ exit_clean(
     ok = roadrunner_transport:close(Socket),
     exit(normal).
 
-%% Linger over the socket (`roadrunner_conn:linger/2`). The conn answers
+%% Linger over the socket (`roadrunner_conn:linger/3`). The conn answers
 %% none of its workers while it lingers, so each worker still running is
 %% told its stream is reset first, as a client reset tells it: one waiting
 %% on the conn ends now rather than when the conn exits. The reads are
@@ -3786,7 +3786,12 @@ exit_clean(
 -spec linger(#loop{}, non_neg_integer()) -> ok.
 linger(_State, 0) ->
     ok;
-linger(#loop{socket = Socket, streams = Streams}, Linger) ->
+linger(
+    #loop{
+        socket = Socket, streams = Streams, proto_opts = #proto_opts{linger_budget = Budget}
+    },
+    Linger
+) ->
     ok = maps:foreach(
         fun
             (StreamId, #stream{worker_pid = Pid, worker_ref = MonRef}) when is_reference(MonRef) ->
@@ -3798,7 +3803,7 @@ linger(#loop{socket = Socket, streams = Streams}, Linger) ->
         Streams
     ),
     _ = roadrunner_transport:setopts(Socket, [{active, false}]),
-    roadrunner_conn:linger(Socket, Linger).
+    roadrunner_conn:linger(Socket, Linger, Budget).
 
 %% The in-flight slots the conn still holds as it exits, counted in its
 %% cell: one per worker not yet seen ending (`workers`), plus any grant on

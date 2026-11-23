@@ -60,6 +60,9 @@
     drain_table = undefined :: ets:table() | undefined,
     requests_counter :: atomics:atomics_ref(),
     rejected_counter :: atomics:atomics_ref(),
+    %% The listener's cap on connections lingering at once, with its
+    %% counters (`roadrunner_conn:linger/3`, the `max_lingering` opt).
+    linger_budget :: roadrunner_conn:linger_budget(),
     %% Aggregate in-flight ceiling for the multiplexed protocols (h2/h3): a
     %% cap on concurrent live stream-worker processes across the whole
     %% listener, independent of `max_clients` and `max_concurrent_streams`.

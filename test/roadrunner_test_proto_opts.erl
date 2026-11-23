@@ -13,7 +13,9 @@
 %% out its whole `linger_timeout`. The linger is covered over real sockets.
 -spec new(#{atom() => term()}) -> #proto_opts{}.
 new(Fields) ->
-    set(Fields, #proto_opts{http2_linger_timeout = 0}).
+    set(Fields, #proto_opts{
+        http2_linger_timeout = 0, linger_budget = roadrunner_conn:new_linger_budget(256)
+    }).
 
 -spec set(#{atom() => term()}, #proto_opts{}) -> #proto_opts{}.
 set(Fields, ProtoOpts) ->

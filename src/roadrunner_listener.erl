@@ -135,6 +135,10 @@ least one must have needed to raise it (`min`).
 -define(DEFAULT_MAX_KEEP_ALIVE, infinity).
 -define(DEFAULT_MAX_CLIENTS, 16384).
 -define(DEFAULT_MAX_CONCURRENT_REQUESTS, infinity).
+%% The least `max_lingering` resolves to under `auto`, and the share of
+%% `max_clients` it grows with above that (`max_lingering/2`).
+-define(MIN_AUTO_MAX_LINGERING, 256).
+-define(AUTO_MAX_LINGERING_DIVISOR, 32).
 %% The HTTP/2 `ping_policy` a listener takes unless set: a PING flood
 %% guard (see `t:http2_opts/0`).
 -define(DEFAULT_PING_POLICY, #{min_time => 1000, permit_without_stream => true, max_strikes => 2}).
@@ -404,6 +408,25 @@ Optional middleware and timing knobs (durations in milliseconds):
   `max_concurrent_requests` below what `max_clients` allows, and the
   ceiling becomes the soft limit that sheds while `max_clients` stays the
   hard one.
+- `max_lingering`: cap on connections lingering at once across the
+  listener, a `t:positive_limit/0` or `auto` (the default). A response
+  that closes the connection before the request was read to its end
+  (a 413, a 431, an HTTP/2 GOAWAY) is followed by a linger: the
+  connection reads and drops what the client still sends for the
+  protocol's `linger_timeout`, so the client reads the response instead
+  of losing it to a reset. Each lingering connection holds its process,
+  its socket buffers and the bytes the client pushes, so a flood of
+  oversized requests would otherwise keep every connection lingering.
+  Over the cap, the connection closes at once; the response may then be
+  lost to a reset, which is what the client gets without lingering. A
+  normal close never lingers, so the cap binds only under such a flood.
+  `auto` is `max(256, max_clients div 32)`: 512 at the default
+  `max_clients`, far more than refused requests in one
+  `linger_timeout` under normal traffic. Closes that skip their linger
+  are counted in `lingers_skipped` from `info/1`. A connection killed
+  while it lingers stops counting at the next `slot_reconciliation`
+  tick; with the reaper off (`graceful_drain => false`), it counts until
+  the listener restarts.
 - `socket_backlog`: TCP listen backlog (kernel SYN/accept queue
   depth). Default 1024. Raise it for connection bursts (load tests,
   health-check storms); Linux clamps the effective value at
@@ -438,6 +461,19 @@ Optional middleware and timing knobs (durations in milliseconds):
   Values above `recv_buffer` are lowered to it. An idle TLS connection
   holds no read buffer, so TLS listeners do not use it. See the
   `buffer` note in `base_listen_opts/2`.
+- `kernel_recv_buffer`: the kernel receive buffer (`SO_RCVBUF`) of
+  every TCP connection, in bytes; Linux doubles the value for its own
+  bookkeeping. Unset (the default), the operating system sizes it and
+  grows it for a client sending faster than the server reads, up to its
+  own maximum (`net.ipv4.tcp_rmem` on Linux). That memory lives outside
+  the Erlang VM, so it does not show in `erlang:memory/0` but counts
+  against a container's limit. A fixed size caps it per connection, at
+  the cost of upload speed: a connection receives at most the buffer
+  per round trip (64 KB on a 50 ms link is about 1.3 MB/s), and large
+  uploads are measurably slower even on a local link. Set it only for
+  many connections sending small requests, where memory matters more
+  than upload speed. Unlike `recv_buffer`, which sizes the Erlang VM's
+  own read buffer, this is the kernel's.
 - `min_bytes_per_second`: slow-loris guard on HTTP/1.1 request
   heads and bodies (0 disables). Default 100. After a 1 s grace from a
   request's first byte, the head's bytes so far must average at least
@@ -612,6 +648,7 @@ ops-tuning rationale.
     max_keep_alive_requests => infinity | pos_integer(),
     max_clients => pos_integer(),
     max_concurrent_requests => infinity | pos_integer(),
+    max_lingering => auto | positive_limit(),
     overload_mode =>
         refuse
         | {queue, #{max_queued => pos_integer(), timeout => pos_integer()}}
@@ -626,6 +663,7 @@ ops-tuning rationale.
     ipv6_v6only => boolean(),
     recv_buffer => pos_integer(),
     idle_recv_buffer => pos_integer(),
+    kernel_recv_buffer => positive_limit(),
     min_bytes_per_second => non_neg_integer(),
     body_buffering => body_buffering(),
     slot_reconciliation => disabled | #{interval := pos_integer()},
@@ -1357,6 +1395,15 @@ Return runtime introspection for a listener:
   `max_concurrent_requests` ceiling. A rising `throttled`
   means the in-flight cap is binding. Also emitted in real time as
   `request_throttled`.
+- `rate_limited`: cumulative count of requests refused at a
+  `rate_limit`, the listener's or a route's.
+- `max_lingering`: the resolved cap on connections lingering at once.
+- `lingering`: current number of connections lingering before their
+  close.
+- `lingers_skipped`: cumulative count of closes that skipped their
+  linger because `max_lingering` connections were already lingering. A
+  rising `lingers_skipped` under normal traffic means the cap is too low
+  for the refusals the listener sends.
 
 Useful for ops dashboards / health endpoints.
 """.
@@ -1368,7 +1415,10 @@ Useful for ops dashboards / health endpoints.
         rejected := non_neg_integer(),
         max_concurrent_requests := infinity | pos_integer(),
         throttled := non_neg_integer(),
-        rate_limited := non_neg_integer()
+        rate_limited := non_neg_integer(),
+        max_lingering := pos_integer(),
+        lingering := non_neg_integer(),
+        lingers_skipped := non_neg_integer()
     }.
 info(Name) ->
     gen_server:call(Name, info).
@@ -1916,13 +1966,28 @@ base_listen_opts(Opts, Buffer) ->
         {reuseaddr, true},
         {packet, raw},
         {nodelay, true},
-        {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)},
-        {buffer, Buffer}
+        {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)}
+        | kernel_recv_buffer(Opts, [{buffer, Buffer}])
     ],
     %% Both `gen_tcp:listen/2` and `ssl:listen/2` accept the bind
     %% options, and the TLS path builds on this list, so a loopback bind
     %% covers HTTP and HTTPS alike.
     bind_opts(Opts, Base).
+
+%% `SocketOpts` with the `recbuf` the `kernel_recv_buffer` opt sets, when
+%% set; every accepted socket inherits it from the listen socket. The inet
+%% `buffer` keeps its size: `recbuf` raises it only on a socket whose
+%% `buffer` was never set, and these listen options always set it.
+-spec kernel_recv_buffer(opts(), [Opt]) -> [Opt | {recbuf, positive_limit()}].
+kernel_recv_buffer(Opts, SocketOpts) ->
+    case Opts of
+        #{kernel_recv_buffer := N} when is_integer(N), N >= 1, N =< ?MAX_LIMIT ->
+            [{recbuf, N} | SocketOpts];
+        #{kernel_recv_buffer := Bad} ->
+            error({invalid_listener_opt, kernel_recv_buffer, Bad});
+        #{} ->
+            SocketOpts
+    end.
 
 %% `SocketOpts` with the options for the address a listener binds,
 %% `{ip, IP}` and `{ipv6_v6only, Bool}`, each only when the caller set it,
@@ -2139,6 +2204,7 @@ build_proto_opts(Opts, ListenerName) ->
     ClientCounter = counters:new(1, [write_concurrency]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     RejectedCounter = atomics:new(1, [{signed, false}]),
+    MaxClients = maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
     %% Per-listener drain registry: every conn inserts its own pid as it
     %% starts and deletes it on exit, which is how `drain/2` and
     %% `notify_drain/2` find the processes to notify. A `write_concurrency`
@@ -2218,7 +2284,7 @@ build_proto_opts(Opts, ListenerName) ->
         keep_alive_timeout =
             timeout_opt(keep_alive_timeout, Opts, ?DEFAULT_KEEP_ALIVE_TIMEOUT, 0),
         max_keep_alive_requests = max_keep_alive_requests(Opts),
-        max_clients = maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
+        max_clients = MaxClients,
         accept_priority = validate_accept_priority(maps:get(accept_priority, Opts, high)),
         max_concurrent_requests = MaxConcurrentRequests,
         overload = Overload,
@@ -2227,6 +2293,9 @@ build_proto_opts(Opts, ListenerName) ->
         drain_table = DrainTable,
         requests_counter = RequestsCounter,
         rejected_counter = RejectedCounter,
+        linger_budget = roadrunner_conn:new_linger_budget(
+            max_lingering(maps:get(max_lingering, Opts, auto), MaxClients)
+        ),
         inflight_counter = InflightCounter,
         throttled_counter = ThrottledCounter,
         rate_limited_counter = RateLimitedCounter,
@@ -2265,6 +2334,16 @@ build_proto_opts(Opts, ListenerName) ->
             end
     },
     maybe_tls_upgrade(flatten_protocol_opts(Entries, Base), Opts, Protocols).
+
+%% The `max_lingering` opt: `auto` grows with `max_clients`, from a floor
+%% that covers the refused requests of normal traffic on any listener.
+-spec max_lingering(term(), pos_integer()) -> pos_integer().
+max_lingering(auto, MaxClients) ->
+    max(?MIN_AUTO_MAX_LINGERING, MaxClients div ?AUTO_MAX_LINGERING_DIVISOR);
+max_lingering(N, _MaxClients) when is_integer(N), N >= 1, N =< ?MAX_LIMIT ->
+    N;
+max_lingering(Other, _MaxClients) ->
+    error({invalid_listener_opt, max_lingering, Other}).
 
 %% Resolve the public `handler_spawn` opt into the spawn options the spawn
 %% sites read: the caller's `opts` merged over the defaults.
@@ -3105,9 +3184,11 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
         rejected_counter = RejectedCounter,
         throttled_counter = ThrottledCounter,
         rate_limited_counter = RateLimitedCounter,
+        linger_budget = {_, _, MaxLingering} = LingerBudget,
         max_clients = MaxClients,
         max_concurrent_requests = MaxConcurrentRequests
     } = ProtoOpts,
+    {Lingering, LingersSkipped} = roadrunner_conn:linger_counts(LingerBudget),
     Reply = #{
         active_clients => counters:get(ClientCounter, 1),
         max_clients => MaxClients,
@@ -3115,7 +3196,10 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
         rejected => atomics:get(RejectedCounter, 1),
         max_concurrent_requests => MaxConcurrentRequests,
         throttled => atomics:get(ThrottledCounter, 1),
-        rate_limited => atomics:get(RateLimitedCounter, 1)
+        rate_limited => atomics:get(RateLimitedCounter, 1),
+        max_lingering => MaxLingering,
+        lingering => Lingering,
+        lingers_skipped => LingersSkipped
     },
     {reply, Reply, State}.
 
@@ -3267,11 +3351,16 @@ handle_info(
     reconcile_slots,
     #state{
         proto_opts = #proto_opts{
-            client_counter = Counter, listener_name = Name, drain_table = Table
+            client_counter = Counter,
+            listener_name = Name,
+            drain_table = Table,
+            linger_budget = LingerBudget
         },
         reconciliation = #{interval := Interval, prev_diff := PrevDiff}
     } = State
 ) ->
+    %% A conn killed while it lingers left its row in the linger budget.
+    ok = roadrunner_conn:prune_lingering(LingerBudget),
     %% We only need to know whether `live members >= counter` (no
     %% orphans) or `live members < counter` (orphans = counter - live);
     %% a bounded count short-circuits at the counter so the alive checks
