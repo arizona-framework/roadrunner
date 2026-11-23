@@ -70,10 +70,12 @@ start(Socket, Status, UserHeaders) ->
     _ = erase(?FIN_KEY),
     Send = fun
         (Data, nofin) ->
-            roadrunner_transport:send(Socket, stream_frame(Data, nofin));
+            {Frame, Size} = stream_frame(Data, nofin),
+            roadrunner_transport:send(Socket, Frame, Size);
         (Data, FinFlag) ->
             _ = put(?FIN_KEY, true),
-            roadrunner_transport:send(Socket, stream_frame(Data, FinFlag))
+            {Frame, Size} = stream_frame(Data, FinFlag),
+            roadrunner_transport:send(Socket, Frame, Size)
     end,
     {Result, Send}.
 
@@ -85,22 +87,29 @@ start(Socket, Status, UserHeaders) ->
 %% emits nothing, `Send(<<>>, fin)` emits just the terminator (no
 %% leading chunk), and `Send(<<>>, {fin, Trailers})` emits just the
 %% terminator + trailers.
--spec stream_frame(iodata(), nofin | fin | {fin, roadrunner_http:headers()}) -> iodata().
+%%
+%% Returns the frame with the size of `Data`, which the send uses to
+%% decide whether to slice it (`roadrunner_transport:send/3`).
+-spec stream_frame(iodata(), nofin | fin | {fin, roadrunner_http:headers()}) ->
+    {iodata(), non_neg_integer()}.
 stream_frame(Data, nofin) ->
     chunk_or_empty(Data);
 stream_frame(Data, fin) ->
-    [chunk_or_empty(Data), ~"0\r\n\r\n"];
+    {Chunk, Size} = chunk_or_empty(Data),
+    {[Chunk, ~"0\r\n\r\n"], Size};
 stream_frame(Data, {fin, Trailers}) ->
-    [chunk_or_empty(Data), ~"0\r\n", encode_trailers(Trailers), ~"\r\n"].
+    {Chunk, Size} = chunk_or_empty(Data),
+    {[Chunk, ~"0\r\n", encode_trailers(Trailers), ~"\r\n"], Size}.
 
 %% One chunk of `Data` (RFC 9112 §7.1), or nothing for empty data: a
-%% zero-length chunk would be the terminator and end the response.
+%% zero-length chunk would be the terminator and end the response. With
+%% the size of `Data`, so the send does not measure it again.
 -doc false.
--spec chunk_or_empty(iodata()) -> iodata().
+-spec chunk_or_empty(iodata()) -> {iodata(), non_neg_integer()}.
 chunk_or_empty(Data) ->
     case iolist_size(Data) of
-        0 -> [];
-        N -> [integer_to_binary(N, 16), ~"\r\n", Data, ~"\r\n"]
+        0 -> {[], 0};
+        N -> {[integer_to_binary(N, 16), ~"\r\n", Data, ~"\r\n"], N}
     end.
 
 -spec encode_trailers(roadrunner_http:headers()) -> iodata().
