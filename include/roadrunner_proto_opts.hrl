@@ -152,6 +152,10 @@
     %% client's flow-control window with nothing sent before it is reset
     %% (the HTTP/2 `send_stall_timeout`), `infinity` for no limit.
     http2_send_stall_timeout = 60000 :: 1..16#FFFFFFFF | infinity,
+    %% How long, in milliseconds, a connection closing after its GOAWAY
+    %% reads and drops what the client still sends (the HTTP/2
+    %% `linger_timeout`), `0` for none.
+    http2_linger_timeout = 1000 :: 0..16#7FFFFFFF,
     %% The HTTP/2 `connection_age`, both fields `undefined` when it is
     %% `false`.
     http2_connection_age_max = undefined :: 1..16#FFFFFFFF | undefined,

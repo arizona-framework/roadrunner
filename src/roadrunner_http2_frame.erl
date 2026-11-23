@@ -141,7 +141,6 @@
 
 -type parse_error() ::
     frame_size_error
-    | protocol_error
     | stream_id_violation
     | bad_padding
     | bad_priority_payload
@@ -331,8 +330,10 @@ decode(_UnknownType, _Flags, _StreamId, _Payload) ->
 
 %% Strip the optional pad-length byte + trailing pad bytes per
 %% §6.1 / §6.2 / §6.6. When PADDED is not set, the payload is
-%% returned unchanged.
--spec strip_padding(flags(), binary()) -> {ok, binary()} | {error, bad_padding}.
+%% returned unchanged. A payload too short for the pad-length byte is a
+%% frame size error (§4.2); padding as long as the rest is `bad_padding`.
+-spec strip_padding(flags(), binary()) ->
+    {ok, binary()} | {error, frame_size_error | bad_padding}.
 strip_padding(Flags, Payload) ->
     case has_flag(Flags, ?FLAG_PADDED) of
         false ->
@@ -343,13 +344,16 @@ strip_padding(Flags, Payload) ->
                     Take = byte_size(Rest) - PadLen,
                     <<Inner:Take/binary, _Pad:PadLen/binary>> = Rest,
                     {ok, Inner};
+                <<>> ->
+                    {error, frame_size_error};
                 _ ->
                     {error, bad_padding}
             end
     end.
 
 %% HEADERS with the PRIORITY flag prepends a 5-byte priority block
-%% (RFC 9113 §6.2).
+%% (RFC 9113 §6.2); a payload too short for it is a frame size error
+%% (§4.2).
 -spec decode_headers_with_priority(stream_id(), flags(), binary()) ->
     {ok, frame()} | {error, parse_error()}.
 decode_headers_with_priority(
@@ -362,7 +366,7 @@ decode_headers_with_priority(
     },
     {ok, {headers, StreamId, Flags, Priority, HeaderBlock}};
 decode_headers_with_priority(_StreamId, _Flags, _Payload) ->
-    {error, protocol_error}.
+    {error, frame_size_error}.
 
 %% Walk a SETTINGS payload (sequence of 6-byte parameter records).
 %% RFC 9113 §6.5: payload length MUST be a multiple of 6; the

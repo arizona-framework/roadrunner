@@ -908,6 +908,14 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   per DATA frame they read, so no usual client comes near it. A flood
   with no response in between is closed at its 2001st frame. PINGs are
   left to `ping_policy`.
+- `linger_timeout`: after the GOAWAY that closes the connection (a
+  connection error, a flood guard, an idle or drained connection, the end
+  of the `connection_age` grace), how
+  long in milliseconds the connection keeps reading and dropping what the
+  client still sends before it closes. Closing with unread input makes
+  the kernel reset the connection, which can wipe the GOAWAY before the
+  client reads it; lingering lets it through. It ends as soon as the
+  client closes. `0` closes at once. Default `1000`.
 - `send_stall_timeout`: how long, in milliseconds, a response may wait
   for the client's flow-control window with nothing sent, or `infinity`
   for no limit. A client opens its window as it reads (RFC 9113 §5.2);
@@ -962,6 +970,7 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
     control_frame_policy =>
         false | #{max => 1..16#7FFFFFFF, window => 1..16#FFFFFFFF},
     send_stall_timeout => 1..16#FFFFFFFF | infinity,
+    linger_timeout => 0..16#7FFFFFFF,
     connection_age =>
         false | #{max := 1..16#FFFFFFFF, grace => 0..16#FFFFFFFF | infinity}
 }.
@@ -2464,6 +2473,7 @@ flatten_protocol_entry(
             ping_policy := PingPolicy,
             control_frame_policy := ControlFramePolicy,
             send_stall_timeout := SendStallTimeout,
+            linger_timeout := Linger,
             connection_age := Age
         } = Http2},
     ProtoOpts
@@ -2480,7 +2490,8 @@ flatten_protocol_entry(
             http2_max_header_block = MaxHeaderBlock,
             http2_max_header_list_size = MaxHeaderListSize,
             http2_active = Active,
-            http2_send_stall_timeout = SendStallTimeout
+            http2_send_stall_timeout = SendStallTimeout,
+            http2_linger_timeout = Linger
         })
     );
 flatten_protocol_entry(
@@ -2517,6 +2528,7 @@ http2_defaults() ->
         ping_policy => ?DEFAULT_PING_POLICY,
         control_frame_policy => ?DEFAULT_CONTROL_FRAME_POLICY,
         send_stall_timeout => 60000,
+        linger_timeout => 1000,
         connection_age => false
     }.
 
@@ -2537,6 +2549,7 @@ validate_http2_opts(Opts, Raw) ->
                 true when K =:= connection_age -> Acc#{K => validate_connection_age(V, Raw)};
                 true when K =:= send_stall_timeout ->
                     Acc#{K => validate_send_stall_timeout(V, Raw)};
+                true when K =:= linger_timeout, V =:= 0 -> Acc#{K => V};
                 true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
                 true ->
                     error({invalid_listener_opt, protocols, Raw})

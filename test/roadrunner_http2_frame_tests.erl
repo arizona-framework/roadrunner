@@ -88,12 +88,23 @@ headers_frame_round_trip_with_priority_test() ->
     Frame = {headers, 1, 16#24, Priority, ~"\x00\x01a"},
     ?assertEqual({ok, Frame, <<>>}, parse(Frame)).
 
-headers_frame_with_priority_short_payload_is_protocol_error_test() ->
+headers_frame_with_priority_short_payload_is_frame_size_error_test() ->
     %% PRIORITY flag set but payload shorter than the 5-byte priority
-    %% block.
+    %% block (RFC 9113 §4.2).
     Header = <<2:24, 1, 16#20, 0:1, 1:31>>,
     Bin = <<Header/binary, 0, 0>>,
-    ?assertEqual({error, protocol_error}, roadrunner_http2_frame:parse(Bin, ?MAX)).
+    ?assertEqual({error, frame_size_error}, roadrunner_http2_frame:parse(Bin, ?MAX)).
+
+padded_frame_without_pad_length_is_frame_size_error_test() ->
+    %% PADDED set on an empty DATA or HEADERS payload: no room for the
+    %% pad-length byte (RFC 9113 §4.2).
+    [
+        ?assertEqual(
+            {error, frame_size_error},
+            roadrunner_http2_frame:parse(<<0:24, Type, 16#08, 0:1, 1:31>>, ?MAX)
+        )
+     || Type <- [0, 1]
+    ].
 
 headers_with_padded_and_priority_round_trip_test() ->
     %% Both PADDED and PRIORITY flags; padding is stripped first,

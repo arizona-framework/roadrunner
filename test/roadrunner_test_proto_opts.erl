@@ -8,9 +8,12 @@
 
 -export([new/1, set/2, get/2, to_map/1, with_slot_keeper/1]).
 
+%% An HTTP/2 conn on a fake socket closes at once rather than lingering
+%% after its GOAWAY: the fake answers no read, so each linger would run
+%% out its whole `linger_timeout`. The linger is covered over real sockets.
 -spec new(#{atom() => term()}) -> #proto_opts{}.
 new(Fields) ->
-    set(Fields, #proto_opts{}).
+    set(Fields, #proto_opts{http2_linger_timeout = 0}).
 
 -spec set(#{atom() => term()}, #proto_opts{}) -> #proto_opts{}.
 set(Fields, ProtoOpts) ->
