@@ -2892,6 +2892,81 @@ drop_controls() ->
     after 0 -> ok
     end.
 
+%% With permessage-deflate, the frames of one reply share the deflate
+%% stream in the order they go on the wire: a client inflating them in
+%% that order with one stream gets each payload back exactly. Covers
+%% replies of two and three frames from `handle_frame/2`, `handle_info/2`
+%% and the frames of a `{close, ...}` return, with context takeover (the
+%% default) and without.
+pmd_multi_frame_replies_inflate_in_wire_order_test_() ->
+    [
+        {"context takeover " ++ What, fun() -> pmd_multi_frame_check(false, Script, Msgs, N) end}
+     || {What, Script, Msgs, N} <- pmd_multi_frame_cases()
+    ] ++
+        [
+            {"no context takeover " ++ What, fun() ->
+                pmd_multi_frame_check(true, Script, Msgs, N)
+            end}
+         || {What, Script, Msgs, N} <- pmd_multi_frame_cases()
+        ].
+
+pmd_multi_frame_cases() ->
+    [
+        {"two frames", [{recv, frame(text, ~"two")}], [], 2},
+        {"three frames", [{recv, frame(text, ~"three")}], [], 3},
+        {"twice in a row",
+            [{recv, <<(frame(text, ~"three"))/binary, (frame(text, ~"two"))/binary>>}], [], 5},
+        {"handle_info", [], [push], 3},
+        {"close frames", [{recv, frame(text, ~"close")}], [], 2}
+    ].
+
+pmd_multi_frame_check(NoTakeover, Script, Messages, Count) ->
+    Tag = make_ref(),
+    Sink = spawn_active_sink(self(), Tag, Script),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => NoTakeover,
+                client_no_context_takeover => false,
+                mem_level => 8
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_multi_frame_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    [Pid ! Message || Message <- Messages],
+    Wire = iolist_to_binary(collect_sends(Tag, 1000)),
+    _ = stop_ws_session(Pid),
+    Sink ! stop,
+    Z = zlib:open(),
+    ok = zlib:inflateInit(Z, -15),
+    Texts = [
+        iolist_to_binary(zlib:inflate(Z, <<Payload/binary, 0, 0, 16#FF, 16#FF>>))
+     || {16#C1, Payload} <- server_frames(Wire)
+    ],
+    ok = zlib:close(Z),
+    ?assertEqual(lists:duplicate(Count, ~"hello world"), Texts).
+
+%% The frames a server wrote (unmasked, short payloads): first byte and
+%% payload.
+server_frames(<<>>) ->
+    [];
+server_frames(<<First, Len, Payload:Len/binary, Rest/binary>>) when Len < 126 ->
+    [{First, Payload} | server_frames(Rest)].
+
 %% Masked pings carrying `From`..`To`, two-digit payloads.
 pings(From, To) ->
     <<<<(ping_frame(integer_to_binary(I)))/binary>> || I <- lists:seq(From, To)>>.

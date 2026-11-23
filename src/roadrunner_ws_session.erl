@@ -2085,11 +2085,13 @@ encode_frames(_Data, _Span, [{close, Payload} | _Dropped]) ->
 encode_frames(Data, Span, [{Op, Payload} | Rest]) ->
     Size = iolist_size(Payload),
     ok = roadrunner_event:ws_frame_out(Span, Op, Size),
+    %% Encode this frame before the ones after it: with permessage-deflate
+    %% the frames share one deflate stream, which must see them in the
+    %% order they go on the wire.
+    Frame = encode_outbound(Data, Op, Payload, Size),
     case encode_frames(Data, Span, Rest) of
-        {Encoded, RestSize} ->
-            {[encode_outbound(Data, Op, Payload, Size) | Encoded], Size + RestSize};
-        {Encoded, RestSize, Close} ->
-            {[encode_outbound(Data, Op, Payload, Size) | Encoded], Size + RestSize, Close}
+        {Encoded, RestSize} -> {[Frame | Encoded], Size + RestSize};
+        {Encoded, RestSize, Close} -> {[Frame | Encoded], Size + RestSize, Close}
     end.
 
 %% `Size` is the payload's, measured once by the caller for its event; only the
