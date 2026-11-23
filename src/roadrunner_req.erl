@@ -615,7 +615,9 @@ Read and parse a form-encoded request body. Inspects the request's
 - `multipart/form-data; boundary=…` →
   `{ok, multipart, [Part], Req2}` where each `Part` is the map
   returned by `roadrunner_multipart:parse/2` (`#{headers, body}`).
-  `{error, no_boundary}` if the boundary parameter is missing.
+  `{error, no_boundary}` if the boundary parameter is missing, and
+  `{error, too_many_parts}` or `{error, too_many_headers}` past that
+  parser's default limits.
 
 Other content types return `{error, unsupported_content_type}`;
 absent `Content-Type` returns `{error, no_content_type}`. Reads the

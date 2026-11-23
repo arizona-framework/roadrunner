@@ -113,6 +113,23 @@ When a cap closes a connection, roadrunner emits the
 `size`) so oversize and flood attempts are visible to your event
 handler.
 
+## Multipart form limits
+
+A multipart body parsed into parts costs more memory than it takes on the
+wire: each part and each header becomes its own term. `roadrunner_multipart`
+caps both, in `parse/2,3` (which `roadrunner_req:read_form/1` uses) and in
+the streaming `read_part/1,2`:
+
+| Limit | Default | Over-limit behavior |
+|---|---|---|
+| `max_parts` | 1000 | `{error, too_many_parts}` |
+| `max_header_count` | 100 per part | `{error, too_many_headers}` |
+| `length` (`read_part/2` only) | 64000 bytes per part's header block | `{error, headers_too_large}` |
+
+Set them in the options of `parse/3` or `read_part/2`. A handler that
+gets one of these errors answers as it sees fit, usually with a 400 or
+413.
+
 ## gRPC limits
 
 `roadrunner_grpc` adds a per-message cap on top of the body cap. Both are
