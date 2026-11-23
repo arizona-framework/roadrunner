@@ -2895,7 +2895,7 @@ encode_and_send_response_atomic(
         {headers, StreamId, 16#04, undefined, HpackBlock}
     ),
     DFrame = roadrunner_http2_frame:encode({data, StreamId, 16#01, Body}),
-    _ = send(State, [HFrame, DFrame]),
+    _ = send(State, [HFrame, DFrame], BodyLen),
     %% The encoder, both send windows and the closed send side land in one
     %% state update (and one stream update): this runs once per buffered
     %% response, and each `#loop{}` copy is ~50 words.
@@ -3013,7 +3013,7 @@ send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream) ->
                     true -> 0
                 end,
             Frame = roadrunner_http2_frame:encode({data, StreamId, Flags, Data}),
-            _ = send(State, Frame),
+            _ = send(State, Frame, Total),
             State1 = consume_send_window(State, StreamId, Stream, Total),
             ok = ack(From, Ref),
             if
@@ -3032,7 +3032,7 @@ send_data_chunks(State, Stream, StreamId, From, Ref, Data, Total, EndStream) ->
             <<ToSend:Sendable/binary, Rest/binary>> = Bin,
             Full = Sendable =:= Total,
             Frames = data_frames(StreamId, ToSend, EndStream andalso Full),
-            _ = send(State, Frames),
+            _ = send(State, Frames, Sendable),
             State1 = consume_send_window(State, StreamId, Stream, Sendable),
             case Full of
                 true ->
@@ -3681,6 +3681,12 @@ validate_settings([_ | Rest]) ->
 -spec send(#loop{}, iodata()) -> ok | {error, term()}.
 send(#loop{socket = Socket}, Data) ->
     roadrunner_transport:send(Socket, Data).
+
+%% `send/2` for DATA whose payload size is known, so the transport does not
+%% measure it again.
+-spec send(#loop{}, iodata(), non_neg_integer()) -> ok | {error, term()}.
+send(#loop{socket = Socket}, Data, Size) ->
+    roadrunner_transport:send(Socket, Data, Size).
 
 -spec send_goaway(#loop{}, roadrunner_http2_frame:error_code()) -> ok | {error, term()}.
 send_goaway(#loop{last_stream_id = LastId} = State, ErrorCode) ->

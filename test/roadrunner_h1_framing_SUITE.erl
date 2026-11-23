@@ -15,6 +15,8 @@ so a kept-alive connection can find where it ends.
     iolist_body_gets_its_size/1,
     head_gets_the_get_length/1,
     own_content_length_is_kept/1,
+    own_content_length_not_in_digits_is_kept/1,
+    not_modified_gets_no_content_length/1,
     chunked_response_is_left_alone/1,
     no_content_gets_no_content_length/1
 ]).
@@ -28,6 +30,8 @@ all() ->
         iolist_body_gets_its_size,
         head_gets_the_get_length,
         own_content_length_is_kept,
+        own_content_length_not_in_digits_is_kept,
+        not_modified_gets_no_content_length,
         chunked_response_is_left_alone,
         no_content_gets_no_content_length
     ].
@@ -75,6 +79,20 @@ head_gets_the_get_length(Config) ->
 own_content_length_is_kept(Config) ->
     Sock = ?config(sock, Config),
     ?assertMatch({200, #{~"content-length" := [~"5"]}, ~"hello"}, get(Sock, ~"/own-length")).
+
+own_content_length_not_in_digits_is_kept(Config) ->
+    %% A value that is not plain digits goes out as the handler wrote it.
+    Sock = ?config(sock, Config),
+    ?assertMatch(
+        {200, #{~"content-length" := [~"+5"]}, ~"hello"}, get(Sock, ~"/own-length-signed")
+    ).
+
+not_modified_gets_no_content_length(Config) ->
+    Sock = ?config(sock, Config),
+    ok = gen_tcp:send(Sock, ~"GET /not-modified HTTP/1.1\r\nHost: x\r\n\r\n"),
+    {304, Headers, <<>>} = recv_head(Sock),
+    ?assertNot(is_map_key(~"content-length", Headers)),
+    ?assertMatch({200, _, ~"hello"}, get(Sock, ~"/binary")).
 
 chunked_response_is_left_alone(Config) ->
     Sock = ?config(sock, Config),

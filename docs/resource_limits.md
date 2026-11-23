@@ -107,6 +107,11 @@ Notes:
 - permessage-deflate is inflated in bounded chunks against
   `max_message_size`, so a small high-ratio frame cannot expand into
   gigabytes before the cap fires
+- a session answers up to 16 pings per write with a pong each; past that
+  it answers only the latest (RFC 6455 §5.5.3), so a client that floods
+  pings and reads nothing has a few pongs queued per write, not one per
+  ping; once the kernel holds `max_unsent_bytes` the session waits, and
+  `send_timeout` closes the connection
 
 When a cap closes a connection, roadrunner emits the
 `ws_frame_rejected` event (with the cap's `reason` and the offending
@@ -391,6 +396,8 @@ table.
 | `recv_buffer` | 64 KB | yes | the most one read takes: every read on TLS, a plain-TCP connection once a large request body comes in, a large WebSocket frame |
 | `idle_recv_buffer` | 4 KB | yes | the read buffer a plain-TCP connection starts with, and what it holds while it waits for the next request or message |
 | `kernel_recv_buffer` | unset (the operating system sizes it) | yes | the kernel receive buffer (`SO_RCVBUF`) of every TCP connection: less kernel memory per connection, slower large uploads; see [Bounding total memory](#bounding-total-memory) |
+| `send_timeout` | 60 s | yes (`infinity` disables) | how long a write may wait for a client that takes none of it before the connection closes (responses, files, streamed chunks, WebSocket frames); on Linux the kernel's `TCP_USER_TIMEOUT`, whose wait starts over whenever the client takes more (closing a client that stops reading needs Linux 5.11+, or 5.10.11 / 5.4.93+); elsewhere the emulator's, per write of at most 256 KB, which does not cover `sendfile` |
+| `max_unsent_bytes` | 64 KB | yes (`infinity` disables) | the most a connection queues in the kernel that is not sent yet (`TCP_NOTSENT_LOWAT`, Linux and macOS), so a client that stops reading holds that much instead of a send buffer of megabytes |
 | `max_clients` | 16384 | yes | concurrent connection cap per listener |
 | `max_concurrent_requests` | `infinity` | yes | concurrent in-flight request cap per listener (HTTP/2 and HTTP/3, every protocol in `shed` mode) |
 | `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |

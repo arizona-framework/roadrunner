@@ -169,7 +169,7 @@ deliver_disconnect(Handler, Push, State, Reason) ->
 make_push(Socket) ->
     fun(Data) ->
         case roadrunner_stream_response:chunk_or_empty(Data) of
-            [] -> ok;
-            Chunk -> roadrunner_transport:send(Socket, Chunk)
+            {[], 0} -> ok;
+            {Chunk, Size} -> roadrunner_transport:send(Socket, Chunk, Size)
         end
     end.

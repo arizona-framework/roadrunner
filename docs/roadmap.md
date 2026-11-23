@@ -214,6 +214,15 @@ its own design.
 
 ## Other
 
+### Inbound frame-rate limit per WebSocket connection — small to medium
+
+**What:** a limit on how many frames a WebSocket client may send per
+second, closing a connection that floods frames (pings, say) as HTTP/2's
+`ping_policy` and `control_frame_policy` do. A session already queues
+at most 17 pongs per write, and `send_timeout` closes a client that
+reads none of them, but a flood still costs the server the CPU to read it and the
+kernel receive buffer that holds what it has not read yet.
+
 ### Production gRPC client — large
 
 **What:** `roadrunner_grpc_client` is a small client for tests, tooling

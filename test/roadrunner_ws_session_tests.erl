@@ -2688,6 +2688,343 @@ pmd_control_frames_stay_uncompressed_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
+%% Pings read together each get a pong, in order (Autobahn 2.10 sends
+%% ten in one write and expects ten pongs).
+pings_read_together_each_get_a_pong_test() ->
+    Pings = <<(ping_frame(~"p1"))/binary, (ping_frame(~"p2"))/binary, (ping_frame(~"p3"))/binary>>,
+    ?assertEqual(
+        [<<16#8A, 2, "p1", 16#8A, 2, "p2", 16#8A, 2, "p3">>], echo_sends([{recv, Pings}])
+    ).
+
+%% Pong payloads are echoed exactly, the empty one and the 125-byte
+%% maximum included, in the order of their pings.
+pongs_echo_payloads_exactly_test() ->
+    Max = binary:copy(~"m", 125),
+    Pings = <<(ping_frame(<<>>))/binary, (ping_frame(~"p"))/binary, (ping_frame(Max))/binary>>,
+    ?assertEqual(
+        [<<16#8A, 0, 16#8A, 1, "p", 16#8A, 125, Max/binary>>], echo_sends([{recv, Pings}])
+    ).
+
+%% RFC 6455 §5.5.3: past 16 pongs between two writes only the latest
+%% ping is answered, after the others, so a client that floods pings and
+%% reads nothing has at most 17 pongs queued per write.
+ping_flood_gets_the_latest_pong_test() ->
+    ?assertEqual(
+        [<<(pongs(11, 26))/binary, (pong(30))/binary>>], echo_sends([{recv, pings(11, 30)}])
+    ).
+
+%% The cap counts per write: each read's pings get their own 16 pongs
+%% and the latest.
+ping_flood_cap_resets_per_write_test() ->
+    ?assertEqual(
+        [
+            <<(pongs(11, 26))/binary, (pong(30))/binary>>,
+            <<(pongs(31, 46))/binary, (pong(50))/binary>>
+        ],
+        echo_sends([{recv, pings(11, 30)}, {recv, pings(31, 50)}])
+    ).
+
+%% A close read after a flood ends the write, after every pong.
+ping_flood_then_close_ends_with_the_close_test() ->
+    In = <<(pings(11, 30))/binary, (frame(close, <<1000:16>>))/binary>>,
+    ?assertEqual(
+        [<<(pongs(11, 26))/binary, (pong(30))/binary, 16#88, 2, 1000:16>>],
+        echo_sends([{recv, In}])
+    ).
+
+%% A ping after the client's close is not answered.
+ping_after_close_gets_no_pong_test() ->
+    In = <<(frame(close, <<1000:16>>))/binary, (ping_frame(~"p1"))/binary>>,
+    ?assertEqual([<<16#88, 2, 1000:16>>], echo_sends([{recv, In}])).
+
+%% A ping between the fragments of a message is answered, and the
+%% message arrives whole after it (RFC 6455 §5.4).
+ping_inside_a_fragmented_message_test() ->
+    In = <<
+        (uncompressed_fragment(text, ~"ab", false))/binary,
+        (ping_frame(~"p1"))/binary,
+        (uncompressed_fragment(continuation, ~"cd", true))/binary
+    >>,
+    ?assertEqual([<<16#8A, 2, "p1", 16#81, 4, "abcd">>], echo_sends([{recv, In}])).
+
+%% A ping between two messages: replies and the pong keep the order they
+%% were produced in, none lost or repeated.
+ping_between_replies_keeps_their_order_test() ->
+    In = <<(frame(text, ~"a"))/binary, (ping_frame(~"p1"))/binary, (frame(text, ~"b"))/binary>>,
+    ?assertEqual(
+        [<<16#81, 1, "a", 16#8A, 2, "p1", 16#81, 1, "b">>], echo_sends([{recv, In}])
+    ).
+
+%% With permessage-deflate negotiated, pongs go out uncompressed (RFC
+%% 7692 §6.1) with their payloads exact.
+pmd_pongs_are_uncompressed_and_exact_test() ->
+    Tag = make_ref(),
+    Sink = spawn_active_sink(self(), Tag, [
+        {recv, <<(ping_frame(~"hi"))/binary, (ping_frame(~"yo"))/binary>>}
+    ]),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => false,
+                client_no_context_takeover => false,
+                mem_level => 8
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    Sends = [iolist_to_binary(Send) || Send <- collect_sends(Tag, 1000)],
+    ok = stop_ws_session(Pid),
+    Sink ! stop,
+    ?assertEqual([<<16#8A, 2, "hi", 16#8A, 2, "yo">>], Sends).
+
+%% `handle_control/2` sees every ping, those past the cap included, while
+%% the pongs stop at 16 and the latest.
+handle_control_sees_every_ping_of_a_flood_test() ->
+    Sends = control_sends([{recv, pings(11, 30)}]),
+    Seen = <<16#81, 4, "seen">>,
+    Answered = <<<<(pong(I))/binary, Seen/binary>> || I <- lists:seq(11, 26)>>,
+    Rest = binary:copy(Seen, 4),
+    ?assertEqual([<<Answered/binary, Rest/binary, (pong(30))/binary>>], Sends),
+    ?assertEqual(
+        [{control, ping, integer_to_binary(I)} || I <- lists:seq(11, 30)],
+        [receive_control() || _ <- lists:seq(11, 30)]
+    ).
+
+%% A raw `close` frame in a reply's list ends the session like a
+%% `{close, ...}` return: the held pong goes before it, the frames after
+%% it in the list are dropped, and nothing follows it.
+raw_close_in_a_reply_ends_the_session_after_the_pongs_test() ->
+    In = <<(pings(11, 27))/binary, (frame(text, ~"raw-close"))/binary>>,
+    {Sends, Down} = control_session([{recv, In}], []),
+    Seen = <<16#81, 4, "seen">>,
+    Answered = <<<<(pong(I))/binary, Seen/binary>> || I <- lists:seq(11, 26)>>,
+    ?assertEqual(
+        [
+            <<Answered/binary, Seen/binary, 16#81, 1, "o", (pong(27))/binary, 16#88, 2, 1000:16>>
+        ],
+        Sends
+    ),
+    ?assertEqual(normal, Down).
+
+%% The same when the reply is the only output (the direct write) and
+%% from a reply with options.
+raw_close_in_a_lone_reply_ends_the_session_test() ->
+    {Sends, Down} = control_session([{recv, frame(text, ~"raw-close")}], []),
+    ?assertEqual([<<16#81, 1, "o", 16#88, 2, 1000:16>>], Sends),
+    ?assertEqual(normal, Down),
+    {Sends2, Down2} = control_session([{recv, frame(text, ~"raw-close-hibernate")}], []),
+    ?assertEqual([<<16#81, 1, "h", 16#88, 2, 1000:16>>], Sends2),
+    ?assertEqual(normal, Down2).
+
+%% The same from the frames of a `{close, ...}` return: the raw close is
+%% the one sent, the return's own close is not.
+raw_close_in_a_close_return_is_the_one_sent_test() ->
+    {Sends, Down} = control_session([{recv, frame(text, ~"raw-close-on-close")}], []),
+    ?assertEqual([<<16#81, 1, "o", 16#88, 2, 1000:16>>], Sends),
+    ?assertEqual(normal, Down).
+
+%% The same from `handle_control/2`, with pings read after it unanswered.
+raw_close_from_handle_control_ends_the_session_test() ->
+    In = <<(ping_frame(~"raw-close"))/binary, (ping_frame(~"p2"))/binary>>,
+    {Sends, Down} = control_session([{recv, In}], []),
+    ?assertEqual(
+        [<<16#8A, 9, "raw-close", 16#81, 1, "c", 16#88, 2, 1000:16>>], Sends
+    ),
+    ?assertEqual(normal, Down).
+
+%% The same from `handle_info/2`.
+raw_close_from_handle_info_ends_the_session_test() ->
+    {Sends, Down} = control_session([], [raw_close]),
+    ?assertEqual([<<16#81, 1, "i", 16#88, 2, 1000:16>>], Sends),
+    ?assertEqual(normal, Down).
+
+%% Run `roadrunner_ws_control_handler` over `Script`, then send it
+%% `Messages`; what it wrote, per write, and how it exited, which it
+%% must do on its own.
+control_session(Script, Messages) ->
+    Tag = make_ref(),
+    Sink = spawn_active_sink(self(), Tag, Script),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_control_handler,
+            self(),
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    [Pid ! Message || Message <- Messages],
+    Down =
+        receive
+            {'DOWN', Ref, process, Pid, Reason} -> Reason
+        after 2000 -> error(session_did_not_exit)
+        end,
+    Sends = [iolist_to_binary(Send) || Send <- collect_sends(Tag, 1000)],
+    Sink ! stop,
+    ok = drop_controls(),
+    {Sends, Down}.
+
+%% Drop the `{control, ...}` reports the handler sent, so a later test
+%% does not read them.
+drop_controls() ->
+    receive
+        {control, _, _} -> drop_controls()
+    after 0 -> ok
+    end.
+
+%% With permessage-deflate, the frames of one reply share the deflate
+%% stream in the order they go on the wire: a client inflating them in
+%% that order with one stream gets each payload back exactly. Covers
+%% replies of two and three frames from `handle_frame/2`, `handle_info/2`
+%% and the frames of a `{close, ...}` return, with context takeover (the
+%% default) and without.
+pmd_multi_frame_replies_inflate_in_wire_order_test_() ->
+    [
+        {"context takeover " ++ What, fun() -> pmd_multi_frame_check(false, Script, Msgs, N) end}
+     || {What, Script, Msgs, N} <- pmd_multi_frame_cases()
+    ] ++
+        [
+            {"no context takeover " ++ What, fun() ->
+                pmd_multi_frame_check(true, Script, Msgs, N)
+            end}
+         || {What, Script, Msgs, N} <- pmd_multi_frame_cases()
+        ].
+
+pmd_multi_frame_cases() ->
+    [
+        {"two frames", [{recv, frame(text, ~"two")}], [], 2},
+        {"three frames", [{recv, frame(text, ~"three")}], [], 3},
+        {"twice in a row",
+            [{recv, <<(frame(text, ~"three"))/binary, (frame(text, ~"two"))/binary>>}], [], 5},
+        {"handle_info", [], [push], 3},
+        {"close frames", [{recv, frame(text, ~"close")}], [], 2}
+    ].
+
+pmd_multi_frame_check(NoTakeover, Script, Messages, Count) ->
+    Tag = make_ref(),
+    Sink = spawn_active_sink(self(), Tag, Script),
+    Negotiated =
+        {permessage_deflate,
+            #{
+                server_max_window_bits => 15,
+                client_max_window_bits => 15,
+                server_no_context_takeover => NoTakeover,
+                client_no_context_takeover => false,
+                mem_level => 8
+            },
+            ~"permessage-deflate"},
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_multi_frame_handler,
+            undefined,
+            ws_ctx(),
+            Negotiated,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    [Pid ! Message || Message <- Messages],
+    Wire = iolist_to_binary(collect_sends(Tag, 1000)),
+    _ = stop_ws_session(Pid),
+    Sink ! stop,
+    Z = zlib:open(),
+    ok = zlib:inflateInit(Z, -15),
+    Texts = [
+        iolist_to_binary(zlib:inflate(Z, <<Payload/binary, 0, 0, 16#FF, 16#FF>>))
+     || {16#C1, Payload} <- server_frames(Wire)
+    ],
+    ok = zlib:close(Z),
+    ?assertEqual(lists:duplicate(Count, ~"hello world"), Texts).
+
+%% The frames a server wrote (unmasked, short payloads): first byte and
+%% payload.
+server_frames(<<>>) ->
+    [];
+server_frames(<<First, Len, Payload:Len/binary, Rest/binary>>) when Len < 126 ->
+    [{First, Payload} | server_frames(Rest)].
+
+%% Masked pings carrying `From`..`To`, two-digit payloads.
+pings(From, To) ->
+    <<<<(ping_frame(integer_to_binary(I)))/binary>> || I <- lists:seq(From, To)>>.
+
+%% The pongs the session writes for `pings(From, To)`.
+pongs(From, To) ->
+    <<<<(pong(I))/binary>> || I <- lists:seq(From, To)>>.
+
+pong(I) ->
+    <<16#8A, 2, (integer_to_binary(I))/binary>>.
+
+%% The pong goes out ahead of the frames queued with it, so a close the
+%% same read brings stays last.
+pong_goes_ahead_of_a_close_test() ->
+    In = <<
+        (ping_frame(~"p1"))/binary, (frame(text, ~"hi"))/binary, (frame(close, <<1000:16>>))/binary
+    >>,
+    ?assertEqual(
+        [<<16#8A, 2, "p1", 16#81, 2, "hi", 16#88, 2, 1000:16>>], echo_sends([{recv, In}])
+    ).
+
+%% A ping and the message after it in one read go out in one write, the
+%% pong first.
+ping_then_message_go_out_together_test() ->
+    In = <<(ping_frame(~"p1"))/binary, (frame(text, ~"hi"))/binary>>,
+    ?assertEqual([<<16#8A, 2, "p1", 16#81, 2, "hi">>], echo_sends([{recv, In}])).
+
+%% Pings in separate reads each get their pong.
+pings_read_apart_each_get_a_pong_test() ->
+    ?assertEqual(
+        [<<16#8A, 2, "p1">>, <<16#8A, 2, "p2">>],
+        echo_sends([{recv, ping_frame(~"p1")}, {recv, ping_frame(~"p2")}])
+    ).
+
+%% What the session wrote, per write, for a script against
+%% `roadrunner_ws_echo_handler`.
+echo_sends(Script) ->
+    Tag = make_ref(),
+    Sink = spawn_active_sink(self(), Tag, Script),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    Sends = [iolist_to_binary(Send) || Send <- collect_sends(Tag, 1000)],
+    _ = stop_ws_session(Pid),
+    Sink ! stop,
+    Sends.
+
 %% The proc_lib loop speaks the OTP sys protocol via `roadrunner_loop_sys`
 %% (mirroring the conn loops): `sys:get_state/1` works, a stray
 %% `gen_server:call/2` fails fast instead of hanging, and a

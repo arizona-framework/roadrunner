@@ -43,6 +43,8 @@ All duration and interval values in `opts()` are in milliseconds —
 %% Exported for a direct test of the port a pool gets with `port => 0`: a
 %% port shared with another socket is rare, so it takes many picks to see.
 -export([resolve_quic_port/3]).
+%% Exported for a direct test of the socket options on each OS.
+-export([send_opts/2]).
 
 -export_type([
     opts/0,
@@ -152,6 +154,13 @@ least one must have needed to raise it (`min`).
 %% which a burst of concurrent connects overflows; 1024 matches cowboy.
 %% Linux clamps the effective value at `net.core.somaxconn`.
 -define(DEFAULT_SOCKET_BACKLOG, 1024).
+%% How long a send may wait for a client that reads nothing before the
+%% connection closes: the default `keep_alive_timeout` and HTTP/2
+%% `send_stall_timeout`.
+-define(DEFAULT_SEND_TIMEOUT, 60000).
+%% The most bytes the kernel holds for a connection that it has not sent
+%% yet (`TCP_NOTSENT_LOWAT`).
+-define(DEFAULT_MAX_UNSENT_BYTES, 65536).
 %% The largest single read: a TLS socket's inet `buffer`, and what a
 %% plain-TCP socket grows to for a large body or WebSocket frame (see the
 %% `buffer` note in `base_listen_opts/2`).
@@ -431,6 +440,34 @@ Optional middleware and timing knobs (durations in milliseconds):
   depth). Default 1024. Raise it for connection bursts (load tests,
   health-check storms); Linux clamps the effective value at
   `net.core.somaxconn`.
+- `send_timeout`: how long, in milliseconds, a write may wait for a
+  client that takes none of it before the connection closes, or
+  `infinity` for no limit. Default `60000` (60 s), the default
+  `keep_alive_timeout`. It covers every TCP connection, plain or TLS,
+  and every protocol on it: a response, a file, a streamed chunk, a
+  WebSocket frame. On Linux the kernel enforces it (`TCP_USER_TIMEOUT`):
+  the wait starts over whenever the client takes more, so a client that
+  reads a large response slowly but steadily is not closed, and a
+  connection whose client is gone without a word closes once sent data
+  has waited this long for its acknowledgement. Closing a client that
+  stops reading needs Linux 5.11 or later (or 5.10.11 / 5.4.93 and
+  later in those series). Elsewhere the emulator
+  enforces it on each write, which goes to the socket in slices of at
+  most 256 KB, so a client is closed when it takes less than about
+  256 KB in that time; a file sent with `sendfile` (a static file on
+  plain TCP) is not covered there, and a client that stops reading one
+  keeps its connection open.
+- `max_unsent_bytes`: the most bytes the kernel queues for a
+  connection that it has not sent yet, or `infinity` to leave it to the
+  kernel. Default `65536`. A write waits while more than this is queued
+  (Linux and macOS `TCP_NOTSENT_LOWAT`; other systems ignore it). A
+  client that stops reading holds at most about this much (plus one
+  segment) in the server's kernel instead of a send buffer the kernel
+  grows to megabytes. Bytes on their way to the client do not count, so
+  ordinary sends keep their speed; a `sendfile` of a large file over
+  loopback, where the kernel can move gigabytes a second, runs about a
+  tenth slower (a sixth at `16384`). Raise it, or set `infinity`, when
+  memory per idle reader matters less than that.
 - `ip`: local interface to bind. Unset (the default) binds every IPv4
   interface (`0.0.0.0`); set `{0,0,0,0,0,0,0,0}` (`::`) to bind every
   IPv6 interface, or a specific address such as `{127,0,0,1}` to
@@ -654,6 +691,8 @@ ops-tuning rationale.
         | {queue, #{max_queued => pos_integer(), timeout => pos_integer()}}
         | {shed, #{retry_after => pos_integer()}},
     socket_backlog => pos_integer(),
+    send_timeout => positive_limit() | infinity,
+    max_unsent_bytes => positive_limit() | infinity,
     %% Local interface to bind. Unset means every IPv4 interface
     %% (`0.0.0.0`). Set to `{127,0,0,1}` to restrict the listener to
     %% loopback.
@@ -1967,7 +2006,7 @@ base_listen_opts(Opts, Buffer) ->
         {packet, raw},
         {nodelay, true},
         {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)}
-        | kernel_recv_buffer(Opts, [{buffer, Buffer}])
+        | kernel_recv_buffer(Opts, [{buffer, Buffer} | send_opts(Opts, os:type())])
     ],
     %% Both `gen_tcp:listen/2` and `ssl:listen/2` accept the bind
     %% options, and the TLS path builds on this list, so a loopback bind
@@ -1987,6 +2026,68 @@ kernel_recv_buffer(Opts, SocketOpts) ->
             error({invalid_listener_opt, kernel_recv_buffer, Bad});
         #{} ->
             SocketOpts
+    end.
+
+%% The options that bound what a connection holds for a client that reads
+%% slowly or not at all. On Linux `send_timeout` is the kernel's
+%% `TCP_USER_TIMEOUT` alone: the kernel closes a connection whose queued
+%% data has waited that long behind a closed receive window, or whose sent
+%% data that long for its acknowledgement, which covers `sendfile` too and
+%% costs nothing per write. The emulator's own `send_timeout` arms a timer
+%% each time a write finds the socket's queue full, which measured 5% more
+%% CPU on a 110 KB page, so it is set only where the kernel option is
+%% missing; there a send that waits that long fails and closes the socket
+%% (`send_timeout_close`). `max_unsent_bytes` is the
+%% kernel's `TCP_NOTSENT_LOWAT`: a write waits while more than this is queued
+%% in the kernel and not sent yet. Without it the kernel grows a socket's
+%% send buffer to megabytes and fills it for a client that does not read (a
+%% static file of a few hundred KB sat in the kernel whole for each such
+%% connection). Bytes in flight are not counted, so a client that reads at
+%% full speed is not slowed. Accepted sockets inherit both from the listen
+%% socket.
+-doc false.
+-spec send_opts(opts(), {atom(), atom()}) -> [gen_tcp:option()].
+send_opts(Opts, OsType) ->
+    send_timeout_opts(
+        send_timeout(Opts), OsType, unsent_opts(max_unsent_bytes(Opts), OsType)
+    ).
+
+-spec send_timeout_opts(pos_integer() | infinity, {atom(), atom()}, [gen_tcp:option()]) ->
+    [gen_tcp:option()].
+%% `TCP_USER_TIMEOUT` is Linux's option 18, at the TCP level (6).
+send_timeout_opts(infinity, _OsType, Rest) ->
+    Rest;
+send_timeout_opts(Timeout, {unix, linux}, Rest) ->
+    [{raw, 6, 18, <<Timeout:32/native>>} | Rest];
+send_timeout_opts(Timeout, _OsType, Rest) ->
+    [{send_timeout, Timeout}, {send_timeout_close, true} | Rest].
+
+%% `TCP_NOTSENT_LOWAT` is Linux's option 25 and macOS's 0x201, at the TCP
+%% level (6). Other systems keep their default.
+-spec unsent_opts(pos_integer() | infinity, {atom(), atom()}) -> [gen_tcp:option()].
+unsent_opts(infinity, _OsType) ->
+    [];
+unsent_opts(Bytes, {unix, linux}) ->
+    [{raw, 6, 25, <<Bytes:32/native>>}];
+unsent_opts(Bytes, {unix, darwin}) ->
+    [{raw, 6, 16#201, <<Bytes:32/native>>}];
+unsent_opts(_Bytes, _OsType) ->
+    [].
+
+-spec send_timeout(opts()) -> positive_limit() | infinity.
+send_timeout(Opts) ->
+    case maps:get(send_timeout, Opts, ?DEFAULT_SEND_TIMEOUT) of
+        infinity -> infinity;
+        Ms when is_integer(Ms), Ms >= 1, Ms =< ?MAX_LIMIT -> Ms;
+        Other -> error({invalid_listener_opt, send_timeout, Other})
+    end.
+
+-spec max_unsent_bytes(opts()) -> positive_limit() | infinity.
+max_unsent_bytes(Opts) ->
+    case maps:get(max_unsent_bytes, Opts, ?DEFAULT_MAX_UNSENT_BYTES) of
+        infinity -> infinity;
+        Bytes when is_integer(Bytes), Bytes >= 1, Bytes =< ?MAX_LIMIT -> Bytes;
+        Other -> error({invalid_listener_opt, max_unsent_bytes, Other})
     end.
 
 %% `SocketOpts` with the options for the address a listener binds,

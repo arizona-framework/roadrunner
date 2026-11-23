@@ -92,6 +92,16 @@ only in case are refused. The route's types are merged into the built-in
 table when the listener starts, so a request does one lookup. A `file`
 route looks its type up once, then.
 
+## Range requests
+
+A `Range` header with one byte range gets that range (`206`), or `416`
+when no byte of the file falls in it. A header with more than one range
+gets the whole file (`200`), as RFC 9110 §14.2 allows a server to ignore
+`Range`: no `multipart/byteranges` response is built, so many or
+overlapping ranges cannot make a response larger than the file. On plain
+TCP the file goes out with `sendfile`, so the connection holds none of it
+in memory.
+
 ## Precompressed-sibling serving
 
 When a request's `Accept-Encoding` opts into a compressed encoding

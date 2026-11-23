@@ -209,7 +209,10 @@
     %% the socket (next-request recv, an interim 100, a body drain, a
     %% writer-owned response, an error send) or exit. Non-empty only
     %% between a queued response and that next socket boundary.
-    out = [] :: iodata()
+    out = [] :: iodata(),
+    %% About how many bytes `out` holds (its bodies), so its send does not
+    %% measure it again (`roadrunner_transport:send/3`).
+    out_size = 0 :: non_neg_integer()
 }).
 
 -type recv_mode() ::
@@ -1809,11 +1812,11 @@ send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
         ({reply, Status, Headers0, Body}, #{method := Method} = Req) ->
             ok = roadrunner_conn:skip_continue(Req),
             Headers = with_close_if_closing(S, Req, Headers0),
-            Resp = roadrunner_http1:response(
-                Status, framed(Status, Headers, Body), reply_body(Method, Body), AltSvc
-            ),
+            {Framed, Size} = framed(Status, Headers, Body),
+            Resp = roadrunner_http1:response(Status, Framed, reply_body(Method, Body), AltSvc),
             Result = roadrunner_event:response_send(
-                roadrunner_transport:send(Socket, Resp), buffered_response
+                roadrunner_transport:send(Socket, Resp, reply_size(Method, Size)),
+                buffered_response
             ),
             {Result, Status, Headers};
         ({stream, Status, Headers}, Req) ->
@@ -1863,6 +1866,10 @@ send_interim(Socket, Status, Headers, AltSvc, _Req) ->
 -spec reply_body(binary(), iodata()) -> iodata().
 reply_body(~"HEAD", _Body) -> ~"";
 reply_body(_Method, Body) -> Body.
+
+-spec reply_size(binary(), non_neg_integer()) -> non_neg_integer().
+reply_size(~"HEAD", _Size) -> 0;
+reply_size(_Method, Size) -> Size.
 
 %% RFC 9112 §9.6: a server that will not reuse the connection MUST signal it on
 %% the final response. The per-request keep-alive decision already reaches the
@@ -1967,16 +1974,16 @@ with_close(Req, Headers) ->
 %% ~3-4% of single-in-flight throughput was two record copies per
 %% request); the second closes out a burst by flushing the batch with
 %% its last response appended.
--spec queue_response(#loop_state{}, iodata()) -> #loop_state{}.
-queue_response(#loop_state{buffered = <<>>, out = [], socket = Socket} = S, Resp) ->
+-spec queue_response(#loop_state{}, iodata(), non_neg_integer()) -> #loop_state{}.
+queue_response(#loop_state{buffered = <<>>, out = [], socket = Socket} = S, Resp, Size) ->
     _ = roadrunner_event:response_send(
-        roadrunner_transport:send(Socket, Resp), buffered_response
+        roadrunner_transport:send(Socket, Resp, Size), buffered_response
     ),
     S;
-queue_response(#loop_state{buffered = <<>>, out = Out} = S, Resp) ->
-    flush_out(S#loop_state{out = [Out | Resp]});
-queue_response(#loop_state{out = Out} = S, Resp) ->
-    S#loop_state{out = [Out | Resp]}.
+queue_response(#loop_state{buffered = <<>>, out = Out, out_size = OutSize} = S, Resp, Size) ->
+    flush_out(S#loop_state{out = [Out | Resp], out_size = OutSize + Size});
+queue_response(#loop_state{out = Out, out_size = OutSize} = S, Resp, Size) ->
+    S#loop_state{out = [Out | Resp], out_size = OutSize + Size}.
 
 %% Write everything queued since the last flush in ONE send and reset
 %% the accumulator. A send failure funnels through the same
@@ -1986,11 +1993,11 @@ queue_response(#loop_state{out = Out} = S, Resp) ->
 -spec flush_out(#loop_state{}) -> #loop_state{}.
 flush_out(#loop_state{out = []} = S) ->
     S;
-flush_out(#loop_state{socket = Socket, out = Out} = S) ->
+flush_out(#loop_state{socket = Socket, out = Out, out_size = OutSize} = S) ->
     _ = roadrunner_event:response_send(
-        roadrunner_transport:send(Socket, Out), buffered_response
+        roadrunner_transport:send(Socket, Out, OutSize), buffered_response
     ),
-    S#loop_state{out = []}.
+    S#loop_state{out = [], out_size = 0}.
 
 %% Dispatches the 5 response shapes that match the
 %% `roadrunner_handler:result/0` type. Stream / loop /
@@ -2093,8 +2100,8 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    Resp = roadrunner_http1:response(Status, framed(Status, Headers0, Body), ~"", AltSvc),
-    queue_response(S, Resp);
+    {Headers, _Size} = framed(Status, Headers0, Body),
+    queue_response(S, roadrunner_http1:response(Status, Headers, ~"", AltSvc), 0);
 dispatch_response(
     #loop_state{alt_svc = AltSvc} = S,
     _Handler,
@@ -2103,8 +2110,8 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    Resp = roadrunner_http1:response(Status, framed(Status, Headers0, Body), Body, AltSvc),
-    queue_response(S, Resp).
+    {Headers, Size} = framed(Status, Headers0, Body),
+    queue_response(S, roadrunner_http1:response(Status, Headers, Body, AltSvc), Size).
 
 %% A buffered response with neither `content-length` nor
 %% `transfer-encoding` has no end an HTTP/1.1 client can find on a
@@ -2113,20 +2120,39 @@ dispatch_response(
 %% 9110 §8.6). 1xx, 204, and 304 carry no body and are left as they are
 %% (RFC 9110 §8.6 forbids `content-length` on a 204).
 -spec framed(roadrunner_http:status(), roadrunner_http:headers(), iodata()) ->
-    roadrunner_http:headers().
-framed(Status, Headers, _Body) when Status < 200; Status =:= 204; Status =:= 304 ->
-    Headers;
+    {roadrunner_http:headers(), non_neg_integer()}.
+framed(Status, Headers, Body) when Status < 200; Status =:= 204; Status =:= 304 ->
+    {Headers, body_size(Body)};
 framed(_Status, Headers, Body) ->
-    case has_framing(Headers) of
-        true -> Headers;
-        false -> [{~"content-length", integer_to_binary(iolist_size(Body))} | Headers]
+    case framing(Headers) of
+        none ->
+            Size = iolist_size(Body),
+            {[{~"content-length", integer_to_binary(Size)} | Headers], Size};
+        {content_length, Value} ->
+            {Headers, content_length_size(Value, Body)};
+        transfer_encoding ->
+            {Headers, body_size(Body)}
     end.
 
--spec has_framing(roadrunner_http:headers()) -> boolean().
-has_framing([{~"content-length", _} | _]) -> true;
-has_framing([{~"transfer-encoding", _} | _]) -> true;
-has_framing([_ | Rest]) -> has_framing(Rest);
-has_framing([]) -> false.
+%% The size a handler's own `content-length` gives, which spares the send
+%% measuring the body; the body's own size when the value is not a number.
+-spec content_length_size(binary(), iodata()) -> non_neg_integer().
+content_length_size(Value, Body) ->
+    case roadrunner_bin:digits_to_integer(Value) of
+        {ok, Size} -> Size;
+        error -> body_size(Body)
+    end.
+
+-spec body_size(iodata()) -> non_neg_integer().
+body_size(Body) when is_binary(Body) -> byte_size(Body);
+body_size(Body) -> iolist_size(Body).
+
+-spec framing(roadrunner_http:headers()) ->
+    none | {content_length, binary()} | transfer_encoding.
+framing([{~"content-length", Value} | _]) -> {content_length, Value};
+framing([{~"transfer-encoding", _} | _]) -> transfer_encoding;
+framing([_ | Rest]) -> framing(Rest);
+framing([]) -> none.
 
 -spec dispatch_websocket(
     #loop_state{},

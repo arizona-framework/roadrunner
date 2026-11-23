@@ -18,6 +18,10 @@ response(~"/iolist") ->
     {200, [{~"content-type", ~"text/plain"}], [~"ab", [~"cd", $e]]};
 response(~"/own-length") ->
     {200, [{~"content-length", ~"5"}], ~"hello"};
+response(~"/own-length-signed") ->
+    {200, [{~"content-length", ~"+5"}], [~"hel", ~"lo"]};
+response(~"/not-modified") ->
+    {304, [], [~""]};
 response(~"/chunked") ->
     {200, [{~"transfer-encoding", ~"chunked"}], ~"5\r\nhello\r\n0\r\n\r\n"};
 response(~"/no-content") ->

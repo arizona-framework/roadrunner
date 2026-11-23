@@ -39,6 +39,9 @@
 %% stapling is intentionally absent — `ssl` does not support
 %% server-side stapling at the time of writing.
 
+%% The most one send hands the socket (`send/2`).
+-define(SEND_SLICE, 262144).
+
 -export([
     listen/2,
     listen_tls/2,
@@ -48,6 +51,7 @@
     controlling_process/2,
     recv/3,
     send/2,
+    send/3,
     close/1,
     shutdown/2,
     peername/1,
@@ -215,18 +219,81 @@ recv({fake, Pid}, Len, Timeout) ->
 -doc """
 Send bytes on the socket.
 
+Data larger than 256 KB goes out in 256 KB slices, one send each, so the
+listener's `send_timeout` measures a client that takes nothing, not one
+that reads a large write slowly (see `send_slices/3`). This measures
+`Data` first; a caller that already knows its size passes it to
+`send/3` instead.
+
 For `{fake, Pid}`: forwards `{roadrunner_fake_send, ConnPid, IoData}` to
 `Pid` and returns `ok`. `IoData` is left unflattened so tests can see
 what the caller actually constructed.
 """.
 -spec send(socket(), iodata()) -> ok | {error, term()}.
-send({gen_tcp, S}, Data) ->
-    gen_tcp:send(S, Data);
-send({ssl, S}, Data) ->
-    ssl:send(S, Data);
+send(Socket, Data) when is_binary(Data) ->
+    send(Socket, Data, byte_size(Data));
 send({fake, Pid}, Data) ->
     Pid ! {roadrunner_fake_send, self(), Data},
+    ok;
+send(Socket, Data) ->
+    send(Socket, Data, iolist_size(Data)).
+
+-doc """
+`send/2` for data whose size the caller already knows, so it is not
+measured again. `Size` only decides whether the data is sliced, so a
+size that leaves out a few bytes (a response head before a measured
+body) is fine.
+""".
+-spec send(socket(), iodata(), non_neg_integer()) -> ok | {error, term()}.
+send({gen_tcp, S}, Data, Size) when Size =< ?SEND_SLICE ->
+    gen_tcp:send(S, Data);
+send({gen_tcp, S}, Data, _Size) ->
+    send_slices(gen_tcp, S, Data);
+send({ssl, S}, Data, Size) when Size =< ?SEND_SLICE ->
+    ssl:send(S, Data);
+send({ssl, S}, Data, _Size) ->
+    send_slices(ssl, S, Data);
+send({fake, Pid}, Data, _Size) ->
+    Pid ! {roadrunner_fake_send, self(), Data},
     ok.
+
+%% Send `Data` a slice at a time. The emulator queues a whole write and
+%% arms `send_timeout` when a later send finds that queue full, disarming
+%% it only once the queue has nearly drained, whatever the client read
+%% meanwhile. A slow client still reading one large write would be closed
+%% as if it read nothing; with slices, each wait lasts until one slice is
+%% read. The slices are sub-binaries and list cells, so nothing is copied.
+-spec send_slices(gen_tcp | ssl, gen_tcp:socket() | ssl:sslsocket(), iodata()) ->
+    ok | {error, term()}.
+send_slices(Mod, S, Data) ->
+    {Slice, Rest, Left} = take(Data, ?SEND_SLICE),
+    case {Mod:send(S, Slice), Left} of
+        {ok, 0} -> send_slices(Mod, S, Rest);
+        {Result, _Left} -> Result
+    end.
+
+%% Split `Data` after `N` bytes: the bytes taken, the rest, and how many
+%% of the `N` were left over (0 when `Data` had `N` or more).
+-spec take(iodata() | byte(), pos_integer()) -> {iodata() | byte(), iodata(), non_neg_integer()}.
+take(Bin, N) when is_binary(Bin) ->
+    case Bin of
+        <<Taken:N/binary, Rest/binary>> -> {Taken, Rest, 0};
+        _ -> {Bin, [], N - byte_size(Bin)}
+    end;
+take(Byte, N) when is_integer(Byte) ->
+    {Byte, [], N - 1};
+take([], N) ->
+    {[], [], N};
+take([Head | Tail], N) ->
+    case take(Head, N) of
+        {Taken, Rest, 0} ->
+            %% Wrapped, so a byte taken here never ends up as the tail of
+            %% the list cell above.
+            {[Taken], [Rest | Tail], 0};
+        {Taken, _Rest, Left} ->
+            {TakenTail, RestTail, LeftTail} = take(Tail, Left),
+            {[Taken | TakenTail], RestTail, LeftTail}
+    end.
 
 -doc """
 Close the socket.
