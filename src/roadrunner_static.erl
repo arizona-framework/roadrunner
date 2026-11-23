@@ -246,7 +246,7 @@ required.
     file => path(),
     cache_control => binary(),
     symlink_policy => follow | refuse | refuse_escapes,
-    cache_ttl_ms => non_neg_integer() | infinity,
+    cache_ttl_ms => timeout(),
     mime_types => #{binary() => binary()}
 }.
 
@@ -271,7 +271,7 @@ routes compile.
     types :: builtin | #{binary() => binary()} | binary(),
     cache_control :: binary() | undefined,
     symlink_policy :: follow | refuse | refuse_escapes,
-    cache_ttl_ms :: non_neg_integer() | infinity
+    cache_ttl_ms :: timeout()
 }).
 
 -doc """
@@ -477,7 +477,7 @@ symlink_policy(#{symlink_policy := Policy}) ->
 symlink_policy(#{}) ->
     refuse_escapes.
 
--spec cache_ttl_ms(map()) -> non_neg_integer() | infinity.
+-spec cache_ttl_ms(map()) -> timeout().
 cache_ttl_ms(#{cache_ttl_ms := infinity}) ->
     infinity;
 cache_ttl_ms(#{cache_ttl_ms := TtlMs}) when is_integer(TtlMs), TtlMs >= 0 ->
@@ -556,7 +556,7 @@ serve_file(FilePath, #static{cache_ttl_ms = TtlMs} = State, Req) ->
 %% the cache. `infinity` entries stay a hit until cleared. Symlinks
 %% always bypass the cache because the policy gate needs the un-followed
 %% `read_link_info` result.
--spec cached_lookup(file:filename_all(), non_neg_integer() | infinity) ->
+-spec cached_lookup(file:filename_all(), timeout()) ->
     {ok, non_neg_integer(), integer(), binary(), binary(), siblings()} | miss.
 cached_lookup(_FilePath, TtlMs) when is_integer(TtlMs), TtlMs =< 0 ->
     miss;
@@ -598,7 +598,7 @@ fresh_lookup(FilePath, #static{cache_ttl_ms = TtlMs} = State, Req) ->
     integer(),
     binary(),
     binary(),
-    non_neg_integer() | infinity,
+    timeout(),
     roadrunner_req:request()
 ) -> roadrunner_handler:response().
 serve_and_maybe_cache(FilePath, Size, Mtime, ETag, LastMod, TtlMs, Req) when

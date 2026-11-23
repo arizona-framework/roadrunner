@@ -11,12 +11,15 @@
 
 -export([code/1, name/1, encode_message/1, decode_message/1]).
 
--export_type([name/0]).
+-export_type([name/0, code/0]).
 
 -define(IS_HEX(C),
     ((C >= $0 andalso C =< $9) orelse (C >= $a andalso C =< $f) orelse
         (C >= $A andalso C =< $F))
 ).
+
+%% A status code's number on the wire (`grpc-status`, google.rpc.Status).
+-type code() :: 0..16.
 
 -type name() ::
     ok
@@ -38,7 +41,7 @@
     | unauthenticated.
 
 -doc "The status code a name stands for.".
--spec code(name()) -> 0..16.
+-spec code(name()) -> code().
 code(ok) -> 0;
 code(cancelled) -> 1;
 code(unknown) -> 2;
@@ -58,7 +61,7 @@ code(data_loss) -> 15;
 code(unauthenticated) -> 16.
 
 -doc "The name of a status code.".
--spec name(0..16) -> name().
+-spec name(code()) -> name().
 name(0) -> ok;
 name(1) -> cancelled;
 name(2) -> unknown;

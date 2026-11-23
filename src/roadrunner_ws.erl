@@ -35,6 +35,7 @@ frames.
     compress/0,
     compress_opts/0,
     compress_config/0,
+    window_bits/0,
     close_code/0
 ]).
 
@@ -98,15 +99,21 @@ Encode-side options for `encode_frame/4`.
 -type encode_opts() :: #{rsv1 => boolean()}.
 
 -doc """
+A permessage-deflate window size (RFC 7692 §7.1.2), as zlib's `windowBits`:
+a window of `2^N` bytes, 8..15.
+""".
+-type window_bits() :: 8..15.
+
+-doc """
 Negotiated permessage-deflate parameters per RFC 7692 §7.1.
-Window-bits values are zlib's (8..15). The `*_no_context_takeover`
+Window-bits values are zlib's (`t:window_bits/0`). The `*_no_context_takeover`
 flags mirror the request; when `true`, the corresponding zlib
 context is reset after every message. `mem_level` is the server's
 zlib `memLevel` for its deflate stream.
 """.
 -type permessage_deflate_params() :: #{
-    server_max_window_bits := 8..15,
-    client_max_window_bits := 8..15,
+    server_max_window_bits := window_bits(),
+    client_max_window_bits := window_bits(),
     server_no_context_takeover := boolean(),
     client_no_context_takeover := boolean(),
     mem_level := 1..9
@@ -133,7 +140,7 @@ traffic that repeats content more than 4 KB back.
 %% `compress_opts()` with every setting present (`compress_config/1`).
 -type compress_config() :: #{
     server_window_bits := 9..15,
-    client_window_bits := 8..15,
+    client_window_bits := window_bits(),
     mem_level := 1..9
 }.
 
@@ -151,7 +158,7 @@ zlib settings for an accepted permessage-deflate offer (`t:compress/0`):
 """.
 -type compress_opts() :: #{
     server_window_bits => 9..15,
-    client_window_bits => 8..15,
+    client_window_bits => window_bits(),
     mem_level => 1..9
 }.
 
@@ -578,7 +585,7 @@ parse_pmd_params([{_Other, _} | Rest], Acc) ->
 
 %% Erlang's zlib accepts windowBits 8..15 for inflate (`-N` for raw
 %% inflate, same range). Spec-allowed range is also 8..15.
--spec window_bits(binary() | true) -> {ok, 8..15} | invalid.
+-spec window_bits(binary() | true) -> {ok, window_bits()} | invalid.
 window_bits(true) ->
     invalid;
 window_bits(Bin) when is_binary(Bin) ->
@@ -613,7 +620,7 @@ format_pmd_response(#{
 format_pmd_flag(_Name, false) -> [];
 format_pmd_flag(Name, true) -> [~"; ", Name].
 
--spec format_pmd_kv(binary(), 8..15, 8..15) -> iodata().
+-spec format_pmd_kv(binary(), window_bits(), window_bits()) -> iodata().
 format_pmd_kv(_Name, Default, Default) -> [];
 format_pmd_kv(Name, Value, _Default) -> [~"; ", Name, ~"=", integer_to_binary(Value)].
 

@@ -543,7 +543,7 @@
     %% Not to be confused with `max_header_list_size`, our own limit on
     %% request headers. Handed to each worker as it is spawned
     %% (`roadrunner_http2_stream_worker:start/6`), which applies it.
-    peer_max_header_list_size = infinity :: non_neg_integer() | infinity,
+    peer_max_header_list_size = infinity :: roadrunner_stream_worker:peer_limit(),
     %% The heap floor this connection starts its workers at
     %% (`roadrunner_stream_worker:conn_heap_floor/1`).
     heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor(),
@@ -1237,7 +1237,7 @@ final_goaway(State, Reason) ->
     #loop{},
     reference(),
     goaway_ping
-    | {connection_age, non_neg_integer() | infinity}
+    | {connection_age, timeout()}
     | connection_age_grace
     | send_stall
 ) -> #loop{}.
@@ -1253,7 +1253,7 @@ handle_timer(State, _TRef, send_stall) ->
 handle_timer(State, _TRef, goaway_ping) ->
     State.
 
--spec start_grace(non_neg_integer() | infinity) -> ok.
+-spec start_grace(timeout()) -> ok.
 start_grace(infinity) ->
     ok;
 start_grace(Grace) ->

@@ -21,13 +21,13 @@ service(Request) ->
 
 %% HealthCheckResponse: `ServingStatus status = 1`, a varint; proto3 leaves
 %% out the default (UNKNOWN, 0), which this never sends.
--spec response(1..3) -> binary().
+-spec response(roadrunner_grpc_health:status_code()) -> binary().
 response(Status) ->
     <<8, Status>>.
 
 %% HealthListResponse: `map<string, HealthCheckResponse> statuses = 1`,
 %% each entry a message of the key (field 1) and the value (field 2).
--spec list([{binary(), 1..3}]) -> iodata().
+-spec list([{binary(), roadrunner_grpc_health:status_code()}]) -> iodata().
 list(Statuses) ->
     [field(1, [field(1, Service), field(2, response(Status))]) || {Service, Status} <- Statuses].
 

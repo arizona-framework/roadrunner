@@ -235,11 +235,11 @@ here crashes it.
 -type upgrade_opts() :: #{
     headers => roadrunner_http:headers(),
     compress => roadrunner_ws:compress(),
-    idle_timeout => pos_integer() | infinity,
+    idle_timeout => roadrunner_listener:idle_ms(),
     max_frame_size => roadrunner_listener:limit(),
     max_message_size => roadrunner_listener:limit(),
     recv_buffer => roadrunner_listener:positive_limit(),
-    hibernate_after => pos_integer() | infinity,
+    hibernate_after => roadrunner_listener:idle_ms(),
     active => roadrunner_listener:active(),
     fullsweep_after => non_neg_integer(),
     min_heap_size => non_neg_integer(),

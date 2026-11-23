@@ -107,7 +107,7 @@ stream's id, leaving the other 99 streams intact.
     pos_integer(),
     roadrunner_req:request(),
     roadrunner_conn:proto_opts(),
-    non_neg_integer() | infinity,
+    roadrunner_stream_worker:peer_limit(),
     roadrunner_stream_worker:heap_floor()
 ) ->
     {pid(), reference()}.
@@ -129,7 +129,7 @@ start(
 %% The client's limit, paired with the `alt-svc` value the conn adds to
 %% every response (read from the same proto opts, as the conn's
 %% `enter/6` does), or `infinity` for no limit.
--spec peer_limit(non_neg_integer() | infinity, binary() | undefined) ->
+-spec peer_limit(roadrunner_stream_worker:peer_limit(), binary() | undefined) ->
     {non_neg_integer(), binary() | undefined} | infinity.
 peer_limit(infinity, _AltSvc) ->
     infinity;

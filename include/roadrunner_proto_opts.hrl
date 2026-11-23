@@ -29,13 +29,13 @@
     ws_buffer = undefined :: pos_integer() | {adaptive, pos_integer(), pos_integer()} | undefined,
     %% Idle ms after which a WebSocket session hibernates; `infinity` never
     %% hibernates on idle.
-    ws_hibernate_after = infinity :: pos_integer() | infinity,
+    ws_hibernate_after = infinity :: roadrunner_listener:idle_ms(),
     %% Whether a WebSocket upgrade accepts permessage-deflate, and with
     %% which zlib settings (`roadrunner_ws:compress_config/1`).
     ws_compress = false :: false | roadrunner_ws:compress_config(),
     %% Ms of client silence after which a WebSocket session closes;
     %% `infinity` never does.
-    ws_idle_timeout = infinity :: pos_integer() | infinity,
+    ws_idle_timeout = infinity :: roadrunner_listener:idle_ms(),
     %% How a WebSocket session reads its socket: `once`, or up to `N` reads
     %% per arm (the listener's `ws.active`); `undefined` is `once` on plain
     %% TCP and `16` on TLS.

@@ -90,7 +90,7 @@ at the connection / stream level, not by crashing this worker).
     non_neg_integer(),
     roadrunner_req:request(),
     roadrunner_conn:proto_opts(),
-    non_neg_integer() | infinity,
+    roadrunner_stream_worker:peer_limit(),
     roadrunner_stream_worker:heap_floor()
 ) ->
     {pid(), reference()}.
@@ -118,7 +118,7 @@ start(
     non_neg_integer(),
     roadrunner_req:request(),
     roadrunner_conn:dispatch(),
-    non_neg_integer() | infinity,
+    roadrunner_stream_worker:peer_limit(),
     roadrunner_stream_worker:heap_floor()
 ) -> ok.
 init(Loop, Conn, StreamId, Req, Dispatch, MaxFieldSection, HeapFloor) ->
@@ -138,7 +138,7 @@ loop() ->
 
 %% Keep the client's limit for the send paths; nothing when it set none,
 %% so `get(?PEER_LIMIT_KEY)` is `undefined` and no size is computed.
--spec set_peer_limit(non_neg_integer() | infinity) -> ok.
+-spec set_peer_limit(roadrunner_stream_worker:peer_limit()) -> ok.
 set_peer_limit(infinity) ->
     ok;
 set_peer_limit(MaxFieldSection) ->

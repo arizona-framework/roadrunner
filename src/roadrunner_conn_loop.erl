@@ -215,6 +215,10 @@
 -type recv_mode() ::
     roadrunner_listener:active() | {roadrunner_listener:active(), pos_integer()}.
 
+%% Idle ms before the conn hibernates (the listener's `hibernate_after`),
+%% `infinity` for never.
+-type hibernate_after() :: pos_integer() | infinity.
+
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.
 start(Socket, #proto_opts{handler_spawn_opts = SpawnOpts} = ProtoOpts0) ->
@@ -539,7 +543,7 @@ sniff_recv_hib(S, Deadline, TRef) ->
     ok = cancel_deadline_timer(TRef),
     sniff_recv(S, Deadline).
 
--spec hibernate_after(recv_mode()) -> pos_integer() | infinity.
+-spec hibernate_after(recv_mode()) -> hibernate_after().
 hibernate_after({_Mode, HibernateAfter}) -> HibernateAfter;
 hibernate_after(_Mode) -> infinity.
 
@@ -1075,7 +1079,7 @@ drain_mailbox_check() ->
 %% stalled one its rate, for as long as the peer stays silent. On wake
 %% the function re-enters via `recv_request_bytes_hib/3`, which drops
 %% that timer first.
--spec recv_active(#loop_state{}, integer(), pos_integer() | infinity) -> no_return().
+-spec recv_active(#loop_state{}, integer(), hibernate_after()) -> no_return().
 recv_active(
     #loop_state{
         socket = Socket,
