@@ -2804,6 +2804,94 @@ handle_control_sees_every_ping_of_a_flood_test() ->
         [receive_control() || _ <- lists:seq(11, 30)]
     ).
 
+%% A raw `close` frame in a reply's list ends the session like a
+%% `{close, ...}` return: the held pong goes before it, the frames after
+%% it in the list are dropped, and nothing follows it.
+raw_close_in_a_reply_ends_the_session_after_the_pongs_test() ->
+    In = <<(pings(11, 27))/binary, (frame(text, ~"raw-close"))/binary>>,
+    {Sends, Down} = control_session([{recv, In}], []),
+    Seen = <<16#81, 4, "seen">>,
+    Answered = <<<<(pong(I))/binary, Seen/binary>> || I <- lists:seq(11, 26)>>,
+    ?assertEqual(
+        [
+            <<Answered/binary, Seen/binary, 16#81, 1, "o", (pong(27))/binary, 16#88, 2, 1000:16>>
+        ],
+        Sends
+    ),
+    ?assertEqual(normal, Down).
+
+%% The same when the reply is the only output (the direct write) and
+%% from a reply with options.
+raw_close_in_a_lone_reply_ends_the_session_test() ->
+    {Sends, Down} = control_session([{recv, frame(text, ~"raw-close")}], []),
+    ?assertEqual([<<16#81, 1, "o", 16#88, 2, 1000:16>>], Sends),
+    ?assertEqual(normal, Down),
+    {Sends2, Down2} = control_session([{recv, frame(text, ~"raw-close-hibernate")}], []),
+    ?assertEqual([<<16#81, 1, "h", 16#88, 2, 1000:16>>], Sends2),
+    ?assertEqual(normal, Down2).
+
+%% The same from the frames of a `{close, ...}` return: the raw close is
+%% the one sent, the return's own close is not.
+raw_close_in_a_close_return_is_the_one_sent_test() ->
+    {Sends, Down} = control_session([{recv, frame(text, ~"raw-close-on-close")}], []),
+    ?assertEqual([<<16#81, 1, "o", 16#88, 2, 1000:16>>], Sends),
+    ?assertEqual(normal, Down).
+
+%% The same from `handle_control/2`, with pings read after it unanswered.
+raw_close_from_handle_control_ends_the_session_test() ->
+    In = <<(ping_frame(~"raw-close"))/binary, (ping_frame(~"p2"))/binary>>,
+    {Sends, Down} = control_session([{recv, In}], []),
+    ?assertEqual(
+        [<<16#8A, 9, "raw-close", 16#81, 1, "c", 16#88, 2, 1000:16>>], Sends
+    ),
+    ?assertEqual(normal, Down).
+
+%% The same from `handle_info/2`.
+raw_close_from_handle_info_ends_the_session_test() ->
+    {Sends, Down} = control_session([], [raw_close]),
+    ?assertEqual([<<16#81, 1, "i", 16#88, 2, 1000:16>>], Sends),
+    ?assertEqual(normal, Down).
+
+%% Run `roadrunner_ws_control_handler` over `Script`, then send it
+%% `Messages`; what it wrote, per write, and how it exited, which it
+%% must do on its own.
+control_session(Script, Messages) ->
+    Tag = make_ref(),
+    Sink = spawn_active_sink(self(), Tag, Script),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_control_handler,
+            self(),
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Ref = monitor(process, Pid),
+    Pid ! socket_ready,
+    [Pid ! Message || Message <- Messages],
+    Down =
+        receive
+            {'DOWN', Ref, process, Pid, Reason} -> Reason
+        after 2000 -> error(session_did_not_exit)
+        end,
+    Sends = [iolist_to_binary(Send) || Send <- collect_sends(Tag, 1000)],
+    Sink ! stop,
+    ok = drop_controls(),
+    {Sends, Down}.
+
+%% Drop the `{control, ...}` reports the handler sent, so a later test
+%% does not read them.
+drop_controls() ->
+    receive
+        {control, _, _} -> drop_controls()
+    after 0 -> ok
+    end.
+
 %% Masked pings carrying `From`..`To`, two-digit payloads.
 pings(From, To) ->
     <<<<(ping_frame(integer_to_binary(I)))/binary>> || I <- lists:seq(From, To)>>.

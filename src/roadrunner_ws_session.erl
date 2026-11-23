@@ -948,16 +948,31 @@ dispatch_message(Opcode, Payload, Rest, Data, Hibernate) ->
         {reply, [_ | _] = OutFrames, NewState} when
             Rest =:= <<>>, Out =:= [], Pong =:= undefined
         ->
-            {Encoded, Size} = encode_frames(Data, Span, OutFrames),
-            _ = roadrunner_transport:send(Socket, Encoded, Size),
-            arm_after_message(
-                byte_size(Payload), Data#data{buffer = <<>>, mod_state = NewState}, Hibernate
-            );
+            case encode_frames(Data, Span, OutFrames) of
+                {Encoded, Size} ->
+                    _ = roadrunner_transport:send(Socket, Encoded, Size),
+                    arm_after_message(
+                        byte_size(Payload),
+                        Data#data{buffer = <<>>, mod_state = NewState},
+                        Hibernate
+                    );
+                {Encoded, Size, {close, ClosePayload}} ->
+                    close_after(
+                        Data#data{
+                            buffer = <<>>, mod_state = NewState, out = Encoded, out_size = Size
+                        },
+                        ClosePayload,
+                        normal
+                    )
+            end;
         {reply, OutFrames, NewState} ->
             %% More frames buffered (a pipelining client) or output
             %% already queued: queue the reply in the same update that
             %% advances the buffer, and keep draining.
-            process_buffer(queue_reply(Data, Rest, OutFrames, NewState), Hibernate);
+            case queue_reply(Data, Rest, OutFrames, NewState) of
+                {close, Queued, ClosePayload} -> close_after(Queued, ClosePayload, normal);
+                Queued -> process_buffer(Queued, Hibernate)
+            end;
         {ok, NewState} when Rest =:= <<>> ->
             %% Same single update as above, without a reply.
             arm_after_message(
@@ -1866,12 +1881,17 @@ handle_drain_msg(
 apply_handler_result(Result, Data, Hibernate, Continue, CloseReason) ->
     case Result of
         {reply, OutFrames, NewState} ->
-            Continue(queue_reply(Data, Data#data.buffer, OutFrames, NewState), Hibernate);
+            case queue_reply(Data, Data#data.buffer, OutFrames, NewState) of
+                {close, Queued, ClosePayload} -> close_after(Queued, ClosePayload, CloseReason);
+                Queued -> Continue(Queued, Hibernate)
+            end;
         {reply, OutFrames, NewState, Opts} when is_list(Opts) ->
-            Continue(
-                queue_reply(Data, Data#data.buffer, OutFrames, NewState),
-                Hibernate orelse lists:member(hibernate, Opts)
-            );
+            case queue_reply(Data, Data#data.buffer, OutFrames, NewState) of
+                {close, Queued, ClosePayload} ->
+                    close_after(Queued, ClosePayload, CloseReason);
+                Queued ->
+                    Continue(Queued, Hibernate orelse lists:member(hibernate, Opts))
+            end;
         {ok, NewState} ->
             Continue(Data#data{mod_state = NewState}, Hibernate);
         {ok, NewState, Opts} when is_list(Opts) ->
@@ -1887,10 +1907,23 @@ apply_handler_result(Result, Data, Hibernate, Continue, CloseReason) ->
                 queue_frame(Data#data{mod_state = NewState}, close, close_payload(Code, Reason))
             );
         {close, Code, Reason, OutFrames, NewState} ->
-            %% The frames, then the close, in the same write.
-            Queued = queue_frames(Data#data{mod_state = NewState}, OutFrames),
-            flush_and_exit(CloseReason, queue_frame(Queued, close, close_payload(Code, Reason)))
+            %% The frames, then the close, in the same write. A close among
+            %% the frames is the one sent, and this one is dropped.
+            case queue_frames(Data#data{mod_state = NewState}, OutFrames) of
+                {close, Queued, ClosePayload} ->
+                    close_after(Queued, ClosePayload, CloseReason);
+                Queued ->
+                    close_after(Queued, close_payload(Code, Reason), CloseReason)
+            end
     end.
+
+%% End the session with a close frame after what is queued, the same way
+%% for a `{close, ...}` return and for a `close` frame in a reply's list:
+%% the held pong goes before the close (`queue_frame/3`), nothing after
+%% it (RFC 6455 §5.5.1), and the session ends once it is written.
+-spec close_after(#data{}, iodata(), roadrunner_ws_handler:terminate_reason()) -> finished.
+close_after(Data, Payload, CloseReason) ->
+    flush_and_exit(CloseReason, queue_frame(Data, close, Payload)).
 
 %% Build the wire payload for a handler-driven close. RFC 6455 §5.5.1
 %% lays out the format: 2-byte big-endian status code followed by the
@@ -1951,24 +1984,44 @@ queue_frame(#data{span = Span, out = Out, out_size = OutSize} = Data, Opcode, Pa
 
 %% Queue a handler `{reply, [...]}` batch — one event per frame (so
 %% the event handler can count by opcode), encoded in one walk.
--spec queue_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) -> #data{}.
+%% A `close` frame in the list ends it: the frames after it are dropped,
+%% and `{close, Data, Payload}` hands the close to `close_after/3`.
+-spec queue_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) ->
+    #data{} | {close, #data{}, iodata()}.
 queue_frames(#data{span = Span, out = Out, out_size = OutSize} = Data, OutFrames) ->
-    {Encoded, Size} = encode_frames(Data, Span, OutFrames),
-    Data#data{out = [Out | Encoded], out_size = OutSize + Size}.
+    case encode_frames(Data, Span, OutFrames) of
+        {Encoded, Size} ->
+            Data#data{out = [Out | Encoded], out_size = OutSize + Size};
+        {Encoded, Size, {close, Payload}} ->
+            {close, Data#data{out = [Out | Encoded], out_size = OutSize + Size}, Payload}
+    end.
 
 %% Queue a handler's `{reply, ...}` and take its new state, with the
 %% buffer the session continues from, in a single `#data{}` update: on
 %% a small-frame stream each extra record copy is a large share of what
 %% the session allocates per message.
--spec queue_reply(#data{}, binary(), [{roadrunner_ws:opcode(), iodata()}], term()) -> #data{}.
+%% A `close` frame in the list ends it, as in `queue_frames/2`.
+-spec queue_reply(#data{}, binary(), [{roadrunner_ws:opcode(), iodata()}], term()) ->
+    #data{} | {close, #data{}, iodata()}.
 queue_reply(#data{span = Span, out = Out, out_size = OutSize} = Data, Buffer, OutFrames, NewState) ->
-    {Encoded, Size} = encode_frames(Data, Span, OutFrames),
-    Data#data{
-        buffer = Buffer,
-        mod_state = NewState,
-        out = [Out | Encoded],
-        out_size = OutSize + Size
-    }.
+    case encode_frames(Data, Span, OutFrames) of
+        {Encoded, Size} ->
+            Data#data{
+                buffer = Buffer,
+                mod_state = NewState,
+                out = [Out | Encoded],
+                out_size = OutSize + Size
+            };
+        {Encoded, Size, {close, Payload}} ->
+            {close,
+                Data#data{
+                    buffer = Buffer,
+                    mod_state = NewState,
+                    out = [Out | Encoded],
+                    out_size = OutSize + Size
+                },
+                Payload}
+    end.
 
 %% Write everything queued since the last flush in ONE `send` and reset
 %% the accumulator. Called before every park (`arm_and_recv/2`) and
@@ -2018,17 +2071,26 @@ release_pong(#data{span = Span, out = Out, out_size = OutSize, pong = Pong} = Da
 flush_and_exit(Reason, Data) ->
     exit_clean(Reason, flush_out(Data)).
 
-%% The frames encoded, with the sum of their payload sizes.
+%% The frames encoded, with the sum of their payload sizes. A `close`
+%% frame stops the list: it is not encoded here, the frames after it are
+%% dropped, and its payload comes back third so the caller ends the
+%% session with it (`close_after/3`).
 -spec encode_frames(
     #data{}, roadrunner_event_handler:span(), [{roadrunner_ws:opcode(), iodata()}]
-) -> {iodata(), non_neg_integer()}.
+) -> {iodata(), non_neg_integer()} | {iodata(), non_neg_integer(), {close, iodata()}}.
 encode_frames(_Data, _Span, []) ->
     {[], 0};
+encode_frames(_Data, _Span, [{close, Payload} | _Dropped]) ->
+    {[], 0, {close, Payload}};
 encode_frames(Data, Span, [{Op, Payload} | Rest]) ->
     Size = iolist_size(Payload),
     ok = roadrunner_event:ws_frame_out(Span, Op, Size),
-    {Encoded, RestSize} = encode_frames(Data, Span, Rest),
-    {[encode_outbound(Data, Op, Payload, Size) | Encoded], Size + RestSize}.
+    case encode_frames(Data, Span, Rest) of
+        {Encoded, RestSize} ->
+            {[encode_outbound(Data, Op, Payload, Size) | Encoded], Size + RestSize};
+        {Encoded, RestSize, Close} ->
+            {[encode_outbound(Data, Op, Payload, Size) | Encoded], Size + RestSize, Close}
+    end.
 
 %% `Size` is the payload's, measured once by the caller for its event; only the
 %% compressed path needs another, of its deflated bytes.
