@@ -2288,7 +2288,7 @@ ws_finish(
     Response
 ) ->
     Close = roadrunner_conn:close_opts(ProtoOpts),
-    #proto_opts{http1_linger_timeout = Linger} = ProtoOpts,
+    #proto_opts{http1_linger_timeout = Linger, linger_budget = Budget} = ProtoOpts,
     Status = roadrunner_conn:response_status(Response),
     Kind = roadrunner_conn:response_kind(Response),
     Reader = maps:get(body_reader, Req, none),
@@ -2296,7 +2296,7 @@ ws_finish(
         ok = roadrunner_event:request_stop(Span, Status, Kind),
         case drain_reader(Reader) of
             {ok, _Leftover} -> ok;
-            {error, _} -> ok = roadrunner_conn:linger(Socket, Linger)
+            {error, _} -> ok = roadrunner_conn:linger(Socket, Linger, Budget)
         end,
         exit_clean(Socket, Close, ConnSpan, Served, normal)
     end.
@@ -2358,15 +2358,18 @@ refuse_too_large(S) ->
 
 %% Close after a response sent before the request was read to its end,
 %% lingering over what the client may still be sending
-%% (`roadrunner_conn:linger/2`) for the listener's `http1` `linger_timeout`.
+%% (`roadrunner_conn:linger/3`) for the listener's `http1` `linger_timeout`.
 -spec exit_lingering(#loop_state{}, roadrunner_event_handler:close_reason()) -> no_return().
 exit_lingering(
-    #loop_state{socket = Socket, proto_opts = #proto_opts{http1_linger_timeout = Linger}} = S,
+    #loop_state{
+        socket = Socket,
+        proto_opts = #proto_opts{http1_linger_timeout = Linger, linger_budget = Budget}
+    } = S,
     Reason
 ) ->
     %% The request is over; its slot is not held through the linger.
     S1 = flush_out(release_request_slot(S)),
-    ok = roadrunner_conn:linger(Socket, Linger),
+    ok = roadrunner_conn:linger(Socket, Linger, Budget),
     exit_normal(S1, Reason).
 
 %% Close after a response sent ahead of the handler, or for its crash: a
