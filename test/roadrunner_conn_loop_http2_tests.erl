@@ -94,6 +94,9 @@ all_test_() ->
         fun handshake_timeout_during_partial_preface/0,
         fun handshake_succeeds_with_fragmented_preface/0,
         fun frame_loop_parse_error_triggers_goaway/0,
+        fun frame_loop_parse_error_goaway_codes/0,
+        fun closes_after_a_goaway_linger/0,
+        fun closes_by_the_peer_do_not_linger/0,
         fun runtime_transport_error_triggers_goaway/0,
         fun runtime_idle_timeout_emits_goaway/0,
         fun active_n_rearms_only_on_passive/0,
@@ -2124,6 +2127,113 @@ frame_loop_parse_error_triggers_goaway() ->
         {'DOWN', Ref, process, Pid, normal} -> ok
     after 500 -> error(process_did_not_exit)
     end.
+
+frame_loop_parse_error_goaway_codes() ->
+    %% RFC 9113 §4.2: a frame over SETTINGS_MAX_FRAME_SIZE, or a
+    %% fixed-size frame of the wrong length, is a FRAME_SIZE_ERROR (6);
+    %% other malformed frames are a PROTOCOL_ERROR (1).
+    lists:foreach(
+        fun({Bad, Code}) ->
+            {Pid, Ref, ConnPid} = post_handshake_conn(),
+            serve_recv(ConnPid, Bad),
+            ?assertMatch(<<0, 0, 8, 7, 0, 0:32, _:32, Code:32>>, expect_send()),
+            expect_close(),
+            receive
+                {'DOWN', Ref, process, Pid, normal} -> ok
+            after 500 -> error(process_did_not_exit)
+            end
+        end,
+        [
+            %% DATA declaring 16385 bytes, one over the default limit.
+            {<<16385:24, 0, 0, 1:32>>, 6},
+            {<<0, 0, 4, 2, 0, 1:32, 0:32>>, 6},
+            {<<0, 0, 5, 3, 0, 1:32, 0:40>>, 6},
+            {<<0, 0, 5, 4, 0, 0:32, 0:40>>, 6},
+            {<<0, 0, 7, 6, 0, 0:32, 0:56>>, 6},
+            {<<0, 0, 4, 7, 0, 0:32, 0:32>>, 6},
+            {<<0, 0, 3, 8, 0, 0:32, 0:24>>, 6},
+            %% HEADERS with PRIORITY too short for its priority block.
+            {<<0, 0, 2, 1, 16#24, 1:32, 0:16>>, 6},
+            %% PADDED DATA and HEADERS with no pad-length byte.
+            {<<0, 0, 0, 0, 16#08, 1:32>>, 6},
+            {<<0, 0, 0, 1, 16#0C, 1:32>>, 6},
+            %% Padding as long as the rest of the payload.
+            {<<0, 0, 2, 0, 16#08, 1:32, 2, 0>>, 1},
+            %% PING on a stream.
+            {<<0, 0, 8, 6, 0, 1:32, 0:64>>, 1}
+        ]
+    ).
+
+closes_after_a_goaway_linger() ->
+    %% Every close that follows a GOAWAY of ours shuts the write side and
+    %% lingers before it closes.
+    Ping = fun(ConnPid) ->
+        serve_recv(ConnPid, roadrunner_http2_frame:encode({ping, 0, <<0:64>>}))
+    end,
+    lists:foreach(
+        fun({Extra, Close}) ->
+            {Pid, Ref, ConnPid} = post_handshake_conn(Extra#{http2_linger_timeout => 1}),
+            _ = Close(ConnPid),
+            expect_linger_close(),
+            receive
+                {'DOWN', Ref, process, Pid, normal} -> ok
+            after 3_000 -> error(process_did_not_exit)
+            end
+        end,
+        [
+            %% A connection error: PING on a stream.
+            {#{}, fun(ConnPid) -> serve_recv(ConnPid, <<0, 0, 8, 6, 0, 1:32, 0:64>>) end},
+            %% The idle timeout.
+            {#{keep_alive_timeout => 1_000}, fun(_ConnPid) -> ok end},
+            %% Too many PINGs.
+            {
+                #{
+                    http2_ping_min_time => 60_000,
+                    http2_ping_permit_without_stream => true,
+                    http2_ping_max_strikes => 0
+                },
+                fun(ConnPid) ->
+                    Ping(ConnPid),
+                    Ping(ConnPid)
+                end
+            },
+            %% The final GOAWAY of a drain.
+            {#{}, fun(ConnPid) ->
+                ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
+                ack_goaway_ping(ConnPid)
+            end},
+            %% The end of the `connection_age` grace.
+            {#{}, fun(ConnPid) ->
+                ConnPid ! {timeout, make_ref(), {roadrunner_conn_loop_http2, connection_age_grace}}
+            end}
+        ]
+    ).
+
+closes_by_the_peer_do_not_linger() ->
+    %% A peer that sent its own GOAWAY, closed, or broke the connection is
+    %% not lingered over.
+    lists:foreach(
+        fun(Close) ->
+            {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_linger_timeout => 60_000}),
+            Close(ConnPid),
+            expect_close(),
+            receive
+                {roadrunner_fake_shutdown, _, _} -> error(lingered)
+            after 0 -> ok
+            end,
+            receive
+                {'DOWN', Ref, process, Pid, normal} -> ok
+            after 500 -> error(process_did_not_exit)
+            end
+        end,
+        [
+            fun(ConnPid) ->
+                serve_recv(ConnPid, roadrunner_http2_frame:encode({goaway, 0, no_error, <<>>}))
+            end,
+            fun(ConnPid) -> ConnPid ! {roadrunner_fake_closed, {fake, self()}} end,
+            fun(ConnPid) -> ConnPid ! {roadrunner_fake_error, {fake, self()}, etimedout} end
+        ]
+    ).
 
 idle_timeout_is_the_keep_alive_timeout() ->
     %% The listener's `keep_alive_timeout` is the connection's idle
@@ -5853,6 +5963,14 @@ drain_send(Timeout) ->
         {roadrunner_fake_send, _Pid, Data} -> iolist_to_binary(Data)
     after Timeout -> undefined
     end.
+
+%% A close that lingers: the write side is shut before the close.
+expect_linger_close() ->
+    receive
+        {roadrunner_fake_shutdown, _Pid, write} -> ok
+    after 3_000 -> error(no_shutdown)
+    end,
+    expect_close().
 
 expect_close() ->
     receive

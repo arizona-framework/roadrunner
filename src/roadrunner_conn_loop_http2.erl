@@ -806,8 +806,8 @@ handshake_phase_settings(#loop{buffer = Buf} = State) ->
             goaway_exit(State, protocol_error);
         {more, _Need} ->
             handshake_recv(State, fun handshake_phase_settings/1);
-        {error, _} ->
-            goaway_exit(State, protocol_error)
+        {error, Reason} ->
+            goaway_exit(State, parse_error_code(Reason))
     end.
 
 -spec handshake_recv(#loop{}, fun((#loop{}) -> no_return())) -> no_return().
@@ -843,7 +843,7 @@ frame_loop(#loop{goaway = {final, Reason}, streams = Streams} = State) when
 ->
     %% Drain done — the last in-flight stream finished or peer
     %% RST'd it, nothing more to do.
-    exit_clean(State, Reason);
+    exit_lingering(State, Reason);
 frame_loop(#loop{buffer = Buf} = State) ->
     case roadrunner_http2_frame:parse(Buf, ?MAX_FRAME_SIZE) of
         {ok, Frame, Rest} ->
@@ -852,8 +852,8 @@ frame_loop(#loop{buffer = Buf} = State) ->
             %% A request parked for an in-flight slot that the frames just
             %% read dropped may leave room for a queued stream.
             arm_and_recv(run_queued(State));
-        {error, _} ->
-            goaway_exit(State, protocol_error)
+        {error, Reason} ->
+            goaway_exit(State, parse_error_code(Reason))
     end.
 
 %% Under `{active, N}` the socket stays armed across reads until the
@@ -1013,7 +1013,7 @@ idle_goaway(State) ->
 idle_goaway(State, Reason) ->
     %% Closing an idle conn is no error (RFC 9113 §6.8, §7).
     _ = send_goaway(State, no_error),
-    exit_clean(State, Reason).
+    exit_lingering(State, Reason).
 
 %% The `idle_deadline` once `Streams` and `Workers` are what the conn holds:
 %% the idle timeout from now when they leave it with no stream and no
@@ -1071,7 +1071,7 @@ too_many_pings(#loop{last_stream_id = LastId} = State, Ack) ->
         Ack,
         roadrunner_http2_frame:encode({goaway, LastId, enhance_your_calm, ?TOO_MANY_PINGS})
     ]),
-    exit_clean(State, too_many_pings).
+    exit_lingering(State, too_many_pings).
 
 %% Count a frame that serves nothing against the listener's
 %% `control_frame_policy` (RFC 9113 §10.5, `http2_control_frame_*`
@@ -1275,7 +1275,7 @@ grace_expired(#loop{streams = Streams} = State) ->
          || StreamId := #stream{state = StreamState} <- Streams, StreamState =/= closed
         ]
     ]),
-    exit_clean(State, connection_age_grace).
+    exit_lingering(State, connection_age_grace).
 
 -spec final_goaway_frame(#loop{}) -> iodata().
 final_goaway_frame(#loop{goaway = {final, _}}) ->
@@ -1324,7 +1324,7 @@ start_worker(
 maybe_exit_when_drained(#loop{goaway = {final, Reason}, streams = Streams} = State) when
     map_size(Streams) =:= 0
 ->
-    exit_clean(State, Reason);
+    exit_lingering(State, Reason);
 maybe_exit_when_drained(State) ->
     State.
 
@@ -3732,17 +3732,73 @@ retry_later(State, StreamId, Status, RetryAfter) ->
 -spec goaway_exit(#loop{}, roadrunner_http2_frame:error_code()) -> no_return().
 goaway_exit(State, ErrorCode) ->
     _ = send_goaway(State, ErrorCode),
-    exit_clean(State, {protocol_error, ErrorCode}).
+    exit_lingering(State, {protocol_error, ErrorCode}).
+
+%% The GOAWAY code for a frame that did not parse. RFC 9113 §4.2: a frame
+%% over SETTINGS_MAX_FRAME_SIZE, or one of a fixed-size type with the wrong
+%% length (§6.3, §6.4, §6.5, §6.7, §6.8, §6.9), is a FRAME_SIZE_ERROR.
+-spec parse_error_code(roadrunner_http2_frame:parse_error()) ->
+    frame_size_error | protocol_error.
+parse_error_code(frame_size_error) -> frame_size_error;
+parse_error_code(bad_priority_payload) -> frame_size_error;
+parse_error_code(bad_rst_stream_payload) -> frame_size_error;
+parse_error_code(bad_settings_payload) -> frame_size_error;
+parse_error_code(bad_ping_payload) -> frame_size_error;
+parse_error_code(bad_goaway_payload) -> frame_size_error;
+parse_error_code(bad_window_update_payload) -> frame_size_error;
+parse_error_code(_) -> protocol_error.
+
+%% Close after a GOAWAY, lingering over what the client may still be
+%% sending for the listener's `http2` `linger_timeout`: closing with input
+%% unread makes the kernel reset the connection, which can wipe the GOAWAY
+%% before the client reads it. A close for abuse (a flood, too many PINGs)
+%% lingers too: the linger is bounded, drops what it reads, and holds the
+%% connection's slot, so it costs the server little, while a client told
+%% to calm down (gRPC's `too_many_pings`) must read why.
+-spec exit_lingering(#loop{}, roadrunner_event_handler:close_reason()) -> no_return().
+exit_lingering(#loop{proto_opts = #proto_opts{http2_linger_timeout = Linger}} = State, Reason) ->
+    exit_clean(State, Reason, Linger).
 
 -spec exit_clean(#loop{}, roadrunner_event_handler:close_reason()) -> no_return().
-exit_clean(#loop{socket = Socket, proto_opts = ProtoOpts, conn_span = ConnSpan} = State, Reason) ->
+exit_clean(State, Reason) ->
+    exit_clean(State, Reason, 0).
+
+-spec exit_clean(#loop{}, roadrunner_event_handler:close_reason(), non_neg_integer()) ->
+    no_return().
+exit_clean(
+    #loop{socket = Socket, proto_opts = ProtoOpts, conn_span = ConnSpan} = State, Reason, Linger
+) ->
     ok = hand_off_slots(State),
+    ok = linger(State, Linger),
     ok = roadrunner_event:listener_conn_close(ConnSpan, 0, Reason),
     Close = roadrunner_conn:close_opts(ProtoOpts),
     ok = roadrunner_conn:unregister_for_drain(Close),
     ok = roadrunner_conn:release_slot(Close),
     ok = roadrunner_transport:close(Socket),
     exit(normal).
+
+%% Linger over the socket (`roadrunner_conn:linger/2`). The conn answers
+%% none of its workers while it lingers, so each worker still running is
+%% told its stream is reset first, as a client reset tells it: one waiting
+%% on the conn ends now rather than when the conn exits. The reads are
+%% passive: a socket left armed with `{active, N}` would fail them at once
+%% and close with input unread.
+-spec linger(#loop{}, non_neg_integer()) -> ok.
+linger(_State, 0) ->
+    ok;
+linger(#loop{socket = Socket, streams = Streams}, Linger) ->
+    ok = maps:foreach(
+        fun
+            (StreamId, #stream{worker_pid = Pid, worker_ref = MonRef}) when is_reference(MonRef) ->
+                _ = (Pid ! {h2_stream_reset, StreamId}),
+                ok;
+            (_StreamId, _Stream) ->
+                ok
+        end,
+        Streams
+    ),
+    _ = roadrunner_transport:setopts(Socket, [{active, false}]),
+    roadrunner_conn:linger(Socket, Linger).
 
 %% The in-flight slots the conn still holds as it exits, counted in its
 %% cell: one per worker not yet seen ending (`workers`), plus any grant on

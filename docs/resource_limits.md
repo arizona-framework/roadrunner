@@ -151,9 +151,14 @@ are advertised to the peer in the initial `SETTINGS` frame.
 | Frames that serve no request (`control_frame_policy`) | 1000, then 1000 per 10 s, less 4 per HEADERS or DATA frame sent | yes (`false` disables) |
 | Response waiting for the client's window (`send_stall_timeout`) | 60 s with nothing sent | yes (`infinity` disables) |
 | Connection lifetime (`connection_age`) | none | opt-in |
+| Linger after the closing GOAWAY (`linger_timeout`) | 1 s | yes (`0` disables) |
 
 A frame whose declared length exceeds the negotiated max frame size is
-rejected on its 9-byte header, before the body is buffered. Streams over
+rejected on its 9-byte header, before the body is buffered, with
+`GOAWAY(FRAME_SIZE_ERROR)`. A connection closed with a GOAWAY then reads
+and drops what the client still sends for up to `linger_timeout` or until
+it closes, so the client reads the GOAWAY rather than losing it to a
+reset. Streams over
 the concurrency limit are refused with `REFUSED_STREAM`, which a client
 may retry (RFC 9113 §8.7).
 
@@ -267,7 +272,8 @@ are, so a block of those can pass it, which the advisory list size
 concurrency and header caps are tuned under `{http2, #{...}}` in the
 `protocols` list, with the keys `max_concurrent_streams`,
 `max_header_block`, `max_header_list_size`, `ping_policy`,
-`control_frame_policy`, `send_stall_timeout` and `connection_age`.
+`control_frame_policy`, `send_stall_timeout`, `connection_age` and
+`linger_timeout`.
 
 `active` sets how many socket reads a connection takes before it asks
 the socket for more (`once` asks after every read). On TLS each ask is a
