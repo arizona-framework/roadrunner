@@ -2688,6 +2688,60 @@ pmd_control_frames_stay_uncompressed_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
+%% RFC 6455 §5.5.3: pings read together get one pong, for the latest,
+%% so a client that floods pings and reads nothing queues one pong per
+%% write instead of one per ping.
+pings_read_together_get_one_pong_test() ->
+    Pings = <<(ping_frame(~"p1"))/binary, (ping_frame(~"p2"))/binary, (ping_frame(~"p3"))/binary>>,
+    ?assertEqual([<<16#8A, 2, "p3">>], echo_sends([{recv, Pings}])).
+
+%% The pong goes out ahead of the frames queued with it, so a close the
+%% same read brings stays last.
+pong_goes_ahead_of_a_close_test() ->
+    In = <<
+        (ping_frame(~"p1"))/binary, (frame(text, ~"hi"))/binary, (frame(close, <<1000:16>>))/binary
+    >>,
+    ?assertEqual(
+        [<<16#8A, 2, "p1", 16#81, 2, "hi", 16#88, 2, 1000:16>>], echo_sends([{recv, In}])
+    ).
+
+%% A ping and the message after it in one read go out in one write, the
+%% pong first.
+ping_then_message_go_out_together_test() ->
+    In = <<(ping_frame(~"p1"))/binary, (frame(text, ~"hi"))/binary>>,
+    ?assertEqual([<<16#8A, 2, "p1", 16#81, 2, "hi">>], echo_sends([{recv, In}])).
+
+%% Pings in separate reads each get their pong.
+pings_read_apart_each_get_a_pong_test() ->
+    ?assertEqual(
+        [<<16#8A, 2, "p1">>, <<16#8A, 2, "p2">>],
+        echo_sends([{recv, ping_frame(~"p1")}, {recv, ping_frame(~"p2")}])
+    ).
+
+%% What the session wrote, per write, for a script against
+%% `roadrunner_ws_echo_handler`.
+echo_sends(Script) ->
+    Tag = make_ref(),
+    Sink = spawn_active_sink(self(), Tag, Script),
+    {ok, Pid} = start_ws_session(
+        roadrunner_ws_session,
+        {
+            {fake, Sink},
+            roadrunner_ws_echo_handler,
+            undefined,
+            ws_ctx(),
+            none,
+            <<>>,
+            ws_proto_opts()
+        },
+        []
+    ),
+    Pid ! socket_ready,
+    Sends = [iolist_to_binary(Send) || Send <- collect_sends(Tag, 1000)],
+    _ = stop_ws_session(Pid),
+    Sink ! stop,
+    Sends.
+
 %% The proc_lib loop speaks the OTP sys protocol via `roadrunner_loop_sys`
 %% (mirroring the conn loops): `sys:get_state/1` works, a stray
 %% `gen_server:call/2` fails fast instead of hanging, and a

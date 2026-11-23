@@ -236,6 +236,14 @@
     %% before a close-frame exit. Order is dispatch order. Always empty
     %% while the session is idle in `recv_loop/1`.
     out = [] :: iodata(),
+    %% About how many bytes `out` holds (its payloads), so its send does not
+    %% measure it again (`roadrunner_transport:send/3`).
+    out_size = 0 :: non_neg_integer(),
+    %% The payload of the last ping read since the last flush, whose pong
+    %% `flush_out/1` writes ahead of `out`. Only the latest ping is
+    %% answered (RFC 6455 §5.5.3), so a client that floods pings and
+    %% reads nothing queues one pong per flush instead of one per ping.
+    pong = undefined :: binary() | undefined,
     %% How the socket is read: `once` re-arms after every message, `N`
     %% arms `{active, N}` and re-arms on the transport's passive message
     %% (the `active` option, `arm_active/1`).
@@ -923,15 +931,19 @@ dispatch_whole_frame(Opcode, true, Compressed, Rest, Data, Hibernate) ->
     end.
 
 %% Hand a complete message to the handler. When the reply is the only
-%% output and nothing else is buffered, it goes out directly instead of
-%% through `#data.out`.
+%% output (no frame and no pong queued) and nothing else is buffered, it
+%% goes out directly instead of through `#data.out`.
 -spec dispatch_message(text | binary, binary(), binary(), #data{}, boolean()) -> finished.
 dispatch_message(Opcode, Payload, Rest, Data, Hibernate) ->
-    #data{socket = Socket, span = Span, mod = Mod, mod_state = State, out = Out} = Data,
+    #data{socket = Socket, span = Span, mod = Mod, mod_state = State, out = Out, pong = Pong} =
+        Data,
     Frame = #{fin => true, rsv1 => false, opcode => Opcode, payload => Payload},
     case Mod:handle_frame(Frame, State) of
-        {reply, [_ | _] = OutFrames, NewState} when Rest =:= <<>>, Out =:= [] ->
-            _ = roadrunner_transport:send(Socket, encode_frames(Data, Span, OutFrames)),
+        {reply, [_ | _] = OutFrames, NewState} when
+            Rest =:= <<>>, Out =:= [], Pong =:= undefined
+        ->
+            {Encoded, Size} = encode_frames(Data, Span, OutFrames),
+            _ = roadrunner_transport:send(Socket, Encoded, Size),
             arm_after_message(
                 byte_size(Payload), Data#data{buffer = <<>>, mod_state = NewState}, Hibernate
             );
@@ -1450,7 +1462,7 @@ handle_frame(#{opcode := close, payload := P}, Data, _Hibernate) ->
 handle_frame(#{opcode := ping, payload := P} = Frame, Data, Hibernate) ->
     %% The pong is the session's (RFC 6455 §5.5.2); the handler only sees
     %% the ping, if it asked to.
-    control_frame(Frame, queue_frame(Data, pong, P), Hibernate);
+    control_frame(Frame, Data#data{pong = P}, Hibernate);
 handle_frame(#{opcode := pong} = Frame, Data, Hibernate) ->
     control_frame(Frame, Data, Hibernate);
 handle_frame(
@@ -1920,27 +1932,32 @@ payload_size(#{payload := P}) -> byte_size(P).
 %% RSV1 even inside a compressed message (we never emit a
 %% multi-fragment outbound message anyway, so the question is moot).
 -spec queue_frame(#data{}, roadrunner_ws:opcode(), iodata()) -> #data{}.
-queue_frame(#data{span = Span, out = Out} = Data, Opcode, Payload) ->
+queue_frame(#data{span = Span, out = Out, out_size = OutSize} = Data, Opcode, Payload) ->
     Size = iolist_size(Payload),
     ok = roadrunner_event:ws_frame_out(Span, Opcode, Size),
-    Data#data{out = [Out | encode_outbound(Data, Opcode, Payload, Size)]}.
+    Data#data{
+        out = [Out | encode_outbound(Data, Opcode, Payload, Size)], out_size = OutSize + Size
+    }.
 
 %% Queue a handler `{reply, [...]}` batch — one event per frame (so
 %% the event handler can count by opcode), encoded in one walk.
 -spec queue_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) -> #data{}.
-queue_frames(#data{span = Span, out = Out} = Data, OutFrames) ->
-    Data#data{out = [Out | encode_frames(Data, Span, OutFrames)]}.
+queue_frames(#data{span = Span, out = Out, out_size = OutSize} = Data, OutFrames) ->
+    {Encoded, Size} = encode_frames(Data, Span, OutFrames),
+    Data#data{out = [Out | Encoded], out_size = OutSize + Size}.
 
 %% Queue a handler's `{reply, ...}` and take its new state, with the
 %% buffer the session continues from, in a single `#data{}` update: on
 %% a small-frame stream each extra record copy is a large share of what
 %% the session allocates per message.
 -spec queue_reply(#data{}, binary(), [{roadrunner_ws:opcode(), iodata()}], term()) -> #data{}.
-queue_reply(#data{span = Span, out = Out} = Data, Buffer, OutFrames, NewState) ->
+queue_reply(#data{span = Span, out = Out, out_size = OutSize} = Data, Buffer, OutFrames, NewState) ->
+    {Encoded, Size} = encode_frames(Data, Span, OutFrames),
     Data#data{
         buffer = Buffer,
         mod_state = NewState,
-        out = [Out | encode_frames(Data, Span, OutFrames)]
+        out = [Out | Encoded],
+        out_size = OutSize + Size
     }.
 
 %% Write everything queued since the last flush in ONE `send` and reset
@@ -1952,11 +1969,20 @@ queue_reply(#data{span = Span, out = Out} = Data, Buffer, OutFrames, NewState) -
 %% failure is discovered on the next receive (closed/error message),
 %% the same as the immediate-send shape it replaces.
 -spec flush_out(#data{}) -> #data{}.
-flush_out(#data{out = []} = Data) ->
+flush_out(#data{out = [], pong = undefined} = Data) ->
     Data;
-flush_out(#data{socket = Socket, out = Out} = Data) ->
-    _ = roadrunner_transport:send(Socket, Out),
-    Data#data{out = []}.
+flush_out(#data{socket = Socket, out = Out, out_size = OutSize, pong = undefined} = Data) ->
+    _ = roadrunner_transport:send(Socket, Out, OutSize),
+    Data#data{out = [], out_size = 0};
+flush_out(#data{socket = Socket, span = Span, out = Out, out_size = OutSize, pong = Pong} = Data) ->
+    %% The pong goes ahead of the rest: `out` may end in a close frame,
+    %% after which nothing may be sent (RFC 6455 §5.5.1).
+    Size = byte_size(Pong),
+    ok = roadrunner_event:ws_frame_out(Span, pong, Size),
+    _ = roadrunner_transport:send(
+        Socket, [encode_outbound(Data, pong, Pong, Size) | Out], OutSize + Size
+    ),
+    Data#data{out = [], out_size = 0, pong = undefined}.
 
 %% Flush pending frames (typically ending in a just-queued close) and
 %% end the session.
@@ -1964,15 +1990,17 @@ flush_out(#data{socket = Socket, out = Out} = Data) ->
 flush_and_exit(Reason, Data) ->
     exit_clean(Reason, flush_out(Data)).
 
+%% The frames encoded, with the sum of their payload sizes.
 -spec encode_frames(
     #data{}, roadrunner_event_handler:span(), [{roadrunner_ws:opcode(), iodata()}]
-) -> iodata().
+) -> {iodata(), non_neg_integer()}.
 encode_frames(_Data, _Span, []) ->
-    [];
+    {[], 0};
 encode_frames(Data, Span, [{Op, Payload} | Rest]) ->
     Size = iolist_size(Payload),
     ok = roadrunner_event:ws_frame_out(Span, Op, Size),
-    [encode_outbound(Data, Op, Payload, Size) | encode_frames(Data, Span, Rest)].
+    {Encoded, RestSize} = encode_frames(Data, Span, Rest),
+    {[encode_outbound(Data, Op, Payload, Size) | Encoded], Size + RestSize}.
 
 %% `Size` is the payload's, measured once by the caller for its event; only the
 %% compressed path needs another, of its deflated bytes.
