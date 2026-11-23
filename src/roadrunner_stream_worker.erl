@@ -12,13 +12,18 @@
 
 -export([run/7]).
 -export([conn_heap_floor/1, heap_floor/3, spawn_opts/2]).
--export_type([conn_heap_floor/0, heap_floor/0]).
+-export_type([conn_heap_floor/0, heap_floor/0, peer_limit/0]).
 
 %% Where a `{send, ...}` fun's worker keeps its reductions as its streamed
 %% body starts, and the most that body may take for the worker to still
 %% learn from it: about one scheduler time slice (see sent_heap_floor/2).
 -define(BODY_START_KEY, '$roadrunner_body_start').
 -define(SHORT_BODY_REDUCTIONS, 4000).
+
+%% The client's cap in bytes on a response's header section (HTTP/2
+%% SETTINGS_MAX_HEADER_LIST_SIZE, HTTP/3 SETTINGS_MAX_FIELD_SECTION_SIZE),
+%% or `infinity` when it set none.
+-type peer_limit() :: non_neg_integer() | infinity.
 
 %% The heap floor of a connection: the min_heap_size it starts its stream
 %% workers at, in an atomics cell its workers raise (see conn_heap_floor/1).

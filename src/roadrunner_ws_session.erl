@@ -141,7 +141,7 @@
 %% `recv_loop/1` clause matching it never fires. Its own record, like
 %% `#callbacks{}`, keeps the per-frame `#data{}` copies small.
 -record(idle, {
-    timeout :: pos_integer() | infinity,
+    timeout :: roadrunner_listener:idle_ms(),
     timer :: reference() | undefined,
     recv = 0 :: non_neg_integer()
 }).
@@ -200,7 +200,7 @@
     %% opt, set once in `init/1`). `infinity` (the default) makes the
     %% recv_loop's `after` clause dead by the receive's own semantics —
     %% the timer never arms, so the default costs nothing per message.
-    hibernate_after :: pos_integer() | infinity,
+    hibernate_after :: roadrunner_listener:idle_ms(),
     idle :: #idle{},
     msg_size = 0 :: non_neg_integer(),
     %% Trailing UTF-8 bytes carried over from a previous fragment that

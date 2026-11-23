@@ -51,6 +51,7 @@ All duration and interval values in `opts()` are in milliseconds —
     positive_timeout_ms/0,
     limit/0,
     positive_limit/0,
+    idle_ms/0,
     active/0,
     heap_floor/0
 ]).
@@ -85,6 +86,13 @@ A size, count or time limit up to `2^31-1`, the largest HTTP/2 window
 
 -doc "A `t:limit/0` of at least 1.".
 -type positive_limit() :: 1..?MAX_LIMIT.
+
+-doc """
+The idle milliseconds before a WebSocket session hibernates or closes
+(`hibernate_after` and `idle_timeout` in `t:ws_opts/0`): a
+`t:positive_limit/0`, or `infinity` for never.
+""".
+-type idle_ms() :: positive_limit() | infinity.
 
 -doc """
 How a connection or WebSocket session reads its socket: `once`, or up to
@@ -2873,9 +2881,9 @@ ws_defaults() ->
         max_frame_size := non_neg_integer(),
         max_message_size := non_neg_integer(),
         recv_buffer := pos_integer() | undefined,
-        hibernate_after := pos_integer() | infinity,
+        hibernate_after := idle_ms(),
         compress := roadrunner_ws:compress(),
-        idle_timeout := pos_integer() | infinity,
+        idle_timeout := idle_ms(),
         active := active() | undefined,
         heap_floor := heap_floor() | undefined
     }.

@@ -1307,7 +1307,7 @@ heap up before the cap fires.
 -spec parse_chunk(
     binary(),
     {pos_integer(), pos_integer(), pos_integer()},
-    non_neg_integer() | infinity
+    roadrunner_router:body_limit()
 ) ->
     {ok, Data :: binary(), Rest :: binary()}
     | {ok, last, Trailers :: headers(), Rest :: binary()}

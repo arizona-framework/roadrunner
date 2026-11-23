@@ -773,7 +773,7 @@ sendable(Encoding, Accepted) ->
         false -> identity
     end.
 
--spec timeout(binary() | undefined) -> non_neg_integer() | infinity.
+-spec timeout(binary() | undefined) -> timeout().
 timeout(undefined) ->
     infinity;
 timeout(Value) ->
@@ -793,7 +793,7 @@ timeout(Value) ->
 %% and the method stops at its next write or read. The timer is cancelled
 %% when the call ends before (`ended/1`). Returns the deadline and the
 %% time left until it.
--spec deadline_after(non_neg_integer() | infinity, roadrunner_req:request()) ->
+-spec deadline_after(timeout(), roadrunner_req:request()) ->
     {integer(), pos_integer()} | {infinity, infinity}.
 deadline_after(infinity, _Req) ->
     {infinity, infinity};

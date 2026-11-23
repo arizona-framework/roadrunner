@@ -301,7 +301,7 @@
     %% off its control stream; `infinity` (the §7.2.4.1 default) until its
     %% SETTINGS arrive or when they leave it out. Each stream worker gets
     %% the value current when it starts and keeps its response within it.
-    peer_max_field_section_size = infinity :: non_neg_integer() | infinity,
+    peer_max_field_section_size = infinity :: roadrunner_stream_worker:peer_limit(),
     %% In-flight-request slot accounting (cross-listener cap). `infinity`
     %% (default) disables it; `inflight_counter` is the shared gauge. Read
     %% from proto_opts at `init/2` so the per-stream acquire/release passes
@@ -1231,7 +1231,7 @@ handle_uni_stream(#h3{uni = Uni, critical = Critical} = State, StreamId, Data, F
 
 %% The client's SETTINGS_MAX_FIELD_SECTION_SIZE, `infinity` when it sent
 %% none (RFC 9114 §7.2.4.1) or its SETTINGS have not arrived yet.
--spec peer_max_field_section_size(false | map()) -> non_neg_integer() | infinity.
+-spec peer_max_field_section_size(false | map()) -> roadrunner_stream_worker:peer_limit().
 peer_max_field_section_size(#{max_field_section_size := MaxFieldSection}) -> MaxFieldSection;
 peer_max_field_section_size(_PeerSettings) -> infinity.
 

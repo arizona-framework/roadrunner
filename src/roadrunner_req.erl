@@ -588,7 +588,7 @@ handle(Req0) ->
     stream_in(Req).
 ```
 """.
--spec set_body_timeout(infinity | 0..16#FFFFFFFF, request()) -> request().
+-spec set_body_timeout(roadrunner_listener:timeout_ms() | infinity, request()) -> request().
 set_body_timeout(Timeout, #{body_reader := #h1_body_reader{} = BS} = Req) ->
     Req#{body_reader := BS#h1_body_reader{deadline = deadline(Timeout)}};
 set_body_timeout(Timeout, #{body_reader := #stream_body_reader{} = BS} = Req) ->
@@ -598,7 +598,7 @@ set_body_timeout(Timeout, Req) when
 ->
     Req.
 
--spec deadline(infinity | 0..16#FFFFFFFF) -> deadline().
+-spec deadline(roadrunner_listener:timeout_ms() | infinity) -> deadline().
 deadline(infinity) ->
     infinity;
 deadline(Ms) when is_integer(Ms), Ms >= 0, Ms =< 16#FFFFFFFF ->

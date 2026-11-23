@@ -12,7 +12,7 @@
 %% The google.rpc.Status of a status code, its message and its details,
 %% each `{TypeUrl, Value}`, `Value` the detail message's own bytes. A detail
 %% of any other shape raises.
--spec status(0..16, binary(), [{binary(), iodata()}]) -> iodata().
+-spec status(roadrunner_grpc_status:code(), binary(), [{binary(), iodata()}]) -> iodata().
 status(Code, Message, Details) ->
     [
         code(Code),
@@ -20,7 +20,7 @@ status(Code, Message, Details) ->
         | [field(3, any(TypeUrl, Value)) || {TypeUrl, Value} <- Details]
     ].
 
--spec code(0..16) -> iodata().
+-spec code(roadrunner_grpc_status:code()) -> iodata().
 code(0) -> [];
 code(Code) -> [1 bsl 3, Code].
 

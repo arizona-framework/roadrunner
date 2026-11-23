@@ -30,10 +30,16 @@ with `UNAVAILABLE` so its client watches again.
 -export([set_status/2]).
 -export([name/0, rpcs/0, files/0, check/2, list/2, watch/2]).
 
+-export_type([status_code/0]).
+
 %% HealthCheckResponse.ServingStatus values.
 -define(SERVING, 1).
 -define(NOT_SERVING, 2).
 -define(SERVICE_UNKNOWN, 3).
+
+%% A HealthCheckResponse.ServingStatus value this service sends.
+-doc false.
+-type status_code() :: ?SERVING..?SERVICE_UNKNOWN.
 
 -doc """
 Set a service's status, by its full name (`~"package.Service"`), or the
@@ -116,7 +122,7 @@ watch(Request, Stream) ->
 %% went away, or the listener drains (`roadrunner_grpc:info/2`; the service
 %% goes NOT_SERVING for the drain first, so a balancer moves away), or the
 %% statuses went with their store (UNAVAILABLE: the client watches again).
--spec watching({binary(), reference()}, 1..3, roadrunner_grpc:stream()) ->
+-spec watching({binary(), reference()}, status_code(), roadrunner_grpc:stream()) ->
     {ok, roadrunner_grpc:stream()} | {error, unavailable, binary(), roadrunner_grpc:stream()}.
 watching({Service, Store} = Watch, Sent, Stream) ->
     receive
@@ -142,7 +148,7 @@ watching({Service, Store} = Watch, Sent, Stream) ->
     end.
 
 %% A last status before the call ends, unless it was the one sent.
--spec last(1..3, 1..3, roadrunner_grpc:stream()) -> roadrunner_grpc:stream().
+-spec last(status_code(), status_code(), roadrunner_grpc:stream()) -> roadrunner_grpc:stream().
 last(Status, Status, Stream) ->
     Stream;
 last(_Status, ?SERVICE_UNKNOWN, Stream) ->
@@ -157,10 +163,10 @@ last(Status, _Sent, Stream) ->
 malformed(Stream) ->
     {error, internal, ~"request message does not decode", Stream}.
 
--spec watch_status(serving | not_serving | unknown) -> 1..3.
+-spec watch_status(serving | not_serving | unknown) -> status_code().
 watch_status(unknown) -> ?SERVICE_UNKNOWN;
 watch_status(Status) -> serving_status(Status).
 
--spec serving_status(serving | not_serving) -> 1..2.
+-spec serving_status(serving | not_serving) -> status_code().
 serving_status(serving) -> ?SERVING;
 serving_status(not_serving) -> ?NOT_SERVING.
