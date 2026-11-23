@@ -236,15 +236,15 @@ here crashes it.
     headers => roadrunner_http:headers(),
     compress => roadrunner_ws:compress(),
     idle_timeout => pos_integer() | infinity,
-    max_frame_size => 0..16#7FFFFFFF,
-    max_message_size => 0..16#7FFFFFFF,
-    recv_buffer => 1..16#7FFFFFFF,
+    max_frame_size => roadrunner_listener:limit(),
+    max_message_size => roadrunner_listener:limit(),
+    recv_buffer => roadrunner_listener:positive_limit(),
     hibernate_after => pos_integer() | infinity,
-    active => once | 1..32767,
+    active => roadrunner_listener:active(),
     fullsweep_after => non_neg_integer(),
     min_heap_size => non_neg_integer(),
     max_heap_size => erlang:max_heap_size(),
-    heap_floor => false | #{max => pos_integer(), min => non_neg_integer()}
+    heap_floor => roadrunner_listener:heap_floor()
 }.
 
 -doc """

@@ -335,7 +335,7 @@
     msg_passive :: atom(),
     %% Socket read mode: `once` re-arms after every read; `N` arms
     %% `{active, N}` and re-arms on the transport's passive message.
-    active :: once | 1..32767,
+    active :: roadrunner_listener:active(),
     %% True while an `{active, N}` arm still has reads left, so the
     %% frame loop skips the setopts call. Always false under `once`.
     armed = false :: boolean(),
