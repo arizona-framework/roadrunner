@@ -213,7 +213,7 @@
 }).
 
 -type recv_mode() ::
-    once | {once, pos_integer()} | 1..32767 | {1..32767, pos_integer()}.
+    roadrunner_listener:active() | {roadrunner_listener:active(), pos_integer()}.
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.
@@ -546,18 +546,18 @@ hibernate_after(_Mode) -> infinity.
 %% `{http1, #{active => ...}}`, or by transport when unset: `{active, 16}`
 %% on TLS, where every arm is a call into the TLS connection process, and
 %% `once` on plain TCP, where `{active, N}` measured no faster.
--spec read_mode(once | 1..32767 | undefined, roadrunner_transport:socket()) ->
-    once | 1..32767.
+-spec read_mode(roadrunner_listener:active() | undefined, roadrunner_transport:socket()) ->
+    roadrunner_listener:active().
 read_mode(undefined, {ssl, _}) -> 16;
 read_mode(undefined, _Socket) -> once;
 read_mode(Mode, _Socket) -> Mode.
 
--spec recv_mode(once | 1..32767, non_neg_integer()) -> recv_mode().
+-spec recv_mode(roadrunner_listener:active(), non_neg_integer()) -> recv_mode().
 recv_mode(Mode, 0) -> Mode;
 recv_mode(Mode, HibernateAfter) -> {Mode, HibernateAfter}.
 
 %% The socket's read mode, without the hibernation it may be paired with.
--spec active_count(recv_mode()) -> once | 1..32767.
+-spec active_count(recv_mode()) -> roadrunner_listener:active().
 active_count({Mode, _HibernateAfter}) -> Mode;
 active_count(Mode) -> Mode.
 
@@ -2422,7 +2422,7 @@ arm_active_n(#loop_state{socket = Socket} = S, N) ->
 %% again is how the hibernating `once` path has always resumed; an
 %% `{active, N}` socket is still armed, and arming it again would add
 %% `N` more unread reads.
--spec rearm_after_stray(#loop_state{}, once | 1..32767) -> ok.
+-spec rearm_after_stray(#loop_state{}, roadrunner_listener:active()) -> ok.
 rearm_after_stray(S, once) -> arm_active_once(S);
 rearm_after_stray(_S, _N) -> ok.
 

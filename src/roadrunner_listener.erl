@@ -44,7 +44,22 @@ All duration and interval values in `opts()` are in milliseconds —
 %% port shared with another socket is rare, so it takes many picks to see.
 -export([resolve_quic_port/3]).
 
--export_type([opts/0, body_buffering/0]).
+-export_type([
+    opts/0,
+    body_buffering/0,
+    timeout_ms/0,
+    positive_timeout_ms/0,
+    limit/0,
+    positive_limit/0,
+    active/0,
+    heap_floor/0
+]).
+
+%% The longest a `receive` waits, so the cap on every timeout a
+%% connection arms its waits from.
+-define(MAX_TIMEOUT_MS, 16#FFFFFFFF).
+%% The 31-bit cap on sizes, counts and the other limits.
+-define(MAX_LIMIT, 16#7FFFFFFF).
 
 -doc """
 How a listener reads request bodies (`body_buffering` in `t:opts/0`):
@@ -52,6 +67,38 @@ How a listener reads request bodies (`body_buffering` in `t:opts/0`):
 to the handler.
 """.
 -type body_buffering() :: auto | manual.
+
+-doc """
+A timeout in milliseconds, up to `16#FFFFFFFF` (about 49 days), the
+longest a `receive` waits.
+""".
+-type timeout_ms() :: 0..?MAX_TIMEOUT_MS.
+
+-doc "A `t:timeout_ms/0` of at least 1 ms.".
+-type positive_timeout_ms() :: 1..?MAX_TIMEOUT_MS.
+
+-doc """
+A size, count or time limit up to `2^31-1`, the largest HTTP/2 window
+(RFC 9113 §6.9.1) and the cap on every such option.
+""".
+-type limit() :: 0..?MAX_LIMIT.
+
+-doc "A `t:limit/0` of at least 1.".
+-type positive_limit() :: 1..?MAX_LIMIT.
+
+-doc """
+How a connection or WebSocket session reads its socket: `once`, or up to
+`N` reads before it asks for more. `32767` is the largest count
+`inet:setopts/2` and `ssl:setopts/2` accept.
+""".
+-type active() :: once | 1..32767.
+
+-doc """
+A WebSocket session's heap floor (`heap_floor` in `t:ws_opts/0`): `false`,
+or the most heap it keeps between `handle_info/2` calls (`max`) and the
+least one must have needed to raise it (`min`).
+""".
+-type heap_floor() :: false | #{max => pos_integer(), min => non_neg_integer()}.
 
 -define(DEFAULT_MAX_CONTENT_LENGTH, 10485760).
 -define(DEFAULT_REQUEST_TIMEOUT, 30000).
@@ -209,8 +256,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the deadline the
   request's read started with (this timeout for a connection's first
   request, `keep_alive_timeout` after). `roadrunner_req:set_body_timeout/2`
-  changes it per request. Default 30 s, at most `16#FFFFFFFF` ms (about
-  49 days, the longest a `receive` waits).
+  changes it per request. Default 30 s, a `t:timeout_ms/0`.
 - `tls_handshake_timeout`: bound on the TLS handshake (TLS listeners
   only). The handshake runs in the connection process, not the
   acceptor, so a slow or silent peer never blocks other connections
@@ -218,7 +264,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   reported as a per-connection `{handshake, timeout}` accept error,
   releasing its `max_clients` slot. On a TLS listener that also reads
   the PROXY protocol, the same bound covers the header read that
-  precedes the handshake. Default 5 s, at most `16#FFFFFFFF` ms.
+  precedes the handshake. Default 5 s, a `t:positive_timeout_ms/0`.
 - `keep_alive_timeout`: idle timeout between requests on a
   keep-alive conn: on HTTP/1.1 between one request and the next, on
   HTTP/2 how long after its last request ended (or after it opened) a
@@ -230,7 +276,7 @@ Optional middleware and timing knobs (durations in milliseconds):
   timeout the server offers (at least 1 s; the connection uses the smaller of it and the
   client's, and closes once it passes with nothing received; a client
   waiting on a response keeps it open, as RFC 9114 §5.1 expects of it,
-  while the server does not). Default 60 s, at most `16#FFFFFFFF` ms.
+  while the server does not). Default 60 s, a `t:timeout_ms/0`.
 - `num_acceptors`: size of the acceptor pool. Default: one per online
   scheduler, at most 10. Every acceptor waits on the same listen socket, so
   more acceptors than schedulers only adds contention: on one or two
@@ -550,9 +596,9 @@ ops-tuning rationale.
     middlewares => roadrunner_middleware:middlewares(),
     max_content_length => non_neg_integer(),
     ws => ws_opts(),
-    request_timeout => 0..16#FFFFFFFF,
-    tls_handshake_timeout => 1..16#FFFFFFFF,
-    keep_alive_timeout => 0..16#FFFFFFFF,
+    request_timeout => timeout_ms(),
+    tls_handshake_timeout => positive_timeout_ms(),
+    keep_alive_timeout => timeout_ms(),
     num_acceptors => pos_integer(),
     accept_priority => high | normal,
     max_keep_alive_requests => infinity | pos_integer(),
@@ -694,11 +740,11 @@ ops-tuning rationale.
     %% HTTP/2 tunables live under the `http2` tuple's opts map:
     %%
     %% - `conn_window` — connection-level receive window peak (bytes,
-    %%   `1..2^31-1`). Default `2^31-1`, the largest allowed, sent as
+    %%   `t:positive_limit/0`). Default `2^31-1`, the largest allowed, sent as
     %%   an early `WINDOW_UPDATE(0, peak - 65535)` after the server
     %%   SETTINGS (RFC 9113 §6.9.2 starts it at `65535`).
     %% - `stream_window` — the peak a stream's receive window grows to
-    %%   (bytes, `1..2^31-1`). Default `16777216` (16 MB). Every stream
+    %%   (bytes, `t:positive_limit/0`). Default `16777216` (16 MB). Every stream
     %%   opens at the RFC `65535` and grows with its first refill once
     %%   its DATA is taken. An upload runs at most one window per round
     %%   trip. Setting above `conn_window` is allowed but not useful —
@@ -793,24 +839,24 @@ cookies / tracing metadata); lower them to tighten the attack surface.
   responses get a passive socket, as with `once`.
 """.
 -type http1_opts() :: #{
-    max_request_line => 1..16#7FFFFFFF,
-    max_header_line => 1..16#7FFFFFFF,
-    max_header_block => 1..16#7FFFFFFF,
-    max_header_count => 1..16#7FFFFFFF,
-    linger_timeout => 0..16#7FFFFFFF,
-    active => once | 1..32767
+    max_request_line => positive_limit(),
+    max_header_line => positive_limit(),
+    max_header_block => positive_limit(),
+    max_header_count => positive_limit(),
+    linger_timeout => limit(),
+    active => active()
 }.
 
 -doc """
 HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
 
 - `conn_window` — connection-level receive window peak in bytes
-  (`1..2^31-1`). Default `2^31-1`, the largest allowed, sent as an
+  (`t:positive_limit/0`). Default `2^31-1`, the largest allowed, sent as an
   early `WINDOW_UPDATE(0, peak - 65535)` after the server SETTINGS
   (RFC 9113 §6.9.2 starts it at `65535`). Its credit is returned as
   DATA arrives, so it bounds no memory.
 - `stream_window` — the peak a stream's receive window grows to, in
-  bytes (`1..2^31-1`). Default `16777216` (16 MB). Every stream
+  bytes (`t:positive_limit/0`). Default `16777216` (16 MB). Every stream
   opens at the RFC's `65535`, so a stream refused or rejected before
   its body is read can draw at most that much; its window grows to
   the peak with its first refill, once its DATA is taken. An upload
@@ -953,26 +999,26 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   ran out.
 """.
 -type http2_opts() :: #{
-    conn_window => 1..16#7FFFFFFF,
-    stream_window => 1..16#7FFFFFFF,
-    window_refill_threshold => 1..16#7FFFFFFF,
-    max_concurrent_streams => 1..16#7FFFFFFF,
-    max_header_block => 1..16#7FFFFFFF,
-    max_header_list_size => 1..16#7FFFFFFF,
-    active => once | 1..32767,
+    conn_window => positive_limit(),
+    stream_window => positive_limit(),
+    window_refill_threshold => positive_limit(),
+    max_concurrent_streams => positive_limit(),
+    max_header_block => positive_limit(),
+    max_header_list_size => positive_limit(),
+    active => active(),
     ping_policy =>
         false
         | #{
-            min_time => 1..16#FFFFFFFF,
+            min_time => positive_timeout_ms(),
             permit_without_stream => boolean(),
-            max_strikes => 0..16#7FFFFFFF
+            max_strikes => limit()
         },
     control_frame_policy =>
-        false | #{max => 1..16#7FFFFFFF, window => 1..16#FFFFFFFF},
-    send_stall_timeout => 1..16#FFFFFFFF | infinity,
-    linger_timeout => 0..16#7FFFFFFF,
+        false | #{max => positive_limit(), window => positive_timeout_ms()},
+    send_stall_timeout => positive_timeout_ms() | infinity,
+    linger_timeout => limit(),
     connection_age =>
-        false | #{max := 1..16#FFFFFFFF, grace => 0..16#FFFFFFFF | infinity}
+        false | #{max := positive_timeout_ms(), grace => timeout_ms() | infinity}
 }.
 
 -doc """
@@ -1038,11 +1084,11 @@ HTTP/3 listener tunables (under `{http3, ThisMap}` in `protocols`).
 """.
 -type http3_opts() :: #{
     listeners => 1..?MAX_H3_LISTENERS,
-    max_header_block => 1..16#7FFFFFFF,
-    max_streams_bidi => 1..16#7FFFFFFF,
-    max_field_section_size => 1..16#7FFFFFFF,
-    qpack_max_table_capacity => 0..16#7FFFFFFF,
-    qpack_blocked_streams => 0..16#7FFFFFFF,
+    max_header_block => positive_limit(),
+    max_streams_bidi => positive_limit(),
+    max_field_section_size => positive_limit(),
+    qpack_max_table_capacity => limit(),
+    qpack_blocked_streams => limit(),
     secret => binary()
 }.
 
@@ -1123,14 +1169,14 @@ An upgrade can set each of these for its own session
 (`t:roadrunner_ws_handler:upgrade_opts/0`).
 """.
 -type ws_opts() :: #{
-    max_frame_size => 0..16#7FFFFFFF,
-    max_message_size => 0..16#7FFFFFFF,
-    recv_buffer => 1..16#7FFFFFFF,
-    hibernate_after => 1..16#7FFFFFFF,
+    max_frame_size => limit(),
+    max_message_size => limit(),
+    recv_buffer => positive_limit(),
+    hibernate_after => positive_limit(),
     compress => roadrunner_ws:compress(),
-    idle_timeout => 1..16#7FFFFFFF,
-    active => once | 1..32767,
-    heap_floor => false | #{max => pos_integer(), min => non_neg_integer()}
+    idle_timeout => positive_limit(),
+    active => active(),
+    heap_floor => heap_floor()
 }.
 
 -record(state, {
@@ -2021,11 +2067,11 @@ maybe_tls_upgrade(ProtoOpts, _Opts, _Protocols) ->
     ProtoOpts.
 
 %% A timeout option in ms, from `Min` up to the longest a `receive` waits
-%% (`16#FFFFFFFF`), as every connection arms its waits from it.
+%% (`?MAX_TIMEOUT_MS`), as every connection arms its waits from it.
 -spec timeout_opt(atom(), opts(), non_neg_integer(), 0 | 1) -> non_neg_integer().
 timeout_opt(Key, Opts, Default, Min) ->
     case maps:get(Key, Opts, Default) of
-        Ms when is_integer(Ms), Ms >= Min, Ms =< 16#FFFFFFFF -> Ms;
+        Ms when is_integer(Ms), Ms >= Min, Ms =< ?MAX_TIMEOUT_MS -> Ms;
         Other -> error({invalid_listener_opt, Key, Other})
     end.
 
@@ -2429,7 +2475,7 @@ validate_http1_opts(Opts, Raw) ->
                 false -> error({invalid_listener_opt, protocols, Raw});
                 true when K =:= active -> Acc#{K => validate_http2_active(V, Raw)};
                 true when K =:= linger_timeout, V =:= 0 -> Acc#{K => V};
-                true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
+                true when is_integer(V), V >= 1, V =< ?MAX_LIMIT -> Acc#{K => V};
                 true -> error({invalid_listener_opt, protocols, Raw})
             end
         end,
@@ -2517,7 +2563,7 @@ flatten_protocol_entry(
 -spec http2_defaults() -> http2_opts().
 http2_defaults() ->
     #{
-        conn_window => 16#7FFFFFFF,
+        conn_window => ?MAX_LIMIT,
         stream_window => 16777216,
         max_concurrent_streams => 100,
         max_header_block => 16384,
@@ -2550,7 +2596,7 @@ validate_http2_opts(Opts, Raw) ->
                 true when K =:= send_stall_timeout ->
                     Acc#{K => validate_send_stall_timeout(V, Raw)};
                 true when K =:= linger_timeout, V =:= 0 -> Acc#{K => V};
-                true when is_integer(V), V >= 1, V =< 16#7FFFFFFF -> Acc#{K => V};
+                true when is_integer(V), V >= 1, V =< ?MAX_LIMIT -> Acc#{K => V};
                 true ->
                     error({invalid_listener_opt, protocols, Raw})
             end
@@ -2579,11 +2625,11 @@ validate_ping_policy(_Policy, Raw) ->
     error({invalid_listener_opt, protocols, Raw}).
 
 %% Milliseconds, or `infinity` for no limit.
--spec validate_send_stall_timeout(term(), term()) -> 1..16#FFFFFFFF | infinity.
+-spec validate_send_stall_timeout(term(), term()) -> positive_timeout_ms() | infinity.
 validate_send_stall_timeout(infinity, _Raw) ->
     infinity;
 validate_send_stall_timeout(Timeout, _Raw) when
-    is_integer(Timeout), Timeout >= 1, Timeout =< 16#FFFFFFFF
+    is_integer(Timeout), Timeout >= 1, Timeout =< ?MAX_TIMEOUT_MS
 ->
     Timeout;
 validate_send_stall_timeout(_Timeout, Raw) ->
@@ -2599,10 +2645,10 @@ validate_control_frame_policy(Policy, Raw) when is_map(Policy) ->
             map_size(Policy1) =:= 2,
             is_integer(Max),
             Max >= 1,
-            Max =< 16#7FFFFFFF,
+            Max =< ?MAX_LIMIT,
             is_integer(Window),
             Window >= 1,
-            Window =< 16#FFFFFFFF
+            Window =< ?MAX_TIMEOUT_MS
         ->
             Policy1;
         #{} ->
@@ -2624,13 +2670,13 @@ flatten_control_frame_policy(#{max := Max, window := Window}, ProtoOpts) ->
 validate_connection_age(false, _Raw) ->
     false;
 validate_connection_age(#{max := Max} = Age, Raw) when
-    is_integer(Max), Max >= 1, Max =< 16#FFFFFFFF
+    is_integer(Max), Max >= 1, Max =< ?MAX_TIMEOUT_MS
 ->
     case maps:merge(#{grace => infinity}, Age) of
         #{grace := Grace} = Age1 when
             map_size(Age1) =:= 2,
             (Grace =:= infinity orelse
-                (is_integer(Grace) andalso Grace >= 0 andalso Grace =< 16#FFFFFFFF))
+                (is_integer(Grace) andalso Grace >= 0 andalso Grace =< ?MAX_TIMEOUT_MS))
         ->
             Age1;
         #{} ->
@@ -2640,16 +2686,16 @@ validate_connection_age(_Age, Raw) ->
     error({invalid_listener_opt, protocols, Raw}).
 
 -spec valid_ping_policy_opt(term(), term()) -> boolean().
-valid_ping_policy_opt(min_time, V) -> is_integer(V) andalso V >= 1 andalso V =< 16#FFFFFFFF;
+valid_ping_policy_opt(min_time, V) -> is_integer(V) andalso V >= 1 andalso V =< ?MAX_TIMEOUT_MS;
 valid_ping_policy_opt(permit_without_stream, V) -> is_boolean(V);
-valid_ping_policy_opt(max_strikes, V) -> is_integer(V) andalso V >= 0 andalso V =< 16#7FFFFFFF;
+valid_ping_policy_opt(max_strikes, V) -> is_integer(V) andalso V >= 0 andalso V =< ?MAX_LIMIT;
 valid_ping_policy_opt(_Key, _V) -> false.
 
 %% `true` is rejected: an always-active socket has no bound on unread
 %% data, so a fast peer could fill the mailbox. `32767` is the largest
 %% count `inet:setopts/2` and `ssl:setopts/2` accept. HTTP/1's `active`
 %% takes the same values.
--spec validate_http2_active(term(), term()) -> once | 1..32767.
+-spec validate_http2_active(term(), term()) -> active().
 validate_http2_active(once, _Raw) ->
     once;
 validate_http2_active(N, _Raw) when is_integer(N), N >= 1, N =< 32767 ->
@@ -2730,11 +2776,11 @@ validate_http3_int_opt(K, V, Acc, Defaults, Raw) ->
     {Min, Max} =
         case K of
             listeners -> {1, ?MAX_H3_LISTENERS};
-            max_header_block -> {1, 16#7FFFFFFF};
-            max_streams_bidi -> {1, 16#7FFFFFFF};
-            max_field_section_size -> {1, 16#7FFFFFFF};
-            qpack_max_table_capacity -> {0, 16#7FFFFFFF};
-            qpack_blocked_streams -> {0, 16#7FFFFFFF};
+            max_header_block -> {1, ?MAX_LIMIT};
+            max_streams_bidi -> {1, ?MAX_LIMIT};
+            max_field_section_size -> {1, ?MAX_LIMIT};
+            qpack_max_table_capacity -> {0, ?MAX_LIMIT};
+            qpack_blocked_streams -> {0, ?MAX_LIMIT};
             _ -> {1, 0}
         end,
     case is_map_key(K, Defaults) of
@@ -2763,7 +2809,7 @@ ws_buffer(WsBuffer, _Base, _Max) -> WsBuffer.
 %% A WebSocket session's heap floor as `{Min, Cap}`: `ws.heap_floor`'s
 %% `min` (default 2586) and `max`, which defaults to the listener's
 %% `handler_spawn.heap_floor`; the cap is `0` when either is `false`.
--spec ws_heap_floor(false | #{max => pos_integer(), min => non_neg_integer()} | undefined, opts()) ->
+-spec ws_heap_floor(heap_floor() | undefined, opts()) ->
     {non_neg_integer(), non_neg_integer()}.
 ws_heap_floor(false, _Opts) ->
     {?DEFAULT_WS_HEAP_FLOOR_MIN, 0};
@@ -2830,8 +2876,8 @@ ws_defaults() ->
         hibernate_after := pos_integer() | infinity,
         compress := roadrunner_ws:compress(),
         idle_timeout := pos_integer() | infinity,
-        active := once | 1..32767 | undefined,
-        heap_floor := false | #{max => pos_integer(), min => non_neg_integer()} | undefined
+        active := active() | undefined,
+        heap_floor := heap_floor() | undefined
     }.
 validate_ws_opts(Opts) when is_map(Opts) ->
     Defaults = ws_defaults(),
@@ -2879,9 +2925,9 @@ valid_ws_opt(compress, V) when is_map(V) ->
 valid_ws_opt(compress, V) ->
     is_boolean(V);
 valid_ws_opt(idle_timeout, V) ->
-    is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
+    is_integer(V) andalso V >= 1 andalso V =< ?MAX_LIMIT;
 valid_ws_opt(recv_buffer, V) ->
-    is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
+    is_integer(V) andalso V >= 1 andalso V =< ?MAX_LIMIT;
 valid_ws_opt(heap_floor, false) ->
     true;
 valid_ws_opt(heap_floor, V) when is_map(V) ->
@@ -2889,9 +2935,9 @@ valid_ws_opt(heap_floor, V) when is_map(V) ->
 valid_ws_opt(heap_floor, _V) ->
     false;
 valid_ws_opt(hibernate_after, V) ->
-    is_integer(V) andalso V >= 1 andalso V =< 16#7FFFFFFF;
+    is_integer(V) andalso V >= 1 andalso V =< ?MAX_LIMIT;
 valid_ws_opt(_SizeCap, V) ->
-    is_integer(V) andalso V >= 0 andalso V =< 16#7FFFFFFF.
+    is_integer(V) andalso V >= 0 andalso V =< ?MAX_LIMIT.
 
 -spec valid_heap_floor_opt(term(), term()) -> boolean().
 valid_heap_floor_opt(max, V) -> is_integer(V) andalso V > 0;
@@ -2913,7 +2959,7 @@ valid_compress_opt(_Key, _N) -> false.
 -spec validate_recv_buffer(map()) -> pos_integer().
 validate_recv_buffer(Opts) ->
     case maps:get(recv_buffer, Opts, ?DEFAULT_RECV_BUFFER) of
-        N when is_integer(N), N >= 1, N =< 16#7FFFFFFF -> N;
+        N when is_integer(N), N >= 1, N =< ?MAX_LIMIT -> N;
         Bad -> error({invalid_listener_opt, recv_buffer, Bad})
     end.
 
@@ -2923,7 +2969,7 @@ validate_recv_buffer(Opts) ->
 -spec idle_recv_buffer(map()) -> pos_integer().
 idle_recv_buffer(Opts) ->
     case maps:get(idle_recv_buffer, Opts, ?DEFAULT_IDLE_RECV_BUFFER) of
-        N when is_integer(N), N >= 1, N =< 16#7FFFFFFF -> min(N, validate_recv_buffer(Opts));
+        N when is_integer(N), N >= 1, N =< ?MAX_LIMIT -> min(N, validate_recv_buffer(Opts));
         Bad -> error({invalid_listener_opt, idle_recv_buffer, Bad})
     end.
 

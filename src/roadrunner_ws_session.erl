@@ -239,7 +239,7 @@
     %% How the socket is read: `once` re-arms after every message, `N`
     %% arms `{active, N}` and re-arms on the transport's passive message
     %% (the `active` option, `arm_active/1`).
-    active :: once | 1..32767,
+    active :: roadrunner_listener:active(),
     %% The adaptive inet `buffer` (`arm_and_recv/2`): the size set now, the
     %% size the session falls back to and the cap it grows to, in one field
     %% so the record every message updates stays small. `undefined` when
@@ -483,7 +483,7 @@ apply_ws_buffer(Socket, #proto_opts{ws_buffer = Buffer}) ->
 %% else keeps the buffer it has.
 -spec adaptive_buf(
     pos_integer() | {adaptive, pos_integer(), pos_integer()} | undefined,
-    once | 1..32767,
+    roadrunner_listener:active(),
     roadrunner_transport:socket()
 ) ->
     {pos_integer(), pos_integer(), pos_integer()} | undefined.
@@ -649,8 +649,8 @@ begin_session(Data) ->
 %% armed is polled with a later wake-up (measured slower per message).
 %% TLS reads with `{active, 16}`, as HTTP/2 does: there each re-arm is a
 %% synchronous call into the ssl connection process.
--spec read_mode(once | 1..32767 | undefined, roadrunner_transport:socket()) ->
-    once | 1..32767.
+-spec read_mode(roadrunner_listener:active() | undefined, roadrunner_transport:socket()) ->
+    roadrunner_listener:active().
 read_mode(undefined, {ssl, _}) -> 16;
 read_mode(undefined, _Socket) -> once;
 read_mode(Active, _Socket) -> Active.
