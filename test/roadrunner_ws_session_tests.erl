@@ -2688,12 +2688,21 @@ pmd_control_frames_stay_uncompressed_test() ->
     Sink ! stop,
     ok = stop_ws_session(Pid).
 
-%% RFC 6455 §5.5.3: pings read together get one pong, for the latest,
-%% so a client that floods pings and reads nothing queues one pong per
-%% write instead of one per ping.
-pings_read_together_get_one_pong_test() ->
+%% Pings read together each get a pong, in order (Autobahn 2.10 sends
+%% ten in one write and expects ten pongs).
+pings_read_together_each_get_a_pong_test() ->
     Pings = <<(ping_frame(~"p1"))/binary, (ping_frame(~"p2"))/binary, (ping_frame(~"p3"))/binary>>,
-    ?assertEqual([<<16#8A, 2, "p3">>], echo_sends([{recv, Pings}])).
+    ?assertEqual(
+        [<<16#8A, 2, "p1", 16#8A, 2, "p2", 16#8A, 2, "p3">>], echo_sends([{recv, Pings}])
+    ).
+
+%% RFC 6455 §5.5.3: past 16 pongs between two writes, only the latest
+%% ping is answered, ahead of the rest, so a client that floods pings and
+%% reads nothing queues a few pongs per write instead of one per ping.
+ping_flood_gets_the_latest_pong_test() ->
+    Pings = <<<<(ping_frame(integer_to_binary(I + 10)))/binary>> || I <- lists:seq(1, 20)>>,
+    Pongs = <<<<16#8A, 2, (integer_to_binary(I + 10))/binary>> || I <- lists:seq(1, 16)>>,
+    ?assertEqual([<<16#8A, 2, "30", Pongs/binary>>], echo_sends([{recv, Pings}])).
 
 %% The pong goes out ahead of the frames queued with it, so a close the
 %% same read brings stays last.

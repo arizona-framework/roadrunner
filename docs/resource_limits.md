@@ -107,10 +107,11 @@ Notes:
 - permessage-deflate is inflated in bounded chunks against
   `max_message_size`, so a small high-ratio frame cannot expand into
   gigabytes before the cap fires
-- pings read together get one pong, for the latest (RFC 6455 §5.5.3), so
-  a client that floods pings and reads nothing has one pong queued per
-  write, not one per ping; once the kernel holds `max_unsent_bytes` the
-  session waits, and `send_timeout` closes the connection
+- a session answers up to 16 pings per write with a pong each; past that
+  it answers only the latest (RFC 6455 §5.5.3), so a client that floods
+  pings and reads nothing has a few pongs queued per write, not one per
+  ping; once the kernel holds `max_unsent_bytes` the session waits, and
+  `send_timeout` closes the connection
 
 When a cap closes a connection, roadrunner emits the
 `ws_frame_rejected` event (with the cap's `reason` and the offending

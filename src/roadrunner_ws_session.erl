@@ -239,10 +239,12 @@
     %% About how many bytes `out` holds (its payloads), so its send does not
     %% measure it again (`roadrunner_transport:send/3`).
     out_size = 0 :: non_neg_integer(),
-    %% The payload of the last ping read since the last flush, whose pong
-    %% `flush_out/1` writes ahead of `out`. Only the latest ping is
-    %% answered (RFC 6455 §5.5.3), so a client that floods pings and
-    %% reads nothing queues one pong per flush instead of one per ping.
+    %% Pongs queued on `out` since the last flush. Past `?MAX_PONGS`, a
+    %% ping read before the flush is answered only by the pong for the
+    %% latest one (RFC 6455 §5.5.3): `pong` holds its payload, and
+    %% `flush_out/1` writes it ahead of `out`. A client that floods pings
+    %% and reads nothing queues a few pongs per flush, not one per ping.
+    pongs = 0 :: non_neg_integer(),
     pong = undefined :: binary() | undefined,
     %% How the socket is read: `once` re-arms after every message, `N`
     %% arms `{active, N}` and re-arms on the transport's passive message
@@ -283,6 +285,9 @@
 %% from the deflate output; receiver appends it before inflating to
 %% terminate the deflate block.
 -define(PMD_TAIL, <<0, 0, 16#FF, 16#FF>>).
+%% The pongs a session queues between two flushes before it answers only
+%% the latest ping (`#data.pongs`).
+-define(MAX_PONGS, 16).
 
 %% Least charge (bytes) a fragment adds to the running message size.
 %% Without a floor a flood of empty continuation frames would never
@@ -1462,7 +1467,7 @@ handle_frame(#{opcode := close, payload := P}, Data, _Hibernate) ->
 handle_frame(#{opcode := ping, payload := P} = Frame, Data, Hibernate) ->
     %% The pong is the session's (RFC 6455 §5.5.2); the handler only sees
     %% the ping, if it asked to.
-    control_frame(Frame, Data#data{pong = P}, Hibernate);
+    control_frame(Frame, queue_pong(Data, P), Hibernate);
 handle_frame(#{opcode := pong} = Frame, Data, Hibernate) ->
     control_frame(Frame, Data, Hibernate);
 handle_frame(
@@ -1973,7 +1978,7 @@ flush_out(#data{out = [], pong = undefined} = Data) ->
     Data;
 flush_out(#data{socket = Socket, out = Out, out_size = OutSize, pong = undefined} = Data) ->
     _ = roadrunner_transport:send(Socket, Out, OutSize),
-    Data#data{out = [], out_size = 0};
+    Data#data{out = [], out_size = 0, pongs = 0};
 flush_out(#data{socket = Socket, span = Span, out = Out, out_size = OutSize, pong = Pong} = Data) ->
     %% The pong goes ahead of the rest: `out` may end in a close frame,
     %% after which nothing may be sent (RFC 6455 §5.5.1).
@@ -1982,7 +1987,15 @@ flush_out(#data{socket = Socket, span = Span, out = Out, out_size = OutSize, pon
     _ = roadrunner_transport:send(
         Socket, [encode_outbound(Data, pong, Pong, Size) | Out], OutSize + Size
     ),
-    Data#data{out = [], out_size = 0, pong = undefined}.
+    Data#data{out = [], out_size = 0, pongs = 0, pong = undefined}.
+
+%% Queue the pong for a ping in dispatch order, or past `?MAX_PONGS` since
+%% the last flush keep only its payload for `flush_out/1`.
+-spec queue_pong(#data{}, binary()) -> #data{}.
+queue_pong(#data{pongs = N} = Data, Payload) when N < ?MAX_PONGS ->
+    queue_frame(Data#data{pongs = N + 1}, pong, Payload);
+queue_pong(Data, Payload) ->
+    Data#data{pong = Payload}.
 
 %% Flush pending frames (typically ending in a just-queued close) and
 %% end the session.
