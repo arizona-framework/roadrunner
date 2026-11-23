@@ -610,12 +610,15 @@ Read and parse a form-encoded request body. Inspects the request's
 
 - `application/x-www-form-urlencoded[; …]` →
   `{ok, urlencoded, [{Name, Value | true}], Req2}`. Values are
-  percent-decoded (and `+` → space) per `roadrunner_qs:parse/1`. Bare
-  flags come back as `{Name, true}`.
+  percent-decoded (and `+` → space) per `roadrunner_qs:parse/2`. Bare
+  flags come back as `{Name, true}`. `{error, too_many_pairs}` past that
+  parser's default limit of 1000 pairs.
 - `multipart/form-data; boundary=…` →
   `{ok, multipart, [Part], Req2}` where each `Part` is the map
   returned by `roadrunner_multipart:parse/2` (`#{headers, body}`).
-  `{error, no_boundary}` if the boundary parameter is missing.
+  `{error, no_boundary}` if the boundary parameter is missing, and
+  `{error, too_many_parts}` or `{error, too_many_headers}` past that
+  parser's default limits.
 
 Other content types return `{error, unsupported_content_type}`;
 absent `Content-Type` returns `{error, no_content_type}`. Reads the
@@ -656,13 +659,12 @@ content_type_kind(ContentType) ->
     | {ok, multipart, [roadrunner_multipart:part()], request()}
     | {error, term()}.
 dispatch_form(urlencoded, _ContentType, Req) ->
-    case read_body(Req) of
-        {ok, Body, Req2} ->
-            %% Parser requires a flat binary; flatten only here, not at
-            %% every body read.
-            {ok, urlencoded, roadrunner_qs:parse(iolist_to_binary(Body)), Req2};
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Body, Req2} ?= read_body(Req),
+        %% Parser requires a flat binary; flatten only here, not at
+        %% every body read.
+        {ok, Pairs} ?= roadrunner_qs:parse(iolist_to_binary(Body), #{}),
+        {ok, urlencoded, Pairs, Req2}
     end;
 dispatch_form(multipart, ContentType, Req) ->
     maybe

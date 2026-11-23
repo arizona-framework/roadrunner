@@ -363,6 +363,13 @@ read_form_urlencoded_with_charset_param_test() ->
     },
     {ok, urlencoded, [{~"a", ~"1"}], _Req2} = roadrunner_req:read_form(Req).
 
+read_form_urlencoded_too_many_pairs_test() ->
+    Req = (sample_req())#{
+        headers => [{~"content-type", ~"application/x-www-form-urlencoded"}],
+        body => iolist_to_binary(lists:join($&, lists:duplicate(1001, ~"k=v")))
+    },
+    ?assertEqual({error, too_many_pairs}, roadrunner_req:read_form(Req)).
+
 read_form_multipart_test() ->
     Body = <<
         "--B\r\n",

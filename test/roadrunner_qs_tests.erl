@@ -235,3 +235,59 @@ parse_decodes_a_trigger_at_every_position_test() ->
         end
      || Len <- lists:seq(1, 30), Pos <- lists:seq(0, Len - 1), Trigger <- [~"+", ~"%20"]
     ].
+
+%% `N` pairs `k=v` joined by `&`.
+pairs(N) ->
+    iolist_to_binary(lists:join($&, lists:duplicate(N, ~"k=v"))).
+
+parse2_matches_parse1_test() ->
+    lists:foreach(
+        fun(Qs) -> ?assertEqual({ok, roadrunner_qs:parse(Qs)}, roadrunner_qs:parse(Qs, #{})) end,
+        [~"", ~"a=1", ~"a=1&flag", ~"&&a=1&&b+c=%20d&", ~"x=%zz&y=+", ~"&", ~"a&"]
+    ).
+
+parse2_max_pairs_default_test() ->
+    {ok, Pairs} = roadrunner_qs:parse(pairs(1000), #{}),
+    ?assertEqual(1000, length(Pairs)),
+    ?assertEqual({error, too_many_pairs}, roadrunner_qs:parse(pairs(1001), #{})).
+
+parse2_max_pairs_option_test() ->
+    Opts = #{max_pairs => 2},
+    ?assertEqual({ok, [{~"a", ~"1"}, {~"b", true}]}, roadrunner_qs:parse(~"a=1&&b&", Opts)),
+    ?assertEqual({error, too_many_pairs}, roadrunner_qs:parse(~"a=1&b&c", Opts)),
+    ?assertEqual({error, too_many_pairs}, roadrunner_qs:parse(~"a=%201&b&c+d", Opts)).
+
+parse2_long_pairs_test() ->
+    %% Pairs longer than the window (4 bytes at `max_pairs => 2`).
+    Opts = #{max_pairs => 2},
+    ?assertEqual({ok, [{~"long", ~"value"}]}, roadrunner_qs:parse(~"long=value", Opts)),
+    ?assertEqual(
+        {ok, [{~"long", ~"value"}, {~"b", true}]}, roadrunner_qs:parse(~"long=value&b", Opts)
+    ),
+    ?assertEqual({error, too_many_pairs}, roadrunner_qs:parse(~"long=value&b&c", Opts)).
+
+%% Every string of up to 7 bytes from `a=&+%2` (`%2` is a bad percent
+%% sequence, kept raw): `parse/2` takes the pairs `parse/1` does, or
+%% returns `too_many_pairs` past `max_pairs`.
+parse2_agrees_with_parse1_test() ->
+    Strings = lists:append([strings(N) || N <- lists:seq(0, 7)]),
+    lists:foreach(
+        fun(Qs) ->
+            Pairs = roadrunner_qs:parse(Qs),
+            lists:foreach(
+                fun(Max) ->
+                    Expected =
+                        case length(Pairs) =< Max of
+                            true -> {ok, Pairs};
+                            false -> {error, too_many_pairs}
+                        end,
+                    ?assertEqual(Expected, roadrunner_qs:parse(Qs, #{max_pairs => Max}))
+                end,
+                [1, 2, 3]
+            )
+        end,
+        Strings
+    ).
+
+strings(0) -> [<<>>];
+strings(N) -> [<<S/binary, C>> || S <- strings(N - 1), C <- "a=&+%2"].

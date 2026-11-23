@@ -89,6 +89,21 @@ save_body(Fd, Req0) ->
 - Per-part transfer encodings (`Content-Transfer-Encoding`) — bodies
   are returned as-is. Modern browsers send raw bytes for
   `multipart/form-data`, so this is rarely needed.
+
+## Limits
+
+A body of many tiny parts, or a part with many headers, costs far more
+memory parsed than it took on the wire. Both readers cap them:
+
+- `max_parts`, 1000 by default: the most parts a body may have. Past
+  it, `{error, too_many_parts}`. A form with more fields or files than
+  that is rare; raise it for one that has them
+- `max_header_count`, 100 by default (the listener's default for a
+  request): the most headers one part may have. Past it,
+  `{error, too_many_headers}`. A browser sends one or two
+
+`parse/3` takes them in its options, and `read_part/2` in its options
+next to `length`. `roadrunner_req:read_form/1` parses with the defaults.
 """.
 
 -on_load(init_patterns/0).
@@ -100,26 +115,52 @@ save_body(Fd, Req0) ->
 -define(DBL_CRLF_CP_KEY, {?MODULE, dbl_crlf_cp}).
 -define(COLON_CP_KEY, {?MODULE, colon_cp}).
 
--export([parse/2, boundary/1, params/1, disposition/1]).
+-export([parse/2, parse/3, boundary/1, params/1, disposition/1]).
 -export([read_part/1, read_part/2, read_part_body/1, read_part_body/2]).
--export_type([part/0, part_headers/0]).
+-export_type([part/0, part_headers/0, parse_opts/0, read_part_opts/0]).
 
 %% The longest header block `read_part/1` takes, and the most bytes
 %% `read_part_body/1` returns at once, as Cowboy's defaults.
 -define(DEFAULT_HEADERS_LENGTH, 64000).
 -define(DEFAULT_BODY_LENGTH, 8000000).
+%% The most parts a body may have, and headers a part may have.
+-define(DEFAULT_MAX_PARTS, 1000).
+-define(DEFAULT_MAX_HEADER_COUNT, 100).
 
 %% The streaming reader's state, kept on the request between calls. `buf`
 %% holds what was read from the request body and not handed out yet;
 %% `stage` is what the bytes at its start are; `eof` is set once the
-%% request body is read to its end.
+%% request body is read to its end; `parts` counts the parts handed out.
 -record(reader, {
     delim :: binary(),
     delim_cp :: binary:cp(),
     buf :: binary(),
     stage :: start | preamble | seek | delimited | headers | body | done,
-    eof :: boolean()
+    eof :: boolean(),
+    parts = 0 :: non_neg_integer()
 }).
+
+-doc """
+Options for `parse/3`:
+
+- `max_parts`: the most parts the body may have, 1000 by default
+- `max_header_count`: the most headers one part may have, 100 by default
+""".
+-type parse_opts() :: #{
+    max_parts => pos_integer(),
+    max_header_count => pos_integer()
+}.
+
+-doc """
+Options for `read_part/2`: `length`, the longest header block a part may
+have and how much each read of the request body asks for, 64000 bytes by
+default, and the limits of `t:parse_opts/0`.
+""".
+-type read_part_opts() :: #{
+    length => pos_integer(),
+    max_parts => pos_integer(),
+    max_header_count => pos_integer()
+}.
 
 -doc """
 One section of a parsed `multipart/form-data` body. `headers` is
@@ -237,21 +278,32 @@ add_pair(Key, Val, Acc) ->
 
 -doc """
 Split `Body` into a list of multipart parts using `Boundary` as the
+delimiter. The same as `parse/3` with the default options.
+""".
+-spec parse(binary(), binary()) -> {ok, [part()]} | {error, term()}.
+parse(Body, Boundary) ->
+    parse(Body, Boundary, #{}).
+
+-doc """
+Split `Body` into a list of multipart parts using `Boundary` as the
 delimiter. The boundary must NOT include the leading `--` — that is
 the multipart wire prefix and is added internally.
 
+`Opts` sets the limits of `t:parse_opts/0`.
+
 Returns `{error, no_initial_boundary}` if the body doesn't start
 with (or contain) the opening boundary, `{error, bad_header}` on
-a malformed part header, or other `{error, _}` shapes when the
-multipart structure is otherwise broken.
+a malformed part header, `{error, too_many_parts}` or
+`{error, too_many_headers}` past a limit, or other `{error, _}` shapes
+when the multipart structure is otherwise broken.
 """.
--spec parse(binary(), binary()) -> {ok, [part()]} | {error, term()}.
-parse(Body, Boundary) when is_binary(Body), is_binary(Boundary) ->
+-spec parse(binary(), binary(), parse_opts()) -> {ok, [part()]} | {error, term()}.
+parse(Body, Boundary, Opts) when is_binary(Body), is_binary(Boundary), is_map(Opts) ->
     Sep = <<"--", Boundary/binary>>,
     case binary:split(Body, Sep) of
         [_Preamble, Rest] ->
             %% Fetch the compiled patterns ONCE on the success branch
-            %% and thread them through `parse_parts/5` → `parse_one_part/5`
+            %% and thread them through `parse_parts/7` → `parse_one_part/6`
             %% → header-line parsing. Avoids three
             %% `persistent_term:get/1` calls per part on a multi-part
             %% body, and avoids fetching them at all when the body
@@ -263,43 +315,78 @@ parse(Body, Boundary) when is_binary(Body), is_binary(Boundary) ->
             CrlfCp = persistent_term:get(?CRLF_CP_KEY),
             ColonCp = persistent_term:get(?COLON_CP_KEY),
             BodyEndCp = binary:compile_pattern(<<"\r\n", Sep/binary>>),
-            parse_parts(Rest, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp);
+            case
+                parse_parts(
+                    Rest,
+                    maps:get(max_parts, Opts, ?DEFAULT_MAX_PARTS),
+                    maps:get(max_header_count, Opts, ?DEFAULT_MAX_HEADER_COUNT),
+                    BodyEndCp,
+                    DblCrlfCp,
+                    CrlfCp,
+                    ColonCp
+                )
+            of
+                Parts when is_list(Parts) -> {ok, Parts};
+                {error, _} = Error -> Error
+            end;
         _ ->
             {error, no_initial_boundary}
     end.
 
 %% After the first boundary marker, what follows is either:
 %% - "--\r\n" or "--" → terminating boundary, end of multipart.
-%% - "\r\n" + part bytes → another part to parse.
--spec parse_parts(binary(), binary:cp(), binary:cp(), binary:cp(), binary:cp()) ->
-    {ok, [part()]} | {error, term()}.
-parse_parts(<<"--\r\n", _Epilogue/binary>>, _BodyEndCp, _DblCrlfCp, _CrlfCp, _ColonCp) ->
-    {ok, []};
-parse_parts(<<"--">>, _BodyEndCp, _DblCrlfCp, _CrlfCp, _ColonCp) ->
-    {ok, []};
-parse_parts(<<"\r\n", PartAndRest/binary>>, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) ->
-    maybe
-        {ok, Part, Rest} ?= parse_one_part(PartAndRest, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp),
-        {ok, More} ?= parse_parts(Rest, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp),
-        {ok, [Part | More]}
+%% - "\r\n" + part bytes → another part to parse, while `PartsLeft` allows.
+%% The parts come back as a bare list, so no `{ok, _}` is built per part.
+-spec parse_parts(
+    binary(),
+    non_neg_integer(),
+    pos_integer(),
+    binary:cp(),
+    binary:cp(),
+    binary:cp(),
+    binary:cp()
+) ->
+    [part()] | {error, term()}.
+parse_parts(<<"--\r\n", _Epilogue/binary>>, _PartsLeft, _MaxHeaders, _, _, _, _) ->
+    [];
+parse_parts(<<"--">>, _PartsLeft, _MaxHeaders, _, _, _, _) ->
+    [];
+parse_parts(<<"\r\n", _/binary>>, 0, _MaxHeaders, _, _, _, _) ->
+    {error, too_many_parts};
+parse_parts(
+    <<"\r\n", PartAndRest/binary>>, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp
+) ->
+    case parse_one_part(PartAndRest, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) of
+        {ok, Part, Rest} ->
+            case
+                parse_parts(
+                    Rest, PartsLeft - 1, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp
+                )
+            of
+                More when is_list(More) -> [Part | More];
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
     end;
-parse_parts(_, _, _, _, _) ->
+parse_parts(_, _, _, _, _, _, _) ->
     {error, malformed}.
 
--spec parse_one_part(binary(), binary:cp(), binary:cp(), binary:cp(), binary:cp()) ->
+-spec parse_one_part(
+    binary(), pos_integer(), binary:cp(), binary:cp(), binary:cp(), binary:cp()
+) ->
     {ok, part(), binary()} | {error, term()}.
 %% Empty header block — the part starts with the empty-line terminator
 %% immediately. RFC 5322 §2.2.3 (referenced by RFC 7578) allows this:
 %% headers are followed by a blank line, and the header list itself
 %% may be empty. Without this clause we'd reject a perfectly valid
 %% file-upload that omits Content-Disposition / Content-Type.
-parse_one_part(<<"\r\n", BodyAndRest/binary>>, BodyEndCp, _DblCrlfCp, _CrlfCp, _ColonCp) ->
+parse_one_part(<<"\r\n", BodyAndRest/binary>>, _MaxHeaders, BodyEndCp, _, _, _) ->
     extract_body(BodyAndRest, [], BodyEndCp);
-parse_one_part(Bytes, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) ->
+parse_one_part(Bytes, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) ->
     maybe
         [HeaderBlock, BodyAndRest] ?= binary:split(Bytes, DblCrlfCp),
-        {ok, Headers} ?=
-            parse_header_lines(binary:split(HeaderBlock, CrlfCp, [global]), ColonCp),
+        {ok, Headers} ?= header_block(HeaderBlock, MaxHeaders, CrlfCp, ColonCp),
         extract_body(BodyAndRest, Headers, BodyEndCp)
     else
         [_] -> {error, no_header_terminator};
@@ -314,23 +401,39 @@ extract_body(BodyAndRest, Headers, BodyEndCp) ->
         _ -> {error, no_part_terminator}
     end.
 
--spec parse_header_lines([binary()], binary:cp()) ->
-    {ok, [{binary(), binary()}]} | {error, bad_header}.
-parse_header_lines(Lines, ColonCp) ->
-    parse_header_lines_loop(Lines, ColonCp).
-
--spec parse_header_lines_loop([binary()], binary:cp()) ->
-    {ok, [{binary(), binary()}]} | {error, bad_header}.
-parse_header_lines_loop([], _ColonCp) ->
+%% A part's header block (without its closing blank line), one line at a
+%% time: no list of all its lines is built first, and a block with more
+%% than `MaxHeaders` lines stops at the first one past it.
+-spec header_block(binary(), pos_integer(), binary:cp(), binary:cp()) ->
+    {ok, part_headers()} | {error, bad_header | too_many_headers}.
+header_block(<<>>, _MaxHeaders, _CrlfCp, _ColonCp) ->
     {ok, []};
-parse_header_lines_loop([Line | Rest], ColonCp) ->
-    maybe
-        [Name, Value] ?= binary:split(Line, ColonCp),
-        {ok, More} ?= parse_header_lines_loop(Rest, ColonCp),
-        {ok, [{roadrunner_bin:ascii_lowercase(Name), roadrunner_bin:trim_ows(Value)} | More]}
-    else
-        [_] -> {error, bad_header};
-        Other -> Other
+header_block(Block, MaxHeaders, CrlfCp, ColonCp) ->
+    case header_lines(Block, MaxHeaders, CrlfCp, ColonCp) of
+        Headers when is_list(Headers) -> {ok, Headers};
+        {error, _} = Error -> Error
+    end.
+
+-spec header_lines(binary(), non_neg_integer(), binary:cp(), binary:cp()) ->
+    part_headers() | {error, bad_header | too_many_headers}.
+header_lines(_Block, 0, _CrlfCp, _ColonCp) ->
+    {error, too_many_headers};
+header_lines(Block, Left, CrlfCp, ColonCp) ->
+    case binary:split(Block, CrlfCp) of
+        [Line] -> header_line(Line, ColonCp, []);
+        [Line, Rest] -> header_line(Line, ColonCp, header_lines(Rest, Left - 1, CrlfCp, ColonCp))
+    end.
+
+-spec header_line(binary(), binary:cp(), part_headers() | {error, term()}) ->
+    part_headers() | {error, bad_header | too_many_headers}.
+header_line(_Line, _ColonCp, {error, _} = Error) ->
+    Error;
+header_line(Line, ColonCp, More) ->
+    case binary:split(Line, ColonCp) of
+        [Name, Value] ->
+            [{roadrunner_bin:ascii_lowercase(Name), roadrunner_bin:trim_ows(Value)} | More];
+        [_] ->
+            {error, bad_header}
     end.
 
 -doc """
@@ -359,7 +462,9 @@ The boundary comes from the request's `Content-Type`. `Opts` may set
 `length`, the longest header block a part may have, 64000 bytes by
 default. It is also how much each read of the request body asks for: a
 read waits until that many bytes arrive or the body ends, as
-`roadrunner_req:read_body/2` does.
+`roadrunner_req:read_body/2` does. `Opts` may also set the limits of
+`t:parse_opts/0`: `max_parts` counts the parts this request's reader has
+returned so far, so pass the same value on every call.
 
 Returns `{error, Reason}` when the body is not a well-formed multipart
 body or can't be read:
@@ -371,21 +476,36 @@ body or can't be read:
 - `no_part_terminator`: the body ended in a part or right after a
   boundary, before the closing boundary
 - `headers_too_large`: a part's header block is over `length`
+- `too_many_parts`: the body has more than `max_parts` parts
+- `too_many_headers`: a part has more than `max_header_count` headers
 - `bad_header`: a part's header line has no `:`
 - `malformed`: a boundary is followed by something other than a line
   break or the closing `--`
 - an error from `roadrunner_req:read_body/2`, such as `request_timeout`
 """.
--spec read_part(roadrunner_req:request(), #{length => pos_integer()}) ->
+-spec read_part(roadrunner_req:request(), read_part_opts()) ->
     {ok, part_headers(), roadrunner_req:request()}
     | {done, roadrunner_req:request()}
     | {error, term()}.
-read_part(Req, Opts) ->
-    Length = maps:get(length, Opts, ?DEFAULT_HEADERS_LENGTH),
-    case reader(Req) of
-        {ok, Reader} -> next_part(Reader, Req, Length, 0);
-        {error, _} = Error -> Error
+read_part(Req0, Opts) ->
+    maybe
+        {ok, Reader0} ?= reader(Req0),
+        {ok, Block, #{multipart := #reader{parts = Parts} = Reader} = Req} ?=
+            next_part(Reader0, Req0, maps:get(length, Opts, ?DEFAULT_HEADERS_LENGTH), 0),
+        ok ?= part_allowed(Parts, maps:get(max_parts, Opts, ?DEFAULT_MAX_PARTS)),
+        {ok, Headers} ?=
+            header_block(
+                Block,
+                maps:get(max_header_count, Opts, ?DEFAULT_MAX_HEADER_COUNT),
+                persistent_term:get(?CRLF_CP_KEY),
+                persistent_term:get(?COLON_CP_KEY)
+            ),
+        {ok, Headers, Req#{multipart := Reader#reader{parts = Parts + 1}}}
     end.
+
+-spec part_allowed(non_neg_integer(), pos_integer()) -> ok | {error, too_many_parts}.
+part_allowed(Parts, MaxParts) when Parts < MaxParts -> ok;
+part_allowed(_Parts, _MaxParts) -> {error, too_many_parts}.
 
 -doc """
 Read the body of the part `read_part/1,2` just returned. The same as
@@ -466,12 +586,13 @@ multipart_type(<<M, U, L, T, I, P, A, R, T2, $/, _/binary>>) when
 multipart_type(_ContentType) ->
     {error, not_multipart}.
 
-%% Walk the buffer to the next part's headers. `Scanned` is how far the
+%% Walk the buffer to the next part's header block, returned unparsed
+%% (empty for a part without headers). `Scanned` is how far the
 %% buffer was already searched for what the stage looks for, so a refill
 %% searches only the new bytes (and the few before them a match could
 %% start in).
 -spec next_part(#reader{}, roadrunner_req:request(), pos_integer(), non_neg_integer()) ->
-    {ok, part_headers(), roadrunner_req:request()}
+    {ok, binary(), roadrunner_req:request()}
     | {done, roadrunner_req:request()}
     | {error, term()}.
 next_part(#reader{stage = done} = Reader, Req, _Length, _Scanned) ->
@@ -529,18 +650,13 @@ next_part(#reader{stage = headers, buf = Buf} = Reader, Req, Length, Scanned) ->
     case Buf of
         <<"\r\n", Rest/binary>> ->
             %% No headers: the blank line comes first (RFC 5322 §2.2.3).
-            {ok, [], Req#{multipart => Reader#reader{stage = body, buf = Rest}}};
+            {ok, <<>>, Req#{multipart => Reader#reader{stage = body, buf = Rest}}};
         _ ->
             DblCrlfCp = persistent_term:get(?DBL_CRLF_CP_KEY),
             case binary:match(Buf, DblCrlfCp, [{scope, {Scanned, byte_size(Buf) - Scanned}}]) of
                 {Pos, _} when Pos =< Length ->
                     <<Block:Pos/binary, _:4/binary, Rest/binary>> = Buf,
-                    Lines = binary:split(Block, persistent_term:get(?CRLF_CP_KEY), [global]),
-                    maybe
-                        {ok, Headers} ?=
-                            parse_header_lines(Lines, persistent_term:get(?COLON_CP_KEY)),
-                        {ok, Headers, Req#{multipart => Reader#reader{stage = body, buf = Rest}}}
-                    end;
+                    {ok, Block, Req#{multipart => Reader#reader{stage = body, buf = Rest}}};
                 {_Pos, _} ->
                     {error, headers_too_large};
                 nomatch when byte_size(Buf) > Length ->
@@ -559,7 +675,7 @@ unterminated(seek) -> no_part_terminator.
 %% Read more of the request body into the buffer and go on, or fail with
 %% `Eof` when the body has ended.
 -spec refill_part(#reader{}, roadrunner_req:request(), pos_integer(), non_neg_integer(), atom()) ->
-    {ok, part_headers(), roadrunner_req:request()}
+    {ok, binary(), roadrunner_req:request()}
     | {done, roadrunner_req:request()}
     | {error, term()}.
 refill_part(#reader{eof = true}, _Req, _Length, _Scanned, Eof) ->

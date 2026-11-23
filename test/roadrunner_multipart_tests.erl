@@ -580,6 +580,66 @@ body_ending_in_headers_after_a_cr_test() ->
         {error, no_header_terminator}, roadrunner_multipart:read_part(stream_req(<<"--B\r\n\r">>))
     ).
 
+%% A body of `N` parts, each with `H` headers and the value `v`.
+flood(N, H) ->
+    Headers = binary:copy(~"x-a: 1\r\n", H),
+    Part = <<"\r\n", Headers/binary, "\r\nv\r\n--B">>,
+    <<"--B", (binary:copy(Part, N))/binary, "--\r\n">>.
+
+parse_max_parts_default_test() ->
+    {ok, Parts} = roadrunner_multipart:parse(flood(1000, 1), ~"B"),
+    ?assertEqual(1000, length(Parts)),
+    ?assertEqual({error, too_many_parts}, roadrunner_multipart:parse(flood(1001, 1), ~"B")).
+
+parse_max_parts_option_test() ->
+    ?assertMatch({ok, [_, _]}, roadrunner_multipart:parse(flood(2, 0), ~"B", #{max_parts => 2})),
+    ?assertEqual(
+        {error, too_many_parts}, roadrunner_multipart:parse(flood(3, 0), ~"B", #{max_parts => 2})
+    ).
+
+parse_max_header_count_default_test() ->
+    {ok, [#{headers := Headers}]} = roadrunner_multipart:parse(flood(1, 100), ~"B"),
+    ?assertEqual(100, length(Headers)),
+    ?assertEqual({error, too_many_headers}, roadrunner_multipart:parse(flood(1, 101), ~"B")).
+
+parse_max_header_count_option_test() ->
+    Opts = #{max_header_count => 2},
+    ?assertMatch(
+        {ok, [#{headers := [_, _]}]}, roadrunner_multipart:parse(flood(1, 2), ~"B", Opts)
+    ),
+    ?assertEqual({error, too_many_headers}, roadrunner_multipart:parse(flood(1, 3), ~"B", Opts)).
+
+read_part_max_parts_test() ->
+    Opts = #{max_parts => 1},
+    {ok, [], R1} = roadrunner_multipart:read_part(stream_req(flood(2, 0)), Opts),
+    ?assertEqual({error, too_many_parts}, roadrunner_multipart:read_part(R1, Opts)),
+    {ok, [], R2} = roadrunner_multipart:read_part(stream_req(flood(1, 0)), Opts),
+    ?assertMatch({done, _}, roadrunner_multipart:read_part(R2, Opts)).
+
+read_part_max_parts_default_test() ->
+    ?assertEqual({error, too_many_parts}, read_all_parts(stream_req(flood(1001, 0)), 0)),
+    ?assertEqual({done, 1000}, read_all_parts(stream_req(flood(1000, 0)), 0)).
+
+read_all_parts(Req0, N) ->
+    case roadrunner_multipart:read_part(Req0) of
+        {ok, [], Req} -> read_all_parts(Req, N + 1);
+        {done, _} -> {done, N};
+        {error, _} = Error -> Error
+    end.
+
+read_part_max_header_count_test() ->
+    ?assertMatch(
+        {ok, [_, _], _},
+        roadrunner_multipart:read_part(stream_req(flood(1, 2)), #{max_header_count => 2})
+    ),
+    ?assertEqual(
+        {error, too_many_headers},
+        roadrunner_multipart:read_part(stream_req(flood(1, 3)), #{max_header_count => 2})
+    ),
+    ?assertEqual(
+        {error, too_many_headers}, roadrunner_multipart:read_part(stream_req(flood(1, 101)))
+    ).
+
 stream_req(Body) ->
     stream_req(~"multipart/form-data; boundary=B", Body).
 
