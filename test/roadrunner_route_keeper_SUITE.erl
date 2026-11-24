@@ -2,15 +2,19 @@
 -moduledoc """
 `roadrunner_route_keeper` on its own: the slots of one route, taken by
 processes standing in for HTTP/1.1 connections (which keep a home slot
-across their requests) and for stream workers, with this suite standing in
-for the listener that owns the tables and restarts the keeper.
+across their requests) and for the stream workers of an HTTP/2 connection
+or HTTP/3's loop (an owner, which starts and monitors its workers and frees
+the slots they take on their own), with this suite standing in for the
+listener that owns the tables and restarts the keeper.
 
 The race cases stop a process between two of its steps
 (`roadrunner_route_pause`) and run what races it there. Each fails when the
 order it relies on changes: a request that ends reading the keeper's gate
 before deleting its row, a keeper parking a request without closing its
 gate first, a request taking its home past the gate, a drain or a lowered
-ceiling.
+ceiling, a worker checking its owner before writing its intent or inserting
+before both, an owner freeing a worker's intent before its row, a keeper
+watching a dead owner's workers before taking its registration.
 """.
 
 -behaviour(ct_suite).
@@ -47,6 +51,20 @@ ceiling.
     reset_after_a_grant_frees_the_slot/1,
     reset_waiter_times_out/1,
     connection_gone_stops_the_wait/1,
+    worker_takes_an_owned_slot_without_the_keeper/1,
+    worker_at_half_the_ceiling_asks_the_keeper/1,
+    orphaned_worker_stays_counted/1,
+    owner_gone_before_the_intent/1,
+    owner_gone_before_the_insert/1,
+    owner_gone_after_the_insert/1,
+    owner_frees_the_row_before_the_intent/1,
+    owner_down_takes_the_registration_first/1,
+    keeper_crash_watches_an_orphaned_worker/1,
+    keeper_restart_leaves_owned_slots_to_their_owner/1,
+    late_intent_is_swept/1,
+    drain_against_a_fast_worker/1,
+    worker_key_taken_asks_the_keeper/1,
+    table_deleted_mid_worker_admission/1,
     keeper_crash_keeps_the_holders/1,
     keeper_crash_refuses_the_waiters/1,
     keeper_gone_before_its_answer_frees_the_row/1,
@@ -95,6 +113,20 @@ all() ->
         reset_after_a_grant_frees_the_slot,
         reset_waiter_times_out,
         connection_gone_stops_the_wait,
+        worker_takes_an_owned_slot_without_the_keeper,
+        worker_at_half_the_ceiling_asks_the_keeper,
+        orphaned_worker_stays_counted,
+        owner_gone_before_the_intent,
+        owner_gone_before_the_insert,
+        owner_gone_after_the_insert,
+        owner_frees_the_row_before_the_intent,
+        owner_down_takes_the_registration_first,
+        keeper_crash_watches_an_orphaned_worker,
+        keeper_restart_leaves_owned_slots_to_their_owner,
+        late_intent_is_swept,
+        drain_against_a_fast_worker,
+        worker_key_taken_asks_the_keeper,
+        table_deleted_mid_worker_admission,
         keeper_crash_keeps_the_holders,
         keeper_crash_refuses_the_waiters,
         keeper_gone_before_its_answer_frees_the_row,
@@ -542,6 +574,255 @@ connection_gone_stops_the_wait(_Config) ->
     ?assertMatch(#{in_flight := 0, throttled := 0}, stats(C)),
     ok = stop_keeper(Keeper).
 
+%% --- stream workers and their owners ---
+
+worker_takes_an_owned_slot_without_the_keeper(_Config) ->
+    %% The first worker of an owner the keeper does not know asks it, and
+    %% the keeper registers the owner. The owner's next workers take a slot
+    %% the owner frees when they end, while the keeper does nothing
+    %% (suspended here).
+    {Keeper, C} = route(4, shed),
+    Owner = owner(C),
+    First = stream(Owner),
+    {ok, K1} = result(First),
+    ?assertEqual([{K1, First, First}], ets:lookup(slots(C), K1)),
+    ?assertEqual([{Owner, none}], ets:lookup(regs(C), Owner)),
+    ok = end_worker(First),
+    ok = wait_in_flight(Keeper, C, 0),
+    ok = sys:suspend(Keeper),
+    Worker = stream(Owner),
+    {ok, K} = result(Worker),
+    ?assertEqual([{K, Owner, Worker}], ets:lookup(slots(C), K)),
+    ?assertEqual([{Owner, Worker, K}], ets:lookup(intents(C), Owner)),
+    ok = end_worker(Worker),
+    ok = wait_rows(C, 0),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ?assertEqual({message_queue_len, 0}, erlang:process_info(Keeper, message_queue_len)),
+    ok = sys:resume(Keeper),
+    ok = stop_keeper(Keeper).
+
+worker_at_half_the_ceiling_asks_the_keeper(_Config) ->
+    %% One request of two runs: a worker of a registered owner asks the
+    %% keeper rather than try a key likely taken.
+    {Keeper, C} = route(2, shed),
+    Owner = owner(C),
+    {ok, _} = result(stream(Owner)),
+    Worker = stream(Owner),
+    {ok, K} = result(Worker),
+    ?assertEqual([{K, Worker, Worker}], ets:lookup(slots(C), K)),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Keeper).
+
+orphaned_worker_stays_counted(_Config) ->
+    %% The owner dies while its worker runs: the keeper watches the worker
+    %% from then on, its slot stays counted, and goes when it ends.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    Worker = stream(Owner),
+    {ok, K} = result(Worker),
+    ok = kill_owner(Keeper, C, Owner),
+    ?assertMatch(#{in_flight := 1}, stats(C)),
+    %% The keeper looking again keeps the intent of a worker it watches.
+    Keeper ! sweep,
+    _ = sys:get_state(Keeper),
+    ?assertEqual([{Owner, Worker, K}], ets:tab2list(intents(C))),
+    ok = end_worker(Worker),
+    ok = wait_in_flight(Keeper, C, 0),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Keeper).
+
+owner_gone_before_the_intent(_Config) ->
+    %% The owner, the worker's connection, dies after the worker told it its
+    %% key: the worker writes its intent, finds the owner no longer
+    %% registered, takes the intent back and asks the keeper, then stops
+    %% waiting as its connection is gone. Nothing is left once it ends.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = roadrunner_route_pause:arm(worker_noted),
+    Worker = stream(Owner),
+    Worker = roadrunner_route_pause:await(worker_noted),
+    ok = kill_owner(Keeper, C, Owner),
+    ok = roadrunner_route_pause:resume(Worker, worker_noted),
+    ?assertEqual(reset, result(Worker)),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = end_worker(Worker),
+    ok = wait_in_flight(Keeper, C, 0),
+    ok = stop_keeper(Keeper).
+
+owner_gone_before_the_insert(_Config) ->
+    %% The owner dies after the worker found it registered, with the
+    %% worker's intent written: the keeper watches the worker, which takes
+    %% its slot, and frees the slot when the worker ends.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = roadrunner_route_pause:arm(worker_checked),
+    Worker = stream(Owner),
+    Worker = roadrunner_route_pause:await(worker_checked),
+    ok = kill_owner(Keeper, C, Owner),
+    ok = roadrunner_route_pause:resume(Worker, worker_checked),
+    {ok, _} = result(Worker),
+    ?assertMatch(#{in_flight := 1}, stats(C)),
+    ok = end_worker(Worker),
+    ok = wait_in_flight(Keeper, C, 0),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Keeper).
+
+owner_gone_after_the_insert(_Config) ->
+    %% The owner, then the worker, die right after the worker's insert:
+    %% the keeper, watching the worker from its intent, frees the slot.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = roadrunner_route_pause:arm(worker_inserted),
+    Worker = stream(Owner),
+    Worker = roadrunner_route_pause:await(worker_inserted),
+    ok = kill_owner(Keeper, C, Owner),
+    exit(Worker, kill),
+    ok = wait_in_flight(Keeper, C, 0),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Keeper).
+
+owner_frees_the_row_before_the_intent(_Config) ->
+    %% A worker ended and its owner, freeing its slot, dies between the row
+    %% and the intent: the keeper finds the intent, and nothing is left.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    Worker = stream(Owner),
+    {ok, _} = result(Worker),
+    ok = roadrunner_route_pause:arm(owner_row_freed, Owner),
+    Worker ! stop,
+    Owner = roadrunner_route_pause:await(owner_row_freed),
+    ok = kill_owner(Keeper, C, Owner),
+    ok = wait_in_flight(Keeper, C, 0),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Keeper).
+
+owner_down_takes_the_registration_first(_Config) ->
+    %% A worker starts as the keeper handles its dead owner, after the
+    %% keeper took the owner's registration and before it looked for the
+    %% owner's workers: the worker finds the owner unregistered and asks the
+    %% keeper, so its slot is never left without someone to free it.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = roadrunner_route_pause:arm(owner_taken, Keeper),
+    exit(Owner, kill),
+    Keeper = roadrunner_route_pause:await(owner_taken),
+    Worker = worker(C, idle(), Owner),
+    ok = roadrunner_route_pause:resume(Keeper, owner_taken),
+    {ok, K} = result(Worker),
+    ?assertEqual([{K, Worker, Worker}], ets:lookup(slots(C), K)),
+    ok = end_worker(Worker),
+    ok = wait_in_flight(Keeper, C, 0),
+    ok = stop_keeper(Keeper).
+
+keeper_crash_watches_an_orphaned_worker(_Config) ->
+    %% The keeper took a dead owner's registration and died before it
+    %% watched the owner's workers: the keeper taking over finds their
+    %% intents, and frees each slot as its worker ends.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    Worker = stream(Owner),
+    {ok, _} = result(Worker),
+    ok = roadrunner_route_pause:arm(owner_taken, Keeper),
+    exit(Owner, kill),
+    Keeper = roadrunner_route_pause:await(owner_taken),
+    exit(Keeper, kill),
+    {'EXIT', Keeper, killed} = receive_exit(Keeper),
+    {ok, Next} = start_keeper(C, false),
+    ?assertMatch(#{in_flight := 1}, stats(C)),
+    ok = end_worker(Worker),
+    ok = wait_in_flight(Next, C, 0),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Next).
+
+keeper_restart_leaves_owned_slots_to_their_owner(_Config) ->
+    %% A registered owner's workers' slots stay its own across a keeper
+    %% restart: the owner frees them as they end.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    Worker = stream(Owner),
+    {ok, _} = result(Worker),
+    exit(Keeper, kill),
+    {'EXIT', Keeper, killed} = receive_exit(Keeper),
+    {ok, Next} = start_keeper(C, false),
+    {monitors, Monitors} = erlang:process_info(Next, monitors),
+    ?assertEqual([{process, Owner}], Monitors),
+    ok = end_worker(Worker),
+    ok = wait_rows(C, 0),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Next).
+
+late_intent_is_swept(_Config) ->
+    %% A worker read its owner registered, the owner died and the keeper
+    %% looked for its workers' intents, then the worker wrote its intent
+    %% and died before taking it back: no row, only the intent, which the
+    %% keeper removes when it looks again.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = roadrunner_route_pause:arm(worker_noted),
+    Worker = stream(Owner),
+    Worker = roadrunner_route_pause:await(worker_noted),
+    ok = kill_owner(Keeper, C, Owner),
+    ok = roadrunner_route_pause:arm(worker_intent, Worker),
+    ok = roadrunner_route_pause:resume(Worker, worker_noted),
+    Worker = roadrunner_route_pause:await(worker_intent),
+    exit(Worker, kill),
+    ?assertMatch([{Owner, Worker, _}], ets:tab2list(intents(C))),
+    ?assertMatch(#{in_flight := 0}, stats(C)),
+    %% Another owner dies before the keeper looks again: it looks for both.
+    ok = kill_owner(Keeper, C, registered_owner(Keeper, C)),
+    Keeper ! sweep,
+    _ = sys:get_state(Keeper),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Keeper).
+
+drain_against_a_fast_worker(_Config) ->
+    %% A worker found its owner registered just as the route was dropped.
+    %% Nothing runs, so the keeper stops; the worker then inserts its row,
+    %% sees the drain and backs off.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = roadrunner_route_pause:arm(worker_checked),
+    Worker = stream(Owner),
+    Worker = roadrunner_route_pause:await(worker_checked),
+    ok = roadrunner_route_keeper:set_draining(Keeper, true),
+    ?assertEqual({'EXIT', Keeper, {shutdown, drained}}, receive_exit(Keeper)),
+    ok = roadrunner_route_pause:resume(Worker, worker_checked),
+    ?assertEqual({refused, 3}, result(Worker)),
+    ?assertMatch(#{in_flight := 0}, stats(C)),
+    ?assertEqual([], ets:tab2list(intents(C))).
+
+worker_key_taken_asks_the_keeper(_Config) ->
+    %% The key a worker picked is taken before it inserts its row: it takes
+    %% its intent back and asks the keeper.
+    {Keeper, C} = route(1, shed),
+    Owner = registered_owner(Keeper, C),
+    Conn = holder(C),
+    {ok, 1} = result(Conn),
+    ok = release(Conn),
+    ok = roadrunner_route_pause:arm(worker_checked),
+    Worker = stream(Owner),
+    Worker = roadrunner_route_pause:await(worker_checked),
+    {ok, 1} = request(Conn),
+    ok = roadrunner_route_pause:resume(Worker, worker_checked),
+    ?assertEqual({refused, 3}, result(Worker)),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Keeper).
+
+table_deleted_mid_worker_admission(_Config) ->
+    %% The route's tables go while a worker takes its slot: it is refused,
+    %% and its owner, freeing what the worker told it of, goes on.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = roadrunner_route_pause:arm(worker_noted),
+    Worker = stream(Owner),
+    Worker = roadrunner_route_pause:await(worker_noted),
+    ok = stop_keeper(Keeper),
+    true = roadrunner_route_keeper:delete_table(table(C)),
+    ok = roadrunner_route_pause:resume(Worker, worker_noted),
+    ?assertEqual({refused, 3}, result(Worker)),
+    ok = end_worker(Worker),
+    ok = ping(Owner).
+
 %% --- the keeper crashes ---
 
 keeper_crash_keeps_the_holders(_Config) ->
@@ -794,11 +1075,11 @@ gone_table_refuses_and_releases(_Config) ->
     ok = stop_keeper(Keeper),
     true = roadrunner_route_keeper:delete_table(table(C)),
     ?assertEqual({refused, 3}, roadrunner_route_keeper:acquire(C)),
-    ?assertEqual({refused, 3}, roadrunner_route_keeper:acquire(C, reset, self())),
+    ?assertEqual({refused, 3}, roadrunner_route_keeper:acquire(C, reset, self(), self())),
     ?assertEqual(ok, roadrunner_route_keeper:release(C, K)),
     %% Tables without a keeper refuse too.
     Bare = roadrunner_route_keeper:ceiling(
-        {ets:new(slots, [public]), ets:new(regs, [public])},
+        {ets:new(slots, [public]), ets:new(regs, [public]), ets:new(intents, [public])},
         atomics:new(4, [{signed, false}]),
         {shed, #{retry_after => 2}},
         ?MODULE
@@ -859,11 +1140,14 @@ slots(Ceiling) ->
 regs(Ceiling) ->
     element(3, Ceiling).
 
-counts(Ceiling) ->
+intents(Ceiling) ->
     element(4, Ceiling).
 
+counts(Ceiling) ->
+    element(5, Ceiling).
+
 table(Ceiling) ->
-    {slots(Ceiling), regs(Ceiling)}.
+    {slots(Ceiling), regs(Ceiling), intents(Ceiling)}.
 
 stats(Ceiling) ->
     roadrunner_route_keeper:stats({table(Ceiling), counts(Ceiling)}).
@@ -924,19 +1208,126 @@ conn_of(K, Conns) ->
     {K, Conn} = lists:keyfind(K, 1, Conns),
     Conn.
 
-%% A stream worker: it asks for a slot, stopping on its reset message or
-%% when its connection goes, and holds what it got until it ends.
+%% A stream worker whose owner the keeper does not know, so it asks the
+%% keeper: it stops waiting on its reset message or when its connection
+%% goes, and holds what it got until it ends.
 worker(Ceiling) ->
-    worker(Ceiling, self()).
+    worker(Ceiling, idle()).
 
 worker(Ceiling, Conn) ->
+    worker(Ceiling, Conn, Conn).
+
+worker(Ceiling, Conn, Owner) ->
     Self = self(),
     spawn(fun() ->
-        Self ! {self(), roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Conn)},
+        Self ! {self(), roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Conn, Owner)},
         receive
             stop -> ok
         end
     end).
+
+idle() ->
+    spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end).
+
+%% A process standing in for an HTTP/2 connection or HTTP/3's loop: it
+%% starts its stream workers and monitors them, keeps the key each one
+%% takes on its own, and frees it when the worker ends, taking both in one
+%% receive as the real ones do.
+owner(Ceiling) ->
+    Self = self(),
+    spawn(fun() -> owner_loop(Ceiling, Self) end).
+
+owner_loop(Ceiling, Test) ->
+    receive
+        {stream, Ref} ->
+            Owner = self(),
+            {Worker, _Mon} = spawn_monitor(fun() ->
+                Test !
+                    {
+                        self(),
+                        roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Owner, Owner)
+                    },
+                receive
+                    stop -> ok
+                end
+            end),
+            Test ! {Ref, Worker},
+            owner_loop(Ceiling, Test);
+        {roadrunner_route_slot, _Worker, _Ceiling, _K} = Note ->
+            ok = roadrunner_route_keeper:noted(Note),
+            owner_loop(Ceiling, Test);
+        {'DOWN', _Mon, process, Worker, _Reason} ->
+            ok = roadrunner_route_keeper:worker_down(Worker),
+            owner_loop(Ceiling, Test);
+        {ping, Ref} ->
+            Test ! {Ref, pong},
+            owner_loop(Ceiling, Test)
+    end.
+
+%% A round trip to an owner: it has handled everything sent to it before.
+ping(Owner) ->
+    Ref = make_ref(),
+    Owner ! {ping, Ref},
+    receive
+        {Ref, pong} -> ok
+    after 5000 -> ct:fail({no_pong, Owner})
+    end.
+
+%% A stream worker its owner starts.
+stream(Owner) ->
+    Ref = make_ref(),
+    Owner ! {stream, Ref},
+    receive
+        {Ref, Worker} -> Worker
+    after 5000 -> ct:fail({no_stream, Owner})
+    end.
+
+%% An owner the keeper registered: its first worker asked the keeper, and
+%% has ended.
+registered_owner(Keeper, Ceiling) ->
+    Owner = owner(Ceiling),
+    First = stream(Owner),
+    {ok, _} = result(First),
+    ok = end_worker(First),
+    ok = wait_in_flight(Keeper, Ceiling, 0),
+    Owner.
+
+%% Kill an owner, until its keeper has handled its death.
+kill_owner(Keeper, Ceiling, Owner) ->
+    exit(Owner, kill),
+    ok = wait_unregistered(Ceiling, Owner, 1000000),
+    _ = sys:get_state(Keeper),
+    ok.
+
+wait_unregistered(_Ceiling, Owner, 0) ->
+    ct:fail({still_registered, Owner});
+wait_unregistered(Ceiling, Owner, Tries) ->
+    case ets:member(regs(Ceiling), Owner) of
+        false ->
+            ok;
+        true ->
+            erlang:yield(),
+            wait_unregistered(Ceiling, Owner, Tries - 1)
+    end.
+
+%% Until the route's table holds `N` rows, without asking the keeper.
+wait_rows(Ceiling, N) ->
+    wait_rows(Ceiling, N, 1000000).
+
+wait_rows(_Ceiling, N, 0) ->
+    ct:fail({rows_never, N});
+wait_rows(Ceiling, N, Tries) ->
+    case ets:info(slots(Ceiling), size) of
+        N ->
+            ok;
+        _ ->
+            erlang:yield(),
+            wait_rows(Ceiling, N, Tries - 1)
+    end.
 
 end_worker(Worker) ->
     Mon = monitor(process, Worker),

@@ -800,18 +800,21 @@ keep-alive connection does not hold on to megabytes.
 
 A ceiling is meant for expensive routes, where a request takes
 milliseconds and megabytes. Each route with a ceiling has a small process
-of its own that hands out its slots, linked to the listener. On HTTP/1.1
-a connection's first request to the route asks that process, which gives
-the connection a slot of its own; the connection's later requests take
-and hand back that slot themselves, as long as no request waits for one,
-so they cost the route's process nothing. On HTTP/2 and HTTP/3 every
-request asks it, which costs a few microseconds of server CPU per
-request. That is nothing next to a request that decodes a large body, but
-it would show on a hot, cheap route: leave those without a ceiling and
-bound them with the listener's `max_concurrent_requests` if needed.
+of its own that hands out its slots, linked to the listener, but most
+requests never reach it. A connection's first request to the route asks
+that process, which then knows the connection. On HTTP/1.1 it gives the
+connection a slot of its own, which the connection's later requests take
+and hand back themselves; on HTTP/2 and HTTP/3 the connection's later
+requests take a slot on their own while the route runs under half its
+ceiling. Requests go through the process while others wait for a slot,
+so they queue behind them, and HTTP/2 and HTTP/3 requests do from half
+the ceiling on, which costs a few microseconds of server CPU per request.
+That is nothing next to a request that decodes a large body, but it would
+show on a hot, cheap route: leave those without a ceiling and bound them
+with the listener's `max_concurrent_requests` if needed.
 
-That process keeps a small record of each HTTP/1.1 connection that took
-a slot through it, for as long as the connection lives. The count itself
+That process keeps a small record of each connection that took a slot
+through it, for as long as the connection lives. The count itself
 is kept by the listener, so if that process crashes the listener starts a
 new one on the same count: the requests still running keep their slots,
 connections go on taking their own slots meanwhile, and only the requests

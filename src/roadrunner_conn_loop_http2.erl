@@ -911,9 +911,19 @@ recv_more(
         {roadrunner_cancel_stream, StreamId} ->
             recv_more(maybe_exit_when_drained(cancel_stream(State, StreamId)));
         {'DOWN', MonRef, process, Pid, Reason} ->
+            ok = roadrunner_route_keeper:worker_down(Pid),
             recv_more(
                 run_queued(maybe_exit_when_drained(handle_worker_down(State, MonRef, Pid, Reason)))
             );
+        {roadrunner_route_slot, _Worker, _Ceiling, _K} = Note ->
+            %% A stream worker took a slot of its route's ceiling owned by this
+            %% process, without the route's keeper: it is freed on the worker's
+            %% `'DOWN'`, which comes after this message. Every receive of this
+            %% process that takes a worker's `'DOWN'` must take this message
+            %% too, so the two are handled in the order they came
+            %% (`roadrunner_route_keeper`).
+            ok = roadrunner_route_keeper:noted(Note),
+            recv_more(State);
         {roadrunner_slot, StreamId, Outcome} ->
             %% A refused park drops its stream, which may be the last one
             %% a draining conn was waiting on.

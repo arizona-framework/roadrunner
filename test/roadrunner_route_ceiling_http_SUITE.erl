@@ -40,11 +40,14 @@ alone.
     h2_reset_while_waiting_leaves_the_queue/1,
     h2_killed_worker_frees_its_slot/1,
     h2_waiting_streams_leave_cheap_routes_a_slot/1,
+    h2_owned_slot_frees_in_order/1,
     h3_shed_answers_503/1,
     h3_queue_grants_in_arrival_order/1,
     h3_queue_timeout_answers_503/1,
     h3_reset_while_waiting_leaves_the_queue/1,
-    h3_killed_worker_frees_its_slot/1
+    h3_killed_worker_frees_its_slot/1,
+    h3_owned_slot_frees_in_order/1,
+    slot_and_down_share_every_receive/1
 ]).
 
 -define(COLLECTOR, roadrunner_h2_slot_collector).
@@ -79,11 +82,14 @@ all() ->
         h2_reset_while_waiting_leaves_the_queue,
         h2_killed_worker_frees_its_slot,
         h2_waiting_streams_leave_cheap_routes_a_slot,
+        h2_owned_slot_frees_in_order,
         h3_shed_answers_503,
         h3_queue_grants_in_arrival_order,
         h3_queue_timeout_answers_503,
         h3_reset_while_waiting_leaves_the_queue,
-        h3_killed_worker_frees_its_slot
+        h3_killed_worker_frees_its_slot,
+        h3_owned_slot_frees_in_order,
+        slot_and_down_share_every_receive
     ].
 
 init_per_suite(Config) ->
@@ -595,6 +601,21 @@ h2_waiting_streams_leave_cheap_routes_a_slot(Config) ->
     expect_handler() ! release,
     {200, _, ~"ok"} = h2_response(Sock, 3).
 
+h2_owned_slot_frees_in_order(Config) ->
+    %% A stream worker takes a slot owned by its connection, then ends while
+    %% the connection is not running: the connection takes the worker's key
+    %% and its `'DOWN'` in the order they came, and frees the slot.
+    Name = ?config(listener, Config),
+    Sock = h2_connect(Config),
+    %% The first stream asks the keeper, which registers the connection.
+    ok = h2_get(Sock, 1, ~"/slow"),
+    expect_handler() ! release,
+    {200, _, ~"ok"} = h2_response(Sock, 1),
+    ok = wait_in_flight(Name, 0),
+    ok = roadrunner_route_pause:arm(worker_noted),
+    ok = h2_get(Sock, 3, ~"/slow"),
+    ok = owned_slot_ends_while_its_owner_waits(Name).
+
 h2_connection_gone_leaves_the_queue(Config) ->
     %% The client goes while a stream waits: its worker stops waiting, and
     %% no handler runs for it once a slot frees.
@@ -698,6 +719,19 @@ h3_killed_worker_frees_its_slot(Config) ->
     {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Next),
     ok = h3_close(Conn).
 
+h3_owned_slot_frees_in_order(Config) ->
+    %% As `h2_owned_slot_frees_in_order`, the owner being HTTP/3's loop.
+    Name = ?config(listener, Config),
+    Conn = h3_connect(Config),
+    {ok, First} = h3_get(Conn, ~"/slow"),
+    expect_handler() ! release,
+    {200, _, _} = roadrunner_quic_test_h3:collect(Conn, First),
+    ok = wait_in_flight(Name, 0),
+    ok = roadrunner_route_pause:arm(worker_noted),
+    {ok, _Second} = h3_get(Conn, ~"/slow"),
+    ok = owned_slot_ends_while_its_owner_waits(Name),
+    ok = h3_close(Conn).
+
 h3_connection_gone_leaves_the_queue(Config) ->
     Name = ?config(listener, Config),
     Conn = h3_connect(Config),
@@ -711,7 +745,80 @@ h3_connection_gone_leaves_the_queue(Config) ->
     ok = wait_in_flight(Name, 0),
     ?assertEqual(none, handler_started()).
 
+%% --- the receive contract ---
+
+slot_and_down_share_every_receive(_Config) ->
+    %% A stream worker that takes a slot of its route on its own tells the
+    %% process that monitors it (the HTTP/2 connection, HTTP/3's loop) its
+    %% key, and that process frees the slot on the worker's `'DOWN'`: every
+    %% receive of theirs that takes a `'DOWN'` must also take the key, so
+    %% the key, sent first, is always handled first, however busy the
+    %% process was when both came.
+    lists:foreach(
+        fun(Mod) ->
+            Beam =
+                case code:which(Mod) of
+                    %% Cover compiles from the same beam on disk.
+                    cover_compiled ->
+                        filename:join([
+                            code:lib_dir(roadrunner), "ebin", atom_to_list(Mod) ++ ".beam"
+                        ]);
+                    Loaded ->
+                        Loaded
+                end,
+            {ok, {Mod, [{abstract_code, {raw_abstract_v1, Forms}}]}} =
+                beam_lib:chunks(Beam, [abstract_code]),
+            Receives = receives(Forms),
+            ?assertNotEqual([], [R || R <- Receives, takes('DOWN', R)]),
+            ?assertEqual(
+                [], [R || R <- Receives, takes('DOWN', R), not takes(roadrunner_route_slot, R)]
+            )
+        end,
+        [roadrunner_conn_loop_http2, roadrunner_conn_loop_http3]
+    ).
+
+%% The clauses of every `receive` in the abstract code `Term`.
+receives({'receive', _, Clauses}) ->
+    [Clauses | receives(Clauses)];
+receives({'receive', _, Clauses, After, Body}) ->
+    [Clauses | receives([Clauses, After, Body])];
+receives(Term) when is_tuple(Term) ->
+    receives(tuple_to_list(Term));
+receives(Terms) when is_list(Terms) ->
+    lists:flatmap(fun receives/1, Terms);
+receives(_Other) ->
+    [].
+
+%% Whether one of the clauses takes a tuple tagged `Tag`.
+takes(Tag, Clauses) ->
+    lists:any(fun({clause, _, [Pattern], _, _}) -> tagged(Tag, Pattern) end, Clauses).
+
+tagged(Tag, {tuple, _, [{atom, _, Tag} | _]}) ->
+    true;
+tagged(Tag, {match, _, Left, Right}) ->
+    tagged(Tag, Left) orelse tagged(Tag, Right);
+tagged(_Tag, _Pattern) ->
+    false.
+
 %% --- helpers ---
+
+%% A worker stopped after telling its owner its key: the owner is suspended,
+%% the worker takes its slot and runs, and is killed, so its key and its
+%% `'DOWN'` both wait for the owner, which then frees the slot.
+owned_slot_ends_while_its_owner_waits(Name) ->
+    Worker = roadrunner_route_pause:await(worker_noted),
+    [Owner] = [P || {P, none} <- ets:tab2list(regs(Name))],
+    true = erlang:suspend_process(Owner),
+    ok = roadrunner_route_pause:resume(Worker, worker_noted),
+    Worker = expect_handler(),
+    ?assertMatch([{_, Owner, Worker}], ets:tab2list(slots(Name))),
+    Mon = monitor(process, Worker),
+    exit(Worker, kill),
+    receive
+        {'DOWN', Mon, process, Worker, _} -> ok
+    end,
+    true = erlang:resume_process(Owner),
+    wait_in_flight(Name, 0).
 
 %% Until the clock reads `At` (ms): the condition under test is that time.
 wait_until(At) ->
@@ -859,11 +966,21 @@ throttled_reason(Ref) ->
     after 5000 -> ct:fail(not_throttled)
     end.
 
-%% The keeper serving `/slow`, as named in its slot table.
+%% The keeper serving `/slow`, as named in its tables.
 keeper(Name) ->
+    ets:lookup_element(regs(Name), '$keeper', 2).
+
+%% `/slow`'s slot table and the table of the processes its keeper knows.
+slots(Name) ->
+    element(2, slow_ceiling(Name)).
+
+regs(Name) ->
+    element(3, slow_ceiling(Name)).
+
+slow_ceiling(Name) ->
     {ok, _, _, _, _, {_Body, Ceiling}} =
         roadrunner_router:resolve(~"GET", ~"/slow", persistent_term:get({roadrunner_routes, Name})),
-    ets:lookup_element(element(3, Ceiling), '$keeper', 2).
+    Ceiling.
 
 route(Name, Path) ->
     #{routes := Routes} = roadrunner_listener:info(Name),

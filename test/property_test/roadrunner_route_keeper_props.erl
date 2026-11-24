@@ -8,9 +8,12 @@ keepers. Two kinds of requesters drive it, one operation at a time:
   lives across its requests, so a kept-alive connection's next request
   (`reuse`) takes its home slot without the keeper; refused or released,
   it stays idle;
-- stream workers (`reset`) of fake connections that start and monitor
-  them, as HTTP/2 and HTTP/3 do: a worker waits until its stream resets
-  or its connection goes, and its request ends with it.
+- stream workers (`reset`) of fake connections that do what the HTTP/2
+  connection and HTTP/3's loop do: start and monitor their workers, keep
+  the key each takes on its own, and free it on the worker's `'DOWN'`. A
+  worker waits until its stream resets or its connection goes, and its
+  request ends with it; a connection killed with workers running leaves
+  them counted until they end.
 
 The operations: requests, releases, releases racing new requests (a
 kept-alive connection's home racing the slot it frees, and any waiter's
@@ -31,7 +34,9 @@ route moved to a new key keeps its old table until it drains):
   lowered it;
 - every slot is freed exactly once: each table's rows are exactly the
   requests the model has running on it, each held by a process the keeper
-  watches, and every connection the keeper registered is watched;
+  watches or owned by a connection it registered (and so watches), every
+  connection the keeper registered is watched, and every intent belongs to
+  a worker holding its row;
 - the keeper's waiting count is exactly the requests it has parked, and
   none is parked while a slot is free;
 - waiting requests are granted first in, first out: none is granted while
@@ -64,9 +69,9 @@ is refused and every holder's release returns.
 
 %% Where the keeper keeps what the model reads of it: its `#state{}` fields
 %% `counts`, `waiters` and `watched`, and a `#waiter{}`'s pid.
--define(STATE_COUNTS, 4).
--define(STATE_WAITERS, 8).
--define(STATE_WATCHED, 10).
+-define(STATE_COUNTS, 5).
+-define(STATE_WAITERS, 9).
+-define(STATE_WATCHED, 11).
 -define(WAITER_PID, 2).
 
 -record(client, {
@@ -77,7 +82,7 @@ is refused and every holder's release returns.
     seq :: non_neg_integer(),
     t0 :: integer(),
     %% The tables and counts the request asked.
-    table :: {{ets:tid(), ets:tid()}, atomics:atomics_ref()},
+    table :: {{ets:tid(), ets:tid(), ets:tid()}, atomics:atomics_ref()},
     %% The fake connection a stream worker belongs to.
     conn :: pid() | undefined,
     %% Set by a keeper crash while it waits: its refusal is expected.
@@ -345,7 +350,7 @@ step(half_grant, Model) ->
             ok = sys:suspend(Keeper),
             {Asker, Model2} = h1_request(new_h1(), long, Model1),
             ok = await_mailbox(Keeper, Asker),
-            {{Slots, _Regs}, _Counts} = route_counts(),
+            {{Slots, _Regs, _Intents}, _Counts} = route_counts(),
             true = ets:insert_new(Slots, {free_key(Slots, 1), Asker, Asker}),
             true = erlang:suspend_process(Asker),
             exit(Keeper, kill),
@@ -400,7 +405,7 @@ step({straggler_at_drain, N}, Model) ->
             Model;
         [] ->
             Keeper = keeper(),
-            {{Slots, _Regs}, _Counts} = Old = route_counts(),
+            {{Slots, _Regs, _Intents}, _Counts} = Old = route_counts(),
             {Straggler, Fresh} =
                 case pick(idle, Model) of
                     [] -> {new_h1(), true};
@@ -509,7 +514,7 @@ set_orphaned(Pid, #model{clients = Clients} = Model) ->
     Model#model{clients = Clients#{Pid := C#client{orphaned = true}}}.
 
 recap(#model{caps = Caps} = Model) ->
-    {{Slots, _Regs}, Counts} = route_counts(),
+    {{Slots, _Regs, _Intents}, Counts} = route_counts(),
     Max = atomics:get(Counts, 1),
     Rows = ets:info(Slots, size),
     Model#model{caps = Caps#{Slots => max(Max, max(Rows, maps:get(Slots, Caps, Max)))}}.
@@ -565,7 +570,9 @@ h1_request_on(Pid, Table, Mode, Model) ->
 ceiling({Table, Counts}, Mode) ->
     roadrunner_route_keeper:ceiling(Table, Counts, wait(Mode), ?LISTENER).
 
-%% A fake multiplexed connection: starts stream workers and monitors them.
+%% A fake multiplexed connection: starts stream workers and monitors them,
+%% keeps the key each takes on its own, and frees it on the worker's
+%% `'DOWN'`, in the one receive.
 new_conn(#model{conns = Conns} = Model) ->
     Conn = spawn(fun conn_loop/0),
     ok = remember_client(Conn),
@@ -578,12 +585,16 @@ conn_loop() ->
             {Pid, _Mon} = spawn_monitor(fun() -> worker(Ceiling, Conn, Driver) end),
             Driver ! {Ref, Pid},
             conn_loop();
-        {'DOWN', _Mon, process, _Worker, _Reason} ->
+        {roadrunner_route_slot, _Worker, _Ceiling, _K} = Note ->
+            ok = roadrunner_route_keeper:noted(Note),
+            conn_loop();
+        {'DOWN', _Mon, process, Worker, _Reason} ->
+            ok = roadrunner_route_keeper:worker_down(Worker),
             conn_loop()
     end.
 
 worker(Ceiling, Conn, Driver) ->
-    Result = roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Conn),
+    Result = roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Conn, Conn),
     Driver ! {client, self(), Result},
     case Result of
         {ok, _Token} ->
@@ -629,7 +640,7 @@ await_asked(Pid, Model, Tries) ->
     receive
         {client, Pid, Result} -> apply_result({Pid, Result}, Model)
     after 0 ->
-        #client{table = {{_Slots, Regs}, _}} = client(Pid, Model),
+        #client{table = {{_Slots, Regs, _Intents}, _}} = client(Pid, Model),
         case lists:member(Pid, waiting(Regs)) of
             true ->
                 set_status(Pid, parked, Model);
@@ -716,7 +727,7 @@ settle(Model, Tries) ->
 at_rest(#model{clients = Clients, conns = Conns} = Model) ->
     Keepers = [
         ets:lookup_element(Regs, '$keeper', 2)
-     || {{_Slots, Regs}, _Counts} <- tables(Model),
+     || {{_Slots, Regs, _Intents}, _Counts} <- tables(Model),
         ets:info(Regs, size) =/= undefined
     ],
     lists:all(fun resting/1, maps:keys(Clients) ++ Conns ++ Keepers).
@@ -734,7 +745,7 @@ tables(Model) ->
         | [table(P, Model) || P <- pick(running, Model) ++ pick(parked, Model)]
     ]).
 
-view({{Slots, Regs}, _Counts} = Table, Model) ->
+view({{Slots, Regs, _Intents}, _Counts} = Table, Model) ->
     Live = [P || P <- pick(running, Model) ++ pick(parked, Model), table(P, Model) =:= Table],
     case ets:info(Slots, size) of
         undefined when Live =/= [] ->
@@ -749,7 +760,7 @@ view({{Slots, Regs}, _Counts} = Table, Model) ->
 %% (its route drained) or served by a new keeper.
 view(_Table, _Model, changing) ->
     changing;
-view({{Slots, Regs}, Counts} = Table, Model, {Waiting, Watched, Queued}) ->
+view({{Slots, Regs, Intents}, Counts} = Table, Model, {Waiting, Watched, Queued}) ->
     Running = [P || P <- pick(running, Model), table(P, Model) =:= Table],
     Parked = [P || P <- pick(parked, Model), table(P, Model) =:= Table],
     Rows = ets:tab2list(Slots),
@@ -757,9 +768,21 @@ view({{Slots, Regs}, Counts} = Table, Model, {Waiting, Watched, Queued}) ->
     #{
         answering => [P || P <- Parked, not lists:member(P, Waiting)],
         waiting => Waiting,
-        %% Every row's holder is watched, and so is every registration.
-        unwatched_rows => [R || {_K, _O, H} = R <- Rows, not lists:member(H, Watched)],
+        %% Every row is covered: its holder is watched, or its owner is (a
+        %% connection the keeper registered); so is every registration;
+        %% every intent belongs to a worker holding its row.
+        unwatched_rows => [
+            R
+         || {_K, O, H} = R <- Rows,
+            not lists:member(H, Watched),
+            not lists:member(O, Watched)
+        ],
         unwatched_regs => [C || C <- Registered, not lists:member(C, Watched)],
+        stray_intents => [
+            I
+         || {O, W, K} = I <- ets:tab2list(Intents),
+            not lists:member({K, O, W}, Rows)
+        ],
         queued => Queued,
         holding => lists:sort([H || {_K, _O, H} <- Rows]),
         running => lists:sort(Running),
@@ -770,14 +793,20 @@ quiet(gone) ->
     true;
 quiet(changing) ->
     false;
-quiet(#{unwatched_rows := [], unwatched_regs := [], holding := Holding, running := Running}) ->
+quiet(#{
+    unwatched_rows := [],
+    unwatched_regs := [],
+    stray_intents := [],
+    holding := Holding,
+    running := Running
+}) ->
     Holding =:= Running;
 quiet(#{}) ->
     false.
 
 check_table({_Table, gone}, Model) ->
     Model;
-check_table({{{Slots, _Regs}, _}, V}, #model{caps = Caps} = Model) ->
+check_table({{{Slots, _Regs, _Intents}, _}, V}, #model{caps = Caps} = Model) ->
     #{waiting := Waiting, queued := Queued, holding := Holding, max := Max} = V,
     Rows = length(Holding),
     Cap = maps:get(Slots, Caps, Max),
@@ -904,13 +933,13 @@ route_counts() ->
     {ok, _, _, _, _, {_Body, Ceiling}} = roadrunner_router:resolve(
         ~"GET", ~"/expensive", persistent_term:get({roadrunner_routes, ?LISTENER})
     ),
-    {{element(2, Ceiling), element(3, Ceiling)}, element(4, Ceiling)}.
+    {{element(2, Ceiling), element(3, Ceiling), element(4, Ceiling)}, element(5, Ceiling)}.
 
 route_stats() ->
     roadrunner_route_keeper:stats(route_counts()).
 
 keeper() ->
-    {{_Slots, Regs}, _Counts} = route_counts(),
+    {{_Slots, Regs, _Intents}, _Counts} = route_counts(),
     ets:lookup_element(Regs, '$keeper', 2).
 
 %% The pids the keeper has waiting, the pids it watches and its waiting
@@ -950,7 +979,7 @@ waiting(Regs) ->
 
 await_rows(Table, N, 0) ->
     error({rows_never, Table, N});
-await_rows({{Slots, _Regs}, _} = Table, N, Tries) ->
+await_rows({{Slots, _Regs, _Intents}, _} = Table, N, Tries) ->
     case ets:info(Slots, size) of
         N ->
             ok;

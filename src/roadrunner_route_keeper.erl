@@ -29,8 +29,25 @@
 %%   the request to the keeper, which grants another key and makes it the
 %%   new home. When the connection dies the keeper deletes the home row it
 %%   may still hold;
-%% - a stream worker of HTTP/2 or HTTP/3 asks the keeper, which grants it a
-%%   key and watches it: the worker's exit, however it comes, frees the slot.
+%% - a stream worker of HTTP/2 or HTTP/3 takes a slot owned by the process
+%%   that monitors it (the connection, or HTTP/3's loop), while the route is
+%%   under half its ceiling and that owner is registered; the keeper
+%%   registers an owner, and watches it for the rest of its life, when one
+%%   of its workers first asks. Before its row, the worker tells the owner
+%%   its key (`{roadrunner_route_slot, ...}`, which the owner keeps with
+%%   `noted/1`), writes an intent `{Owner, Worker, K}` in the route's
+%%   `intents` table, and checks that the owner is still registered. The
+%%   owner frees the row, then the intent, on the worker's `'DOWN'`
+%%   (`worker_down/1`): it must take the key and the `'DOWN'` in the same
+%%   receive, so the key, sent first, is handled first. When the owner dies
+%%   the keeper takes its registration, then watches every worker it has
+%%   an intent of, freeing each row as its worker ends: either the keeper
+%%   finds a worker's intent, or the worker finds the registration gone
+%%   before its row exists. A worker killed between its intent and backing
+%%   off leaves only the intent, which the keeper looks for again a second
+%%   later. A worker at a route half full or more, or one whose owner is
+%%   not registered, asks the keeper, which grants it a key and watches it:
+%%   the worker's exit, however it comes, frees the slot.
 %%
 %% The gate, in the `'$keeper'` row of `regs`, sends every request to the
 %% keeper while requests wait for a slot (so a new request queues behind
@@ -62,7 +79,8 @@
 %% The tables and `counts` belong to the listener, not to the keeper, so a
 %% keeper that crashes loses no count: the listener starts a new one on the
 %% same tables, which watches every registered connection and every holder
-%% the table has (`init/1`). Requests that were waiting for the dead keeper
+%% the table has, and the workers of owners no longer registered
+%% (`init/1`). Requests that were waiting for the dead keeper
 %% see it go and are refused, each removing the row the keeper may have
 %% added for it before dying; connections with a home keep taking it
 %% meanwhile.
@@ -87,8 +105,10 @@
     stats/1,
     delete_table/1,
     acquire/1,
-    acquire/3,
-    release/2
+    acquire/4,
+    release/2,
+    noted/1,
+    worker_down/1
 ]).
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2]).
 -export_type([ceiling/0, table/0, token/0, wait/0]).
@@ -121,6 +141,10 @@
 %% of connections it watched grew.
 -define(HIBERNATE_AFTER_MS, 1000).
 
+%% How long after an owner died the keeper looks for its workers' intents
+%% again.
+-define(SWEEP_MS, 1000).
+
 %% A route's ceiling as a request meets it, carried in the route's compiled
 %% entry: the tables and counts the listener keeps for the route across
 %% reloads, how a request over the ceiling waits (`shed`, or a queue
@@ -129,6 +153,7 @@
 -record(ceiling, {
     slots :: ets:tid(),
     regs :: ets:tid(),
+    intents :: ets:tid(),
     counts :: atomics:atomics_ref(),
     wait :: wait(),
     retry_after :: pos_integer(),
@@ -136,10 +161,12 @@
 }).
 
 -opaque ceiling() :: #ceiling{}.
--opaque table() :: {ets:tid(), ets:tid()}.
+-opaque table() :: {ets:tid(), ets:tid(), ets:tid()}.
 -type token() :: pos_integer().
 -type wait() :: shed | pos_integer().
 -type kind() :: h1 | worker.
+%% The key a stream worker tells its owner it took.
+-type note() :: {roadrunner_route_slot, pid(), ceiling(), token()}.
 -type row() :: {token(), pid(), pid()}.
 
 %% A request waiting for a slot.
@@ -151,8 +178,9 @@
 }).
 
 %% A process the keeper watches: a registered connection, or a stream
-%% worker holding a slot it granted, with the rows to free when it dies.
-%% Only a registered one has a registration to remove then.
+%% worker holding a slot it granted or one whose owner died, with the rows
+%% to free when it dies. Only a registered one has a registration to remove
+%% then.
 -record(watched, {
     monitor :: reference(),
     registered = false :: boolean(),
@@ -162,6 +190,7 @@
 -record(state, {
     slots :: ets:tid(),
     regs :: ets:tid(),
+    intents :: ets:tid(),
     counts :: atomics:atomics_ref(),
     %% Set once the route left the table: the keeper stops when nothing is
     %% running or waiting any more.
@@ -178,7 +207,11 @@
     watched = #{} :: #{pid() => #watched{}},
     %% Keys heard freed, which may be free still, and the next key to try.
     spare = #{} :: #{token() => []},
-    rotor = 1 :: token()
+    rotor = 1 :: token(),
+    %% Owners that died, whose workers' intents the keeper looks for again
+    %% when `sweep` fires.
+    late = [] :: [pid()],
+    sweep :: reference() | undefined
 }).
 
 %% --- listener side ---
@@ -194,11 +227,12 @@ new(Max, MaxQueued, Draining) ->
     Regs = ets:new(roadrunner_route_regs, [
         set, public, {read_concurrency, true}, {write_concurrency, true}
     ]),
+    Intents = ets:new(roadrunner_route_intents, [duplicate_bag, public, {write_concurrency, true}]),
     Counts = atomics:new(4, [{signed, false}]),
     ok = atomics:put(Counts, ?MAX, Max),
     ok = atomics:put(Counts, ?MAX_QUEUED, MaxQueued),
-    {ok, Pid} = start_link({Slots, Regs}, Counts, Draining),
-    {Pid, {Slots, Regs}, Counts}.
+    {ok, Pid} = start_link({Slots, Regs, Intents}, Counts, Draining),
+    {Pid, {Slots, Regs, Intents}, Counts}.
 
 %% Start a keeper on a route's tables, linked to the caller (the listener):
 %% the first, or one taking over from a keeper that died or drained.
@@ -231,19 +265,21 @@ set_draining(Pid, Draining) ->
     {shed, #{retry_after := pos_integer()}} | {queue, #{timeout := pos_integer()}},
     atom()
 ) -> ceiling().
-ceiling({Slots, Regs}, Counts, {shed, #{retry_after := RetryAfter}}, Listener) ->
+ceiling({Slots, Regs, Intents}, Counts, {shed, #{retry_after := RetryAfter}}, Listener) ->
     #ceiling{
         slots = Slots,
         regs = Regs,
+        intents = Intents,
         counts = Counts,
         wait = shed,
         retry_after = RetryAfter,
         listener = Listener
     };
-ceiling({Slots, Regs}, Counts, {queue, #{timeout := Timeout}}, Listener) ->
+ceiling({Slots, Regs, Intents}, Counts, {queue, #{timeout := Timeout}}, Listener) ->
     #ceiling{
         slots = Slots,
         regs = Regs,
+        intents = Intents,
         counts = Counts,
         wait = Timeout,
         retry_after = 1,
@@ -258,7 +294,7 @@ ceiling({Slots, Regs}, Counts, {queue, #{timeout := Timeout}}, Listener) ->
         queued := non_neg_integer(),
         throttled := non_neg_integer()
     }.
-stats({{Slots, _Regs}, Counts}) ->
+stats({{Slots, _Regs, _Intents}, Counts}) ->
     #{
         max_concurrent_requests => atomics:get(Counts, ?MAX),
         in_flight => ets:info(Slots, size),
@@ -268,9 +304,10 @@ stats({{Slots, _Regs}, Counts}) ->
 
 %% The tables of a route whose keeper is gone for good.
 -spec delete_table(table()) -> true.
-delete_table({Slots, Regs}) ->
+delete_table({Slots, Regs, Intents}) ->
     true = ets:delete(Slots),
-    ets:delete(Regs).
+    true = ets:delete(Regs),
+    ets:delete(Intents).
 
 %% --- request side ---
 
@@ -291,34 +328,47 @@ acquire(#ceiling{slots = Slots} = Ceiling) ->
             end
     end.
 
-%% `acquire/1` for a stream worker, which also stops waiting on `Reset`,
-%% the message that says its stream was reset, or when its connection
-%% process `Conn` goes: it returns `reset` and the worker ends, which frees
-%% a slot granted in the meantime (the keeper watches the worker).
--spec acquire(ceiling(), term(), pid()) -> {ok, token()} | {refused, pos_integer()} | reset.
-acquire(#ceiling{} = Ceiling, Reset, Conn) ->
-    case ask(Ceiling, worker) of
-        {asked, Token} ->
-            ConnMon = erlang:monitor(process, Conn),
-            Result =
-                receive
-                    {Token, {granted, K}} ->
-                        {ok, K};
-                    {Token, refused} ->
-                        refuse(Ceiling);
-                    {'DOWN', Token, process, _Keeper, _Reason} ->
-                        keeper_gone(Ceiling);
-                    Reset ->
-                        true = erlang:demonitor(Token, [flush]),
-                        reset;
-                    {'DOWN', ConnMon, process, Conn, _Reason} ->
-                        true = erlang:demonitor(Token, [flush]),
-                        reset
-                end,
-            true = erlang:demonitor(ConnMon, [flush]),
-            Result;
-        _FullOrGone ->
-            refuse(Ceiling)
+%% Take a slot for the calling stream worker, whose `Owner` (the process
+%% that monitors it: the HTTP/2 connection, or HTTP/3's loop) frees it when
+%% the worker ends: one owned by `Owner` while that owner is registered and
+%% the route under half its ceiling, else through the keeper. Waiting, the
+%% worker also stops on `Reset`, the message that says its stream was
+%% reset, or when its connection process `Conn` goes: it returns `reset` and
+%% ends, which frees a slot granted in the meantime (the keeper watches it).
+-spec acquire(ceiling(), term(), pid(), pid()) ->
+    {ok, token()} | {refused, pos_integer()} | reset.
+acquire(#ceiling{} = Ceiling, Reset, Conn, Owner) ->
+    case take_owned(Ceiling, Owner) of
+        {taken, K} -> {ok, K};
+        busy -> ask_worker(Ceiling, Reset, Conn, Owner);
+        gone -> refuse(Ceiling)
+    end.
+
+%% A stream worker's owner keeps the key its worker took (the message the
+%% worker sent it), until the worker's `'DOWN'`.
+-spec noted(note()) -> ok.
+noted({roadrunner_route_slot, Worker, Ceiling, K}) ->
+    _ = put({?MODULE, Worker}, {Ceiling, K}),
+    ok.
+
+%% A worker of the calling owner ended: the slot it took goes, row first,
+%% then its intent, so the keeper finding the intent of a worker never
+%% misses its row.
+-spec worker_down(pid()) -> ok.
+worker_down(Worker) ->
+    case erase({?MODULE, Worker}) of
+        undefined ->
+            ok;
+        {#ceiling{slots = Slots, intents = Intents} = Ceiling, K} ->
+            Self = self(),
+            try
+                true = ets:delete_object(Slots, {K, Self, Worker}),
+                ok = ?PAUSE(owner_row_freed),
+                true = ets:delete_object(Intents, {Self, Worker, K}),
+                notify(Ceiling, K)
+            catch
+                error:badarg -> ok
+            end
     end.
 
 %% An HTTP/1.1 connection hands its slot back as its request ends, telling
@@ -360,16 +410,71 @@ take_home(#ceiling{slots = Slots, regs = Regs, counts = Counts} = Ceiling, K) ->
 %% while the gate says so, as a release does: the row may have kept a
 %% request waiting.
 -spec kept(ceiling(), token(), pid()) -> taken | busy.
-kept(#ceiling{slots = Slots, regs = Regs, counts = Counts} = Ceiling, K, Self) ->
-    case
-        ets:info(Slots, size) =< atomics:get(Counts, ?MAX) andalso
-            ets:lookup_element(Regs, '$keeper', 3) band ?DRAINING =:= 0
-    of
+kept(Ceiling, K, Self) ->
+    case within(Ceiling) of
         true ->
             taken;
         false ->
-            true = ets:delete_object(Slots, {K, Self, Self}),
+            true = ets:delete_object(Ceiling#ceiling.slots, {K, Self, Self}),
             ok = notify(Ceiling, K),
+            busy
+    end.
+
+-spec within(ceiling()) -> boolean().
+within(#ceiling{slots = Slots, regs = Regs, counts = Counts}) ->
+    ets:info(Slots, size) =< atomics:get(Counts, ?MAX) andalso
+        ets:lookup_element(Regs, '$keeper', 3) band ?DRAINING =:= 0.
+
+%% A slot owned by the worker's owner, at a key picked from the worker's
+%% pid. The owner hears of it first, as its `'DOWN'` of the worker comes
+%% after anything the worker sent; then the intent goes in, then the
+%% owner's registration is checked again, then the row. A route at half its
+%% ceiling or more goes to the keeper: a key picked at random is likely
+%% taken there, and the try wasted. That is looked at first, as it costs a
+%% request that goes to the keeper anyway the least.
+-spec take_owned(ceiling(), pid()) -> {taken, token()} | busy | gone.
+take_owned(#ceiling{slots = Slots, regs = Regs, counts = Counts} = Ceiling, Owner) ->
+    try
+        Max = atomics:get(Counts, ?MAX),
+        case
+            ets:info(Slots, size) < (Max + 1) div 2 andalso open(Regs) andalso
+                ets:member(Regs, Owner)
+        of
+            true -> take_owned(Ceiling, Owner, erlang:phash2(self(), Max) + 1);
+            false -> busy
+        end
+    catch
+        error:badarg -> gone
+    end.
+
+-spec take_owned(ceiling(), pid(), token()) -> {taken, token()} | busy.
+take_owned(#ceiling{slots = Slots, regs = Regs, intents = Intents} = Ceiling, Owner, K) ->
+    Self = self(),
+    _ = erlang:send(Owner, {roadrunner_route_slot, Self, Ceiling, K}),
+    ok = ?PAUSE(worker_noted),
+    true = ets:insert(Intents, {Owner, Self, K}),
+    ok = ?PAUSE(worker_intent),
+    case ets:member(Regs, Owner) of
+        true ->
+            ok = ?PAUSE(worker_checked),
+            case ets:insert_new(Slots, {K, Owner, Self}) of
+                true ->
+                    ok = ?PAUSE(worker_inserted),
+                    case within(Ceiling) of
+                        true ->
+                            {taken, K};
+                        false ->
+                            true = ets:delete_object(Slots, {K, Owner, Self}),
+                            true = ets:delete_object(Intents, {Owner, Self, K}),
+                            ok = notify(Ceiling, K),
+                            busy
+                    end;
+                false ->
+                    true = ets:delete_object(Intents, {Owner, Self, K}),
+                    busy
+            end;
+        false ->
+            true = ets:delete_object(Intents, {Owner, Self, K}),
             busy
     end.
 
@@ -387,6 +492,34 @@ notify(#ceiling{regs = Regs}, K) ->
         [{'$keeper', Keeper, _Gate}] ->
             _ = erlang:send(Keeper, {done, K}),
             ok
+    end.
+
+%% A stream worker asks the keeper, which registers its owner.
+-spec ask_worker(ceiling(), term(), pid(), pid()) ->
+    {ok, token()} | {refused, pos_integer()} | reset.
+ask_worker(Ceiling, Reset, Conn, Owner) ->
+    case ask(Ceiling, {worker, Owner}) of
+        {asked, Token} ->
+            ConnMon = erlang:monitor(process, Conn),
+            Result =
+                receive
+                    {Token, {granted, K}} ->
+                        {ok, K};
+                    {Token, refused} ->
+                        refuse(Ceiling);
+                    {'DOWN', Token, process, _Keeper, _Reason} ->
+                        keeper_gone(Ceiling);
+                    Reset ->
+                        true = erlang:demonitor(Token, [flush]),
+                        reset;
+                    {'DOWN', ConnMon, process, Conn, _Reason} ->
+                        true = erlang:demonitor(Token, [flush]),
+                        reset
+                end,
+            true = erlang:demonitor(ConnMon, [flush]),
+            Result;
+        _FullOrGone ->
+            refuse(Ceiling)
     end.
 
 %% An HTTP/1.1 connection asks the keeper, which makes the key it grants the
@@ -413,7 +546,7 @@ ask_home(#ceiling{slots = Slots} = Ceiling) ->
 %% Ask the keeper for a slot, unless the route is full and the request
 %% would not wait for one. The ask carries a monitor of the keeper that is
 %% also the alias its answer comes on.
--spec ask(ceiling(), kind()) -> {asked, reference()} | full | gone.
+-spec ask(ceiling(), h1 | {worker, pid()}) -> {asked, reference()} | full | gone.
 ask(#ceiling{slots = Slots, regs = Regs, counts = Counts, wait = Wait}, Kind) ->
     case ets:info(Slots, size) of
         undefined ->
@@ -479,19 +612,26 @@ refuse(#ceiling{counts = Counts, retry_after = RetryAfter, listener = Listener})
 
 -spec init({table(), atomics:atomics_ref(), boolean()}) ->
     {ok, #state{}} | {ok, #state{}, {continue, drained}}.
-init({{Slots, Regs}, Counts, Draining}) ->
+init({{Slots, Regs, Intents}, Counts, Draining}) ->
     Gate = draining(Draining),
     %% Published first: a request asking from now on reaches this keeper.
     true = ets:insert(Regs, {'$keeper', self(), Gate}),
     %% Whatever waited for a keeper before this one was refused when it went.
     ok = atomics:put(Counts, ?QUEUED, 0),
     State0 = #state{
-        slots = Slots, regs = Regs, counts = Counts, draining = Draining, gate = Gate
+        slots = Slots,
+        regs = Regs,
+        intents = Intents,
+        counts = Counts,
+        draining = Draining,
+        gate = Gate
     },
-    %% Every registered connection is watched again, and every other holder
-    %% with its row.
+    %% Every registered connection is watched again, every worker of an
+    %% owner no longer registered (whose keeper died taking it), and every
+    %% other holder with its row.
     State1 = ets:foldl(fun watch_registered/2, State0, Regs),
-    State = ets:foldl(fun take_over_row/2, State1, Slots),
+    State2 = ets:foldl(fun adopt_orphan/2, State1, Intents),
+    State = ets:foldl(fun take_over_row/2, State2, Slots),
     case Draining of
         %% Taking over a route already dropped: it may have drained.
         true -> {ok, State, {continue, drained}};
@@ -504,9 +644,19 @@ watch_registered({'$keeper', _Keeper, _Gate}, State) ->
 watch_registered({Conn, _Home}, State) ->
     registered(Conn, undefined, State).
 
+%% An intent whose owner is not registered: the owner died, and the keeper
+%% that took its registration died before it watched every worker.
+-spec adopt_orphan({pid(), pid(), token()}, #state{}) -> #state{}.
+adopt_orphan({Owner, Worker, K}, #state{regs = Regs} = State) ->
+    case ets:member(Regs, Owner) of
+        true -> State;
+        false -> hold_row(Worker, {K, Owner, Worker}, undefined, State)
+    end.
+
 %% A row found at a takeover. A registered connection's row is its home:
-%% the old keeper may have died between that row and the registration. Any
-%% other holder is watched with its row.
+%% the old keeper may have died between that row and the registration. A
+%% worker's row owned by another process is that owner's, or the keeper's
+%% through its intent. Any other holder is watched with its row.
 -spec take_over_row(row(), #state{}) -> #state{}.
 take_over_row({K, Pid, Pid} = Row, #state{regs = Regs} = State) ->
     case ets:member(Regs, Pid) of
@@ -515,7 +665,9 @@ take_over_row({K, Pid, Pid} = Row, #state{regs = Regs} = State) ->
             State;
         false ->
             hold_row(Pid, Row, undefined, State)
-    end.
+    end;
+take_over_row({_K, _Owner, _Worker}, State) ->
+    State.
 
 -spec handle_continue(drained, #state{}) ->
     {noreply, #state{}} | {stop, {shutdown, drained}, #state{}}.
@@ -532,9 +684,11 @@ handle_cast(_Msg, State) ->
 
 -spec handle_info(term(), #state{}) ->
     {noreply, #state{}} | {stop, {shutdown, drained}, #state{}}.
-handle_info({acquire, Token, Pid, Kind, Wait}, State) ->
+handle_info({acquire, Token, Pid, h1, Wait}, State) ->
     %% The requests already waiting go first.
-    noreply(admit(Token, Pid, Kind, Wait, serve(State)));
+    noreply(admit(Token, Pid, h1, Wait, serve(State)));
+handle_info({acquire, Token, Pid, {worker, Owner}, Wait}, State) ->
+    noreply(admit(Token, Pid, worker, Wait, serve(register_owner(Owner, State))));
 handle_info({done, K}, State) ->
     noreply(serve(spare(K, State)));
 handle_info({expire, Token}, #state{waiters = Waiters} = State) ->
@@ -559,6 +713,8 @@ handle_info({'DOWN', Mon, process, Pid, _Reason}, #state{monitors = Monitors} = 
     end;
 handle_info(serve, State) ->
     noreply(serve(State));
+handle_info(sweep, #state{late = Late} = State) ->
+    noreply(lists:foldl(fun sweep/2, State#state{late = [], sweep = undefined}, Late));
 handle_info({draining, Draining}, #state{gate = Gate} = State) ->
     noreply(
         set_gate(Gate band bnot ?DRAINING bor draining(Draining), State#state{draining = Draining})
@@ -694,6 +850,20 @@ hold(h1, Conn, K, Mon, #state{regs = Regs} = State) ->
 hold(worker, Pid, K, Mon, State) ->
     hold_row(Pid, {K, Pid, Pid}, Mon, State).
 
+%% The owner of a stream worker asking: watched, then registered, once, so
+%% every registration is watched and its workers take their slots from now
+%% on.
+-spec register_owner(pid(), #state{}) -> #state{}.
+register_owner(Owner, #state{watched = Watched, regs = Regs} = State) ->
+    case Watched of
+        #{Owner := #watched{registered = true}} ->
+            State;
+        #{} ->
+            State1 = registered(Owner, undefined, State),
+            true = ets:insert_new(Regs, {Owner, none}),
+            State1
+    end.
+
 %% Watch `Pid` from now on, once. A waiter's monitor is the one kept when
 %% the process is not watched yet, and dropped when it is.
 -spec watch(pid(), reference() | undefined, #state{}) -> #state{}.
@@ -733,8 +903,10 @@ drop_monitor(Mon, #state{monitors = Monitors} = State) ->
     true = erlang:demonitor(Mon, [flush]),
     State#state{monitors = maps:remove(Mon, Monitors)}.
 
-%% A watched process died. A connection's registration goes first, with
-%% the home row it may hold; then every row it held is freed.
+%% A watched process died. A registered one's registration goes first, so
+%% none of its workers takes a slot from now on; then the keeper watches
+%% every worker it has an intent of, and frees the home row it may hold
+%% and every row it held.
 -spec watched_down(pid(), reference(), #state{}) -> #state{}.
 watched_down(Pid, Mon, #state{regs = Regs, watched = Watched, monitors = Monitors} = State) ->
     #{Pid := #watched{registered = Registered, rows = Rows}} = Watched,
@@ -744,16 +916,67 @@ watched_down(Pid, Mon, #state{regs = Regs, watched = Watched, monitors = Monitor
     case Registered of
         true ->
             [{Pid, Home}] = ets:take(Regs, Pid),
-            free_rows([{Home, Pid, Pid} | Rows], State1);
+            ok = ?PAUSE(owner_taken),
+            free_rows(home(Home, Pid, Rows), sweep_later(Pid, adopt(Pid, State1)));
         false ->
             free_rows(Rows, State1)
     end.
 
+-spec home(token() | none, pid(), [row()]) -> [row()].
+home(none, _Pid, Rows) ->
+    Rows;
+home(K, Pid, Rows) ->
+    [{K, Pid, Pid} | Rows].
+
+%% Watch every worker `Owner` has an intent of, freeing its row when it
+%% ends.
+-spec adopt(pid(), #state{}) -> #state{}.
+adopt(Owner, #state{intents = Intents} = State) ->
+    lists:foldl(
+        fun({_Owner, Worker, K}, Acc) -> hold_row(Worker, {K, Owner, Worker}, undefined, Acc) end,
+        State,
+        ets:lookup(Intents, Owner)
+    ).
+
+%% A worker can write its intent after the keeper looked for them, if it
+%% read the owner registered before then; it then finds the registration
+%% gone and takes its intent back, unless it dies first. The keeper looks
+%% again a little later and removes the intents of workers it does not
+%% watch, which hold no row.
+-spec sweep_later(pid(), #state{}) -> #state{}.
+sweep_later(Owner, #state{late = Late, sweep = undefined} = State) ->
+    State#state{late = [Owner | Late], sweep = erlang:send_after(?SWEEP_MS, self(), sweep)};
+sweep_later(Owner, #state{late = Late} = State) ->
+    State#state{late = [Owner | Late]}.
+
+-spec sweep(pid(), #state{}) -> #state{}.
+sweep(Owner, #state{intents = Intents, watched = Watched} = State) ->
+    lists:foreach(
+        fun({_Owner, Worker, K} = Intent) ->
+            adopted(Worker, {K, Owner, Worker}, Watched) orelse
+                ets:delete_object(Intents, Intent)
+        end,
+        ets:lookup(Intents, Owner)
+    ),
+    State.
+
+-spec adopted(pid(), row(), #{pid() => #watched{}}) -> boolean().
+adopted(Worker, Row, Watched) ->
+    case Watched of
+        #{Worker := #watched{rows = Rows}} -> lists:member(Row, Rows);
+        #{} -> false
+    end.
+
+%% Free each row, and the intent of one a worker took for its owner.
 -spec free_rows([row()], #state{}) -> #state{}.
 free_rows([], State) ->
     State;
-free_rows([{K, _Owner, _Holder} = Row | Rows], #state{slots = Slots} = State) ->
+free_rows([{K, Pid, Pid} = Row | Rows], #state{slots = Slots} = State) ->
     true = ets:delete_object(Slots, Row),
+    free_rows(Rows, spare(K, State));
+free_rows([{K, Owner, Worker} = Row | Rows], #state{slots = Slots, intents = Intents} = State) ->
+    true = ets:delete_object(Slots, Row),
+    true = ets:delete_object(Intents, {Owner, Worker, K}),
     free_rows(Rows, spare(K, State)).
 
 %% A key heard freed, kept for the grants to come. There are no more of

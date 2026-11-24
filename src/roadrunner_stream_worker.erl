@@ -332,20 +332,32 @@ raise_heap_floor(Cell, Floor, Heap, Cap) ->
 %% body read in manual mode is held to the route's cap as it is read.
 %% A slot of the route's own `max_concurrent_requests`, taken before any
 %% middleware or the handler runs, and held for as long as this worker
-%% lives: its keeper monitors it, so the worker's exit, however it comes,
-%% frees the slot. The stream already holds a slot of the listener's
+%% lives: the process that monitors it (its HTTP/2 connection, or HTTP/3's
+%% loop), or the route's keeper, frees it when the worker exits, however
+%% that comes. The stream already holds a slot of the listener's
 %% ceiling while it waits here, which `roadrunner_listener` keeps the route
 %% queues from filling. A reset of the stream, or its connection going, ends
 %% the wait: nobody is left to answer.
 -spec route_slot(roadrunner_router:limits(), h2 | h3, pid(), non_neg_integer()) ->
     granted | {refused, pos_integer()} | reset.
 route_slot({_Body, Ceiling}, Protocol, Conn, StreamId) ->
-    case roadrunner_route_keeper:acquire(Ceiling, stream_reset(Protocol, StreamId), Conn) of
+    case
+        roadrunner_route_keeper:acquire(
+            Ceiling, stream_reset(Protocol, StreamId), Conn, slot_owner(Protocol, Conn)
+        )
+    of
         {ok, _Token} -> granted;
         Refused -> Refused
     end;
 route_slot(_Limits, _Protocol, _Conn, _StreamId) ->
     granted.
+
+%% The process that monitors this worker, which frees a slot the worker
+%% takes on its own: the HTTP/2 connection, or HTTP/3's loop (`Conn` is then
+%% the QUIC connection).
+-spec slot_owner(h2 | h3, pid()) -> pid().
+slot_owner(h2, Conn) -> Conn;
+slot_owner(h3, _Conn) -> roadrunner_http3_stream_worker:loop().
 
 %% The message the connection sends a worker whose stream was reset.
 -spec stream_reset(h2 | h3, non_neg_integer()) ->
