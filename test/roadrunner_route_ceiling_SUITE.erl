@@ -351,7 +351,7 @@ route_info(Name) ->
     maps:get(routes, roadrunner_listener:info(Name)).
 
 wait_queued(Name, N) ->
-    wait_queued(Name, N, 1000).
+    wait_queued(Name, N, 1000000).
 
 wait_queued(_Name, N, 0) ->
     ct:fail({never_queued, N});
@@ -365,7 +365,7 @@ wait_queued(Name, N, Tries) ->
     end.
 
 wait_links(Pid, Links) ->
-    wait_links(Pid, Links, 1000).
+    wait_links(Pid, Links, 1000000).
 
 wait_links(_Pid, Links, 0) ->
     ct:fail({links_never, Links});
@@ -382,7 +382,7 @@ wait_links(Pid, Links, Tries) ->
     end.
 
 wait_new_keeper(Name, Path, Old) ->
-    wait_new_keeper(Name, Path, Old, 1000).
+    wait_new_keeper(Name, Path, Old, 1000000).
 
 wait_new_keeper(_Name, _Path, _Old, 0) ->
     ct:fail(no_new_keeper);

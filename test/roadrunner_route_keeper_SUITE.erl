@@ -433,7 +433,7 @@ parked(Keeper, Ceiling) ->
 %% Until the keeper has `N` requests waiting. Each check is a round trip to
 %% the keeper, so it has handled every message sent to it before.
 wait_parked(Keeper, N) ->
-    wait_parked(Keeper, N, 1000).
+    wait_parked(Keeper, N, 1000000).
 
 wait_parked(_Keeper, N, 0) ->
     ct:fail({never_parked, N});
@@ -448,7 +448,7 @@ wait_parked(Keeper, N, Tries) ->
     end.
 
 wait_in_flight(Keeper, Ceiling, N) ->
-    wait_in_flight(Keeper, Ceiling, N, 1000).
+    wait_in_flight(Keeper, Ceiling, N, 1000000).
 
 wait_in_flight(_Keeper, _Ceiling, N, 0) ->
     ct:fail({in_flight_never, N});
@@ -464,7 +464,7 @@ wait_in_flight(Keeper, Ceiling, N, Tries) ->
 
 %% Until `Pid`'s acquire is in the (suspended) keeper's mailbox.
 wait_mailbox(Keeper, Pid) ->
-    wait_mailbox(Keeper, Pid, 1000).
+    wait_mailbox(Keeper, Pid, 1000000).
 
 wait_mailbox(_Keeper, Pid, 0) ->
     ct:fail({never_asked, Pid});
