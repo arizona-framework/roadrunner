@@ -133,6 +133,9 @@ every service in it:
   [Message size limits](#message-size-limits))
 - `middlewares`: middlewares for every route, see
   [Middlewares](#middlewares)
+- `max_concurrent_requests` and `overload_mode`: how many calls each
+  service runs at once, by default no limit (see
+  [Calls at once](#calls-at-once))
 - `send_compression`: how responses are compressed, `identity` (the
   default), `gzip` or `deflate`
 - `health`: `true` adds the health service, by default `false`
@@ -694,6 +697,34 @@ method runs, so a route left at `infinity` keeps the listener's
 `413`.
 
 See [Resource limits](resource_limits.md) for the defaults.
+
+## Calls at once
+
+A method that decodes large messages holds them in memory while it runs,
+so a burst of calls to it can take more memory than the box has. Set
+`max_concurrent_requests` to cap how many calls each service runs at
+once, and `overload_mode` to choose what happens to one over it (see
+`t:roadrunner_router:route/0`):
+
+```erlang
+roadrunner_grpc:routes(#{
+    services => [report_service],
+    health => true,
+    max_concurrent_requests => 16,
+    overload_mode => {queue, #{max_queued => 32, timeout => 2_000}}
+})
+```
+
+Each service counts its own calls, whatever method they name. A call over
+the ceiling is answered HTTP `503` with `Retry-After` before its method
+runs, which a gRPC client reports as `UNAVAILABLE`, a status clients may
+retry. In queue mode a call waits for a slot first, and the wait counts
+against its deadline. With `body_buffering => manual` a waiting call holds
+at most one stream window of its messages (64 KB on HTTP/2, 256 KB by
+default on HTTP/3); with `auto` the whole body is read first, up to
+`max_content_length`. The health and
+reflection services never take the ceiling, so health checks are answered
+while the services are at theirs.
 
 ## Keepalive
 

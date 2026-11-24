@@ -51,9 +51,19 @@ from starting:
 - `middlewares`: route middlewares (`roadrunner_middleware`) for every
   route `routes/1` returns, the health and reflection ones among them;
   one answers a call with a gRPC status with `reject/3`
+- `max_concurrent_requests` and `overload_mode`: a ceiling on the calls
+  each service runs at once, for `routes/1` to set on each service's
+  route (see `t:roadrunner_router:route/0`). Each service counts its own
+  calls, whatever method they name. A call over it is answered `503`
+  before its method runs, which a gRPC client reports as `UNAVAILABLE`,
+  a status it may retry. With `body_buffering => manual` a call that waits
+  in queue mode holds at most one stream window of its messages (64 KB on
+  HTTP/2, 256 KB by default on HTTP/3); with `auto` its whole body is read
+  first. By default no ceiling
 
 The health and reflection routes keep the defaults: the other shared
-options apply to the services' routes.
+options apply to the services' routes. A ceiling never applies to them,
+so a health check is answered while the services are at theirs.
 
 ## Body buffering
 
@@ -193,6 +203,8 @@ every service (see the moduledoc).
     max_message_size => pos_integer(),
     max_content_length => roadrunner_router:body_limit(),
     middlewares => roadrunner_middleware:middlewares(),
+    max_concurrent_requests => roadrunner_listener:positive_limit(),
+    overload_mode => roadrunner_router:overload_mode(),
     send_compression => encoding(),
     health => boolean(),
     reflection => boolean()
@@ -314,13 +326,25 @@ that is not the call's.
 
 -doc """
 The routes for `Opts`'s `services`, one per service, at
-`/package.Service/:method`, answering `POST` only: `max_content_length` set on each route,
+`/package.Service/:method`, answering `POST` only: `max_content_length`,
+`max_concurrent_requests` and `overload_mode` set on each service's route,
 `middlewares` on each route, the health and reflection ones among them,
 the other options its state.
 """.
 -spec routes(opts()) -> roadrunner_router:routes().
 routes(#{services := Services} = Opts) when is_list(Services) ->
-    Shared = maps:without([services, max_content_length, middlewares, health, reflection], Opts),
+    Shared = maps:without(
+        [
+            services,
+            max_content_length,
+            middlewares,
+            max_concurrent_requests,
+            overload_mode,
+            health,
+            reflection
+        ],
+        Opts
+    ),
     Keys = route_keys(Opts),
     Health = health_route(Opts, Keys),
     Health ++
@@ -338,15 +362,18 @@ routes(Opts) ->
     error({invalid_grpc_opts, Opts}).
 
 %% The route keys of the services' routes: `max_content_length`, by
-%% default `infinity`, and `middlewares`, which the router checks as the
-%% routes compile. The health and reflection routes take the
-%% `middlewares`.
+%% default `infinity`, `middlewares`, `max_concurrent_requests` and
+%% `overload_mode`, which the router checks as the routes compile. The
+%% health and reflection routes take the `middlewares` only.
 -spec route_keys(map()) -> map().
 route_keys(#{middlewares := Middlewares}) when not is_list(Middlewares) ->
     error({invalid_grpc_opt, middlewares, Middlewares});
 route_keys(Opts) ->
     maps:merge(
-        #{max_content_length => infinity}, maps:with([max_content_length, middlewares], Opts)
+        #{max_content_length => infinity},
+        maps:with(
+            [max_content_length, middlewares, max_concurrent_requests, overload_mode], Opts
+        )
     ).
 
 %% The health service's route, with `health => true`: it speaks its own

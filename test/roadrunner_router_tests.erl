@@ -751,6 +751,111 @@ rate_limit_is_a_pipeline_stage_test() ->
         persistent_term:erase({roadrunner_route_rate_limit, router_rl})
     end.
 
+compile_rejects_invalid_max_concurrent_requests_test_() ->
+    %% A positive integer up to 2^31-1.
+    [
+        ?_assertError(
+            {invalid_route_max_concurrent_requests, Bad},
+            roadrunner_router:compile(
+                [#{path => ~"/x", handler => h, max_concurrent_requests => Bad}], []
+            )
+        )
+     || Bad <- [0, -1, 1.5, infinity, 16#80000000]
+    ].
+
+compile_rejects_invalid_route_overload_mode_test_() ->
+    %% Shed or queue, with only the keys each documents, in range; no
+    %% `refuse` for a route.
+    [
+        ?_assertError(
+            {invalid_route_overload_mode, Bad},
+            roadrunner_router:compile(
+                [
+                    #{
+                        path => ~"/x",
+                        handler => h,
+                        max_concurrent_requests => 4,
+                        overload_mode => Bad
+                    }
+                ],
+                []
+            )
+        )
+     || Bad <- [
+            refuse,
+            shed,
+            {shed, []},
+            {shed, #{retry_after => 0}},
+            {shed, #{retry_after => 16#80000000}},
+            {shed, #{retry_after => 1, max_queued => 1}},
+            {queue, []},
+            {queue, #{max_queued => 0}},
+            {queue, #{max_queued => 16#80000000}},
+            {queue, #{timeout => 0}},
+            {queue, #{timeout => 16#100000000}},
+            {queue, #{timeout => 10, retry_after => 1}},
+            {refuse, #{}}
+        ]
+    ].
+
+overload_mode_needs_max_concurrent_requests_test() ->
+    Mode = {queue, #{}},
+    ?assertEqual(
+        {error, {invalid_route_overload_mode, {Mode, requires_max_concurrent_requests}}},
+        roadrunner_router:validate([#{path => ~"/x", handler => h, overload_mode => Mode}])
+    ).
+
+ceilings_fill_in_the_defaults_test() ->
+    %% In table order, keyed by path and sorted methods, shed by default
+    %% with `Retry-After: 1`, and a queue as deep as its ceiling unless set.
+    %% A queue's `timeout` stays unset: the listener fills it.
+    Routes = [
+        {~"/plain", h},
+        #{path => ~"/a", handler => h, max_concurrent_requests => 2},
+        #{
+            path => ~"/b",
+            handler => h,
+            methods => [~"POST", ~"GET"],
+            max_concurrent_requests => 3,
+            overload_mode => {shed, #{retry_after => 9}}
+        },
+        #{
+            path => ~"/c",
+            handler => h,
+            max_concurrent_requests => 4,
+            overload_mode => {queue, #{}}
+        },
+        #{
+            path => ~"/d",
+            handler => h,
+            max_concurrent_requests => 5,
+            overload_mode => {queue, #{max_queued => 1, timeout => 50}}
+        }
+    ],
+    ?assertEqual(ok, roadrunner_router:validate(Routes)),
+    ?assertEqual(
+        [
+            {{~"/a", undefined}, 2, {shed, #{retry_after => 1}}},
+            {{~"/b", [~"GET", ~"POST"]}, 3, {shed, #{retry_after => 9}}},
+            {{~"/c", undefined}, 4, {queue, #{max_queued => 4}}},
+            {{~"/d", undefined}, 5, {queue, #{max_queued => 1, timeout => 50}}}
+        ],
+        roadrunner_router:ceilings(Routes)
+    ).
+
+ceiling_needs_a_listener_count_test() ->
+    %% Compiled outside a listener, a ceiling has nothing counting it: the
+    %% route carries its body cap alone.
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/a", handler => h, max_concurrent_requests => 1},
+            #{path => ~"/b", handler => h, max_concurrent_requests => 1, max_content_length => 9}
+        ],
+        []
+    ),
+    ?assertMatch({ok, h, _, _, _, undefined}, roadrunner_router:resolve(~"GET", ~"/a", Compiled)),
+    ?assertMatch({ok, h, _, _, _, 9}, roadrunner_router:resolve(~"GET", ~"/b", Compiled)).
+
 validate_reports_a_bad_rate_limit_test() ->
     ?assertEqual(
         {error, {invalid_route_rate_limit, #{rate => 0}}},

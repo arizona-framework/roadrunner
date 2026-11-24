@@ -3,8 +3,9 @@
 A route's own `max_content_length` over HTTP/1.1 (buffered and manual body
 reads) and HTTP/2 (h2c). The listener caps bodies at 8 bytes; `/up` raises
 its cap to 64, `/small` lowers it to 2, `/open` sets none with manual body
-reads (`infinity`) and `/plain` keeps the listener's. The
-HTTP/3 cases live in `roadrunner_http3_SUITE`.
+reads (`infinity`) and `/plain` keeps the listener's. `/up_capped` and
+`/plain_capped` are `/up` and `/plain` with a `max_concurrent_requests`,
+which leaves their body caps as they are. The HTTP/3 cases live in `roadrunner_http3_SUITE`.
 """.
 
 -include_lib("common_test/include/ct.hrl").
@@ -38,7 +39,9 @@ HTTP/3 cases live in `roadrunner_http3_SUITE`.
     h2_expect_continue_without_length/1,
     open_route_reads_past_the_listener_cap/1,
     open_route_keeps_the_listener_cap_when_buffered/1,
-    h2_open_route_keeps_the_listener_cap_when_buffered/1
+    h2_open_route_keeps_the_listener_cap_when_buffered/1,
+    capped_route_keeps_its_body_cap/1,
+    h2_capped_route_keeps_its_body_cap/1
 ]).
 
 -define(LISTENER_CAP, 8).
@@ -57,7 +60,8 @@ groups() ->
         route_without_cap_keeps_listener_cap,
         chunked_body_within_raised_cap,
         expect_continue_within_raised_cap,
-        expect_continue_over_lowered_cap
+        expect_continue_over_lowered_cap,
+        capped_route_keeps_its_body_cap
     ],
     [
         {http1, [], [
@@ -76,7 +80,8 @@ groups() ->
             h2_expect_continue_within_raised_cap,
             h2_expect_continue_over_lowered_cap,
             h2_expect_continue_without_length,
-            h2_open_route_keeps_the_listener_cap_when_buffered
+            h2_open_route_keeps_the_listener_cap_when_buffered,
+            h2_capped_route_keeps_its_body_cap
         ]}
     ].
 
@@ -114,7 +119,18 @@ init_per_testcase(_Case, Config) ->
                         handler => roadrunner_body_size_handler,
                         max_content_length => infinity
                     },
-                    {~"/plain", roadrunner_body_size_handler}
+                    {~"/plain", roadrunner_body_size_handler},
+                    #{
+                        path => ~"/up_capped",
+                        handler => roadrunner_body_size_handler,
+                        max_content_length => 64,
+                        max_concurrent_requests => 4
+                    },
+                    #{
+                        path => ~"/plain_capped",
+                        handler => roadrunner_body_size_handler,
+                        max_concurrent_requests => 4
+                    }
                 ]
             },
             ?config(listener_opts, Config)
@@ -141,6 +157,12 @@ body_over_lowered_cap(Config) ->
 route_without_cap_keeps_listener_cap(Config) ->
     ?assertEqual({200, ~"8"}, h1_post(Config, ~"/plain", binary:copy(~"x", 8))),
     ?assertMatch({413, _}, h1_post(Config, ~"/plain", binary:copy(~"x", 9))).
+
+capped_route_keeps_its_body_cap(Config) ->
+    ?assertEqual({200, ~"20"}, h1_post(Config, ~"/up_capped", binary:copy(~"x", 20))),
+    ?assertMatch({413, _}, h1_post(Config, ~"/up_capped", binary:copy(~"x", 65))),
+    ?assertEqual({200, ~"8"}, h1_post(Config, ~"/plain_capped", binary:copy(~"x", 8))),
+    ?assertMatch({413, _}, h1_post(Config, ~"/plain_capped", binary:copy(~"x", 9))).
 
 unmatched_path_keeps_listener_cap(Config) ->
     %% A request no route answers still has its body read, under the
@@ -224,6 +246,12 @@ h2_route_without_cap_keeps_listener_cap(Config) ->
 
 h2_open_route_keeps_the_listener_cap_when_buffered(Config) ->
     ?assertMatch({[413], _}, h2_request(Config, ~"/open", [], [binary:copy(~"x", 9)])).
+
+h2_capped_route_keeps_its_body_cap(Config) ->
+    ?assertEqual({[200], ~"20"}, h2_request(Config, ~"/up_capped", [], [binary:copy(~"x", 20)])),
+    ?assertMatch({[413], _}, h2_request(Config, ~"/up_capped", [], [binary:copy(~"x", 65)])),
+    ?assertEqual({[200], ~"8"}, h2_request(Config, ~"/plain_capped", [], [binary:copy(~"x", 8)])),
+    ?assertMatch({[413], _}, h2_request(Config, ~"/plain_capped", [], [binary:copy(~"x", 9)])).
 
 h2_expect_continue_within_raised_cap(Config) ->
     Expect = [{~"content-length", ~"20"}, {~"expect", ~"100-continue"}],

@@ -149,6 +149,7 @@ it. See the [gRPC guide](grpc.md).
 |---|---|---|
 | `max_message_size` | 4 MB | one request message, both as it arrives and after it is decompressed; over it the call ends with `RESOURCE_EXHAUSTED` |
 | `max_content_length` | `infinity` | all of a call's request messages together, set on each gRPC route; over it the call ends with `RESOURCE_EXHAUSTED`. With `body_buffering => auto` a route at `infinity` keeps the listener's cap, and a body over it is answered 413 |
+| `max_concurrent_requests` | none | the calls each service runs at once, set on each service's route; over it a call is answered `503` (`UNAVAILABLE`), or waits in queue mode. See [A ceiling per route](#a-ceiling-per-route) |
 
 A compressed message is inflated in bounded chunks against
 `max_message_size`, so a small message cannot expand into unbounded
@@ -711,6 +712,116 @@ Watch `roadrunner_listener:info/1` to see which bound is working:
 `rejected` counts connections turned away at `max_clients`, `throttled`
 requests shed at `max_concurrent_requests`, and `lingers_skipped` closes
 that skipped their linger at `max_lingering`.
+
+### A ceiling per route
+
+The body is what a request sends; what it costs is what the handler
+builds from it. A JSON document decoded into terms, a parsed form or a
+decompressed body can take several times its size on the wire, so a
+route that does that work can use far more memory per request than the
+rest of the server. A listener-wide `max_concurrent_requests` low enough
+to bound that route also holds back every cheap route behind it.
+
+Give the expensive route a ceiling of its own instead, in its map form:
+
+```erlang
+routes => [
+    #{
+        path => ~"/parse",
+        handler => parse_handler,
+        max_content_length => 1_048_576,
+        max_concurrent_requests => 16
+    },
+    {~"/health", health_handler},
+    {~"/items/:id", item_handler}
+]
+```
+
+At most 16 requests to `/parse` run at once; the others are not counted
+against it. Size it from the memory you can give the route:
+
+    max_concurrent_requests × (max_content_length + what the handler builds)
+        ≤ memory for that route
+
+For a JSON route that decodes a 1 MB body into about 6 MB of terms, 16
+requests take about 112 MB at most.
+
+The route's ceiling is checked once the request is routed, before its
+middlewares and handler run. When that is depends on how the body is read:
+
+- On HTTP/1.1 it is before any of the body is read or a `100 Continue` is
+  sent, so a request turned away costs no more than its headers, and one
+  waiting in a queue holds no body.
+- On HTTP/2 and HTTP/3 with `body_buffering => manual` it is before the
+  handler reads any of the body, but the connection still takes in what
+  the client sends up to the stream's flow-control window while the
+  request waits: at most 64 KB on HTTP/2 and, by default, 256 KB on
+  HTTP/3. A request that sends `Expect: 100-continue` holds none, as its
+  `100` comes only once the handler asks for the body.
+- On HTTP/2 and HTTP/3 with `body_buffering => auto` (the default), the
+  connection reads the whole body first, up to the route's
+  `max_content_length`, and only then is the request checked. Those
+  bodies are bounded by the cap but not by the ceiling, so on an
+  expensive route keep `max_content_length` low, or use `manual`.
+
+`overload_mode` decides what happens to one over it:
+
+- `{shed, #{retry_after => Secs}}`, the default, answers `503` with
+  `Retry-After` (1 second unless set) on every protocol. On HTTP/1.1 a
+  request without a body gets the `503` as an ordinary response and the
+  connection stays open for its next request; one with a body to come is
+  answered and closed, the close lingering over the body.
+- `{queue, #{max_queued => N, timeout => Ms}}` waits for a slot, first
+  in, first out. A request still waiting after `Ms` (the listener's
+  `request_timeout` unless set), or one arriving while `N` already wait
+  (the route's ceiling unless set), gets the same `503`.
+
+A request to a route with a ceiling takes the route's slot first and the
+listener's `max_concurrent_requests` slot second, and both must be free;
+on HTTP/1.1 a request no route answers (`404`, `405`) takes neither. On HTTP/2 and
+HTTP/3 the connection takes the listener's slot before the request is
+routed, so a request waiting in a route's queue already holds one. The
+queued routes could then fill the listener's ceiling and leave no slot
+for a cheap route: a listener with a finite `max_concurrent_requests`
+refuses, at start and on `reload_routes/2`, any table in which the
+queued routes' `max_concurrent_requests` plus `max_queued`, added up,
+reach it (`{route_queues_reach_max_concurrent_requests, Sum, Max}`).
+Shed routes wait for nothing and are not counted.
+
+A slot is held until the request ends: a buffered response once it is
+sent, a loop or stream response once it ends, a WebSocket upgrade once
+the `101` is out. A request whose process dies in any way (killed, over
+its `max_heap_size`, its connection gone) frees its slot as soon as it
+goes. On HTTP/1.1 the handler runs in the connection's process, so what
+it built stays on that process's heap until the next collection; for a
+route with a ceiling the connection collects it once the response is out,
+before it hands the slot back and waits for the next request, so an idle
+keep-alive connection does not hold on to megabytes.
+
+A ceiling is meant for expensive routes, where a request takes
+milliseconds and megabytes. Taking and handing back a slot costs about
+11 µs of server CPU per request (measured on a trivial handler, about
+twice the cost of the request itself), and every request to the route
+passes through the one process that counts it. That is nothing next to a
+request that decodes a large body, but it would show on a hot, cheap
+route: leave those without a ceiling and bound them with the listener's
+`max_concurrent_requests` if needed.
+
+Each route with a ceiling has a small process of its own that hands out
+its slots, linked to the listener. The count itself is kept by the
+listener, so if that process crashes the listener starts a new one on the
+same count: the requests still running keep their slots, and only those
+waiting are answered `503`. `reload_routes/2` keeps the count of a route
+whose path and methods are the same in the new table, and a new ceiling
+applies at once. A route the new table drops keeps counting the requests
+it still runs until they end. A route whose path or methods change is a
+new route with a count of its own, so until its old requests end the two
+can run up to twice the ceiling between them.
+
+`roadrunner_listener:info/1` reports each route with a ceiling under
+`routes`: its `in_flight` and `queued` requests and the `throttled` ones
+it turned away. Each refusal also emits `request_throttled` with the
+reason `route_max_concurrent_requests`.
 
 ## Configuring
 

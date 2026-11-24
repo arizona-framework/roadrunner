@@ -188,17 +188,11 @@
     %% The listener's in-flight ceiling, which an HTTP/1 request joins only
     %% in `shed` overload mode (`undefined` otherwise, the common case, a
     %% single branch per request). `idle` between requests, `held` from the
-    %% slot's acquire in `admit/3` until the request ends, so an exit path
-    %% knows whether it has a slot to hand back.
-    request_slot = undefined ::
-        undefined
-        | {
-            idle | held,
-            pos_integer(),
-            counters:counters_ref(),
-            atomics:atomics_ref(),
-            roadrunner_conn:overload()
-        },
+    %% slot's acquire in `admit/4` until the request ends, so an exit path
+    %% knows whether it has a slot to hand back. A request to a route with
+    %% its own `max_concurrent_requests` wraps it in `route` for as long as
+    %% it holds the route's slot, so the record keeps its size.
+    request_slot = undefined :: request_slot(),
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
     %% otherwise, the common case, so the request path resolves nothing.
@@ -217,6 +211,17 @@
 
 -type recv_mode() ::
     roadrunner_listener:active() | {roadrunner_listener:active(), pos_integer()}.
+
+-type request_slot() ::
+    undefined
+    | {
+        idle | held,
+        pos_integer(),
+        counters:counters_ref(),
+        atomics:atomics_ref(),
+        roadrunner_conn:overload()
+    }
+    | {route, roadrunner_route_keeper:ceiling(), roadrunner_route_keeper:token(), request_slot()}.
 
 %% Idle ms before the conn hibernates (the listener's `hibernate_after`),
 %% `infinity` for never.
@@ -1275,35 +1280,94 @@ handle_request_bytes(
 %%
 %% The per-peer rate limit is checked first, from the headers alone, so a
 %% request over its rate is answered 429 before any of its body is read.
-%% A shed listener's in-flight ceiling comes next, the same way: a request
-%% over it is answered 503 before its body is read or a handler runs.
 %% The request is then routed, once, before its body is read: the match is
 %% the one dispatch uses, and a matched route's own `max_content_length`
 %% caps the body in place of the listener's, for the read itself, the
-%% `100 Continue` decision and the early 413 alike.
+%% `100 Continue` decision and the early 413 alike. A route with its own
+%% `max_concurrent_requests` gives the request a slot of it next, or turns
+%% it away, and a shed listener's in-flight ceiling comes after that, the
+%% same way: a request over either is answered 503 before its body is read,
+%% any `100 Continue` is sent, or a handler runs. A request no route
+%% answers (404, 405) takes neither slot.
 -spec read_body_phase(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
 read_body_phase(
     #loop_state{rate_limit = RateLimit, listener_name = ListenerName} = S, Req, Deadline
 ) ->
     case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
         allow ->
-            admit(S, Req, Deadline);
+            route(S, Req, Deadline);
         {deny, RetryAfter} ->
             refuse_retry_later(S, 429, RetryAfter, roadrunner_conn:body_framing(Req))
     end.
 
+%% Route the request, then take the slots it needs.
+-spec route(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
+route(#loop_state{dispatch = Dispatch} = S, Req, Deadline) ->
+    Resolved = roadrunner_conn:resolve_handler(Dispatch, Req),
+    case Resolved of
+        {ok, _Handler, _Bindings, _Pipeline, _State, {_Body, Ceiling}} ->
+            take_route_slot(S, Req, Deadline, Resolved, Ceiling);
+        _NoCeiling ->
+            admit(S, Req, Deadline, Resolved)
+    end.
+
+%% A slot of the route's own `max_concurrent_requests`, waiting for one in
+%% queue mode, or the request is turned away with a 503. The time spent
+%% waiting is added to the request's deadline, so a request let in late
+%% still has its full time to send its body.
+-spec take_route_slot(
+    #loop_state{},
+    roadrunner_req:request(),
+    integer(),
+    roadrunner_conn:resolved(),
+    roadrunner_route_keeper:ceiling()
+) -> no_return().
+take_route_slot(#loop_state{request_slot = Slot} = S, Req, Deadline, Resolved, Ceiling) ->
+    Asked = erlang:monotonic_time(millisecond),
+    case roadrunner_route_keeper:acquire(Ceiling) of
+        {ok, Token} ->
+            Waited = erlang:monotonic_time(millisecond) - Asked,
+            admit(
+                S#loop_state{request_slot = {route, Ceiling, Token, Slot}},
+                Req,
+                Deadline + Waited,
+                Resolved
+            );
+        {refused, RetryAfter} ->
+            refuse_route(S, Req, RetryAfter)
+    end.
+
+%% A request its route turned away. One without a body is answered like any
+%% other response, `Retry-After` and all, and the connection carries on: a
+%% route at its ceiling is no reason to close a connection that may next ask
+%% for a route that is not. One with a body to come closes after the 503,
+%% lingering over that body as for any refusal ahead of its read.
+-spec refuse_route(#loop_state{}, roadrunner_req:request(), pos_integer()) -> no_return().
+refuse_route(S, Req, RetryAfter) ->
+    case roadrunner_conn:body_framing(Req) of
+        none ->
+            Headers = [{~"retry-after", integer_to_binary(RetryAfter)}],
+            run_pipeline(S, roadrunner_route_keeper, Req#{body => <<>>}, fun(Req1) ->
+                {{503, Headers, ~""}, Req1}
+            end);
+        Framing ->
+            refuse_retry_later(S, 503, RetryAfter, Framing)
+    end.
+
 %% Take the request's in-flight slot when HTTP/1 is under the ceiling
 %% (shed mode), or shed it: 503 + `Retry-After`, counted and reported as a
-%% throttled request, as the multiplexed protocols do.
--spec admit(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
-admit(#loop_state{request_slot = undefined} = S, Req, Deadline) ->
-    route_and_read(S, Req, Deadline);
-admit(#loop_state{request_slot = {idle, Max, Counter, Cell, Overload}} = S, Req, Deadline) ->
-    case roadrunner_conn:acquire_request_slot(Max, Counter, Cell, Overload, h1) of
+%% throttled request, as the multiplexed protocols do. A request no route
+%% answers runs no handler, so it takes no slot.
+-spec admit(#loop_state{}, roadrunner_req:request(), integer(), roadrunner_conn:resolved()) ->
+    no_return().
+admit(#loop_state{request_slot = undefined} = S, Req, Deadline, Resolved) ->
+    route_and_read(S, Req, Deadline, Resolved);
+admit(#loop_state{request_slot = Slot} = S, Req, Deadline, Resolved) ->
+    case unrouted(Resolved) orelse take_request_slot(Slot) of
         true ->
-            route_and_read(
-                S#loop_state{request_slot = {held, Max, Counter, Cell, Overload}}, Req, Deadline
-            );
+            route_and_read(S, Req, Deadline, Resolved);
+        {ok, Held} ->
+            route_and_read(S#loop_state{request_slot = Held}, Req, Deadline, Resolved);
         {shed, RetryAfter} ->
             #loop_state{
                 proto_opts = #proto_opts{throttled_counter = Throttled}, listener_name = Name
@@ -1312,14 +1376,48 @@ admit(#loop_state{request_slot = {idle, Max, Counter, Cell, Overload}} = S, Req,
             refuse_retry_later(S, 503, RetryAfter, roadrunner_conn:body_framing(Req))
     end.
 
-%% Hand the request's in-flight slot back once it has ended: before the
+-spec unrouted(roadrunner_conn:resolved()) -> boolean().
+unrouted({ok, _Handler, _Bindings, _Pipeline, _State, _Limits}) -> false;
+unrouted(_NotFoundOrNotAllowed) -> true.
+
+%% The listener's slot, under the route's when the request holds one.
+-spec take_request_slot(request_slot()) -> {ok, request_slot()} | {shed, pos_integer()}.
+take_request_slot(undefined) ->
+    {ok, undefined};
+take_request_slot({idle, Max, Counter, Cell, Overload}) ->
+    case roadrunner_conn:acquire_request_slot(Max, Counter, Cell, Overload, h1) of
+        true -> {ok, {held, Max, Counter, Cell, Overload}};
+        {shed, _RetryAfter} = Shed -> Shed
+    end;
+take_request_slot({route, Ceiling, Token, Slot}) ->
+    case take_request_slot(Slot) of
+        {ok, Held} -> {ok, {route, Ceiling, Token, Held}};
+        {shed, _RetryAfter} = Shed -> Shed
+    end.
+
+%% Hand the request's in-flight slots back once it has ended: before the
 %% next request on a kept-alive connection, on the way out, or as a
 %% WebSocket session starts.
 -spec release_request_slot(#loop_state{}) -> #loop_state{}.
 release_request_slot(#loop_state{request_slot = {held, Max, Counter, Cell, Overload}} = S) ->
     ok = roadrunner_conn:release_request_slot(Max, Counter, Cell, Overload),
     S#loop_state{request_slot = {idle, Max, Counter, Cell, Overload}};
+release_request_slot(#loop_state{request_slot = {route, Ceiling, Token, Slot}} = S) ->
+    ok = roadrunner_route_keeper:release(Ceiling, Token),
+    release_request_slot(S#loop_state{request_slot = Slot});
 release_request_slot(S) ->
+    S.
+
+%% A request of a route with its own ceiling ran its handler in this
+%% process, so what it built (a decoded body, a parsed form) is garbage on
+%% this heap once it ends. Collected before the route's slot goes back, so
+%% a connection kept alive, or a WebSocket session, does not hold on to
+%% it; the ceiling then bounds that memory too.
+-spec collect_route_heap(#loop_state{}) -> #loop_state{}.
+collect_route_heap(#loop_state{request_slot = {route, _Ceiling, _Token, _Slot}} = S) ->
+    true = erlang:garbage_collect(),
+    S;
+collect_route_heap(S) ->
     S.
 
 %% Over its rate (429) or shed (503): queued pipelined responses go out
@@ -1339,9 +1437,10 @@ refuse_retry_later(#loop_state{socket = Socket} = S, Status, RetryAfter, Framing
         _ -> exit_lingering(S1, rejected)
     end.
 
--spec route_and_read(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
-route_and_read(#loop_state{body_buffering = BodyMode, dispatch = Dispatch} = S, Req, Deadline) ->
-    Resolved = roadrunner_conn:resolve_handler(Dispatch, Req),
+-spec route_and_read(
+    #loop_state{}, roadrunner_req:request(), integer(), roadrunner_conn:resolved()
+) -> no_return().
+route_and_read(#loop_state{body_buffering = BodyMode} = S, Req, Deadline, Resolved) ->
     case {BodyMode, roadrunner_conn:body_framing(Req)} of
         {auto, none} ->
             dispatch_phase(S, Req#{body => <<>>}, Resolved);
@@ -1653,7 +1752,7 @@ trailer_limits(#loop_state{http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, Ma
 
 %% --- dispatch phase ---
 %%
-%% Take the request's resolved handler (routed in `read_body_phase/3`),
+%% Take the request's resolved handler (routed in `route/3`),
 %% run its middleware pipeline bracketed by request_start / request_stop |
 %% request_exception telemetry. The 5 returned response shapes (buffered,
 %% stream, loop, sendfile, websocket) dispatch to their respective
@@ -1708,7 +1807,12 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
                     %% its timing (response writer finished) matches the
                     %% other writer-owned shapes.
                     Run(
-                        ws_finish(release_request_slot(reset_heap_floor(S3)), Req2, Span, Response)
+                        ws_finish(
+                            release_request_slot(collect_route_heap(reset_heap_floor(S3))),
+                            Req2,
+                            Span,
+                            Response
+                        )
                     );
                 #loop_state{} = S3 ->
                     ok = roadrunner_event:request_stop(
@@ -1754,7 +1858,14 @@ send_phase(S0, Handler, Req, Headers, Fun, Span) ->
         {done, {websocket, _Status, {session, Upgrade, Run}}, Req2} ->
             %% The fun answered with an upgrade: run the session here, as
             %% for a returned one; `request_stop` fires when it ends.
-            Run(ws_finish(release_request_slot(reset_heap_floor(S)), Req2, Span, Upgrade));
+            Run(
+                ws_finish(
+                    release_request_slot(collect_route_heap(reset_heap_floor(S))),
+                    Req2,
+                    Span,
+                    Upgrade
+                )
+            );
         {done, {Kind, Status, SentHeaders}, Req2} ->
             ok = roadrunner_event:request_stop(Span, Status, Kind),
             send_finish(S, Req2, Kind, SentHeaders);
@@ -2244,7 +2355,7 @@ buffered_finish(S0, Req, Headers) ->
                     exit_closing(S, Req, ManualLeftover);
                 keep_alive ->
                     Leftover = pipelined_leftover(Req, S, ManualLeftover),
-                    S1 = release_request_slot(S),
+                    S1 = release_request_slot(collect_route_heap(S)),
                     read_request_phase(S1#loop_state{
                         phase = keep_alive,
                         buffered = Leftover

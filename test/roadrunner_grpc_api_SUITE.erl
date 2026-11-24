@@ -26,7 +26,8 @@ gRPC's rich error details, decoded here as a client would.
     auto_keeps_the_listener_cap/1,
     error_details_before_a_response/1,
     error_details_after_a_response/1,
-    rejection_with_details_and_pushback/1
+    rejection_with_details_and_pushback/1,
+    service_ceiling_leaves_health_alone/1
 ]).
 
 -define(SVC, ~"/test.Echo/").
@@ -47,7 +48,8 @@ all() ->
         auto_keeps_the_listener_cap,
         error_details_before_a_response,
         error_details_after_a_response,
-        rejection_with_details_and_pushback
+        rejection_with_details_and_pushback,
+        service_ceiling_leaves_health_alone
     ].
 
 init_per_testcase(request_tells_what_the_metadata_leaves_out, Config) ->
@@ -67,6 +69,15 @@ init_per_testcase(auto_keeps_the_listener_cap, Config) ->
     start(Config, tcp, capped(auto));
 init_per_testcase(shadowing_route_is_refused, Config) ->
     Config;
+init_per_testcase(service_ceiling_leaves_health_alone, Config) ->
+    start(Config, tcp, #{
+        routes => roadrunner_grpc:routes(#{
+            services => [roadrunner_grpc_test_service],
+            health => true,
+            max_concurrent_requests => 1,
+            overload_mode => {shed, #{retry_after => 2}}
+        })
+    });
 init_per_testcase(_Case, Config) ->
     start(Config, tcp, #{
         routes => roadrunner_grpc:routes(#{
@@ -272,6 +283,33 @@ rejection_with_details_and_pushback(Config) ->
         {14, ~"too many calls", [{~"type.googleapis.com/google.rpc.RetryInfo", <<10, 2, 8, 1>>}]},
         status_details(Headers)
     ).
+
+%% With the service at its ceiling, a call to it is answered 503 before
+%% its method runs, which a gRPC client takes as UNAVAILABLE; the health
+%% service has no ceiling and answers.
+service_ceiling_leaves_health_alone(Config) ->
+    {ok, _, _, _, _, {_Body, Ceiling}} = roadrunner_router:resolve(
+        ~"POST", <<?SVC/binary, "Unary">>, persistent_term:get({roadrunner_routes, ?MODULE})
+    ),
+    Self = self(),
+    Holder = spawn(fun() ->
+        Self ! {held, roadrunner_route_keeper:acquire(Ceiling)},
+        receive
+            release -> ok
+        end
+    end),
+    receive
+        {held, {ok, _}} -> ok
+    after 5000 -> ct:fail(not_held)
+    end,
+    {Headers, [], _, _} = call(Config, ~"Unary", [], [~"x"]),
+    ?assertEqual(~"503", header(~":status", Headers)),
+    ?assertEqual(~"2", header(~"retry-after", Headers)),
+    {_, [_], Trailers, _} = roadrunner_grpc_test_client:call(
+        open(Config), 1, ~"/grpc.health.v1.Health/Check", [], [<<>>]
+    ),
+    ?assertEqual(~"0", header(~"grpc-status", Trailers)),
+    Holder ! release.
 
 %% --- helpers ---
 

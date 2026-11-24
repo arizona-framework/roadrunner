@@ -180,7 +180,9 @@ request_rejected(ListenerName, Peer, Reason) ->
     ok.
 
 -doc "Emit `request_throttled` for a request refused at a listener limit.".
--spec request_throttled(atom(), max_concurrent_requests | rate_limit) -> ok.
+-spec request_throttled(
+    atom(), max_concurrent_requests | route_max_concurrent_requests | rate_limit
+) -> ok.
 request_throttled(ListenerName, Reason) ->
     _ = dispatch(request_throttled, {ListenerName, Reason}),
     ok.

@@ -91,17 +91,34 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch, HeapFloor0) ->
         {ok, Handler, Bindings, Pipeline, _State, Limits} ->
             case route_body(Limits, Req) of
                 #{} = Req1 ->
-                    invoke(
-                        Worker,
-                        Protocol,
-                        Conn,
-                        StreamId,
-                        Handler,
-                        Pipeline,
-                        Req1#{bindings => Bindings},
-                        Span,
-                        HeapFloor
-                    );
+                    case route_slot(Limits, Protocol, Conn, StreamId) of
+                        granted ->
+                            invoke(
+                                Worker,
+                                Protocol,
+                                Conn,
+                                StreamId,
+                                Handler,
+                                Pipeline,
+                                Req1#{bindings => Bindings},
+                                Span,
+                                HeapFloor
+                            );
+                        {refused, RetryAfter} ->
+                            ok = Worker:send_buffered(
+                                Conn,
+                                StreamId,
+                                503,
+                                [{~"retry-after", integer_to_binary(RetryAfter)}],
+                                ~""
+                            ),
+                            ok = roadrunner_event:request_stop(Span, 503, buffered);
+                        reset ->
+                            %% The client reset the stream, or its
+                            %% connection went, while it waited: nothing is
+                            %% left to answer.
+                            ok
+                    end;
                 too_large ->
                     ok = Worker:send_buffered(
                         Conn,
@@ -313,10 +330,35 @@ raise_heap_floor(Cell, Floor, Heap, Cap) ->
 %% route's when a body outgrows it, so only a route cap tighter than the
 %% listener's is left to check on one here, once the request is routed. A
 %% body read in manual mode is held to the route's cap as it is read.
+%% A slot of the route's own `max_concurrent_requests`, taken before any
+%% middleware or the handler runs, and held for as long as this worker
+%% lives: its keeper monitors it, so the worker's exit, however it comes,
+%% frees the slot. The stream already holds a slot of the listener's
+%% ceiling while it waits here, which `roadrunner_listener` keeps the route
+%% queues from filling. A reset of the stream, or its connection going, ends
+%% the wait: nobody is left to answer.
+-spec route_slot(roadrunner_router:limits(), h2 | h3, pid(), non_neg_integer()) ->
+    granted | {refused, pos_integer()} | reset.
+route_slot({_Body, Ceiling}, Protocol, Conn, StreamId) ->
+    case roadrunner_route_keeper:acquire(Ceiling, stream_reset(Protocol, StreamId), Conn) of
+        {ok, _Token} -> granted;
+        Refused -> Refused
+    end;
+route_slot(_Limits, _Protocol, _Conn, _StreamId) ->
+    granted.
+
+%% The message the connection sends a worker whose stream was reset.
+-spec stream_reset(h2 | h3, non_neg_integer()) ->
+    {h2_stream_reset, non_neg_integer()} | {roadrunner_stream_reset, non_neg_integer()}.
+stream_reset(h2, StreamId) -> {h2_stream_reset, StreamId};
+stream_reset(h3, StreamId) -> {roadrunner_stream_reset, StreamId}.
+
 -spec route_body(roadrunner_router:limits(), roadrunner_req:request()) ->
     roadrunner_req:request() | too_large.
 route_body(undefined, Req) ->
     Req;
+route_body({Max, _Ceiling}, Req) ->
+    route_body(Max, Req);
 route_body(Max, #{body := Body} = Req) ->
     case iolist_size(Body) > Max of
         true -> too_large;
