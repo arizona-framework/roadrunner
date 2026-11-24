@@ -70,7 +70,9 @@ watching a dead owner's workers before taking its registration.
     keeper_gone_before_its_answer_frees_the_row/1,
     keeper_gone_tells_the_next_keeper/1,
     homes_work_while_the_keeper_restarts/1,
-    keeper_restart_repairs_a_home/1,
+    keeper_dies_before_a_new_home_is_answered/1,
+    takeover_finds_a_grant_never_answered/1,
+    takeover_frees_a_grant_of_a_dead_connection/1,
     raised_ceiling_serves_the_queue/1,
     lowered_ceiling_holds_new_requests/1,
     draining_keeper_stops_when_empty/1,
@@ -133,7 +135,9 @@ all() ->
         keeper_gone_before_its_answer_frees_the_row,
         keeper_gone_tells_the_next_keeper,
         homes_work_while_the_keeper_restarts,
-        keeper_restart_repairs_a_home,
+        keeper_dies_before_a_new_home_is_answered,
+        takeover_finds_a_grant_never_answered,
+        takeover_frees_a_grant_of_a_dead_connection,
         raised_ceiling_serves_the_queue,
         lowered_ceiling_holds_new_requests,
         draining_keeper_stops_when_empty,
@@ -928,21 +932,75 @@ homes_work_while_the_keeper_restarts(_Config) ->
     ?assertEqual([], ets:lookup(regs(C), A)),
     ok = stop_keeper(Next).
 
-keeper_restart_repairs_a_home(_Config) ->
-    %% The old keeper granted key 2 to a registered connection and died
-    %% before it made 2 the connection's home: the keeper taking over makes
-    %% it so, and frees that row when the connection dies.
+keeper_dies_before_a_new_home_is_answered(_Config) ->
+    %% A connection's home is taken, so it asks the keeper, which makes key 2
+    %% its home and dies before the answer goes out. The connection is
+    %% refused and forgets its home: kept, it would take home 1 again while
+    %% the keeper taking over knows it by 2, and the slot would never be
+    %% freed when it died.
     {Keeper, C} = route(2, shed),
     Conn = holder(C),
     {ok, 1} = result(Conn),
     ok = release(Conn),
-    true = ets:insert(slots(C), {2, Conn, Conn}),
+    Other = idle(),
+    true = ets:insert(slots(C), {1, Other, Other}),
+    ok = roadrunner_route_pause:arm(held, Keeper),
+    Conn ! request,
+    Keeper = roadrunner_route_pause:await(held),
+    ?assertEqual([{Conn, 2}], ets:lookup(regs(C), Conn)),
     exit(Keeper, kill),
     {'EXIT', Keeper, killed} = receive_exit(Keeper),
     {ok, Next} = start_keeper(C, false),
-    ?assertEqual([{Conn, 2}], ets:lookup(regs(C), Conn)),
+    ?assertEqual({refused, 3}, result(Conn)),
+    ?assertEqual(undefined, home(Conn, C)),
+    true = ets:delete_object(slots(C), {1, Other, Other}),
+    ok = rehomed_and_freed(Next, C, Conn).
+
+takeover_finds_a_grant_never_answered(_Config) ->
+    %% The old keeper added key 2's row for a connection whose home is 1 and
+    %% died before answering. The keeper taking over keeps the connection's
+    %% home as it is; the connection removes the row, forgets its home, and
+    %% its next request asks the keeper.
+    {Keeper, C} = route(2, shed),
+    Conn = holder(C),
+    {ok, 1} = result(Conn),
+    ok = release(Conn),
+    Other = idle(),
+    true = ets:insert(slots(C), {1, Other, Other}),
+    ok = sys:suspend(Keeper),
+    Conn ! request,
+    ok = wait_mailbox(Keeper, Conn),
+    true = ets:insert(slots(C), {2, Conn, Conn}),
+    true = erlang:suspend_process(Conn),
+    exit(Keeper, kill),
+    {'EXIT', Keeper, killed} = receive_exit(Keeper),
+    {ok, Next} = start_keeper(C, false),
+    ?assertEqual([{Conn, 1}], ets:lookup(regs(C), Conn)),
+    true = erlang:resume_process(Conn),
+    ?assertEqual({refused, 3}, result(Conn)),
+    ?assertEqual(undefined, home(Conn, C)),
+    true = ets:delete_object(slots(C), {1, Other, Other}),
+    ok = rehomed_and_freed(Next, C, Conn).
+
+takeover_frees_a_grant_of_a_dead_connection(_Config) ->
+    %% As above, but the connection dies before it can remove that row: the
+    %% keeper taking over frees it with the connection's home.
+    {Keeper, C} = route(2, shed),
+    Conn = holder(C),
+    {ok, 1} = result(Conn),
+    ok = release(Conn),
+    Other = idle(),
+    true = ets:insert(slots(C), {1, Other, Other}),
+    ok = sys:suspend(Keeper),
+    Conn ! request,
+    ok = wait_mailbox(Keeper, Conn),
+    true = ets:insert(slots(C), {2, Conn, Conn}),
     exit(Conn, kill),
-    ok = wait_in_flight(Next, C, 0),
+    exit(Keeper, kill),
+    {'EXIT', Keeper, killed} = receive_exit(Keeper),
+    {ok, Next} = start_keeper(C, false),
+    ok = wait_registered(C, 0),
+    ?assertEqual([{1, Other, Other}], ets:tab2list(slots(C))),
     ok = stop_keeper(Next).
 
 %% --- reloads ---
@@ -1136,6 +1194,17 @@ idle_connections_gone_leave_no_keys(_Config) ->
     ok = stop_keeper(Keeper).
 
 %% --- helpers ---
+
+%% A connection that forgot its home asks the keeper, which makes the key
+%% it grants the connection's home in both their views; killed holding it,
+%% the connection leaves no row.
+rehomed_and_freed(Keeper, Ceiling, Conn) ->
+    {ok, K} = request(Conn),
+    ?assertEqual(K, home(Conn, Ceiling)),
+    ?assertEqual([{Conn, K}], ets:lookup(regs(Ceiling), Conn)),
+    exit(Conn, kill),
+    ok = wait_in_flight(Keeper, Ceiling, 0),
+    stop_keeper(Keeper).
 
 %% Until the keeper has `N` connections registered.
 wait_registered(Ceiling, N) ->

@@ -581,10 +581,14 @@ full(Rows, Counts, _Timeout) ->
 %% The keeper died before it answered. It may have added the caller's row
 %% first, and a caller asking holds no other row of the route, so every row
 %% the caller holds goes, or the slot would stay taken by a request that
-%% never ran; the keeper serving the table now hears of it.
+%% never ran; the keeper serving the table now hears of it. It may also
+%% have made that row's key a connection's home: the connection forgets
+%% its own, so its next request asks the keeper and the two agree again
+%% (the keeper frees only the home it knows when the connection dies).
 -spec keeper_gone(ceiling()) -> {refused, pos_integer()}.
 keeper_gone(#ceiling{slots = Slots} = Ceiling) ->
     Self = self(),
+    _ = erase({?MODULE, Slots}),
     try
         lists:foreach(
             fun({K, _, _} = Row) ->
@@ -655,18 +659,18 @@ adopt_orphan({Owner, Worker, K}, #state{regs = Regs} = State) ->
         false -> hold_row(Worker, {K, Owner, Worker}, undefined, State)
     end.
 
-%% A row found at a takeover. A registered connection's row is its home:
-%% the old keeper may have died between that row and the registration. A
-%% worker's row owned by another process is that owner's, or the keeper's
-%% through its intent. Any other holder is watched with its row.
+%% A row found at a takeover. A registered connection's row at its home is
+%% its own. At any other key it is a grant the connection never received,
+%% as the old keeper died before answering: the connection removes it when
+%% it sees that keeper gone, and the keeper frees it should the connection
+%% die first. A worker's row owned by another process is that owner's, or
+%% the keeper's through its intent. Any other holder is watched with its
+%% row.
 -spec take_over_row(row(), #state{}) -> #state{}.
 take_over_row({K, Pid, Pid} = Row, #state{regs = Regs} = State) ->
-    case ets:member(Regs, Pid) of
-        true ->
-            true = ets:update_element(Regs, Pid, {2, K}),
-            State;
-        false ->
-            hold_row(Pid, Row, undefined, State)
+    case ets:lookup(Regs, Pid) of
+        [{Pid, K}] -> State;
+        _NotItsHome -> hold_row(Pid, Row, undefined, State)
     end;
 take_over_row({_K, _Owner, _Worker}, State) ->
     State.
@@ -828,6 +832,7 @@ grant(Token, Pid, Kind, Mon, #state{slots = Slots, counts = Counts} = State) ->
                     case ets:info(Slots, size) =< Max of
                         true ->
                             State2 = hold(Kind, Pid, K, Mon, State1),
+                            ok = ?PAUSE(held),
                             _ = erlang:send(Token, {Token, {granted, K}}),
                             {granted, State2};
                         false ->

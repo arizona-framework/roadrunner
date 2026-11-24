@@ -19,8 +19,8 @@ The operations: requests, releases, releases racing new requests (a
 kept-alive connection's home racing the slot it frees, and any waiter's
 claim on it) and stream resets, holder and waiter deaths, a connection
 going with its workers waiting or running, keeper crashes (plain, with a
-release and a request landing while no keeper runs, and in the middle of
-a grant), reloads changing the ceiling and queue depth, reloads that move
+release and a request landing while no keeper runs, in the middle of a
+grant, and in the middle of giving a kept-alive connection a new home), reloads changing the ceiling and queue depth, reloads that move
 the route to a new key, drop and re-add it while its keeper is behind,
 drop it as a request still routed by the old table asks, or fail, and a
 listener stop with requests in flight.
@@ -120,6 +120,7 @@ op() ->
         {1, crash_keeper},
         {1, {crash_window, nat(), oneof([shed, long])}},
         {1, half_grant},
+        {1, {rehome_crash, nat(), boolean()}},
         {1, {reload, integer(1, 4), integer(1, 4)}},
         {1, rekey},
         {1, drop_and_bring_back},
@@ -361,6 +362,52 @@ step(half_grant, Model) ->
             true = erlang:resume_process(Asker),
             settle(apply_result(receive_result(Asker), Model5))
     end;
+step({rehome_crash, N, Registered}, Model) ->
+    %% An idle connection with a home asks the keeper (its fast path closed
+    %% here), which adds another key's row for it and, when `Registered`,
+    %% makes that key its home, then dies before answering. The connection
+    %% is refused; whatever it takes next must be freed when it dies, so it
+    %% and the keeper taking over must agree on its home.
+    {{Slots, Regs, _Intents}, Counts} = route_counts(),
+    Max = atomics:get(Counts, 1),
+    Homes = [{P, H} || P <- pick(idle, Model), H <- [home(P, Slots)], is_integer(H), H =< Max],
+    case Homes of
+        [] ->
+            Model;
+        _ ->
+            {Conn, Home} = lists:nth(N rem length(Homes) + 1, Homes),
+            case free_key_but(Slots, Home, Max) of
+                none ->
+                    Model;
+                K ->
+                    Keeper = keeper(),
+                    Model1 = orphan_waiters(Model),
+                    ok = sys:suspend(Keeper),
+                    Gate = ets:lookup_element(Regs, '$keeper', 3),
+                    true = ets:update_element(Regs, '$keeper', {3, Gate bor 1}),
+                    {Conn, Model2} = h1_request(Conn, long, Model1),
+                    ok = await_mailbox(Keeper, Conn),
+                    true = ets:insert_new(Slots, {K, Conn, Conn}),
+                    _ = Registered andalso ets:insert(Regs, {Conn, K}),
+                    %% The keeper taking over sees the row before the
+                    %% connection, seeing the old one gone, removes it.
+                    true = erlang:suspend_process(Conn),
+                    exit(Keeper, kill),
+                    ok = await_new_keeper(Keeper),
+                    _ = sys:get_state(keeper()),
+                    true = erlang:resume_process(Conn),
+                    Model3 = apply_result(receive_result(Conn), set_orphaned(Conn, Model2)),
+                    {Conn, Model4} = h1_request(Conn, shed, Model3),
+                    Model5 = settle(await_asked(Conn, Model4)),
+                    case (client(Conn, Model5))#client.status of
+                        running ->
+                            exit(Conn, kill),
+                            settle(set_status(Conn, gone, Model5));
+                        idle ->
+                            Model5
+                    end
+            end
+    end;
 step({reload, Max, MaxQueued}, Model) ->
     Model1 = Model#model{max = Max, max_queued = MaxQueued},
     ok = reload(Model1),
@@ -524,6 +571,18 @@ free_key(Slots, K) ->
         true -> free_key(Slots, K + 1);
         false -> K
     end.
+
+%% A free key within `Max` other than `Not`, if any.
+free_key_but(Slots, Not, Max) ->
+    case [K || K <- lists:seq(1, Max), K =/= Not, not ets:member(Slots, K)] of
+        [K | _] -> K;
+        [] -> none
+    end.
+
+%% The home a connection keeps for the route of `Slots`.
+home(Conn, Slots) ->
+    {dictionary, Dictionary} = erlang:process_info(Conn, dictionary),
+    proplists:get_value({roadrunner_route_keeper, Slots}, Dictionary).
 
 %% --- requesters ---
 
