@@ -115,9 +115,11 @@
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2]).
 -export_type([ceiling/0, table/0, token/0, wait/0]).
 
-%% Test builds can stop a process at these points, so a test runs what
-%% races it in between (`roadrunner_route_pause`). Other builds have none.
--ifdef(TEST).
+%% Common Test builds can stop a process at these points, so a test runs
+%% what races it in between (`roadrunner_route_pause`). Other builds have
+%% none, the `test` profile's own (`rebar3 as test,bench`, which measures
+%% the server) included: only `rebar3 ct` defines `COMMON_TEST`.
+-ifdef(COMMON_TEST).
 -define(PAUSE(Point), roadrunner_route_pause:here(Point)).
 -else.
 -define(PAUSE(Point), ok).

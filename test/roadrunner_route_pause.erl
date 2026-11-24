@@ -1,7 +1,7 @@
 -module(roadrunner_route_pause).
 -moduledoc """
 Stops a process at a named point of `roadrunner_route_keeper` (a
-`?PAUSE(Point)` there, compiled only into test builds) until the test lets
+`?PAUSE(Point)` there, compiled only into Common Test builds) until the test lets
 it go on, so a test can run what races that process between two of its
 steps: a request between its insert and its check, the keeper between
 closing its gate and parking a request, and so on.
