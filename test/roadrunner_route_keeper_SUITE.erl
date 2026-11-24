@@ -24,6 +24,7 @@ listener that owns the table and restarts the keeper.
     reset_stops_the_wait/1,
     reset_after_a_grant_frees_the_slot/1,
     reset_waiter_times_out/1,
+    connection_gone_stops_the_wait/1,
     keeper_gone_tells_the_next_keeper/1,
     raised_ceiling_serves_the_queue/1,
     lowered_ceiling_holds_new_requests/1,
@@ -51,6 +52,7 @@ all() ->
         reset_stops_the_wait,
         reset_after_a_grant_frees_the_slot,
         reset_waiter_times_out,
+        connection_gone_stops_the_wait,
         keeper_gone_tells_the_next_keeper,
         raised_ceiling_serves_the_queue,
         lowered_ceiling_holds_new_requests,
@@ -195,7 +197,7 @@ reset_stops_the_wait(_Config) ->
     {ok, _} = result(Holder),
     Self = self(),
     Waiter = spawn(fun() ->
-        Self ! {self(), roadrunner_route_keeper:acquire(C, {reset, 7})},
+        Self ! {self(), roadrunner_route_keeper:acquire(C, {reset, 7}, Self)},
         receive
             stop -> ok
         end
@@ -222,7 +224,7 @@ reset_after_a_grant_frees_the_slot(_Config) ->
         receive
             go -> ok
         end,
-        Self ! {self(), roadrunner_route_keeper:acquire(C, {reset, 7})},
+        Self ! {self(), roadrunner_route_keeper:acquire(C, {reset, 7}, Self)},
         receive
             stop -> ok
         end
@@ -245,8 +247,31 @@ reset_waiter_times_out(_Config) ->
     {Keeper, C} = route(1, {queue, 50, 10}),
     {ok, _} = result(holder(C)),
     Self = self(),
-    Waiter = spawn(fun() -> Self ! {self(), roadrunner_route_keeper:acquire(C, {reset, 7})} end),
+    Waiter = spawn(fun() ->
+        Self ! {self(), roadrunner_route_keeper:acquire(C, {reset, 7}, Self)}
+    end),
     ?assertEqual({refused, 1}, result(Waiter)),
+    ok = stop_keeper(Keeper).
+
+connection_gone_stops_the_wait(_Config) ->
+    %% A worker whose connection goes while it waits stops waiting: nobody
+    %% is left to answer.
+    {Keeper, C} = route(1, {queue, 5000, 10}),
+    Holder = holder(C),
+    {ok, _} = result(Holder),
+    Self = self(),
+    Conn = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    Waiter = spawn(fun() -> Self ! {self(), roadrunner_route_keeper:acquire(C, reset, Conn)} end),
+    ok = wait_parked(Keeper, 1),
+    exit(Conn, kill),
+    ?assertEqual(reset, result(Waiter)),
+    ok = wait_parked(Keeper, 0),
+    ok = release(Holder),
+    ?assertMatch(#{in_flight := 0, throttled := 0}, stats(C)),
     ok = stop_keeper(Keeper).
 
 keeper_gone_tells_the_next_keeper(_Config) ->

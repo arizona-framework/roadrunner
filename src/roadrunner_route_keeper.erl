@@ -50,7 +50,7 @@
     ceiling/4,
     stats/1,
     acquire/1,
-    acquire/2,
+    acquire/3,
     release/2
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
@@ -191,24 +191,31 @@ acquire(#ceiling{} = Ceiling) ->
     end.
 
 %% `acquire/1` for a stream worker, which also stops waiting on `Reset`,
-%% the message that says its stream was reset: it returns `reset` and the
-%% worker ends, which frees a slot granted in the meantime (the keeper
-%% monitors it).
--spec acquire(ceiling(), term()) -> {ok, token()} | {refused, pos_integer()} | reset.
-acquire(#ceiling{} = Ceiling, Reset) ->
+%% the message that says its stream was reset, or when its connection
+%% process `Conn` goes: it returns `reset` and the worker ends, which frees
+%% a slot granted in the meantime (the keeper monitors it).
+-spec acquire(ceiling(), term(), pid()) -> {ok, token()} | {refused, pos_integer()} | reset.
+acquire(#ceiling{} = Ceiling, Reset, Conn) ->
     case ask(Ceiling) of
         {asked, Token} ->
-            receive
-                {Token, granted} ->
-                    {ok, Token};
-                {Token, refused} ->
-                    refuse(Ceiling);
-                {'DOWN', Token, process, _Keeper, _Reason} ->
-                    keeper_gone(Token, Ceiling);
-                Reset ->
-                    true = erlang:demonitor(Token, [flush]),
-                    reset
-            end;
+            ConnMon = erlang:monitor(process, Conn),
+            Result =
+                receive
+                    {Token, granted} ->
+                        {ok, Token};
+                    {Token, refused} ->
+                        refuse(Ceiling);
+                    {'DOWN', Token, process, _Keeper, _Reason} ->
+                        keeper_gone(Token, Ceiling);
+                    Reset ->
+                        true = erlang:demonitor(Token, [flush]),
+                        reset;
+                    {'DOWN', ConnMon, process, Conn, _Reason} ->
+                        true = erlang:demonitor(Token, [flush]),
+                        reset
+                end,
+            true = erlang:demonitor(ConnMon, [flush]),
+            Result;
         refused ->
             refuse(Ceiling)
     end.

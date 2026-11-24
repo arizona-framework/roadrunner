@@ -193,7 +193,7 @@ request(Mode) ->
     spawn(fun() ->
         Result =
             case Mode of
-                reset -> roadrunner_route_keeper:acquire(Ceiling, {reset, self()});
+                reset -> roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Driver);
                 _ -> roadrunner_route_keeper:acquire(Ceiling)
             end,
         Driver ! {client, self(), Result},

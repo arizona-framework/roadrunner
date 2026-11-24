@@ -32,6 +32,8 @@ alone.
     pipelined_refusal_keeps_the_rest/1,
     idle_connection_drops_the_route_heap/1,
     wait_does_not_eat_the_body_deadline/1,
+    h2_connection_gone_leaves_the_queue/1,
+    h3_connection_gone_leaves_the_queue/1,
     h2_shed_answers_503/1,
     h2_queue_grants_in_arrival_order/1,
     h2_queue_timeout_answers_503/1,
@@ -69,6 +71,8 @@ all() ->
         pipelined_refusal_keeps_the_rest,
         idle_connection_drops_the_route_heap,
         wait_does_not_eat_the_body_deadline,
+        h2_connection_gone_leaves_the_queue,
+        h3_connection_gone_leaves_the_queue,
         h2_shed_answers_503,
         h2_queue_grants_in_arrival_order,
         h2_queue_timeout_answers_503,
@@ -150,6 +154,10 @@ case_opts(Case) when
     {#{overload_mode => {queue, #{max_queued => 5}}}, #{}};
 case_opts(Case) when Case =:= h2_queue_timeout_answers_503; Case =:= h3_queue_timeout_answers_503 ->
     {#{overload_mode => {queue, #{timeout => 50}}}, #{}};
+case_opts(Case) when
+    Case =:= h2_connection_gone_leaves_the_queue; Case =:= h3_connection_gone_leaves_the_queue
+->
+    {#{overload_mode => {queue, #{max_queued => 5}}}, #{}};
 case_opts(wait_does_not_eat_the_body_deadline) ->
     {#{overload_mode => {queue, #{timeout => 10000}}}, #{request_timeout => 300}};
 case_opts(h2_waiting_streams_leave_cheap_routes_a_slot) ->
@@ -587,6 +595,21 @@ h2_waiting_streams_leave_cheap_routes_a_slot(Config) ->
     expect_handler() ! release,
     {200, _, ~"ok"} = h2_response(Sock, 3).
 
+h2_connection_gone_leaves_the_queue(Config) ->
+    %% The client goes while a stream waits: its worker stops waiting, and
+    %% no handler runs for it once a slot frees.
+    Name = ?config(listener, Config),
+    Sock = h2_connect(Config),
+    ok = h2_get(Sock, 1, ~"/slow"),
+    First = expect_handler(),
+    ok = h2_get(Sock, 3, ~"/slow"),
+    ok = wait_queued(Name, 1),
+    ok = gen_tcp:close(Sock),
+    ok = wait_queued(Name, 0),
+    First ! release,
+    ok = wait_in_flight(Name, 0),
+    ?assertEqual(none, handler_started()).
+
 %% --- HTTP/3 ---
 
 h3_shed_answers_503(Config) ->
@@ -674,6 +697,19 @@ h3_killed_worker_frees_its_slot(Config) ->
     expect_handler() ! release,
     {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Next),
     ok = h3_close(Conn).
+
+h3_connection_gone_leaves_the_queue(Config) ->
+    Name = ?config(listener, Config),
+    Conn = h3_connect(Config),
+    {ok, _Holding} = h3_get(Conn, ~"/slow"),
+    First = expect_handler(),
+    {ok, _Waiting} = h3_get(Conn, ~"/slow"),
+    ok = wait_queued(Name, 1),
+    ok = h3_close(Conn),
+    ok = wait_queued(Name, 0),
+    First ! release,
+    ok = wait_in_flight(Name, 0),
+    ?assertEqual(none, handler_started()).
 
 %% --- helpers ---
 

@@ -91,7 +91,7 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch, HeapFloor0) ->
         {ok, Handler, Bindings, Pipeline, _State, Limits} ->
             case route_body(Limits, Req) of
                 #{} = Req1 ->
-                    case route_slot(Limits, Protocol, StreamId) of
+                    case route_slot(Limits, Protocol, Conn, StreamId) of
                         granted ->
                             invoke(
                                 Worker,
@@ -114,8 +114,9 @@ run(Worker, Protocol, Conn, StreamId, Req, Dispatch, HeapFloor0) ->
                             ),
                             ok = roadrunner_event:request_stop(Span, 503, buffered);
                         reset ->
-                            %% The client reset the stream while it waited:
-                            %% nothing is left to answer.
+                            %% The client reset the stream, or its
+                            %% connection went, while it waited: nothing is
+                            %% left to answer.
                             ok
                     end;
                 too_large ->
@@ -334,15 +335,16 @@ raise_heap_floor(Cell, Floor, Heap, Cap) ->
 %% lives: its keeper monitors it, so the worker's exit, however it comes,
 %% frees the slot. The stream already holds a slot of the listener's
 %% ceiling while it waits here, which `roadrunner_listener` keeps the route
-%% queues from filling. A reset of the stream ends the wait.
--spec route_slot(roadrunner_router:limits(), h2 | h3, non_neg_integer()) ->
+%% queues from filling. A reset of the stream, or its connection going, ends
+%% the wait: nobody is left to answer.
+-spec route_slot(roadrunner_router:limits(), h2 | h3, pid(), non_neg_integer()) ->
     granted | {refused, pos_integer()} | reset.
-route_slot({_Body, Ceiling}, Protocol, StreamId) ->
-    case roadrunner_route_keeper:acquire(Ceiling, stream_reset(Protocol, StreamId)) of
+route_slot({_Body, Ceiling}, Protocol, Conn, StreamId) ->
+    case roadrunner_route_keeper:acquire(Ceiling, stream_reset(Protocol, StreamId), Conn) of
         {ok, _Token} -> granted;
         Refused -> Refused
     end;
-route_slot(_Limits, _Protocol, _StreamId) ->
+route_slot(_Limits, _Protocol, _Conn, _StreamId) ->
     granted.
 
 %% The message the connection sends a worker whose stream was reset.
