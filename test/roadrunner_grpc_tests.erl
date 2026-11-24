@@ -243,6 +243,31 @@ routes_middlewares_test() ->
         {invalid_grpc_opt, middlewares, x}, ?M:routes(#{services => [?SVC], middlewares => x})
     ).
 
+%% A ceiling goes on each service's route, never on the health and
+%% reflection ones, and stays out of the state.
+routes_ceiling_test() ->
+    Mode = {queue, #{max_queued => 4}},
+    Routes = ?M:routes(#{
+        services => [?SVC],
+        health => true,
+        reflection => true,
+        max_concurrent_requests => 8,
+        overload_mode => Mode
+    }),
+    [Service | Others] = lists:reverse(Routes),
+    ?assertMatch(
+        #{max_concurrent_requests := 8, overload_mode := Mode, state := #{service := ?SVC}},
+        Service
+    ),
+    ?assertEqual(3, length(Others)),
+    [
+        ?assertNot(is_map_key(K, R))
+     || R <- Others, K <- [max_concurrent_requests, overload_mode]
+    ],
+    #{state := State} = Service,
+    ?assertNot(is_map_key(max_concurrent_requests, State)),
+    ?assertNot(is_map_key(overload_mode, State)).
+
 %% A middleware's rejection answers with the status in the headers alone,
 %% under the request's gRPC `content-type`, or gRPC's own.
 reject_test() ->
