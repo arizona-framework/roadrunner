@@ -31,6 +31,7 @@ alone.
     pipelined_requests_take_turns/1,
     pipelined_refusal_keeps_the_rest/1,
     idle_connection_drops_the_route_heap/1,
+    wait_does_not_eat_the_body_deadline/1,
     h2_shed_answers_503/1,
     h2_queue_grants_in_arrival_order/1,
     h2_queue_timeout_answers_503/1,
@@ -67,6 +68,7 @@ all() ->
         pipelined_requests_take_turns,
         pipelined_refusal_keeps_the_rest,
         idle_connection_drops_the_route_heap,
+        wait_does_not_eat_the_body_deadline,
         h2_shed_answers_503,
         h2_queue_grants_in_arrival_order,
         h2_queue_timeout_answers_503,
@@ -148,6 +150,8 @@ case_opts(Case) when
     {#{overload_mode => {queue, #{max_queued => 5}}}, #{}};
 case_opts(Case) when Case =:= h2_queue_timeout_answers_503; Case =:= h3_queue_timeout_answers_503 ->
     {#{overload_mode => {queue, #{timeout => 50}}}, #{}};
+case_opts(wait_does_not_eat_the_body_deadline) ->
+    {#{overload_mode => {queue, #{timeout => 10000}}}, #{request_timeout => 300}};
 case_opts(h2_waiting_streams_leave_cheap_routes_a_slot) ->
     %% `/slow` may hold two listener slots, one running and one waiting:
     %% the third stays for the other routes.
@@ -460,6 +464,25 @@ idle_connection_drops_the_route_heap(Config) ->
     ?assert(FreeHeap > 800000),
     ?assert(CappedHeap < 100000).
 
+wait_does_not_eat_the_body_deadline(Config) ->
+    %% A request that waited for its slot past its `request_timeout` still
+    %% has the time to send its body: the wait is added to its deadline.
+    Name = ?config(listener, Config),
+    Holder = connect(Config),
+    ok = gen_tcp:send(Holder, get_request(~"/slow")),
+    First = expect_handler(),
+    Sock = connect(Config),
+    Sent = erlang:monotonic_time(millisecond),
+    ok = gen_tcp:send(Sock, expect_continue(~"/slow", 5)),
+    ok = wait_queued(Name, 1),
+    ok = wait_until(Sent + 600),
+    First ! release,
+    {200, _, ~"ok"} = recv_response(Holder),
+    ?assertEqual({ok, ~"HTTP/1.1 100 Continue\r\n\r\n"}, gen_tcp:recv(Sock, 25, 5000)),
+    ok = gen_tcp:send(Sock, ~"hello"),
+    expect_handler() ! release,
+    {200, _, ~"ok"} = recv_response(Sock).
+
 %% --- HTTP/2 ---
 
 h2_shed_answers_503(Config) ->
@@ -653,6 +676,16 @@ h3_killed_worker_frees_its_slot(Config) ->
     ok = h3_close(Conn).
 
 %% --- helpers ---
+
+%% Until the clock reads `At` (ms): the condition under test is that time.
+wait_until(At) ->
+    case erlang:monotonic_time(millisecond) >= At of
+        true ->
+            ok;
+        false ->
+            erlang:yield(),
+            wait_until(At)
+    end.
 
 h2_connect(Config) ->
     Sock = connect(Config),

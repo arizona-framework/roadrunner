@@ -1312,7 +1312,9 @@ route(#loop_state{dispatch = Dispatch} = S, Req, Deadline) ->
     end.
 
 %% A slot of the route's own `max_concurrent_requests`, waiting for one in
-%% queue mode, or the request is turned away with a 503.
+%% queue mode, or the request is turned away with a 503. The time spent
+%% waiting is added to the request's deadline, so a request let in late
+%% still has its full time to send its body.
 -spec take_route_slot(
     #loop_state{},
     roadrunner_req:request(),
@@ -1321,10 +1323,15 @@ route(#loop_state{dispatch = Dispatch} = S, Req, Deadline) ->
     roadrunner_route_keeper:ceiling()
 ) -> no_return().
 take_route_slot(#loop_state{request_slot = Slot} = S, Req, Deadline, Resolved, Ceiling) ->
+    Asked = erlang:monotonic_time(millisecond),
     case roadrunner_route_keeper:acquire(Ceiling) of
         {ok, Token} ->
+            Waited = erlang:monotonic_time(millisecond) - Asked,
             admit(
-                S#loop_state{request_slot = {route, Ceiling, Token, Slot}}, Req, Deadline, Resolved
+                S#loop_state{request_slot = {route, Ceiling, Token, Slot}},
+                Req,
+                Deadline + Waited,
+                Resolved
             );
         {refused, RetryAfter} ->
             refuse_route(S, Req, RetryAfter)
