@@ -1336,9 +1336,9 @@ An upgrade can set each of these for its own session
     %% until they drain, and the keys of the table's own, in table order.
     route_keepers = #{} :: #{ceiling_key() => #route_keeper{}},
     route_ceilings = [] :: [ceiling_key()],
-    %% Keepers told to stop (a route drained, or a reload that failed),
-    %% with their tables, until their exit arrives: the table goes then,
-    %% and the exit is known not to be a crash.
+    %% Keepers a failed reload started, told to stop, with their tables,
+    %% until their exit arrives: the table goes then, and the exit is known
+    %% not to be a crash.
     route_stopping = #{} :: #{pid() => roadrunner_route_keeper:table()}
 }).
 
@@ -2001,9 +2001,7 @@ start_route_keepers(Specs, Keepers) ->
             ({Key, _Max, _Mode}, {Acc, Started}) when is_map_key(Key, Acc) ->
                 {Acc, Started};
             ({Key, Max, Mode}, {Acc, Started}) ->
-                {Pid, Slots, Counts} = roadrunner_route_keeper:new(
-                    Max, queue_depth(Mode), false, self()
-                ),
+                {Pid, Slots, Counts} = roadrunner_route_keeper:new(Max, queue_depth(Mode), false),
                 {Acc#{Key => #route_keeper{pid = Pid, slots = Slots, counts = Counts}}, [
                     Key | Started
                 ]}
@@ -2069,9 +2067,8 @@ draining_route_keeper(Draining, Draining, _Pid) ->
 draining_route_keeper(_Was, Draining, Pid) ->
     roadrunner_route_keeper:set_draining(Pid, Draining).
 
-%% Stop route keepers: those a failed reload started, or one whose route
-%% drained. Each moves to `route_stopping` until its exit arrives, when its
-%% table goes.
+%% Stop the route keepers a failed reload started. Each moves to
+%% `route_stopping` until its exit arrives, when its table goes.
 -spec stop_route_keepers([ceiling_key()], #state{}) -> #state{}.
 stop_route_keepers(Keys, #state{route_keepers = Keepers, route_stopping = Stopping} = State) ->
     {Keepers1, Stopping1} = lists:foldl(
@@ -3802,16 +3799,26 @@ handle_info({'EXIT', Pid, _Reason}, #state{route_stopping = Stopping} = State) w
 handle_info({'EXIT', Pid, Reason}, #state{route_keepers = Keepers} = State) ->
     case route_keeper_key(Pid, Keepers) of
         {ok, Key} ->
-            %% A route keeper died. Its count is in the table and counts this
-            %% process owns, so a new keeper takes over the same route: it
-            %% watches the holders the table has, and nothing waiting for the
-            %% old one is let in.
             #{Key := #route_keeper{slots = Slots, counts = Counts, draining = Draining} = Keeper} =
                 Keepers,
-            {ok, NewPid} = roadrunner_route_keeper:start_link(Slots, Counts, {Draining, self()}),
-            {noreply, State#state{
-                route_keepers = Keepers#{Key := Keeper#route_keeper{pid = NewPid}}
-            }};
+            case {Reason, Draining} of
+                {{shutdown, drained}, true} ->
+                    %% A route the table dropped drained: its keeper stopped in
+                    %% the step it found nothing running or waiting, so nothing
+                    %% was let in since, and the count goes.
+                    true = ets:delete(Slots),
+                    {noreply, State#state{route_keepers = maps:remove(Key, Keepers)}};
+                _ ->
+                    %% A route keeper died, or drained after a reload brought
+                    %% its route back. The count is in the table and counts
+                    %% this process owns, so a new keeper takes over the same
+                    %% route: it watches the holders the table has, and
+                    %% nothing waiting for the old one is let in.
+                    {ok, NewPid} = roadrunner_route_keeper:start_link(Slots, Counts, Draining),
+                    {noreply, State#state{
+                        route_keepers = Keepers#{Key := Keeper#route_keeper{pid = NewPid}}
+                    }}
+            end;
         error when Reason =:= normal ->
             %% An acceptor ends normally once the listen socket is closed.
             {noreply, State};
@@ -3821,33 +3828,6 @@ handle_info({'EXIT', Pid, Reason}, #state{route_keepers = Keepers} = State) ->
             %% exits, but through `terminate/2`, and its supervisor restarts
             %% it.
             {stop, Reason, State}
-    end;
-handle_info({route_keeper_drained, Pid}, #state{route_keepers = Keepers} = State) ->
-    %% A route the table dropped has nothing left running or waiting: its
-    %% count goes. One a reload brought back since keeps it.
-    case route_keeper_key(Pid, Keepers) of
-        {ok, Key} ->
-            case Keepers of
-                #{Key := #route_keeper{draining = true, slots = Slots, counts = Counts}} ->
-                    %% The notice can be older than the table: a reload
-                    %% brought the route back and dropped it again since,
-                    %% and a request took a slot or began to wait in
-                    %% between (a release may have emptied the table while
-                    %% the keeper has yet to hand that slot on). Only a
-                    %% table holding nothing but its keeper's row, with
-                    %% nothing waiting, is done.
-                    case
-                        ets:info(Slots, size) =:= 1 andalso
-                            roadrunner_route_keeper:queued(Counts) =:= 0
-                    of
-                        true -> {noreply, stop_route_keepers([Key], State)};
-                        false -> {noreply, State}
-                    end;
-                #{} ->
-                    {noreply, State}
-            end;
-        error ->
-            {noreply, State}
     end;
 handle_info(_Msg, State) ->
     {noreply, State}.

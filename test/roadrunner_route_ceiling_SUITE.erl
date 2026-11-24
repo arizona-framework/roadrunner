@@ -19,8 +19,9 @@ A route's own `max_concurrent_requests` and `overload_mode` in a listener.
     dropped_route_drains_then_goes/1,
     route_brought_back_keeps_its_count/1,
     route_dropped_twice_keeps_draining/1,
-    stale_drained_notice_keeps_a_busy_keeper/1,
-    stale_drained_notice_keeps_a_keeper_with_waiters/1,
+    drained_keeper_refuses_a_straggler/1,
+    drained_keeper_of_a_route_brought_back_is_replaced/1,
+    draining_keeper_serves_its_waiter_first/1,
     reload_adds_a_route_ceiling/1,
     failed_reload_stops_the_new_keepers/1,
     keeper_crash_is_taken_over_by_a_new_keeper/1,
@@ -40,8 +41,9 @@ all() ->
         dropped_route_drains_then_goes,
         route_brought_back_keeps_its_count,
         route_dropped_twice_keeps_draining,
-        stale_drained_notice_keeps_a_busy_keeper,
-        stale_drained_notice_keeps_a_keeper_with_waiters,
+        drained_keeper_refuses_a_straggler,
+        drained_keeper_of_a_route_brought_back_is_replaced,
+        draining_keeper_serves_its_waiter_first,
         reload_adds_a_route_ceiling,
         failed_reload_stops_the_new_keepers,
         keeper_crash_is_taken_over_by_a_new_keeper,
@@ -207,8 +209,7 @@ dropped_route_drains_then_goes(_Config) ->
     ok = roadrunner_listener:stop(Name).
 
 route_brought_back_keeps_its_count(_Config) ->
-    %% Dropped and brought back before it drained: the same count, and the
-    %% drained notice it sends on the way is ignored.
+    %% Dropped and brought back before it drained: the same count.
     Name = ?FUNCTION_NAME,
     {ok, _} = roadrunner_listener:start_link(Name, #{port => 0, routes => [capped(~"/a", 1)]}),
     A = holder(Name, ~"GET", ~"/a"),
@@ -218,8 +219,6 @@ route_brought_back_keeps_its_count(_Config) ->
     ok = roadrunner_listener:reload_routes(Name, [capped(~"/a", 1)]),
     ?assertEqual(Keeper, keeper(Name, ~"/a")),
     ?assertMatch([#{in_flight := 1}], route_info(Name)),
-    whereis(Name) ! {route_keeper_drained, Keeper},
-    whereis(Name) ! {route_keeper_drained, self()},
     ok = release(A),
     _ = sys:get_state(Keeper),
     _ = sys:get_state(Name),
@@ -245,34 +244,62 @@ route_dropped_twice_keeps_draining(_Config) ->
     end,
     ok = roadrunner_listener:stop(Name).
 
-stale_drained_notice_keeps_a_busy_keeper(_Config) ->
-    %% A drained notice sent before a reload brought the route back, read
-    %% after it was dropped again while a request holds a slot: the keeper
-    %% stays for that request, and goes once it ends.
+drained_keeper_refuses_a_straggler(_Config) ->
+    %% A request routed by the old table asks for a slot of a route the new
+    %% table dropped, just as that route drains. Its keeper finds the route
+    %% drained and stops in the same step, so the request is refused: it is
+    %% never let in to run on a count the listener then deletes. A keeper
+    %% that only reported the drain and went on serving until the listener
+    %% stopped it would grant this request.
     Name = ?FUNCTION_NAME,
     {ok, _} = roadrunner_listener:start_link(Name, #{port => 0, routes => [capped(~"/a", 1)]}),
-    A = holder(Name, ~"GET", ~"/a"),
-    {ok, _} = result(A),
+    Old = persistent_term:get({roadrunner_routes, Name}),
+    {ok, _, _, _, _, {_Body, Ceiling}} = roadrunner_router:resolve(~"GET", ~"/a", Old),
     Keeper = keeper(Name, ~"/a"),
-    Plain = [{~"/plain", roadrunner_hello_handler}],
-    ok = roadrunner_listener:reload_routes(Name, Plain),
-    ok = roadrunner_listener:reload_routes(Name, [capped(~"/a", 1)]),
-    ok = roadrunner_listener:reload_routes(Name, Plain),
-    whereis(Name) ! {route_keeper_drained, Keeper},
-    _ = sys:get_state(Name),
-    ?assert(is_process_alive(Keeper)),
     Mon = monitor(process, Keeper),
-    ok = release(A),
+    ok = sys:suspend(Keeper),
+    ok = roadrunner_listener:reload_routes(Name, [{~"/plain", roadrunner_hello_handler}]),
+    Straggler = holder_on(Old, ~"GET", ~"/a"),
+    ok = wait_acquire(Keeper, Straggler),
+    ok = sys:resume(Keeper),
+    ?assertEqual({refused, 1}, result(Straggler)),
     receive
-        {'DOWN', Mon, process, Keeper, _} -> ok
+        {'DOWN', Mon, process, Keeper, Reason} -> ?assertEqual({shutdown, drained}, Reason)
     after 5000 -> ct:fail(keeper_kept)
     end,
+    %% The listener deleted the count, and serves its other routes.
+    ok = wait_deleted(element(2, Ceiling)),
+    ?assertEqual([], route_info(Name)),
     ok = roadrunner_listener:stop(Name).
 
-stale_drained_notice_keeps_a_keeper_with_waiters(_Config) ->
-    %% A dropped route's last slot was released, but its keeper has yet to
-    %% hand it to the request waiting when a stale drained notice arrives:
-    %% the table is empty, the queue is not, and the keeper stays.
+drained_keeper_of_a_route_brought_back_is_replaced(_Config) ->
+    %% The route is dropped and brought back while its keeper lags behind:
+    %% the keeper finds the route drained and stops, but the listener has
+    %% the route back by then, so a new keeper takes over the same count.
+    Name = ?FUNCTION_NAME,
+    {ok, _} = roadrunner_listener:start_link(Name, #{port => 0, routes => [capped(~"/a", 1)]}),
+    Keeper = keeper(Name, ~"/a"),
+    Mon = monitor(process, Keeper),
+    ok = sys:suspend(Keeper),
+    ok = roadrunner_listener:reload_routes(Name, [{~"/plain", roadrunner_hello_handler}]),
+    ok = roadrunner_listener:reload_routes(Name, [capped(~"/a", 1)]),
+    ok = sys:resume(Keeper),
+    receive
+        {'DOWN', Mon, process, Keeper, Reason} -> ?assertEqual({shutdown, drained}, Reason)
+    after 5000 -> ct:fail(keeper_kept)
+    end,
+    _ = wait_new_keeper(Name, ~"/a", Keeper),
+    A = holder(Name, ~"GET", ~"/a"),
+    {ok, _} = result(A),
+    ?assertMatch([#{in_flight := 1}], route_info(Name)),
+    {refused, 1} = result(holder(Name, ~"GET", ~"/a")),
+    ok = release(A),
+    ok = roadrunner_listener:stop(Name).
+
+draining_keeper_serves_its_waiter_first(_Config) ->
+    %% A dropped route's last slot is released while a request waits for
+    %% it: the table is empty, the queue is not, so the keeper hands the
+    %% slot on rather than stopping, and stops once that request ends too.
     Name = ?FUNCTION_NAME,
     {ok, _} = roadrunner_listener:start_link(Name, #{
         port => 0, routes => [queued(~"/a", 1, #{max_queued => 1})]
@@ -285,15 +312,13 @@ stale_drained_notice_keeps_a_keeper_with_waiters(_Config) ->
     ok = roadrunner_listener:reload_routes(Name, [{~"/plain", roadrunner_hello_handler}]),
     ok = sys:suspend(Keeper),
     ok = release(A),
-    whereis(Name) ! {route_keeper_drained, Keeper},
-    _ = sys:get_state(Name),
-    ?assert(is_process_alive(Keeper)),
     ok = sys:resume(Keeper),
     {ok, _} = result(W),
+    ?assert(is_process_alive(Keeper)),
     Mon = monitor(process, Keeper),
     ok = release(W),
     receive
-        {'DOWN', Mon, process, Keeper, _} -> ok
+        {'DOWN', Mon, process, Keeper, Reason} -> ?assertEqual({shutdown, drained}, Reason)
     after 5000 -> ct:fail(keeper_kept)
     end,
     ok = roadrunner_listener:stop(Name).
@@ -436,6 +461,37 @@ wait_links(Pid, Links, Tries) ->
         {links, _} ->
             erlang:yield(),
             wait_links(Pid, Links, Tries - 1)
+    end.
+
+%% Until `Pid`'s acquire is in the (suspended) keeper's mailbox.
+wait_acquire(Keeper, Pid) ->
+    wait_acquire(Keeper, Pid, 1000000).
+
+wait_acquire(_Keeper, Pid, 0) ->
+    ct:fail({never_asked, Pid});
+wait_acquire(Keeper, Pid, Tries) ->
+    {messages, Messages} = erlang:process_info(Keeper, messages),
+    case [P || {acquire, _Token, P, _Wait} <- Messages, P =:= Pid] of
+        [_] ->
+            ok;
+        [] ->
+            erlang:yield(),
+            wait_acquire(Keeper, Pid, Tries - 1)
+    end.
+
+%% Until the listener has deleted a route's slot table.
+wait_deleted(Slots) ->
+    wait_deleted(Slots, 1000000).
+
+wait_deleted(Slots, 0) ->
+    ct:fail({table_kept, Slots});
+wait_deleted(Slots, Tries) ->
+    case ets:info(Slots, size) of
+        undefined ->
+            ok;
+        _ ->
+            erlang:yield(),
+            wait_deleted(Slots, Tries - 1)
     end.
 
 wait_new_keeper(Name, Path, Old) ->
