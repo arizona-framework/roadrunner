@@ -5,7 +5,8 @@ A model check of a route's `max_concurrent_requests` count
 keepers. Random sequences of operations are driven one at a time:
 requests asking for a slot (shedding, waiting long, waiting briefly, or
 waiting until their stream resets), releases, releases racing new
-requests and stream resets, holder and waiter deaths, keeper crashes
+requests and stream resets, holder and waiter deaths, a stream's
+connection going while it waits, keeper crashes
 (plain, with a release and a request landing while no keeper runs, and
 in the middle of a grant), reloads changing the ceiling and queue depth,
 reloads that move the route to a new key, drop and re-add it while its
@@ -25,7 +26,8 @@ by table (a route moved to a new key keeps its old table until it drains):
   an older one that cannot time out still waits, even when a new request
   reaches the keeper ahead of the release that freed the slot;
 - no request waits past its timeout, and a long wait is never dropped
-  except by a keeper crash or the listener stopping;
+  except by a keeper crash or the listener stopping (a drained notice that
+  reaches the listener while a request still waits does not stop it);
 - a request to a route without a ceiling is answered whatever the capped
   route is doing.
 
@@ -53,6 +55,8 @@ is refused and every holder's release returns.
     t0 :: integer(),
     %% The slot table and counts the request asked.
     table :: {ets:tid(), atomics:atomics_ref()},
+    %% The connection process a stream worker (`reset`) waits beside.
+    conn :: pid() | undefined,
     %% Set by a keeper crash while it waits: its refusal is expected.
     orphaned = false :: boolean()
 }).
@@ -83,6 +87,8 @@ op() ->
         {1, {reload, integer(1, 4), integer(1, 4)}},
         {1, rekey},
         {1, stale_drain},
+        {1, drained_before_waiter},
+        {1, {conn_gone, nat()}},
         {1, failed_reload},
         {1, cheap}
     ]).
@@ -307,6 +313,45 @@ step(stale_drain, Model) ->
             ok = reload(Model2),
             settle(Model2)
     end;
+step(drained_before_waiter, Model) ->
+    %% The route is dropped while one request runs and one waits. The
+    %% runner releases while the keeper is behind, so the table is empty but
+    %% the waiter not yet served when a drained notice (one from an earlier
+    %% drain, say) reaches the listener: the keeper must stay.
+    Long = [P || P <- pick(parked, Model), mode(P, Model) =/= short],
+    case {pick(running, Model), Long, length(tables(Model))} of
+        {[Holder], [_ | _], 1} ->
+            Keeper = keeper(),
+            Plain = [{~"/cheap", roadrunner_hello_handler}],
+            ok = roadrunner_listener:reload_routes(?LISTENER, Plain),
+            ok = sys:suspend(Keeper),
+            Model1 = set_status(Holder, gone, Model),
+            Mon = monitor(process, Holder),
+            Holder ! release,
+            receive
+                {'DOWN', Mon, process, Holder, _} -> ok
+            end,
+            whereis(?LISTENER) ! {route_keeper_drained, Keeper},
+            _ = sys:get_state(?LISTENER),
+            is_process_alive(Keeper) orelse
+                error({keeper_stopped_with_waiters, Long}),
+            ok = sys:resume(Keeper),
+            ok = reload(Model1),
+            settle(Model1);
+        _ ->
+            Model
+    end;
+step({conn_gone, N}, Model) ->
+    %% A stream worker's connection goes while it waits: it stops waiting.
+    case [P || P <- pick(parked, Model), mode(P, Model) =:= reset] of
+        [] ->
+            Model;
+        Waiting ->
+            Pid = lists:nth(N rem length(Waiting) + 1, Waiting),
+            exit((client(Pid, Model))#client.conn, kill),
+            %% Reset, or granted just before: either way it answers.
+            settle(apply_result(receive_result(Pid), Model))
+    end;
 step(failed_reload, Model) ->
     %% A table whose hook fails is refused whole, the keepers it started
     %% with it.
@@ -367,10 +412,23 @@ request(Mode, Model) ->
     Driver = self(),
     {Slots, Counts} = Table = route_counts(),
     Ceiling = roadrunner_route_keeper:ceiling(Slots, Counts, wait(Mode), ?LISTENER),
+    Conn =
+        case Mode of
+            reset ->
+                C = spawn(fun() ->
+                    receive
+                        stop -> ok
+                    end
+                end),
+                ok = remember_client(C),
+                C;
+            _ ->
+                undefined
+        end,
     Pid = spawn(fun() ->
         Result =
             case Mode of
-                reset -> roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Driver);
+                reset -> roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Conn);
                 _ -> roadrunner_route_keeper:acquire(Ceiling)
             end,
         Driver ! {client, self(), Result},
@@ -395,7 +453,8 @@ request(Mode, Model) ->
         status = asking,
         seq = Model#model.seq,
         t0 = erlang:monotonic_time(millisecond),
-        table = Table
+        table = Table,
+        conn = Conn
     },
     {Pid, Model#model{seq = Model#model.seq + 1, clients = (Model#model.clients)#{Pid => Client}}}.
 

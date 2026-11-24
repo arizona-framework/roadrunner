@@ -49,6 +49,7 @@
     set_draining/2,
     ceiling/4,
     stats/1,
+    queued/1,
     acquire/1,
     acquire/3,
     release/2
@@ -172,6 +173,11 @@ stats({Slots, Counts}) ->
         queued => atomics:get(Counts, ?QUEUED),
         throttled => atomics:get(Counts, ?THROTTLED)
     }.
+
+%% How many requests wait for a slot now.
+-spec queued(atomics:atomics_ref()) -> non_neg_integer().
+queued(Counts) ->
+    atomics:get(Counts, ?QUEUED).
 
 %% --- request side ---
 

@@ -20,6 +20,7 @@ A route's own `max_concurrent_requests` and `overload_mode` in a listener.
     route_brought_back_keeps_its_count/1,
     route_dropped_twice_keeps_draining/1,
     stale_drained_notice_keeps_a_busy_keeper/1,
+    stale_drained_notice_keeps_a_keeper_with_waiters/1,
     reload_adds_a_route_ceiling/1,
     failed_reload_stops_the_new_keepers/1,
     keeper_crash_is_taken_over_by_a_new_keeper/1,
@@ -40,6 +41,7 @@ all() ->
         route_brought_back_keeps_its_count,
         route_dropped_twice_keeps_draining,
         stale_drained_notice_keeps_a_busy_keeper,
+        stale_drained_notice_keeps_a_keeper_with_waiters,
         reload_adds_a_route_ceiling,
         failed_reload_stops_the_new_keepers,
         keeper_crash_is_taken_over_by_a_new_keeper,
@@ -261,6 +263,35 @@ stale_drained_notice_keeps_a_busy_keeper(_Config) ->
     ?assert(is_process_alive(Keeper)),
     Mon = monitor(process, Keeper),
     ok = release(A),
+    receive
+        {'DOWN', Mon, process, Keeper, _} -> ok
+    after 5000 -> ct:fail(keeper_kept)
+    end,
+    ok = roadrunner_listener:stop(Name).
+
+stale_drained_notice_keeps_a_keeper_with_waiters(_Config) ->
+    %% A dropped route's last slot was released, but its keeper has yet to
+    %% hand it to the request waiting when a stale drained notice arrives:
+    %% the table is empty, the queue is not, and the keeper stays.
+    Name = ?FUNCTION_NAME,
+    {ok, _} = roadrunner_listener:start_link(Name, #{
+        port => 0, routes => [queued(~"/a", 1, #{max_queued => 1})]
+    }),
+    A = holder(Name, ~"GET", ~"/a"),
+    {ok, _} = result(A),
+    Keeper = keeper(Name, ~"/a"),
+    W = holder(Name, ~"GET", ~"/a"),
+    ok = wait_queued(Name, 1),
+    ok = roadrunner_listener:reload_routes(Name, [{~"/plain", roadrunner_hello_handler}]),
+    ok = sys:suspend(Keeper),
+    ok = release(A),
+    whereis(Name) ! {route_keeper_drained, Keeper},
+    _ = sys:get_state(Name),
+    ?assert(is_process_alive(Keeper)),
+    ok = sys:resume(Keeper),
+    {ok, _} = result(W),
+    Mon = monitor(process, Keeper),
+    ok = release(W),
     receive
         {'DOWN', Mon, process, Keeper, _} -> ok
     after 5000 -> ct:fail(keeper_kept)
