@@ -56,6 +56,12 @@ and the second one can never be reached, so compiling raises
 Ordering stays the caller's to choose; getting it wrong stops the
 listener from booting instead of turning into a 404 in production.
 
+A route's map form can also bound how many of its requests run at once
+(`max_concurrent_requests`), for a route whose handler takes much more
+memory than the rest, without holding back the other routes. A listener
+counts each such route and turns away, or queues, a request over it
+before its body is read (see `t:route/0`).
+
 The opaque `compiled()` shape is a tree keyed on literal segments, so
 matching only walks the branches a request's segments can follow instead
 of trying every route in turn.
@@ -222,10 +228,10 @@ Why a route table was rejected, as returned by `validate/1` and raised by
   is not a non-negative integer or `infinity`.
 - `{invalid_route_rate_limit, Value}` — a `rate_limit` key that is not a
   `t:rate_limit/0` map of positive integers with `rate` set.
-- `{invalid_route_max_concurrent_requests, Value}` — a
+- `{invalid_route_max_concurrent_requests, Value}`: a
   `max_concurrent_requests` key that is not a
   `t:roadrunner_listener:positive_limit/0`.
-- `{invalid_route_overload_mode, Value}` — an `overload_mode` key that is
+- `{invalid_route_overload_mode, Value}`: an `overload_mode` key that is
   not a `t:overload_mode/0`, or `{Mode, requires_max_concurrent_requests}`
   for one on a route without `max_concurrent_requests`.
 - `{invalid_route_path, Path, wildcard_not_last}` — a segment after the
@@ -263,10 +269,12 @@ with the count of its `max_concurrent_requests` when a listener keeps one
 `rate_limit` is not here: it is a stage of the route's pipeline
 (`roadrunner_route_rate_limit`).
 """.
+%% The count is a `roadrunner_route_keeper:ceiling()`, internal to the
+%% listener, so it is not named here.
 -type limits() ::
     undefined
     | body_limit()
-    | {body_limit() | undefined, roadrunner_route_keeper:ceiling()}.
+    | {body_limit() | undefined, Ceiling :: term()}.
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].

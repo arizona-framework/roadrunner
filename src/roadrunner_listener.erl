@@ -234,7 +234,16 @@ Routing (pick one):
   already answer in full is a config error and raises at listener
   start rather than turning into a runtime 404. `OPTIONS *` reaches
   no route: the listener answers it itself (see
-  `roadrunner_router:match/3`).
+  `roadrunner_router:match/3`). A route's `max_concurrent_requests`
+  bounds how many of its requests run at once, on top of the listener's
+  own ceiling: the listener counts each such route, and reports it under
+  `routes` in `info/1`. A finite listener `max_concurrent_requests` must
+  stay above what the routes that queue can hold, their
+  `max_concurrent_requests` plus `max_queued` added up, or the start fails
+  with `{route_queues_reach_max_concurrent_requests, Sum, Max}`: on HTTP/2
+  and HTTP/3 a request waiting in a route's queue already holds a slot of
+  the listener's, and a full house of them would leave the other routes
+  none. See the resource limits guide for sizing one.
 
 Whichever form is used, a handler that exports the optional
 `roadrunner_handler` callback `init_route/1` has it run once per route
@@ -360,7 +369,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   which RFC 9113 §8.7 marks safe to retry; each refusal emits
   `request_throttled` and increments the `throttled`
   count from `info/1`. HTTP/1 is unaffected (one request per connection,
-  already bounded by `max_clients`), except in `shed` mode below.
+  already bounded by `max_clients`), except in `shed` mode below. A
+  route's own `max_concurrent_requests` counts on every protocol, HTTP/1
+  included (`t:roadrunner_router:route/0`).
 - `overload_mode`: what happens to a request that arrives over
   `max_concurrent_requests`. Default `refuse`, which is the behavior
   described above. `{queue, Opts}` instead
@@ -1539,6 +1550,15 @@ option): the reload returns `{error, {init_failed, Reason}}` and the
 listener keeps its current routes. At listener start the same failure
 stops the start, since there is no table to keep.
 Both run again for the new table, once per route.
+
+A route with its own `max_concurrent_requests` keeps its count across the
+reload when the new table has a route with the same path and methods, and
+takes the new ceiling at once. A route the new table drops keeps counting
+the requests it still runs until they end; one whose path or methods
+change counts afresh, so the old and new can run up to twice the
+ceiling until the old requests end. A table whose queued routes reach the
+listener's own `max_concurrent_requests` is refused with
+`{error, {route_queues_reach_max_concurrent_requests, Sum, Max}}`.
 
 Each call performs one global `persistent_term` swap, which scans every
 process heap to reclaim the old table. That cost is acceptable for a
