@@ -1,8 +1,10 @@
 -module(roadrunner_route_ceiling_http_SUITE).
 -moduledoc """
-A route's own `max_concurrent_requests` as clients meet it over HTTP/1.1.
-`/slow` runs one request at a time and holds it until the test releases
-its handler (`roadrunner_h2_slot_handler`); `/cheap` has no ceiling.
+A route's own `max_concurrent_requests` as clients meet it over HTTP/1.1,
+HTTP/2 (h2c) and HTTP/3. `/slow` runs one request at a time and holds it
+until the test releases its handler (`roadrunner_h2_slot_handler`);
+`/cheap` has no ceiling. The `h2_` and `h3_` cases run their protocol
+alone.
 """.
 
 -behaviour(ct_suite).
@@ -28,7 +30,18 @@ its handler (`roadrunner_h2_slot_handler`); `/cheap` has no ceiling.
     continue_is_never_sent_when_refused/1,
     pipelined_requests_take_turns/1,
     pipelined_refusal_keeps_the_rest/1,
-    idle_connection_drops_the_route_heap/1
+    idle_connection_drops_the_route_heap/1,
+    h2_shed_answers_503/1,
+    h2_queue_grants_in_arrival_order/1,
+    h2_queue_timeout_answers_503/1,
+    h2_reset_while_waiting_leaves_the_queue/1,
+    h2_killed_worker_frees_its_slot/1,
+    h2_waiting_streams_leave_cheap_routes_a_slot/1,
+    h3_shed_answers_503/1,
+    h3_queue_grants_in_arrival_order/1,
+    h3_queue_timeout_answers_503/1,
+    h3_reset_while_waiting_leaves_the_queue/1,
+    h3_killed_worker_frees_its_slot/1
 ]).
 
 -define(COLLECTOR, roadrunner_h2_slot_collector).
@@ -53,11 +66,23 @@ all() ->
         continue_is_never_sent_when_refused,
         pipelined_requests_take_turns,
         pipelined_refusal_keeps_the_rest,
-        idle_connection_drops_the_route_heap
+        idle_connection_drops_the_route_heap,
+        h2_shed_answers_503,
+        h2_queue_grants_in_arrival_order,
+        h2_queue_timeout_answers_503,
+        h2_reset_while_waiting_leaves_the_queue,
+        h2_killed_worker_frees_its_slot,
+        h2_waiting_streams_leave_cheap_routes_a_slot,
+        h3_shed_answers_503,
+        h3_queue_grants_in_arrival_order,
+        h3_queue_timeout_answers_503,
+        h3_reset_while_waiting_leaves_the_queue,
+        h3_killed_worker_frees_its_slot
     ].
 
 init_per_suite(Config) ->
     {ok, _} = roadrunner_test_event_handler:start(),
+    {ok, _} = application:ensure_all_started(ssl),
     Config.
 
 end_per_suite(_Config) ->
@@ -65,7 +90,8 @@ end_per_suite(_Config) ->
 
 init_per_testcase(Case, Config) ->
     true = register(?COLLECTOR, self()),
-    {Slow, Listener} = case_opts(Case),
+    {Slow, Listener0} = case_opts(Case),
+    Listener = maps:merge(Listener0, protocol_opts(Case)),
     {ok, _} = roadrunner_listener:start_link(Case, Listener#{
         port => 0,
         routes => [
@@ -105,7 +131,29 @@ end_per_testcase(Case, _Config) ->
     true = unregister(?COLLECTOR),
     ok = roadrunner_listener:stop(Case).
 
+protocol_opts(Case) ->
+    case atom_to_list(Case) of
+        "h2_" ++ _ -> #{protocols => [http2]};
+        "h3_" ++ _ -> #{protocols => [http3], tls => roadrunner_test_certs:server_opts()};
+        _ -> #{}
+    end.
+
 %% The `/slow` route's own keys, and the listener's options.
+case_opts(Case) when
+    Case =:= h2_queue_grants_in_arrival_order;
+    Case =:= h3_queue_grants_in_arrival_order;
+    Case =:= h2_reset_while_waiting_leaves_the_queue;
+    Case =:= h3_reset_while_waiting_leaves_the_queue
+->
+    {#{overload_mode => {queue, #{max_queued => 5}}}, #{}};
+case_opts(Case) when Case =:= h2_queue_timeout_answers_503; Case =:= h3_queue_timeout_answers_503 ->
+    {#{overload_mode => {queue, #{timeout => 50}}}, #{}};
+case_opts(h2_waiting_streams_leave_cheap_routes_a_slot) ->
+    %% `/slow` may hold two listener slots, one running and one waiting:
+    %% the third stays for the other routes.
+    {#{overload_mode => {queue, #{max_queued => 1}}}, #{
+        max_concurrent_requests => 3, overload_mode => {shed, #{retry_after => 9}}
+    }};
 case_opts(queue_grants_in_arrival_order) ->
     {#{overload_mode => {queue, #{max_queued => 5}}}, #{}};
 case_opts(Case) when
@@ -412,7 +460,272 @@ idle_connection_drops_the_route_heap(Config) ->
     ?assert(FreeHeap > 800000),
     ?assert(CappedHeap < 100000).
 
+%% --- HTTP/2 ---
+
+h2_shed_answers_503(Config) ->
+    Throttled = attach(throttled),
+    Sock = h2_connect(Config),
+    ok = h2_get(Sock, 1, ~"/slow"),
+    First = expect_handler(),
+    ok = h2_get(Sock, 3, ~"/slow"),
+    {503, Headers, ~""} = h2_response(Sock, 3),
+    ?assertEqual(~"5", header(~"retry-after", Headers)),
+    ?assertEqual(route_max_concurrent_requests, throttled_reason(Throttled)),
+    ?assertEqual(none, handler_started()),
+    %% The connection carries on.
+    ok = h2_get(Sock, 5, ~"/cheap"),
+    {200, _, _} = h2_response(Sock, 5),
+    First ! release,
+    {200, _, ~"ok"} = h2_response(Sock, 1).
+
+h2_queue_grants_in_arrival_order(Config) ->
+    Name = ?config(listener, Config),
+    Sock = h2_connect(Config),
+    ok = h2_get(Sock, 1, ~"/slow"),
+    First = expect_handler(),
+    [
+        begin
+            ok = h2_get(Sock, Id, ~"/slow"),
+            ok = wait_queued(Name, N)
+        end
+     || {Id, N} <- [{3, 1}, {5, 2}, {7, 3}]
+    ],
+    lists:foldl(
+        fun(Id, Running) ->
+            Running ! release,
+            Next = expect_handler(),
+            ?assertEqual(none, handler_started()),
+            Next ! release,
+            {200, _, ~"ok"} = h2_response(Sock, Id),
+            Next
+        end,
+        First,
+        [3, 5, 7]
+    ),
+    {200, _, ~"ok"} = h2_response(Sock, 1).
+
+h2_queue_timeout_answers_503(Config) ->
+    Sock = h2_connect(Config),
+    ok = h2_get(Sock, 1, ~"/slow"),
+    First = expect_handler(),
+    ok = h2_get(Sock, 3, ~"/slow"),
+    {503, Headers, ~""} = h2_response(Sock, 3),
+    ?assertEqual(~"1", header(~"retry-after", Headers)),
+    First ! release,
+    {200, _, ~"ok"} = h2_response(Sock, 1).
+
+h2_reset_while_waiting_leaves_the_queue(Config) ->
+    %% The client gives up on a waiting stream: its worker stops waiting
+    %% and ends, so the slot freed next goes to the stream behind it.
+    Name = ?config(listener, Config),
+    Sock = h2_connect(Config),
+    ok = h2_get(Sock, 1, ~"/slow"),
+    First = expect_handler(),
+    ok = h2_get(Sock, 3, ~"/slow"),
+    ok = wait_queued(Name, 1),
+    ok = h2_get(Sock, 5, ~"/slow"),
+    ok = wait_queued(Name, 2),
+    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({rst_stream, 3, cancel})),
+    ok = wait_queued(Name, 1),
+    First ! release,
+    {200, _, ~"ok"} = h2_response(Sock, 1),
+    expect_handler() ! release,
+    {200, _, ~"ok"} = h2_response(Sock, 5),
+    ?assertEqual(none, handler_started()),
+    ok = wait_in_flight(Name, 0).
+
+h2_killed_worker_frees_its_slot(Config) ->
+    Name = ?config(listener, Config),
+    Sock = h2_connect(Config),
+    ok = h2_get(Sock, 1, ~"/slow"),
+    exit(expect_handler(), kill),
+    ok = wait_in_flight(Name, 0),
+    ok = h2_get(Sock, 3, ~"/slow"),
+    expect_handler() ! release,
+    {200, _, ~"ok"} = h2_response(Sock, 3).
+
+h2_waiting_streams_leave_cheap_routes_a_slot(Config) ->
+    %% Each stream takes a listener slot before it is routed. `/slow` holds
+    %% one running and one waiting, the most its ceiling and queue allow,
+    %% and the listener's third slot still serves `/cheap`.
+    Name = ?config(listener, Config),
+    Sock = h2_connect(Config),
+    ok = h2_get(Sock, 1, ~"/slow"),
+    First = expect_handler(),
+    ok = h2_get(Sock, 3, ~"/slow"),
+    ok = wait_queued(Name, 1),
+    ok = h2_get(Sock, 5, ~"/slow"),
+    {503, _, _} = h2_response(Sock, 5),
+    ok = h2_get(Sock, 7, ~"/cheap"),
+    {200, _, _} = h2_response(Sock, 7),
+    ?assertMatch(#{throttled := 0}, roadrunner_listener:info(Name)),
+    First ! release,
+    {200, _, ~"ok"} = h2_response(Sock, 1),
+    expect_handler() ! release,
+    {200, _, ~"ok"} = h2_response(Sock, 3).
+
+%% --- HTTP/3 ---
+
+h3_shed_answers_503(Config) ->
+    Throttled = attach(throttled),
+    Conn = h3_connect(Config),
+    {ok, Holding} = h3_get(Conn, ~"/slow"),
+    First = expect_handler(),
+    {ok, Shed} = h3_get(Conn, ~"/slow"),
+    {503, Headers, Body} = roadrunner_quic_test_h3:collect(Conn, Shed),
+    ?assertEqual(~"", iolist_to_binary(Body)),
+    ?assertEqual(~"5", header(~"retry-after", Headers)),
+    ?assertEqual(route_max_concurrent_requests, throttled_reason(Throttled)),
+    ?assertEqual(none, handler_started()),
+    {ok, Cheap} = h3_get(Conn, ~"/cheap"),
+    {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Cheap),
+    First ! release,
+    {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Holding),
+    ok = h3_close(Conn).
+
+h3_queue_grants_in_arrival_order(Config) ->
+    Name = ?config(listener, Config),
+    Conn = h3_connect(Config),
+    {ok, Holding} = h3_get(Conn, ~"/slow"),
+    First = expect_handler(),
+    Waiting = [
+        begin
+            {ok, Id} = h3_get(Conn, ~"/slow"),
+            ok = wait_queued(Name, N),
+            Id
+        end
+     || N <- [1, 2, 3]
+    ],
+    lists:foldl(
+        fun(Id, Running) ->
+            Running ! release,
+            Next = expect_handler(),
+            ?assertEqual(none, handler_started()),
+            Next ! release,
+            {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Id),
+            Next
+        end,
+        First,
+        Waiting
+    ),
+    {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Holding),
+    ok = h3_close(Conn).
+
+h3_queue_timeout_answers_503(Config) ->
+    Conn = h3_connect(Config),
+    {ok, Holding} = h3_get(Conn, ~"/slow"),
+    First = expect_handler(),
+    {ok, Late} = h3_get(Conn, ~"/slow"),
+    {503, Headers, _} = roadrunner_quic_test_h3:collect(Conn, Late),
+    ?assertEqual(~"1", header(~"retry-after", Headers)),
+    First ! release,
+    {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Holding),
+    ok = h3_close(Conn).
+
+h3_reset_while_waiting_leaves_the_queue(Config) ->
+    Name = ?config(listener, Config),
+    Conn = h3_connect(Config),
+    {ok, Holding} = h3_get(Conn, ~"/slow"),
+    First = expect_handler(),
+    {ok, Cancelled} = h3_get(Conn, ~"/slow"),
+    ok = wait_queued(Name, 1),
+    {ok, Next} = h3_get(Conn, ~"/slow"),
+    ok = wait_queued(Name, 2),
+    ok = roadrunner_quic_test_h3:cancel(Conn, Cancelled),
+    ok = wait_queued(Name, 1),
+    First ! release,
+    {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Holding),
+    expect_handler() ! release,
+    {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Next),
+    ?assertEqual(none, handler_started()),
+    ok = wait_in_flight(Name, 0),
+    ok = h3_close(Conn).
+
+h3_killed_worker_frees_its_slot(Config) ->
+    Name = ?config(listener, Config),
+    Conn = h3_connect(Config),
+    {ok, _Killed} = h3_get(Conn, ~"/slow"),
+    exit(expect_handler(), kill),
+    ok = wait_in_flight(Name, 0),
+    {ok, Next} = h3_get(Conn, ~"/slow"),
+    expect_handler() ! release,
+    {200, _, _} = roadrunner_quic_test_h3:collect(Conn, Next),
+    ok = h3_close(Conn).
+
 %% --- helpers ---
+
+h2_connect(Config) ->
+    Sock = connect(Config),
+    ok = gen_tcp:send(Sock, [
+        ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", roadrunner_http2_frame:encode({settings, 0, []})
+    ]),
+    _ = put({h2, Sock}, {<<>>, roadrunner_http2_hpack:new_decoder(4096), #{}}),
+    Sock.
+
+h2_get(Sock, StreamId, Path) ->
+    {Block, _} = roadrunner_http2_hpack:encode(
+        [{~":method", ~"GET"}, {~":scheme", ~"http"}, {~":authority", ~"x"}, {~":path", Path}],
+        roadrunner_http2_hpack:new_encoder(4096)
+    ),
+    gen_tcp:send(
+        Sock,
+        roadrunner_http2_frame:encode(
+            {headers, StreamId, 16#04 bor 16#01, undefined, iolist_to_binary(Block)}
+        )
+    ).
+
+%% Stream `StreamId`'s response, `{Status, Headers, Body}`. Frames of other
+%% streams read on the way are kept for their own call; the HPACK decoder is
+%% the connection's, so every HEADERS block is decoded in order.
+h2_response(Sock, StreamId) ->
+    {Buf, Dec, Streams} = get({h2, Sock}),
+    case Streams of
+        #{StreamId := {done, Status, Headers, Body}} ->
+            _ = put({h2, Sock}, {Buf, Dec, maps:remove(StreamId, Streams)}),
+            {Status, Headers, Body};
+        #{} ->
+            case roadrunner_http2_frame:parse(Buf, 16384) of
+                {ok, Frame, Rest} ->
+                    {Dec1, Streams1} = h2_frame(Frame, Dec, Streams),
+                    _ = put({h2, Sock}, {Rest, Dec1, Streams1}),
+                    h2_response(Sock, StreamId);
+                _More ->
+                    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+                    _ = put({h2, Sock}, {<<Buf/binary, Data/binary>>, Dec, Streams}),
+                    h2_response(Sock, StreamId)
+            end
+    end.
+
+h2_frame({headers, Id, Flags, _Priority, Block}, Dec, Streams) ->
+    {ok, Headers, Dec1} = roadrunner_http2_hpack:decode(Block, Dec),
+    {_, Status} = lists:keyfind(~":status", 1, Headers),
+    {Dec1, h2_part(Id, Flags, {binary_to_integer(Status), Headers, <<>>}, Streams)};
+h2_frame({data, Id, Flags, Data, _FlowLen}, Dec, Streams) ->
+    #{Id := {open, Status, Headers, Body}} = Streams,
+    {Dec, h2_part(Id, Flags, {Status, Headers, <<Body/binary, Data/binary>>}, Streams)};
+h2_frame(_Other, Dec, Streams) ->
+    {Dec, Streams}.
+
+h2_part(Id, Flags, {Status, Headers, Body}, Streams) when Flags band 16#01 =:= 16#01 ->
+    Streams#{Id => {done, Status, Headers, Body}};
+h2_part(Id, _Flags, {Status, Headers, Body}, Streams) ->
+    Streams#{Id => {open, Status, Headers, Body}}.
+
+h3_connect(Config) ->
+    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, ?config(port, Config)),
+    Conn.
+
+h3_close(Conn) ->
+    _ = roadrunner_quic_test_h3:close(Conn),
+    ok.
+
+h3_get(Conn, Path) ->
+    roadrunner_quic_test_h3:open_request(Conn, [
+        {~":method", ~"GET"},
+        {~":scheme", ~"https"},
+        {~":authority", ~"localhost"},
+        {~":path", Path}
+    ]).
 
 connect(Config) ->
     {ok, Sock} = gen_tcp:connect(
