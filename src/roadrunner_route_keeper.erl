@@ -37,24 +37,29 @@
 %% never added by anyone but the keeper serving the table, so a restart
 %% cannot let in more than the ceiling while the old holders still run.
 %%
+%% A route a reload dropped drains: its keeper goes on serving the requests
+%% it counts and any still routed by the old table, and stops in the step
+%% it finds nothing running or waiting, so nothing is granted after that.
+%% The listener then deletes the table, or, when a reload brought the route
+%% back meanwhile, starts a new keeper on it.
+%%
 %% `counts` holds the ceiling and the queue depth the listener configured
 %% (both updated in place by `reload_routes/2`, so a new ceiling applies
 %% to the requests already counted), the number of requests waiting, and
 %% the cumulative number refused.
 
 -export([
-    new/4,
+    new/3,
     start_link/3,
     configure/3,
     set_draining/2,
     ceiling/4,
     stats/1,
-    queued/1,
     acquire/1,
     acquire/3,
     release/2
 ]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+-export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2]).
 -export_type([ceiling/0, table/0, token/0, wait/0]).
 
 %% The `counts` cells.
@@ -89,11 +94,10 @@
 }).
 
 -record(state, {
-    listener :: pid(),
     slots :: table(),
     counts :: atomics:atomics_ref(),
-    %% Set once the route left the table: the keeper tells the listener
-    %% when nothing is running or waiting any more.
+    %% Set once the route left the table: the keeper stops when nothing is
+    %% running or waiting any more.
     draining :: boolean(),
     %% Waiting tokens in arrival order. One that stopped waiting (served,
     %% expired, gone) leaves `waiters` but stays here until a pop reaches
@@ -110,21 +114,20 @@
 
 %% A route's slot table and counts, made in (and owned by) the listener so
 %% they outlive any one keeper.
--spec new(pos_integer(), pos_integer(), boolean(), pid()) ->
-    {pid(), table(), atomics:atomics_ref()}.
-new(Max, MaxQueued, Draining, Listener) ->
+-spec new(pos_integer(), pos_integer(), boolean()) -> {pid(), table(), atomics:atomics_ref()}.
+new(Max, MaxQueued, Draining) ->
     Slots = ets:new(roadrunner_route_slots, [set, public, {read_concurrency, true}]),
     Counts = atomics:new(4, [{signed, false}]),
     ok = atomics:put(Counts, ?MAX, Max),
     ok = atomics:put(Counts, ?MAX_QUEUED, MaxQueued),
-    {ok, Pid} = start_link(Slots, Counts, {Draining, Listener}),
+    {ok, Pid} = start_link(Slots, Counts, Draining),
     {Pid, Slots, Counts}.
 
-%% Start a keeper on a route's table, the first or one taking over from a
-%% keeper that died.
--spec start_link(table(), atomics:atomics_ref(), {boolean(), pid()}) -> {ok, pid()}.
-start_link(Slots, Counts, {Draining, Listener}) ->
-    gen_server:start_link(?MODULE, {Slots, Counts, Draining, Listener}, []).
+%% Start a keeper on a route's table, linked to the caller (the listener):
+%% the first, or one taking over from a keeper that died or drained.
+-spec start_link(table(), atomics:atomics_ref(), boolean()) -> {ok, pid()}.
+start_link(Slots, Counts, Draining) ->
+    gen_server:start_link(?MODULE, {Slots, Counts, Draining}, []).
 
 %% A new ceiling and queue depth, from a reload. They apply at once, to the
 %% requests already counted too; a raised ceiling hands its slots to the
@@ -173,11 +176,6 @@ stats({Slots, Counts}) ->
         queued => atomics:get(Counts, ?QUEUED),
         throttled => atomics:get(Counts, ?THROTTLED)
     }.
-
-%% How many requests wait for a slot now.
--spec queued(atomics:atomics_ref()) -> non_neg_integer().
-queued(Counts) ->
-    atomics:get(Counts, ?QUEUED).
 
 %% --- request side ---
 
@@ -286,19 +284,29 @@ refuse(#ceiling{counts = Counts, retry_after = RetryAfter, listener = Listener})
 
 %% --- keeper ---
 
--spec init({table(), atomics:atomics_ref(), boolean(), pid()}) -> {ok, #state{}}.
-init({Slots, Counts, Draining, Listener}) ->
+-spec init({table(), atomics:atomics_ref(), boolean()}) ->
+    {ok, #state{}} | {ok, #state{}, {continue, drained}}.
+init({Slots, Counts, Draining}) ->
     %% Whatever waited for a keeper before this one was refused when it went.
     ok = atomics:put(Counts, ?QUEUED, 0),
     %% A keeper taking over watches every holder the table still has.
     Holders = ets:select(Slots, [{{'$1', '$2'}, [{is_reference, '$1'}], [{{'$1', '$2'}}]}]),
     State = lists:foldl(
         fun({Token, Pid}, Acc) -> watch_holder(Token, erlang:monitor(process, Pid), Acc) end,
-        #state{listener = Listener, slots = Slots, counts = Counts, draining = Draining},
+        #state{slots = Slots, counts = Counts, draining = Draining},
         Holders
     ),
     true = ets:insert(Slots, {keeper, self()}),
-    {ok, drained(State)}.
+    case Draining of
+        %% Taking over a route already dropped: it may have drained.
+        true -> {ok, State, {continue, drained}};
+        false -> {ok, State}
+    end.
+
+-spec handle_continue(drained, #state{}) ->
+    {noreply, #state{}} | {stop, {shutdown, drained}, #state{}}.
+handle_continue(drained, State) ->
+    noreply(State).
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, {error, unknown_call}, #state{}}.
 handle_call(_Request, _From, State) ->
@@ -308,7 +316,8 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
--spec handle_info(term(), #state{}) -> {noreply, #state{}}.
+-spec handle_info(term(), #state{}) ->
+    {noreply, #state{}} | {stop, {shutdown, drained}, #state{}}.
 handle_info({acquire, Token, Pid, Wait}, State0) ->
     %% The requests already waiting go first.
     State = serve(State0),
@@ -323,18 +332,18 @@ handle_info({done, Token}, #state{holders = Holders, monitors = Monitors} = Stat
             State1 = State#state{
                 holders = maps:remove(Token, Holders), monitors = maps:remove(Mon, Monitors)
             },
-            {noreply, drained(serve(State1))};
+            noreply(serve(State1));
         #{} ->
             %% A row this keeper does not watch went (a request that saw the
             %% keeper before this one go): its slot may be free.
-            {noreply, drained(serve(State))}
+            noreply(serve(State))
     end;
 handle_info({expire, Token}, #state{waiters = Waiters} = State) ->
     case Waiters of
         #{Token := #waiter{monitor = Mon}} ->
             _ = erlang:send(Token, {Token, refused}),
             true = erlang:demonitor(Mon, [flush]),
-            {noreply, drained(forget_waiter(Token, Mon, State))};
+            noreply(forget_waiter(Token, Mon, State));
         #{} ->
             {noreply, State}
     end;
@@ -348,18 +357,18 @@ handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{monitors = Monitors} =
                 holders = maps:remove(Token, State#state.holders),
                 monitors = maps:remove(Mon, Monitors)
             },
-            {noreply, drained(serve(State1))};
+            noreply(serve(State1));
         #{Mon := {waiter, Token}} ->
             #{Token := #waiter{timer = Timer}} = State#state.waiters,
             _ = erlang:cancel_timer(Timer),
-            {noreply, drained(forget_waiter(Token, Mon, State))};
+            noreply(forget_waiter(Token, Mon, State));
         #{} ->
             {noreply, State}
     end;
 handle_info(serve, State) ->
     {noreply, serve(State)};
 handle_info({draining, Draining}, State) ->
-    {noreply, drained(State#state{draining = Draining})};
+    noreply(State#state{draining = Draining});
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -437,16 +446,18 @@ forget_waiter(Token, Mon, #state{waiters = Waiters, monitors = Monitors, counts 
     ok = atomics:sub(Counts, ?QUEUED, 1),
     State#state{waiters = maps:remove(Token, Waiters), monitors = maps:remove(Mon, Monitors)}.
 
-%% A draining keeper with nothing running or waiting tells its listener,
-%% which stops it.
--spec drained(#state{}) -> #state{}.
-drained(#state{draining = true, slots = Slots, waiters = Waiters, listener = Listener} = State) when
+%% A draining keeper with nothing running or waiting stops, in the same
+%% step it finds so: no request is let in after that. The listener deletes
+%% the table on its exit (`{shutdown, drained}`), or starts a new keeper on
+%% it when a reload brought the route back meanwhile. A request still
+%% asking sees the keeper go and is refused.
+-spec noreply(#state{}) -> {noreply, #state{}} | {stop, {shutdown, drained}, #state{}}.
+noreply(#state{draining = true, slots = Slots, waiters = Waiters} = State) when
     map_size(Waiters) =:= 0
 ->
     case ets:info(Slots, size) of
-        1 -> _ = erlang:send(Listener, {route_keeper_drained, self()});
-        _Busy -> ok
-    end,
-    State;
-drained(State) ->
-    State.
+        1 -> {stop, {shutdown, drained}, State};
+        _Busy -> {noreply, State}
+    end;
+noreply(State) ->
+    {noreply, State}.

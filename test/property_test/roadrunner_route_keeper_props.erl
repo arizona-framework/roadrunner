@@ -10,7 +10,8 @@ connection going while it waits, keeper crashes
 (plain, with a release and a request landing while no keeper runs, and
 in the middle of a grant), reloads changing the ceiling and queue depth,
 reloads that move the route to a new key, drop and re-add it while its
-keeper is behind, or fail, and a listener stop with requests in flight.
+keeper is behind, drop it as a request still routed by the old table asks,
+or fail, and a listener stop with requests in flight.
 After each the system is let settle and checked against the model, table
 by table (a route moved to a new key keeps its old table until it drains):
 
@@ -28,6 +29,8 @@ by table (a route moved to a new key keeps its old table until it drains):
 - no request waits past its timeout, and a long wait is never dropped
   except by a keeper crash or the listener stopping (a drained notice that
   reaches the listener while a request still waits does not stop it);
+- a dropped route's keeper grants nothing once it has found the route
+  drained, and its count goes only after that;
 - a request to a route without a ceiling is answered whatever the capped
   route is doing.
 
@@ -86,7 +89,8 @@ op() ->
         {1, half_grant},
         {1, {reload, integer(1, 4), integer(1, 4)}},
         {1, rekey},
-        {1, stale_drain},
+        {1, drop_and_bring_back},
+        {1, straggler_at_drain},
         {1, drained_before_waiter},
         {1, {conn_gone, nat()}},
         {1, failed_reload},
@@ -282,10 +286,11 @@ step(rekey, #model{methods = Methods} = Model) ->
         end,
     ok = reload(Model1),
     settle(recap(Model1));
-step(stale_drain, Model) ->
-    %% The route is dropped while its keeper is behind and empty, brought
-    %% back, a request takes a slot, and it is dropped again before the
-    %% listener reads the keeper's drained notice: the notice is stale.
+step(drop_and_bring_back, Model) ->
+    %% The route is dropped and brought back while its keeper is behind and
+    %% has nothing running: the keeper finds the route drained and stops, a
+    %% request asking meanwhile is refused, and the listener, which has the
+    %% route back, starts a new keeper on the same count.
     case pick(running, Model) ++ pick(parked, Model) of
         [_ | _] ->
             Model;
@@ -295,29 +300,48 @@ step(stale_drain, Model) ->
             ok = sys:suspend(Keeper),
             ok = roadrunner_listener:reload_routes(?LISTENER, Plain),
             ok = reload(Model),
-            {Holder, Model1} = request(shed, Model),
-            ok = sys:suspend(?LISTENER),
-            Self = self(),
-            _ = spawn(fun() ->
-                Self ! {dropped, roadrunner_listener:reload_routes(?LISTENER, Plain)}
-            end),
-            ok = await_queue(whereis(?LISTENER), 1),
+            {Asker, Model1} = request(shed, Model),
+            _ = await_mailbox(Keeper, Asker),
             ok = sys:resume(Keeper),
-            Model2 = apply_result(receive_result(Holder), Model1),
-            %% The drained notice is behind the drop now.
-            ok = await_queue(whereis(?LISTENER), 2),
-            ok = sys:resume(?LISTENER),
-            receive
-                {dropped, ok} -> ok
+            Model2 = apply_result(receive_result(Asker), Model1),
+            ok = await_new_keeper(Keeper),
+            settle(Model2)
+    end;
+step(straggler_at_drain, Model) ->
+    %% A request still routed by the old table asks for a slot just as the
+    %% route, dropped by a reload, drains. Its keeper finds the route drained
+    %% and stops in that step, so the request is refused rather than let in
+    %% to run on a count the listener then deletes. A keeper that reported
+    %% the drain and served on until the listener stopped it could let it in
+    %% once the listener had found the route empty; that window is too short
+    %% to reach, so this checks what closes it: nothing is granted after the
+    %% keeper finds the route drained.
+    case pick(running, Model) ++ pick(parked, Model) of
+        [_ | _] ->
+            Model;
+        [] ->
+            Keeper = keeper(),
+            {Slots, _Counts} = Old = route_counts(),
+            Plain = [{~"/cheap", roadrunner_hello_handler}],
+            ok = sys:suspend(Keeper),
+            ok = roadrunner_listener:reload_routes(?LISTENER, Plain),
+            {Straggler, Model1} = request_on(Old, shed, Model),
+            _ = await_mailbox(Keeper, Straggler),
+            ok = sys:resume(Keeper),
+            case receive_result(Straggler) of
+                {Straggler, {refused, _}} -> ok;
+                {Straggler, Granted} -> error({granted_after_drain, Granted})
             end,
+            Model2 = set_status(Straggler, gone, Model1),
+            ok = await_deleted(Slots),
             ok = reload(Model2),
             settle(Model2)
     end;
 step(drained_before_waiter, Model) ->
     %% The route is dropped while one request runs and one waits. The
-    %% runner releases while the keeper is behind, so the table is empty but
-    %% the waiter not yet served when a drained notice (one from an earlier
-    %% drain, say) reaches the listener: the keeper must stay.
+    %% runner releases while the keeper is behind, so the table empties with
+    %% a request still waiting: the keeper hands it the slot rather than
+    %% stopping.
     Long = [P || P <- pick(parked, Model), mode(P, Model) =/= short],
     case {pick(running, Model), Long, length(tables(Model))} of
         {[Holder], [_ | _], 1} ->
@@ -331,11 +355,10 @@ step(drained_before_waiter, Model) ->
             receive
                 {'DOWN', Mon, process, Holder, _} -> ok
             end,
-            whereis(?LISTENER) ! {route_keeper_drained, Keeper},
-            _ = sys:get_state(?LISTENER),
+            ok = sys:resume(Keeper),
+            _ = sys:get_state(Keeper),
             is_process_alive(Keeper) orelse
                 error({keeper_stopped_with_waiters, Long}),
-            ok = sys:resume(Keeper),
             ok = reload(Model1),
             settle(Model1);
         _ ->
@@ -409,8 +432,11 @@ recap(#model{caps = Caps} = Model) ->
 %% A process asking for a slot as a connection or a stream worker does, on
 %% the route's table now.
 request(Mode, Model) ->
+    request_on(route_counts(), Mode, Model).
+
+%% The same on `Table`, one the route may no longer have.
+request_on({Slots, Counts} = Table, Mode, Model) ->
     Driver = self(),
-    {Slots, Counts} = Table = route_counts(),
     Ceiling = roadrunner_route_keeper:ceiling(Slots, Counts, wait(Mode), ?LISTENER),
     Conn =
         case Mode of
@@ -473,7 +499,7 @@ await_asked(Pid, Model, Tries) ->
         {client, Pid, Result} -> apply_result({Pid, Result}, Model)
     after 0 ->
         #client{table = {Slots, _}} = client(Pid, Model),
-        case lists:member(Pid, element(1, keeper_view(Slots))) of
+        case lists:member(Pid, waiting(Slots)) of
             true ->
                 set_status(Pid, parked, Model);
             false ->
@@ -558,7 +584,7 @@ tables(Model) ->
     ]).
 
 %% One table as its keeper and rows have it now.
-view({Slots, Counts} = Table, Model) ->
+view({Slots, _Counts} = Table, Model) ->
     Live = [P || P <- pick(running, Model) ++ pick(parked, Model), table(P, Model) =:= Table],
     case ets:info(Slots, size) of
         undefined when Live =/= [] ->
@@ -566,22 +592,30 @@ view({Slots, Counts} = Table, Model) ->
         undefined ->
             {Table, gone};
         _ ->
-            {Waiting, Watched, Queued} = keeper_view(Slots),
-            Running = [P || P <- pick(running, Model), table(P, Model) =:= Table],
-            Parked = [P || P <- pick(parked, Model), table(P, Model) =:= Table],
-            {Table, #{
-                answering => [P || P <- Parked, not lists:member(P, Waiting)],
-                waiting => Waiting,
-                watched => Watched,
-                queued => Queued,
-                holding => lists:sort(holders(Slots)),
-                running => lists:sort(Running),
-                max => atomics:get(Counts, 1)
-            }}
+            view(Table, Model, keeper_view(Slots))
     end.
+
+%% A table whose keeper has gone is changing hands: it is about to be
+%% deleted (its route drained) or served by a new keeper.
+view(Table, _Model, changing) ->
+    {Table, changing};
+view({Slots, Counts} = Table, Model, {Waiting, Watched, Queued}) ->
+    Running = [P || P <- pick(running, Model), table(P, Model) =:= Table],
+    Parked = [P || P <- pick(parked, Model), table(P, Model) =:= Table],
+    {Table, #{
+        answering => [P || P <- Parked, not lists:member(P, Waiting)],
+        waiting => Waiting,
+        watched => Watched,
+        queued => Queued,
+        holding => lists:sort(holders(Slots)),
+        running => lists:sort(Running),
+        max => atomics:get(Counts, 1)
+    }}.
 
 quiet(gone) ->
     true;
+quiet(changing) ->
+    false;
 quiet(#{watched := Watched, holding := Holding, running := Running}) ->
     Watched =:= length(Holding) andalso Holding =:= Running.
 
@@ -613,6 +647,8 @@ diagnose_view(#{watched := Watched, holding := Holding, running := Running}) whe
     {keeper_watches_freed_slots, Watched, Holding, Running};
 diagnose_view(#{holding := Holding, running := Running}) when Holding =/= Running ->
     {slots_not_matching_requests, #{rows => Holding, running => Running}};
+diagnose_view(changing) ->
+    keeper_gone_with_its_table;
 diagnose_view(V) ->
     {unexplained, V}.
 
@@ -710,14 +746,27 @@ keeper_view(Slots) ->
     Keeper = ets:lookup_element(Slots, keeper, 2),
     Self = self(),
     Ref = make_ref(),
-    _ = sys:replace_state(Keeper, fun(State) ->
-        Self !
-            {Ref, [element(2, W) || W <- maps:values(element(7, State))],
-                map_size(element(9, State)), atomics:get(element(4, State), 3)},
-        State
-    end),
-    receive
-        {Ref, Waiting, Watched, Queued} -> {Waiting, Watched, Queued}
+    try
+        sys:replace_state(Keeper, fun(State) ->
+            Self !
+                {Ref, [element(2, W) || W <- maps:values(element(6, State))],
+                    map_size(element(8, State)), atomics:get(element(3, State), 3)},
+            State
+        end)
+    of
+        _ ->
+            receive
+                {Ref, Waiting, Watched, Queued} -> {Waiting, Watched, Queued}
+            end
+    catch
+        exit:{noproc, _} -> changing
+    end.
+
+%% The requests `Slots`' keeper has waiting (none while it changes hands).
+waiting(Slots) ->
+    case keeper_view(Slots) of
+        changing -> [];
+        {Waiting, _Watched, _Queued} -> Waiting
     end.
 
 holders(Slots) ->
@@ -752,14 +801,19 @@ await_mailbox(Keeper, Pid) ->
             await_mailbox(Keeper, Pid)
     end.
 
-%% Until `Pid` has `N` messages waiting.
-await_queue(Pid, N) ->
-    case erlang:process_info(Pid, message_queue_len) of
-        {message_queue_len, Len} when Len >= N ->
+%% Until the listener has deleted a slot table.
+await_deleted(Slots) ->
+    await_deleted(Slots, 1000000).
+
+await_deleted(Slots, 0) ->
+    error({table_kept, Slots});
+await_deleted(Slots, Tries) ->
+    case ets:info(Slots, size) of
+        undefined ->
             ok;
         _ ->
             erlang:yield(),
-            await_queue(Pid, N)
+            await_deleted(Slots, Tries - 1)
     end.
 
 %% --- model helpers ---

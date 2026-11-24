@@ -28,7 +28,8 @@ listener that owns the table and restarts the keeper.
     keeper_gone_tells_the_next_keeper/1,
     raised_ceiling_serves_the_queue/1,
     lowered_ceiling_holds_new_requests/1,
-    draining_keeper_reports_when_empty/1,
+    draining_keeper_stops_when_empty/1,
+    keeper_taking_over_a_drained_route_stops/1,
     keeper_crash_keeps_the_holders/1,
     keeper_crash_refuses_the_waiters/1,
     keeper_gone_before_its_answer_frees_the_row/1,
@@ -56,7 +57,8 @@ all() ->
         keeper_gone_tells_the_next_keeper,
         raised_ceiling_serves_the_queue,
         lowered_ceiling_holds_new_requests,
-        draining_keeper_reports_when_empty,
+        draining_keeper_stops_when_empty,
+        keeper_taking_over_a_drained_route_stops,
         keeper_crash_keeps_the_holders,
         keeper_crash_refuses_the_waiters,
         keeper_gone_before_its_answer_frees_the_row,
@@ -288,14 +290,14 @@ keeper_gone_tells_the_next_keeper(_Config) ->
     true = erlang:suspend_process(Asker),
     exit(Keeper, kill),
     {'EXIT', Keeper, killed} = receive_exit(Keeper),
-    {ok, Next} = roadrunner_route_keeper:start_link(slots(C), element(3, C), {false, self()}),
+    {ok, Next} = roadrunner_route_keeper:start_link(slots(C), element(3, C), false),
     Waiter = parked(Next, C),
     true = erlang:resume_process(Asker),
     ?assertEqual({refused, 1}, result(Asker)),
     {ok, _} = result(Waiter),
     ?assertMatch(#{in_flight := 1, queued := 0}, stats(C)),
     %% And the new keeper no longer watches the asker.
-    ?assertEqual(1, map_size(element(9, sys:get_state(Next)))),
+    ?assertEqual(1, map_size(element(8, sys:get_state(Next)))),
     ok = stop_keeper(Next).
 
 %% --- reloads ---
@@ -324,22 +326,43 @@ lowered_ceiling_holds_new_requests(_Config) ->
     {ok, _} = result(holder(C)),
     ok = stop_keeper(Keeper).
 
-draining_keeper_reports_when_empty(_Config) ->
+draining_keeper_stops_when_empty(_Config) ->
+    %% Draining, the keeper stops in the step it finds nothing running or
+    %% waiting; one whose route came back before that stays.
     {Keeper, C} = route(1, shed),
     Holder = holder(C),
     {ok, _} = result(Holder),
     ok = roadrunner_route_keeper:set_draining(Keeper, true),
-    _ = sys:get_state(Keeper),
-    ok = release(Holder),
-    receive
-        {route_keeper_drained, Keeper} -> ok
-    after 5000 -> ct:fail(never_drained)
-    end,
-    %% Brought back, it stays.
     ok = roadrunner_route_keeper:set_draining(Keeper, false),
+    ok = release(Holder),
     _ = sys:get_state(Keeper),
-    ?assertEqual(none, drained_message()),
-    ok = stop_keeper(Keeper).
+    ?assert(is_process_alive(Keeper)),
+    Next = holder(C),
+    {ok, _} = result(Next),
+    ok = roadrunner_route_keeper:set_draining(Keeper, true),
+    _ = sys:get_state(Keeper),
+    ?assert(is_process_alive(Keeper)),
+    ok = release(Next),
+    ?assertEqual({'EXIT', Keeper, {shutdown, drained}}, receive_exit(Keeper)),
+    %% It answers nothing after that: a request still asking is refused.
+    ?assertEqual({refused, 3}, result(holder(C))).
+
+keeper_taking_over_a_drained_route_stops(_Config) ->
+    %% A keeper started on a dropped route stops at once when nothing runs,
+    %% and serves until the last request ends otherwise.
+    {Keeper, C} = route(1, shed),
+    ok = stop_keeper(Keeper),
+    {ok, Idle} = roadrunner_route_keeper:start_link(slots(C), element(3, C), true),
+    ?assertEqual({'EXIT', Idle, {shutdown, drained}}, receive_exit(Idle)),
+    {ok, Serving} = roadrunner_route_keeper:start_link(slots(C), element(3, C), false),
+    Holder = holder(C),
+    {ok, _} = result(Holder),
+    ok = stop_keeper(Serving),
+    {ok, Draining} = roadrunner_route_keeper:start_link(slots(C), element(3, C), true),
+    _ = sys:get_state(Draining),
+    ?assert(is_process_alive(Draining)),
+    ok = release(Holder),
+    ?assertEqual({'EXIT', Draining, {shutdown, drained}}, receive_exit(Draining)).
 
 %% --- the keeper crashes ---
 
@@ -354,7 +377,7 @@ keeper_crash_keeps_the_holders(_Config) ->
     {ok, _} = result(B),
     exit(Keeper, kill),
     {'EXIT', Keeper, killed} = receive_exit(Keeper),
-    {ok, NewKeeper} = roadrunner_route_keeper:start_link(slots(C), element(3, C), {false, self()}),
+    {ok, NewKeeper} = roadrunner_route_keeper:start_link(slots(C), element(3, C), false),
     ?assertMatch(#{in_flight := 2, queued := 0}, stats(C)),
     Waiter = parked(NewKeeper, C),
     %% A killed holder and a released one: each frees its slot once.
@@ -371,7 +394,7 @@ keeper_crash_refuses_the_waiters(_Config) ->
     exit(Keeper, kill),
     ?assertEqual({refused, 1}, result(Waiter)),
     {'EXIT', Keeper, killed} = receive_exit(Keeper),
-    {ok, NewKeeper} = roadrunner_route_keeper:start_link(slots(C), element(3, C), {false, self()}),
+    {ok, NewKeeper} = roadrunner_route_keeper:start_link(slots(C), element(3, C), false),
     ?assertMatch(#{in_flight := 1, queued := 0, throttled := 1}, stats(C)),
     ok = stop_keeper(NewKeeper).
 
@@ -442,7 +465,7 @@ route(Max, Wait) ->
             shed -> {{shed, #{retry_after => 3}}, 0};
             {queue, Timeout, Queued} -> {{queue, #{timeout => Timeout}}, Queued}
         end,
-    {Keeper, Slots, Counts} = roadrunner_route_keeper:new(Max, MaxQueued, false, self()),
+    {Keeper, Slots, Counts} = roadrunner_route_keeper:new(Max, MaxQueued, false),
     {Keeper, roadrunner_route_keeper:ceiling(Slots, Counts, Mode, ?MODULE)}.
 
 slots(Ceiling) ->
@@ -490,7 +513,7 @@ wait_parked(_Keeper, N, 0) ->
     ct:fail({never_parked, N});
 wait_parked(Keeper, N, Tries) ->
     State = sys:get_state(Keeper),
-    case map_size(element(7, State)) of
+    case map_size(element(6, State)) of
         N ->
             ok;
         _ ->
@@ -548,10 +571,4 @@ receive_exit(Pid) ->
     receive
         {'EXIT', Pid, _} = Exit -> Exit
     after 5000 -> ct:fail({no_exit, Pid})
-    end.
-
-drained_message() ->
-    receive
-        {route_keeper_drained, _} = Msg -> Msg
-    after 0 -> none
     end.
