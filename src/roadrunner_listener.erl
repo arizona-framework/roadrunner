@@ -3828,8 +3828,15 @@ handle_info({route_keeper_drained, Pid}, #state{route_keepers = Keepers} = State
     case route_keeper_key(Pid, Keepers) of
         {ok, Key} ->
             case Keepers of
-                #{Key := #route_keeper{draining = true}} ->
-                    {noreply, stop_route_keepers([Key], State)};
+                #{Key := #route_keeper{draining = true, slots = Slots}} ->
+                    %% The notice can be older than the table: a reload
+                    %% brought the route back and dropped it again since,
+                    %% and a request took a slot in between. Only a table
+                    %% holding nothing but its keeper's row is done.
+                    case ets:info(Slots, size) of
+                        1 -> {noreply, stop_route_keepers([Key], State)};
+                        _Busy -> {noreply, State}
+                    end;
                 #{} ->
                     {noreply, State}
             end;

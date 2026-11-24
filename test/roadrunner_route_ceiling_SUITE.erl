@@ -19,6 +19,7 @@ A route's own `max_concurrent_requests` and `overload_mode` in a listener.
     dropped_route_drains_then_goes/1,
     route_brought_back_keeps_its_count/1,
     route_dropped_twice_keeps_draining/1,
+    stale_drained_notice_keeps_a_busy_keeper/1,
     reload_adds_a_route_ceiling/1,
     failed_reload_stops_the_new_keepers/1,
     keeper_crash_is_taken_over_by_a_new_keeper/1,
@@ -38,6 +39,7 @@ all() ->
         dropped_route_drains_then_goes,
         route_brought_back_keeps_its_count,
         route_dropped_twice_keeps_draining,
+        stale_drained_notice_keeps_a_busy_keeper,
         reload_adds_a_route_ceiling,
         failed_reload_stops_the_new_keepers,
         keeper_crash_is_taken_over_by_a_new_keeper,
@@ -234,6 +236,30 @@ route_dropped_twice_keeps_draining(_Config) ->
     ok = roadrunner_listener:reload_routes(Name, Plain),
     ok = roadrunner_listener:reload_routes(Name, Plain),
     ?assert(is_process_alive(Keeper)),
+    ok = release(A),
+    receive
+        {'DOWN', Mon, process, Keeper, _} -> ok
+    after 5000 -> ct:fail(keeper_kept)
+    end,
+    ok = roadrunner_listener:stop(Name).
+
+stale_drained_notice_keeps_a_busy_keeper(_Config) ->
+    %% A drained notice sent before a reload brought the route back, read
+    %% after it was dropped again while a request holds a slot: the keeper
+    %% stays for that request, and goes once it ends.
+    Name = ?FUNCTION_NAME,
+    {ok, _} = roadrunner_listener:start_link(Name, #{port => 0, routes => [capped(~"/a", 1)]}),
+    A = holder(Name, ~"GET", ~"/a"),
+    {ok, _} = result(A),
+    Keeper = keeper(Name, ~"/a"),
+    Plain = [{~"/plain", roadrunner_hello_handler}],
+    ok = roadrunner_listener:reload_routes(Name, Plain),
+    ok = roadrunner_listener:reload_routes(Name, [capped(~"/a", 1)]),
+    ok = roadrunner_listener:reload_routes(Name, Plain),
+    whereis(Name) ! {route_keeper_drained, Keeper},
+    _ = sys:get_state(Name),
+    ?assert(is_process_alive(Keeper)),
+    Mon = monitor(process, Keeper),
     ok = release(A),
     receive
         {'DOWN', Mon, process, Keeper, _} -> ok
