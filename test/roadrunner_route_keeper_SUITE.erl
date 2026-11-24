@@ -79,7 +79,8 @@ watching a dead owner's workers before taking its registration.
     scan_under_half_keeps_releases_quiet/1,
     gone_table_refuses_and_releases/1,
     unknown_messages_are_ignored/1,
-    idle_keeper_hibernates/1
+    idle_keeper_hibernates/1,
+    idle_connections_gone_leave_no_keys/1
 ]).
 
 suite() ->
@@ -141,7 +142,8 @@ all() ->
         scan_under_half_keeps_releases_quiet,
         gone_table_refuses_and_releases,
         unknown_messages_are_ignored,
-        idle_keeper_hibernates
+        idle_keeper_hibernates,
+        idle_connections_gone_leave_no_keys
     ].
 
 init_per_suite(Config) ->
@@ -1109,7 +1111,46 @@ idle_keeper_hibernates(_Config) ->
     ok = wait_heap_below(Keeper, Grown div 4, erlang:monotonic_time(millisecond) + 10000),
     ok = stop_keeper(Keeper).
 
+idle_connections_gone_leave_no_keys(_Config) ->
+    %% Five hundred connections took a slot through the keeper and went
+    %% idle, then all close. Their homes held no row, so the keeper keeps
+    %% none of those keys for later grants: once it has looked again for
+    %% late intents, it holds no more than a keeper that never served one.
+    {Fresh, _} = route(1000, shed),
+    {Keeper, C} = route(1000, shed),
+    Conns = [holder(C) || _ <- lists:seq(1, 500)],
+    lists:foreach(
+        fun(Conn) ->
+            {ok, _} = result(Conn),
+            ok = release(Conn)
+        end,
+        Conns
+    ),
+    lists:foreach(fun(Conn) -> exit(Conn, kill) end, Conns),
+    ok = wait_registered(C, 0),
+    Keeper ! sweep,
+    ?assertEqual(
+        erts_debug:flat_size(sys:get_state(Fresh)), erts_debug:flat_size(sys:get_state(Keeper))
+    ),
+    ok = stop_keeper(Fresh),
+    ok = stop_keeper(Keeper).
+
 %% --- helpers ---
+
+%% Until the keeper has `N` connections registered.
+wait_registered(Ceiling, N) ->
+    wait_registered(Ceiling, N, 1000000).
+
+wait_registered(_Ceiling, N, 0) ->
+    ct:fail({registered_never, N});
+wait_registered(Ceiling, N, Tries) ->
+    case ets:info(regs(Ceiling), size) - 1 of
+        N ->
+            ok;
+        _ ->
+            erlang:yield(),
+            wait_registered(Ceiling, N, Tries - 1)
+    end.
 
 %% Until `Pid`'s heap is under `Words`, or `Deadline` (ms) passes.
 wait_heap_below(Pid, Words, Deadline) ->

@@ -45,9 +45,11 @@
 %%   finds a worker's intent, or the worker finds the registration gone
 %%   before its row exists. A worker killed between its intent and backing
 %%   off leaves only the intent, which the keeper looks for again a second
-%%   later. A worker at a route half full or more, or one whose owner is
-%%   not registered, asks the keeper, which grants it a key and watches it:
-%%   the worker's exit, however it comes, frees the slot.
+%%   later; one stalled for longer than that before it died leaves the
+%%   intent, a few words and never a slot, until a keeper takes over or the
+%%   route's tables go. A worker at a route half full or more, or one whose
+%%   owner is not registered, asks the keeper, which grants it a key and
+%%   watches it: the worker's exit, however it comes, frees the slot.
 %%
 %% The gate, in the `'$keeper'` row of `regs`, sends every request to the
 %% keeper while requests wait for a slot (so a new request queues behind
@@ -971,13 +973,22 @@ adopted(Worker, Row, Watched) ->
 -spec free_rows([row()], #state{}) -> #state{}.
 free_rows([], State) ->
     State;
-free_rows([{K, Pid, Pid} = Row | Rows], #state{slots = Slots} = State) ->
-    true = ets:delete_object(Slots, Row),
-    free_rows(Rows, spare(K, State));
-free_rows([{K, Owner, Worker} = Row | Rows], #state{slots = Slots, intents = Intents} = State) ->
-    true = ets:delete_object(Slots, Row),
+free_rows([{_K, Pid, Pid} = Row | Rows], State) ->
+    free_rows(Rows, free_row(Row, State));
+free_rows([{K, Owner, Worker} = Row | Rows], #state{intents = Intents} = State) ->
+    State1 = free_row(Row, State),
     true = ets:delete_object(Intents, {Owner, Worker, K}),
-    free_rows(Rows, spare(K, State)).
+    free_rows(Rows, State1).
+
+%% A row goes, and its key is kept for the grants to come only when the row
+%% was there: a connection that died idle held none, and its home may be
+%% another request's by then.
+-spec free_row(row(), #state{}) -> #state{}.
+free_row({K, _Owner, _Holder} = Row, #state{slots = Slots} = State) ->
+    case ets:select_delete(Slots, [{Row, [], [true]}]) of
+        1 -> spare(K, State);
+        0 -> State
+    end.
 
 %% A key heard freed, kept for the grants to come. There are no more of
 %% them than the largest ceiling the route had.

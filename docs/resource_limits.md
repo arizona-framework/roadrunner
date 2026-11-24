@@ -814,16 +814,21 @@ show on a hot, cheap route: leave those without a ceiling and bound them
 with the listener's `max_concurrent_requests` if needed.
 
 That process keeps a small record of each connection that took a slot
-through it, for as long as the connection lives. The count itself
-is kept by the listener, so if that process crashes the listener starts a
-new one on the same count: the requests still running keep their slots,
-connections go on taking their own slots meanwhile, and only the requests
-waiting are answered `503`. `reload_routes/2` keeps the count of a route
-whose path and methods are the same in the new table, and a new ceiling
-applies at once. A route the new table drops keeps counting the requests
-it still runs until they end. A route whose path or methods change is a
-new route with a count of its own, so until its old requests end the two
-can run up to twice the ceiling between them.
+through it, for as long as the connection lives, and gives the memory back
+once it has been idle for a second. On HTTP/2 and HTTP/3, a stream killed at
+one exact point of taking its slot, as its connection dies too, can leave a
+few bytes behind, never a slot: the process removes them a second later, or,
+for a stream stalled longer than that, when the process restarts or the
+route is dropped. The count itself is kept by the listener, so if that
+process crashes the listener starts a new one on the same count: the
+requests still running keep their slots, connections go on taking their
+own slots meanwhile, and only the requests waiting are answered `503`.
+`reload_routes/2` keeps the count of a route whose path and methods are
+the same in the new table, and a new ceiling applies at once. A route the
+new table drops keeps counting the requests it still runs until they end.
+A route whose path or methods change is a new route with a count of its
+own, so until its old requests end the two can run up to twice the
+ceiling between them.
 
 `roadrunner_listener:info/1` reports each route with a ceiling under
 `routes`: its `in_flight` and `queued` requests and the `throttled` ones
