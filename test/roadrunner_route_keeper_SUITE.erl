@@ -24,6 +24,7 @@ listener that owns the table and restarts the keeper.
     reset_stops_the_wait/1,
     reset_after_a_grant_frees_the_slot/1,
     reset_waiter_times_out/1,
+    keeper_gone_tells_the_next_keeper/1,
     raised_ceiling_serves_the_queue/1,
     lowered_ceiling_holds_new_requests/1,
     draining_keeper_reports_when_empty/1,
@@ -50,6 +51,7 @@ all() ->
         reset_stops_the_wait,
         reset_after_a_grant_frees_the_slot,
         reset_waiter_times_out,
+        keeper_gone_tells_the_next_keeper,
         raised_ceiling_serves_the_queue,
         lowered_ceiling_holds_new_requests,
         draining_keeper_reports_when_empty,
@@ -246,6 +248,30 @@ reset_waiter_times_out(_Config) ->
     Waiter = spawn(fun() -> Self ! {self(), roadrunner_route_keeper:acquire(C, {reset, 7})} end),
     ?assertEqual({refused, 1}, result(Waiter)),
     ok = stop_keeper(Keeper).
+
+keeper_gone_tells_the_next_keeper(_Config) ->
+    %% The old keeper added a row and died before answering; the new one
+    %% took the row over and parked a request behind it. The asker, seeing
+    %% the old keeper gone, removes the row and tells the new keeper, which
+    %% hands the slot to the request waiting.
+    {Keeper, C} = route(1, {queue, 5000, 10}),
+    ok = sys:suspend(Keeper),
+    Asker = holder(C),
+    ok = wait_mailbox(Keeper, Asker),
+    [Token] = [T || {T, P} <- tracer_acquires(Keeper), P =:= Asker],
+    true = ets:insert(slots(C), {Token, Asker}),
+    true = erlang:suspend_process(Asker),
+    exit(Keeper, kill),
+    {'EXIT', Keeper, killed} = receive_exit(Keeper),
+    {ok, Next} = roadrunner_route_keeper:start_link(slots(C), element(3, C), {false, self()}),
+    Waiter = parked(Next, C),
+    true = erlang:resume_process(Asker),
+    ?assertEqual({refused, 1}, result(Asker)),
+    {ok, _} = result(Waiter),
+    ?assertMatch(#{in_flight := 1, queued := 0}, stats(C)),
+    %% And the new keeper no longer watches the asker.
+    ?assertEqual(1, map_size(element(9, sys:get_state(Next)))),
+    ok = stop_keeper(Next).
 
 %% --- reloads ---
 

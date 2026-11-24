@@ -178,13 +178,13 @@ stats({Slots, Counts}) ->
 %% Take a slot for the calling process, waiting in queue mode. `{refused,
 %% RetryAfter}` is counted and reported as a throttled request.
 -spec acquire(ceiling()) -> {ok, token()} | {refused, pos_integer()}.
-acquire(#ceiling{slots = Slots} = Ceiling) ->
+acquire(#ceiling{} = Ceiling) ->
     case ask(Ceiling) of
         {asked, Token} ->
             receive
                 {Token, granted} -> {ok, Token};
                 {Token, refused} -> refuse(Ceiling);
-                {'DOWN', Token, process, _Keeper, _Reason} -> keeper_gone(Slots, Token, Ceiling)
+                {'DOWN', Token, process, _Keeper, _Reason} -> keeper_gone(Token, Ceiling)
             end;
         refused ->
             refuse(Ceiling)
@@ -195,7 +195,7 @@ acquire(#ceiling{slots = Slots} = Ceiling) ->
 %% worker ends, which frees a slot granted in the meantime (the keeper
 %% monitors it).
 -spec acquire(ceiling(), term()) -> {ok, token()} | {refused, pos_integer()} | reset.
-acquire(#ceiling{slots = Slots} = Ceiling, Reset) ->
+acquire(#ceiling{} = Ceiling, Reset) ->
     case ask(Ceiling) of
         {asked, Token} ->
             receive
@@ -204,7 +204,7 @@ acquire(#ceiling{slots = Slots} = Ceiling, Reset) ->
                 {Token, refused} ->
                     refuse(Ceiling);
                 {'DOWN', Token, process, _Keeper, _Reason} ->
-                    keeper_gone(Slots, Token, Ceiling);
+                    keeper_gone(Token, Ceiling);
                 Reset ->
                     true = erlang:demonitor(Token, [flush]),
                     reset
@@ -258,14 +258,12 @@ full(Rows, Counts, _Timeout) ->
 
 %% The keeper died before it answered. It may have added the caller's row
 %% first, so the row goes, or the slot would stay taken by a request that
-%% never ran.
--spec keeper_gone(table(), token(), ceiling()) -> {refused, pos_integer()}.
-keeper_gone(Slots, Token, Ceiling) ->
-    try ets:delete(Slots, Token) of
-        true -> refuse(Ceiling)
-    catch
-        error:badarg -> refuse(Ceiling)
-    end.
+%% never ran, and the keeper serving the table now hears of it: it may watch
+%% that row already and have requests waiting for the slot.
+-spec keeper_gone(token(), ceiling()) -> {refused, pos_integer()}.
+keeper_gone(Token, Ceiling) ->
+    ok = release(Ceiling, Token),
+    refuse(Ceiling).
 
 -spec refuse(ceiling()) -> {refused, pos_integer()}.
 refuse(#ceiling{counts = Counts, retry_after = RetryAfter, listener = Listener}) ->
@@ -314,7 +312,9 @@ handle_info({done, Token}, #state{holders = Holders, monitors = Monitors} = Stat
             },
             {noreply, drained(serve(State1))};
         #{} ->
-            {noreply, State}
+            %% A row this keeper does not watch went (a request that saw the
+            %% keeper before this one go): its slot may be free.
+            {noreply, drained(serve(State))}
     end;
 handle_info({expire, Token}, #state{waiters = Waiters} = State) ->
     case Waiters of
