@@ -863,7 +863,7 @@ throttled_reason(Ref) ->
 keeper(Name) ->
     {ok, _, _, _, _, {_Body, Ceiling}} =
         roadrunner_router:resolve(~"GET", ~"/slow", persistent_term:get({roadrunner_routes, Name})),
-    ets:lookup_element(element(2, Ceiling), keeper, 2).
+    ets:lookup_element(element(3, Ceiling), '$keeper', 2).
 
 route(Name, Path) ->
     #{routes := Routes} = roadrunner_listener:info(Name),

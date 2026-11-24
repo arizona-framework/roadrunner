@@ -4,44 +4,74 @@
 -behaviour(gen_server).
 
 %% The count of one route's `max_concurrent_requests` (`roadrunner_router`),
-%% and the process that hands its slots out. A listener starts one keeper
-%% per route that sets a ceiling, linked to it, so admission to one route
-%% never waits behind another route's traffic, and a fault in one keeper
-%% leaves the other routes' counts alone.
+%% and the process that watches it. A listener starts one keeper per route
+%% that sets a ceiling, linked to it, so admission to one route never waits
+%% behind another route's traffic, and a fault in one keeper leaves the
+%% other routes' counts alone.
 %%
-%% A slot is a row in the route's `slots` table, `{Token, Holder}`, and the
-%% table's size less the `keeper` row (which names the keeper serving it)
-%% is the number of requests running. Only the keeper adds rows, and only
-%% while fewer than the ceiling are there, so the route can never run more
-%% than its ceiling, whatever else happens at the same time. A row is
-%% removed once, by whoever gets there first: the holder as its request
-%% ends (`release/2`), or the keeper on the holder's `'DOWN'`. A holder
-%% that dies in any way (killed, over `max_heap_size`, its connection
-%% gone) frees its slot as soon as the keeper sees it go.
+%% A slot is a row `{K, Owner, Holder}` in the route's `slots` table, K in
+%% 1..Max. `ets:insert_new/2` on K is the admission and the record of who
+%% holds the slot, in one step: with only Max keys, the route can never run
+%% more than its ceiling, whatever else happens at the same time. A request
+%% that inserts its row also reads the table's size after the insert and
+%% backs off when the route runs over its ceiling, which only a reload that
+%% lowered it leaves behind. A row is removed by matching all of it, so a
+%% second removal, or one after the slot went to someone else, does
+%% nothing. The table's size is the number of requests running.
 %%
-%% Taking a slot is a call: the caller sends `acquire` to the keeper
-%% named in the table and waits. The keeper monitors the caller, adds its
-%% row and answers `granted`; when the route is full it answers `refused`,
-%% or in queue mode parks the caller and answers when a slot frees (first
-%% in, first out) or its `timeout` passes. A shed route full of requests
-%% does not reach the keeper at all: the caller reads the table's size and
-%% the ceiling in `counts` first, so a flood at a full route costs the
-%% keeper nothing. A queue route does the same once its queue is full too.
+%% Most requests never reach the keeper:
 %%
-%% The table and `counts` belong to the listener, not to the keeper, so
-%% a keeper that crashes loses no count: the listener starts a new one on
-%% the same table, which monitors every holder still in it (`init/1`).
-%% Requests that were waiting for the dead keeper see it go and are refused,
-%% each removing the row the keeper may have added for it before dying,
-%% so a slot whose `granted` never arrived is not left taken. Rows are
-%% never added by anyone but the keeper serving the table, so a restart
-%% cannot let in more than the ceiling while the old holders still run.
+%% - an HTTP/1.1 connection's first request asks the keeper, which grants it
+%%   a free key, watches the connection for the rest of its life, and keeps
+%%   that key as the connection's home in the route's `regs` table. Its
+%%   later requests insert the home row themselves and delete it as they
+%%   end. A home taken by another request, or past a lowered ceiling, sends
+%%   the request to the keeper, which grants another key and makes it the
+%%   new home. When the connection dies the keeper deletes the home row it
+%%   may still hold;
+%% - a stream worker of HTTP/2 or HTTP/3 asks the keeper, which grants it a
+%%   key and watches it: the worker's exit, however it comes, frees the slot.
+%%
+%% The gate, in the `'$keeper'` row of `regs`, sends every request to the
+%% keeper while requests wait for a slot (so a new request queues behind
+%% them) or the route drains, and has a request that ends tell the keeper
+%% its key (`{done, K}`) while requests wait, the route drains, or the
+%% keeper collects free keys. Two races decide whether a slot is lost or
+%% let in late, and the gate's row settles both:
+%%
+%% - the keeper closes the gate before its last look for room for a request
+%%   it may park, and a request that ends reads the gate after deleting its
+%%   row. The two touch the gate's row, so one comes first: either the
+%%   keeper sees the slot free, or the request sees the gate closed and
+%%   tells the keeper, so no request waits beside a free slot;
+%% - a draining keeper marks the gate before it looks at the table's size,
+%%   and a request that inserted its row reads the gate after the insert:
+%%   either the keeper sees the row and stays, or the request sees the
+%%   drain and backs off, so nothing runs on a table the listener deleted.
+%%
+%% Each side reads the table's size, a count ETS updates with every insert
+%% and delete, after its own operation on the gate's row, so it sees any
+%% row the other side changed before that.
+%%
+%% The keeper grants the keys it heard were freed first, then tries a few
+%% keys in turn, then scans the table for the free ones and keeps them for
+%% the grants to come. When a scan finds the route at least half full,
+%% every request that ends tells the keeper its key until the route is back
+%% under a quarter, so the keys it keeps stay complete and it seldom scans.
+%%
+%% The tables and `counts` belong to the listener, not to the keeper, so a
+%% keeper that crashes loses no count: the listener starts a new one on the
+%% same tables, which watches every registered connection and every holder
+%% the table has (`init/1`). Requests that were waiting for the dead keeper
+%% see it go and are refused, each removing the row the keeper may have
+%% added for it before dying; connections with a home keep taking it
+%% meanwhile.
 %%
 %% A route a reload dropped drains: its keeper goes on serving the requests
 %% it counts and any still routed by the old table, and stops in the step
 %% it finds nothing running or waiting, so nothing is granted after that.
-%% The listener then deletes the table, or, when a reload brought the route
-%% back meanwhile, starts a new keeper on it.
+%% The listener then deletes the tables, or, when a reload brought the
+%% route back meanwhile, starts a new keeper on them.
 %%
 %% `counts` holds the ceiling and the queue depth the listener configured
 %% (both updated in place by `reload_routes/2`, so a new ceiling applies
@@ -55,6 +85,7 @@
     set_draining/2,
     ceiling/4,
     stats/1,
+    delete_table/1,
     acquire/1,
     acquire/3,
     release/2
@@ -62,19 +93,42 @@
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2]).
 -export_type([ceiling/0, table/0, token/0, wait/0]).
 
+%% Test builds can stop a process at these points, so a test runs what
+%% races it in between (`roadrunner_route_pause`). Other builds have none.
+-ifdef(TEST).
+-define(PAUSE(Point), roadrunner_route_pause:here(Point)).
+-else.
+-define(PAUSE(Point), ok).
+-endif.
+
 %% The `counts` cells.
 -define(MAX, 1).
 -define(MAX_QUEUED, 2).
 -define(QUEUED, 3).
 -define(THROTTLED, 4).
 
+%% The gate's bits: requests wait for a slot, the route drains, every
+%% request that ends tells the keeper its key.
+-define(SLOW, 1).
+-define(DRAINING, 2).
+-define(REPORT, 4).
+-define(CLOSED, (?SLOW bor ?DRAINING)).
+
+%% The keys the keeper tries in turn before it scans the table.
+-define(PROBES, 16).
+
+%% A keeper idle this long hibernates, giving back the heap that a burst
+%% of connections it watched grew.
+-define(HIBERNATE_AFTER_MS, 1000).
+
 %% A route's ceiling as a request meets it, carried in the route's compiled
-%% entry: the slot table and counts the listener keeps for the route across
+%% entry: the tables and counts the listener keeps for the route across
 %% reloads, how a request over the ceiling waits (`shed`, or a queue
 %% timeout in milliseconds), the `Retry-After` its refusal carries, and the
 %% listener that reports it.
 -record(ceiling, {
-    slots :: table(),
+    slots :: ets:tid(),
+    regs :: ets:tid(),
     counts :: atomics:atomics_ref(),
     wait :: wait(),
     retry_after :: pos_integer(),
@@ -82,52 +136,77 @@
 }).
 
 -opaque ceiling() :: #ceiling{}.
--type table() :: ets:tid().
--type token() :: reference().
+-opaque table() :: {ets:tid(), ets:tid()}.
+-type token() :: pos_integer().
 -type wait() :: shed | pos_integer().
+-type kind() :: h1 | worker.
+-type row() :: {token(), pid(), pid()}.
 
 %% A request waiting for a slot.
 -record(waiter, {
     pid :: pid(),
+    kind :: kind(),
     monitor :: reference(),
     timer :: reference()
 }).
 
+%% A process the keeper watches: a registered connection, or a stream
+%% worker holding a slot it granted, with the rows to free when it dies.
+%% Only a registered one has a registration to remove then.
+-record(watched, {
+    monitor :: reference(),
+    registered = false :: boolean(),
+    rows = [] :: [row()]
+}).
+
 -record(state, {
-    slots :: table(),
+    slots :: ets:tid(),
+    regs :: ets:tid(),
     counts :: atomics:atomics_ref(),
     %% Set once the route left the table: the keeper stops when nothing is
     %% running or waiting any more.
     draining :: boolean(),
+    %% The gate as written in `regs`; only this keeper writes it.
+    gate :: non_neg_integer(),
     %% Waiting tokens in arrival order. One that stopped waiting (served,
     %% expired, gone) leaves `waiters` but stays here until a pop reaches
     %% it, so a removal does not search the queue.
-    order = queue:new() :: queue:queue(token()),
-    waiters = #{} :: #{token() => #waiter{}},
-    %% Every monitor this keeper holds, waiting or holding a slot.
-    monitors = #{} :: #{reference() => {holder | waiter, token()}},
-    %% The monitor of each slot's holder, by its token.
-    holders = #{} :: #{token() => reference()}
+    order = queue:new() :: queue:queue(reference()),
+    waiters = #{} :: #{reference() => #waiter{}},
+    %% Every monitor this keeper holds.
+    monitors = #{} :: #{reference() => {waiter, reference()} | {watched, pid()}},
+    watched = #{} :: #{pid() => #watched{}},
+    %% Keys heard freed, which may be free still, and the next key to try.
+    spare = #{} :: #{token() => []},
+    rotor = 1 :: token()
 }).
 
 %% --- listener side ---
 
-%% A route's slot table and counts, made in (and owned by) the listener so
-%% they outlive any one keeper.
+%% A route's tables and counts, made in (and owned by) the listener so they
+%% outlive any one keeper. The slot table keeps one count of its rows, so a
+%% read of its size sees every insert and delete before it.
 -spec new(pos_integer(), pos_integer(), boolean()) -> {pid(), table(), atomics:atomics_ref()}.
 new(Max, MaxQueued, Draining) ->
-    Slots = ets:new(roadrunner_route_slots, [set, public, {read_concurrency, true}]),
+    Slots = ets:new(roadrunner_route_slots, [
+        set, public, {write_concurrency, true}, {decentralized_counters, false}
+    ]),
+    Regs = ets:new(roadrunner_route_regs, [
+        set, public, {read_concurrency, true}, {write_concurrency, true}
+    ]),
     Counts = atomics:new(4, [{signed, false}]),
     ok = atomics:put(Counts, ?MAX, Max),
     ok = atomics:put(Counts, ?MAX_QUEUED, MaxQueued),
-    {ok, Pid} = start_link(Slots, Counts, Draining),
-    {Pid, Slots, Counts}.
+    {ok, Pid} = start_link({Slots, Regs}, Counts, Draining),
+    {Pid, {Slots, Regs}, Counts}.
 
-%% Start a keeper on a route's table, linked to the caller (the listener):
+%% Start a keeper on a route's tables, linked to the caller (the listener):
 %% the first, or one taking over from a keeper that died or drained.
 -spec start_link(table(), atomics:atomics_ref(), boolean()) -> {ok, pid()}.
-start_link(Slots, Counts, Draining) ->
-    gen_server:start_link(?MODULE, {Slots, Counts, Draining}, []).
+start_link(Table, Counts, Draining) ->
+    gen_server:start_link(
+        ?MODULE, {Table, Counts, Draining}, [{hibernate_after, ?HIBERNATE_AFTER_MS}]
+    ).
 
 %% A new ceiling and queue depth, from a reload. They apply at once, to the
 %% requests already counted too; a raised ceiling hands its slots to the
@@ -152,13 +231,23 @@ set_draining(Pid, Draining) ->
     {shed, #{retry_after := pos_integer()}} | {queue, #{timeout := pos_integer()}},
     atom()
 ) -> ceiling().
-ceiling(Slots, Counts, {shed, #{retry_after := RetryAfter}}, Listener) ->
+ceiling({Slots, Regs}, Counts, {shed, #{retry_after := RetryAfter}}, Listener) ->
     #ceiling{
-        slots = Slots, counts = Counts, wait = shed, retry_after = RetryAfter, listener = Listener
+        slots = Slots,
+        regs = Regs,
+        counts = Counts,
+        wait = shed,
+        retry_after = RetryAfter,
+        listener = Listener
     };
-ceiling(Slots, Counts, {queue, #{timeout := Timeout}}, Listener) ->
+ceiling({Slots, Regs}, Counts, {queue, #{timeout := Timeout}}, Listener) ->
     #ceiling{
-        slots = Slots, counts = Counts, wait = Timeout, retry_after = 1, listener = Listener
+        slots = Slots,
+        regs = Regs,
+        counts = Counts,
+        wait = Timeout,
+        retry_after = 1,
+        listener = Listener
     }.
 
 %% What `roadrunner_listener:info/1` reports of a route.
@@ -169,48 +258,56 @@ ceiling(Slots, Counts, {queue, #{timeout := Timeout}}, Listener) ->
         queued := non_neg_integer(),
         throttled := non_neg_integer()
     }.
-stats({Slots, Counts}) ->
+stats({{Slots, _Regs}, Counts}) ->
     #{
         max_concurrent_requests => atomics:get(Counts, ?MAX),
-        in_flight => ets:info(Slots, size) - 1,
+        in_flight => ets:info(Slots, size),
         queued => atomics:get(Counts, ?QUEUED),
         throttled => atomics:get(Counts, ?THROTTLED)
     }.
 
+%% The tables of a route whose keeper is gone for good.
+-spec delete_table(table()) -> true.
+delete_table({Slots, Regs}) ->
+    true = ets:delete(Slots),
+    ets:delete(Regs).
+
 %% --- request side ---
 
-%% Take a slot for the calling process, waiting in queue mode. `{refused,
-%% RetryAfter}` is counted and reported as a throttled request.
+%% Take a slot for the calling HTTP/1.1 connection, waiting in queue mode:
+%% its home slot when it has one and the gate is open, else through the
+%% keeper. `{refused, RetryAfter}` is counted and reported as a throttled
+%% request.
 -spec acquire(ceiling()) -> {ok, token()} | {refused, pos_integer()}.
-acquire(#ceiling{} = Ceiling) ->
-    case ask(Ceiling) of
-        {asked, Token} ->
-            receive
-                {Token, granted} -> {ok, Token};
-                {Token, refused} -> refuse(Ceiling);
-                {'DOWN', Token, process, _Keeper, _Reason} -> keeper_gone(Token, Ceiling)
-            end;
-        refused ->
-            refuse(Ceiling)
+acquire(#ceiling{slots = Slots} = Ceiling) ->
+    case get({?MODULE, Slots}) of
+        undefined ->
+            ask_home(Ceiling);
+        Home ->
+            case take_home(Ceiling, Home) of
+                taken -> {ok, Home};
+                busy -> ask_home(Ceiling);
+                gone -> gone(Ceiling)
+            end
     end.
 
 %% `acquire/1` for a stream worker, which also stops waiting on `Reset`,
 %% the message that says its stream was reset, or when its connection
 %% process `Conn` goes: it returns `reset` and the worker ends, which frees
-%% a slot granted in the meantime (the keeper monitors it).
+%% a slot granted in the meantime (the keeper watches the worker).
 -spec acquire(ceiling(), term(), pid()) -> {ok, token()} | {refused, pos_integer()} | reset.
 acquire(#ceiling{} = Ceiling, Reset, Conn) ->
-    case ask(Ceiling) of
+    case ask(Ceiling, worker) of
         {asked, Token} ->
             ConnMon = erlang:monitor(process, Conn),
             Result =
                 receive
-                    {Token, granted} ->
-                        {ok, Token};
+                    {Token, {granted, K}} ->
+                        {ok, K};
                     {Token, refused} ->
                         refuse(Ceiling);
                     {'DOWN', Token, process, _Keeper, _Reason} ->
-                        keeper_gone(Token, Ceiling);
+                        keeper_gone(Ceiling);
                     Reset ->
                         true = erlang:demonitor(Token, [flush]),
                         reset;
@@ -220,60 +317,156 @@ acquire(#ceiling{} = Ceiling, Reset, Conn) ->
                 end,
             true = erlang:demonitor(ConnMon, [flush]),
             Result;
-        refused ->
+        _FullOrGone ->
             refuse(Ceiling)
     end.
 
-%% Hand a slot back as its request ends. A table already gone went with its
-%% listener, which counts nothing any more.
+%% An HTTP/1.1 connection hands its slot back as its request ends, telling
+%% the keeper while the gate says so. A table already gone went with its
+%% listener, or with a route that drained, and counts nothing any more.
 -spec release(ceiling(), token()) -> ok.
-release(#ceiling{slots = Slots}, Token) ->
+release(#ceiling{slots = Slots} = Ceiling, K) ->
+    Self = self(),
     try
-        true = ets:delete(Slots, Token),
-        _ = erlang:send(ets:lookup_element(Slots, keeper, 2), {done, Token}),
-        ok
+        true = ets:delete_object(Slots, {K, Self, Self}),
+        ok = ?PAUSE(released),
+        notify(Ceiling, K)
     catch
         error:badarg -> ok
     end.
 
-%% Ask the keeper for a slot, unless the route is full and the request
-%% would not wait for one. The ask carries the token the slot will be known
-%% by: a monitor of the keeper that is also the alias its answer comes on.
--spec ask(ceiling()) -> {asked, token()} | refused.
-ask(#ceiling{slots = Slots, counts = Counts, wait = Wait}) ->
-    case full(ets:info(Slots, size), Counts, Wait) of
+%% The connection's home row, while the gate is open and the home is within
+%% the ceiling.
+-spec take_home(ceiling(), token()) -> taken | busy | gone.
+take_home(#ceiling{slots = Slots, regs = Regs, counts = Counts} = Ceiling, K) ->
+    Self = self(),
+    try
+        case open(Regs) andalso K =< atomics:get(Counts, ?MAX) of
+            true ->
+                ok = ?PAUSE(home_open),
+                case ets:insert_new(Slots, {K, Self, Self}) of
+                    true -> kept(Ceiling, K, Self);
+                    false -> busy
+                end;
+            false ->
+                busy
+        end
+    catch
+        error:badarg -> gone
+    end.
+
+%% A row inserted without the keeper stays only while the route runs no
+%% more than its ceiling and does not drain. Backing off tells the keeper
+%% while the gate says so, as a release does: the row may have kept a
+%% request waiting.
+-spec kept(ceiling(), token(), pid()) -> taken | busy.
+kept(#ceiling{slots = Slots, regs = Regs, counts = Counts} = Ceiling, K, Self) ->
+    case
+        ets:info(Slots, size) =< atomics:get(Counts, ?MAX) andalso
+            ets:lookup_element(Regs, '$keeper', 3) band ?DRAINING =:= 0
+    of
         true ->
-            refused;
+            taken;
         false ->
-            try ets:lookup_element(Slots, keeper, 2) of
-                Keeper ->
-                    Token = erlang:monitor(process, Keeper, [{alias, reply_demonitor}]),
-                    _ = erlang:send(Keeper, {acquire, Token, self(), Wait}),
-                    {asked, Token}
-            catch
-                error:badarg -> refused
+            true = ets:delete_object(Slots, {K, Self, Self}),
+            ok = notify(Ceiling, K),
+            busy
+    end.
+
+%% Whether a request may take its slot without the keeper.
+-spec open(ets:tid()) -> boolean().
+open(Regs) ->
+    ets:lookup_element(Regs, '$keeper', 3) band ?CLOSED =:= 0.
+
+%% The keeper hears of a freed slot while its gate says so.
+-spec notify(ceiling(), token()) -> ok.
+notify(#ceiling{regs = Regs}, K) ->
+    case ets:lookup(Regs, '$keeper') of
+        [{'$keeper', _Keeper, 0}] ->
+            ok;
+        [{'$keeper', Keeper, _Gate}] ->
+            _ = erlang:send(Keeper, {done, K}),
+            ok
+    end.
+
+%% An HTTP/1.1 connection asks the keeper, which makes the key it grants the
+%% connection's home.
+-spec ask_home(ceiling()) -> {ok, token()} | {refused, pos_integer()}.
+ask_home(#ceiling{slots = Slots} = Ceiling) ->
+    case ask(Ceiling, h1) of
+        {asked, Token} ->
+            receive
+                {Token, {granted, K}} ->
+                    _ = put({?MODULE, Slots}, K),
+                    {ok, K};
+                {Token, refused} ->
+                    refuse(Ceiling);
+                {'DOWN', Token, process, _Keeper, _Reason} ->
+                    keeper_gone(Ceiling)
+            end;
+        full ->
+            refuse(Ceiling);
+        gone ->
+            gone(Ceiling)
+    end.
+
+%% Ask the keeper for a slot, unless the route is full and the request
+%% would not wait for one. The ask carries a monitor of the keeper that is
+%% also the alias its answer comes on.
+-spec ask(ceiling(), kind()) -> {asked, reference()} | full | gone.
+ask(#ceiling{slots = Slots, regs = Regs, counts = Counts, wait = Wait}, Kind) ->
+    case ets:info(Slots, size) of
+        undefined ->
+            gone;
+        Rows ->
+            case full(Rows, Counts, Wait) of
+                true ->
+                    full;
+                false ->
+                    try ets:lookup_element(Regs, '$keeper', 2) of
+                        Keeper ->
+                            Token = erlang:monitor(process, Keeper, [{alias, reply_demonitor}]),
+                            _ = erlang:send(Keeper, {acquire, Token, self(), Kind, Wait}),
+                            {asked, Token}
+                    catch
+                        error:badarg -> gone
+                    end
             end
     end.
 
 %% Whether a request would be turned away without asking: the route runs
-%% its ceiling and, for a queue, its queue is full too. A table already gone
-%% (`undefined`) went with its listener.
--spec full(non_neg_integer() | undefined, atomics:atomics_ref(), wait()) -> boolean().
-full(undefined, _Counts, _Wait) ->
-    true;
+%% its ceiling and, for a queue, its queue is full too.
+-spec full(non_neg_integer(), atomics:atomics_ref(), wait()) -> boolean().
 full(Rows, Counts, shed) ->
-    Rows - 1 >= atomics:get(Counts, ?MAX);
+    Rows >= atomics:get(Counts, ?MAX);
 full(Rows, Counts, _Timeout) ->
-    Rows - 1 >= atomics:get(Counts, ?MAX) andalso
+    Rows >= atomics:get(Counts, ?MAX) andalso
         atomics:get(Counts, ?QUEUED) >= atomics:get(Counts, ?MAX_QUEUED).
 
 %% The keeper died before it answered. It may have added the caller's row
-%% first, so the row goes, or the slot would stay taken by a request that
-%% never ran, and the keeper serving the table now hears of it: it may watch
-%% that row already and have requests waiting for the slot.
--spec keeper_gone(token(), ceiling()) -> {refused, pos_integer()}.
-keeper_gone(Token, Ceiling) ->
-    ok = release(Ceiling, Token),
+%% first, and a caller asking holds no other row of the route, so every row
+%% the caller holds goes, or the slot would stay taken by a request that
+%% never ran; the keeper serving the table now hears of it.
+-spec keeper_gone(ceiling()) -> {refused, pos_integer()}.
+keeper_gone(#ceiling{slots = Slots} = Ceiling) ->
+    Self = self(),
+    try
+        lists:foreach(
+            fun({K, _, _} = Row) ->
+                true = ets:delete_object(Slots, Row),
+                ok = notify(Ceiling, K)
+            end,
+            ets:match_object(Slots, {'_', Self, Self})
+        )
+    catch
+        error:badarg -> ok
+    end,
+    refuse(Ceiling).
+
+%% The route's tables are gone: the connection forgets its home there.
+-spec gone(ceiling()) -> {refused, pos_integer()}.
+gone(#ceiling{slots = Slots} = Ceiling) ->
+    _ = erase({?MODULE, Slots}),
     refuse(Ceiling).
 
 -spec refuse(ceiling()) -> {refused, pos_integer()}.
@@ -286,21 +479,42 @@ refuse(#ceiling{counts = Counts, retry_after = RetryAfter, listener = Listener})
 
 -spec init({table(), atomics:atomics_ref(), boolean()}) ->
     {ok, #state{}} | {ok, #state{}, {continue, drained}}.
-init({Slots, Counts, Draining}) ->
+init({{Slots, Regs}, Counts, Draining}) ->
+    Gate = draining(Draining),
+    %% Published first: a request asking from now on reaches this keeper.
+    true = ets:insert(Regs, {'$keeper', self(), Gate}),
     %% Whatever waited for a keeper before this one was refused when it went.
     ok = atomics:put(Counts, ?QUEUED, 0),
-    %% A keeper taking over watches every holder the table still has.
-    Holders = ets:select(Slots, [{{'$1', '$2'}, [{is_reference, '$1'}], [{{'$1', '$2'}}]}]),
-    State = lists:foldl(
-        fun({Token, Pid}, Acc) -> watch_holder(Token, erlang:monitor(process, Pid), Acc) end,
-        #state{slots = Slots, counts = Counts, draining = Draining},
-        Holders
-    ),
-    true = ets:insert(Slots, {keeper, self()}),
+    State0 = #state{
+        slots = Slots, regs = Regs, counts = Counts, draining = Draining, gate = Gate
+    },
+    %% Every registered connection is watched again, and every other holder
+    %% with its row.
+    State1 = ets:foldl(fun watch_registered/2, State0, Regs),
+    State = ets:foldl(fun take_over_row/2, State1, Slots),
     case Draining of
         %% Taking over a route already dropped: it may have drained.
         true -> {ok, State, {continue, drained}};
         false -> {ok, State}
+    end.
+
+-spec watch_registered(tuple(), #state{}) -> #state{}.
+watch_registered({'$keeper', _Keeper, _Gate}, State) ->
+    State;
+watch_registered({Conn, _Home}, State) ->
+    registered(Conn, undefined, State).
+
+%% A row found at a takeover. A registered connection's row is its home:
+%% the old keeper may have died between that row and the registration. Any
+%% other holder is watched with its row.
+-spec take_over_row(row(), #state{}) -> #state{}.
+take_over_row({K, Pid, Pid} = Row, #state{regs = Regs} = State) ->
+    case ets:member(Regs, Pid) of
+        true ->
+            true = ets:update_element(Regs, Pid, {2, K}),
+            State;
+        false ->
+            hold_row(Pid, Row, undefined, State)
     end.
 
 -spec handle_continue(drained, #state{}) ->
@@ -318,26 +532,11 @@ handle_cast(_Msg, State) ->
 
 -spec handle_info(term(), #state{}) ->
     {noreply, #state{}} | {stop, {shutdown, drained}, #state{}}.
-handle_info({acquire, Token, Pid, Wait}, State0) ->
+handle_info({acquire, Token, Pid, Kind, Wait}, State) ->
     %% The requests already waiting go first.
-    State = serve(State0),
-    case room(State) of
-        true -> {noreply, grant(Token, Pid, erlang:monitor(process, Pid), State)};
-        false -> {noreply, wait(Token, Pid, Wait, State)}
-    end;
-handle_info({done, Token}, #state{holders = Holders, monitors = Monitors} = State) ->
-    case Holders of
-        #{Token := Mon} ->
-            true = erlang:demonitor(Mon, [flush]),
-            State1 = State#state{
-                holders = maps:remove(Token, Holders), monitors = maps:remove(Mon, Monitors)
-            },
-            noreply(serve(State1));
-        #{} ->
-            %% A row this keeper does not watch went (a request that saw the
-            %% keeper before this one go): its slot may be free.
-            noreply(serve(State))
-    end;
+    noreply(admit(Token, Pid, Kind, Wait, serve(State)));
+handle_info({done, K}, State) ->
+    noreply(serve(spare(K, State)));
 handle_info({expire, Token}, #state{waiters = Waiters} = State) ->
     case Waiters of
         #{Token := #waiter{monitor = Mon}} ->
@@ -347,17 +546,10 @@ handle_info({expire, Token}, #state{waiters = Waiters} = State) ->
         #{} ->
             {noreply, State}
     end;
-handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{monitors = Monitors} = State) ->
+handle_info({'DOWN', Mon, process, Pid, _Reason}, #state{monitors = Monitors} = State) ->
     case Monitors of
-        #{Mon := {holder, Token}} ->
-            %% Whichever of this and the holder's own `release/2` removes the
-            %% row frees the slot; the other finds nothing to remove.
-            true = ets:delete(State#state.slots, Token),
-            State1 = State#state{
-                holders = maps:remove(Token, State#state.holders),
-                monitors = maps:remove(Mon, Monitors)
-            },
-            noreply(serve(State1));
+        #{Mon := {watched, Pid}} ->
+            noreply(serve(watched_down(Pid, Mon, State)));
         #{Mon := {waiter, Token}} ->
             #{Token := #waiter{timer = Timer}} = State#state.waiters,
             _ = erlang:cancel_timer(Timer),
@@ -366,56 +558,75 @@ handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{monitors = Monitors} =
             {noreply, State}
     end;
 handle_info(serve, State) ->
-    {noreply, serve(State)};
-handle_info({draining, Draining}, State) ->
-    noreply(State#state{draining = Draining});
+    noreply(serve(State));
+handle_info({draining, Draining}, #state{gate = Gate} = State) ->
+    noreply(
+        set_gate(Gate band bnot ?DRAINING bor draining(Draining), State#state{draining = Draining})
+    );
 handle_info(_Msg, State) ->
     {noreply, State}.
 
-%% Whether one more request may run.
--spec room(#state{}) -> boolean().
-room(#state{slots = Slots, counts = Counts}) ->
-    ets:info(Slots, size) - 1 < atomics:get(Counts, ?MAX).
+-spec draining(boolean()) -> 0 | ?DRAINING.
+draining(true) -> ?DRAINING;
+draining(false) -> 0.
 
-%% Give `Pid` the slot `Token`, watched by `Mon`. The row goes in before the
-%% answer goes out: a keeper killed between the two leaves a row the
-%% caller removes when it sees the keeper gone, never a running request
-%% without one.
--spec grant(token(), pid(), reference(), #state{}) -> #state{}.
-grant(Token, Pid, Mon, #state{slots = Slots} = State) ->
-    true = ets:insert(Slots, {Token, Pid}),
-    _ = erlang:send(Token, {Token, granted}),
-    watch_holder(Token, Mon, State).
+%% A request asking, once those waiting were served: granted while there
+%% is room, else refused, or parked in queue mode while the queue has room.
+-spec admit(reference(), pid(), kind(), wait(), #state{}) -> #state{}.
+admit(Token, Pid, Kind, Wait, #state{waiters = Waiters} = State) when map_size(Waiters) =:= 0 ->
+    case grant(Token, Pid, Kind, undefined, State) of
+        {granted, State1} -> State1;
+        {no_room, State1} -> no_room(Token, Pid, Kind, Wait, State1)
+    end;
+admit(Token, Pid, Kind, Wait, State) ->
+    no_room(Token, Pid, Kind, Wait, State).
 
--spec watch_holder(token(), reference(), #state{}) -> #state{}.
-watch_holder(Token, Mon, #state{holders = Holders, monitors = Monitors} = State) ->
-    State#state{holders = Holders#{Token => Mon}, monitors = Monitors#{Mon => {holder, Token}}}.
-
-%% The route is full: refuse, or park the request while the queue has room.
--spec wait(token(), pid(), wait(), #state{}) -> #state{}.
-wait(Token, _Pid, shed, State) ->
+-spec no_room(reference(), pid(), kind(), wait(), #state{}) -> #state{}.
+no_room(Token, _Pid, _Kind, shed, State) ->
     _ = erlang:send(Token, {Token, refused}),
     State;
-wait(Token, Pid, Timeout, #state{counts = Counts} = State) ->
+no_room(Token, Pid, Kind, Timeout, #state{counts = Counts} = State) ->
     case atomics:get(Counts, ?QUEUED) < atomics:get(Counts, ?MAX_QUEUED) of
         true ->
-            #state{order = Order, waiters = Waiters, monitors = Monitors} = State,
-            Mon = erlang:monitor(process, Pid),
-            Waiter = #waiter{
-                pid = Pid,
-                monitor = Mon,
-                timer = erlang:send_after(Timeout, self(), {expire, Token})
-            },
-            ok = atomics:add(Counts, ?QUEUED, 1),
-            State#state{
-                order = queue:in(Token, Order),
-                waiters = Waiters#{Token => Waiter},
-                monitors = Monitors#{Mon => {waiter, Token}}
-            };
+            ok = ?PAUSE(full),
+            %% The gate closes before the last look for room: a request
+            %% that ends from now on tells the keeper, and one that ended
+            %% before freed its slot ahead of this look.
+            case last_look(Token, Pid, Kind, close(State)) of
+                {granted, State1} ->
+                    State1;
+                {no_room, State1} ->
+                    ok = ?PAUSE(parking),
+                    park(Token, Pid, Kind, Timeout, State1)
+            end;
         false ->
             _ = erlang:send(Token, {Token, refused}),
             State
     end.
+
+-spec last_look(reference(), pid(), kind(), #state{}) ->
+    {granted, #state{}} | {no_room, #state{}}.
+last_look(Token, Pid, Kind, #state{waiters = Waiters} = State) when map_size(Waiters) =:= 0 ->
+    grant(Token, Pid, Kind, undefined, State);
+last_look(_Token, _Pid, _Kind, State) ->
+    {no_room, State}.
+
+-spec park(reference(), pid(), kind(), pos_integer(), #state{}) -> #state{}.
+park(Token, Pid, Kind, Timeout, #state{counts = Counts} = State) ->
+    #state{order = Order, waiters = Waiters, monitors = Monitors} = State,
+    Mon = erlang:monitor(process, Pid),
+    Waiter = #waiter{
+        pid = Pid,
+        kind = Kind,
+        monitor = Mon,
+        timer = erlang:send_after(Timeout, self(), {expire, Token})
+    },
+    ok = atomics:add(Counts, ?QUEUED, 1),
+    State#state{
+        order = queue:in(Token, Order),
+        waiters = Waiters#{Token => Waiter},
+        monitors = Monitors#{Mon => {waiter, Token}}
+    }.
 
 %% Hand free slots to the waiting requests, oldest first.
 -spec serve(#state{}) -> #state{}.
@@ -425,39 +636,249 @@ serve(#state{order = Order, waiters = Waiters} = State) ->
             State;
         {{value, Token}, Rest} ->
             case Waiters of
-                #{Token := #waiter{pid = Pid, monitor = Mon, timer = Timer}} ->
-                    case room(State) of
-                        true ->
+                #{Token := #waiter{pid = Pid, kind = Kind, monitor = Mon, timer = Timer}} ->
+                    case grant(Token, Pid, Kind, Mon, State) of
+                        {granted, #state{counts = Counts, waiters = Waiters1} = State1} ->
                             _ = erlang:cancel_timer(Timer),
-                            State1 = forget_waiter(Token, Mon, State#state{order = Rest}),
-                            serve(grant(Token, Pid, Mon, State1));
-                        false ->
-                            State
+                            ok = atomics:sub(Counts, ?QUEUED, 1),
+                            serve(State1#state{
+                                order = Rest, waiters = maps:remove(Token, Waiters1)
+                            });
+                        {no_room, State1} ->
+                            State1
                     end;
                 #{} ->
                     serve(State#state{order = Rest})
             end
     end.
 
-%% A request stops waiting: served, expired or gone. Its token stays in
-%% `order` until a pop reaches it.
--spec forget_waiter(token(), reference(), #state{}) -> #state{}.
+%% Give `Pid` a free key. Its row goes in before the answer goes out: a
+%% keeper killed between the two leaves a row the caller removes when it
+%% sees the keeper go, never a running request without one. The row stays
+%% only while the route runs no more than its ceiling, which requests that
+%% took their slot without the keeper can fill after a reload lowered it.
+%% `Mon` is the monitor of a waiter served, which watches it from now on.
+-spec grant(reference(), pid(), kind(), reference() | undefined, #state{}) ->
+    {granted, #state{}} | {no_room, #state{}}.
+grant(Token, Pid, Kind, Mon, #state{slots = Slots, counts = Counts} = State) ->
+    Max = atomics:get(Counts, ?MAX),
+    case ets:info(Slots, size) < Max of
+        true ->
+            ok = ?PAUSE(granting),
+            case claim(Pid, Max, State) of
+                {ok, K, State1} ->
+                    case ets:info(Slots, size) =< Max of
+                        true ->
+                            State2 = hold(Kind, Pid, K, Mon, State1),
+                            _ = erlang:send(Token, {Token, {granted, K}}),
+                            {granted, State2};
+                        false ->
+                            true = ets:delete_object(Slots, {K, Pid, Pid}),
+                            {no_room, spare(K, State1)}
+                    end;
+                {none, State1} ->
+                    {no_room, State1}
+            end;
+        false ->
+            {no_room, State}
+    end.
+
+%% An HTTP/1.1 connection is watched, then registered with the key as its
+%% home, so every registration is watched. A stream worker is watched with
+%% its row.
+-spec hold(kind(), pid(), token(), reference() | undefined, #state{}) -> #state{}.
+hold(h1, Conn, K, Mon, #state{regs = Regs} = State) ->
+    State1 = registered(Conn, Mon, State),
+    true = ets:insert(Regs, {Conn, K}),
+    State1;
+hold(worker, Pid, K, Mon, State) ->
+    hold_row(Pid, {K, Pid, Pid}, Mon, State).
+
+%% Watch `Pid` from now on, once. A waiter's monitor is the one kept when
+%% the process is not watched yet, and dropped when it is.
+-spec watch(pid(), reference() | undefined, #state{}) -> #state{}.
+watch(Pid, Mon, #state{watched = Watched} = State) when is_map_key(Pid, Watched) ->
+    drop_monitor(Mon, State);
+watch(Pid, Mon, #state{watched = Watched, monitors = Monitors} = State) ->
+    Mon1 = monitor_once(Pid, Mon),
+    State#state{
+        watched = Watched#{Pid => #watched{monitor = Mon1}},
+        monitors = Monitors#{Mon1 => {watched, Pid}}
+    }.
+
+%% Watch `Pid`, which has a registration from now on.
+-spec registered(pid(), reference() | undefined, #state{}) -> #state{}.
+registered(Pid, Mon, State) ->
+    #state{watched = Watched} = State1 = watch(Pid, Mon, State),
+    #{Pid := W} = Watched,
+    State1#state{watched = Watched#{Pid := W#watched{registered = true}}}.
+
+%% Watch `Pid` with a row to free when it dies.
+-spec hold_row(pid(), row(), reference() | undefined, #state{}) -> #state{}.
+hold_row(Pid, Row, Mon, State) ->
+    #state{watched = Watched} = State1 = watch(Pid, Mon, State),
+    #{Pid := #watched{rows = Rows} = W} = Watched,
+    State1#state{watched = Watched#{Pid := W#watched{rows = [Row | Rows]}}}.
+
+-spec monitor_once(pid(), reference() | undefined) -> reference().
+monitor_once(Pid, undefined) ->
+    erlang:monitor(process, Pid);
+monitor_once(_Pid, Mon) ->
+    Mon.
+
+-spec drop_monitor(reference() | undefined, #state{}) -> #state{}.
+drop_monitor(undefined, State) ->
+    State;
+drop_monitor(Mon, #state{monitors = Monitors} = State) ->
+    true = erlang:demonitor(Mon, [flush]),
+    State#state{monitors = maps:remove(Mon, Monitors)}.
+
+%% A watched process died. A connection's registration goes first, with
+%% the home row it may hold; then every row it held is freed.
+-spec watched_down(pid(), reference(), #state{}) -> #state{}.
+watched_down(Pid, Mon, #state{regs = Regs, watched = Watched, monitors = Monitors} = State) ->
+    #{Pid := #watched{registered = Registered, rows = Rows}} = Watched,
+    State1 = State#state{
+        watched = maps:remove(Pid, Watched), monitors = maps:remove(Mon, Monitors)
+    },
+    case Registered of
+        true ->
+            [{Pid, Home}] = ets:take(Regs, Pid),
+            free_rows([{Home, Pid, Pid} | Rows], State1);
+        false ->
+            free_rows(Rows, State1)
+    end.
+
+-spec free_rows([row()], #state{}) -> #state{}.
+free_rows([], State) ->
+    State;
+free_rows([{K, _Owner, _Holder} = Row | Rows], #state{slots = Slots} = State) ->
+    true = ets:delete_object(Slots, Row),
+    free_rows(Rows, spare(K, State)).
+
+%% A key heard freed, kept for the grants to come. There are no more of
+%% them than the largest ceiling the route had.
+-spec spare(token(), #state{}) -> #state{}.
+spare(K, #state{spare = Spare} = State) ->
+    State#state{spare = Spare#{K => []}}.
+
+%% A free key for `Pid`, its row inserted: one heard freed, else the next
+%% few in turn, else one a scan of the table finds.
+-spec claim(pid(), pos_integer(), #state{}) ->
+    {ok, token(), #state{}} | {none, #state{}}.
+claim(Pid, Max, #state{slots = Slots, spare = Spare, rotor = Rotor} = State) ->
+    case claim_spare(Slots, Pid, Max, Spare) of
+        {ok, K, Spare1} ->
+            {ok, K, State#state{spare = Spare1}};
+        {none, Spare1} ->
+            case probe(Slots, Pid, Max, min(Rotor, Max), min(Max, ?PROBES)) of
+                {ok, K} ->
+                    {ok, K, State#state{spare = Spare1, rotor = K rem Max + 1}};
+                {none, Next} when Max =< ?PROBES ->
+                    {none, State#state{spare = Spare1, rotor = Next}};
+                {none, Next} ->
+                    scan(Pid, Max, State#state{spare = Spare1, rotor = Next})
+            end
+    end.
+
+-spec claim_spare(ets:tid(), pid(), pos_integer(), #{token() => []}) ->
+    {ok, token(), #{token() => []}} | {none, #{token() => []}}.
+claim_spare(Slots, Pid, Max, Spare) ->
+    case maps:next(maps:iterator(Spare)) of
+        none ->
+            {none, Spare};
+        {K, [], _Iterator} ->
+            Rest = maps:remove(K, Spare),
+            case K =< Max andalso ets:insert_new(Slots, {K, Pid, Pid}) of
+                true -> {ok, K, Rest};
+                false -> claim_spare(Slots, Pid, Max, Rest)
+            end
+    end.
+
+-spec probe(ets:tid(), pid(), pos_integer(), token(), non_neg_integer()) ->
+    {ok, token()} | {none, token()}.
+probe(_Slots, _Pid, _Max, K, 0) ->
+    {none, K};
+probe(Slots, Pid, Max, K, Left) ->
+    case ets:insert_new(Slots, {K, Pid, Pid}) of
+        true -> {ok, K};
+        false -> probe(Slots, Pid, Max, K rem Max + 1, Left - 1)
+    end.
+
+%% The free keys, from the taken ones, kept for the grants to come. A route
+%% at least half full has every request that ends tell the keeper its key
+%% from before the scan, so the keys kept stay complete.
+-spec scan(pid(), pos_integer(), #state{}) -> {ok, token(), #state{}} | {none, #state{}}.
+scan(Pid, Max, #state{slots = Slots} = State0) ->
+    State =
+        case ets:info(Slots, size) * 2 >= Max of
+            true -> report(State0);
+            false -> State0
+        end,
+    Taken = ets:select(Slots, [{{'$1', '_', '_'}, [], ['$1']}]),
+    case claim_spare(Slots, Pid, Max, maps:from_keys(lists:seq(1, Max) -- Taken, [])) of
+        {ok, K, Spare} -> {ok, K, State#state{spare = Spare}};
+        {none, Spare} -> {none, State#state{spare = Spare}}
+    end.
+
+%% --- the gate ---
+
+%% Requests wait, or may: the fast paths go to the keeper.
+-spec close(#state{}) -> #state{}.
+close(#state{gate = Gate} = State) when Gate band ?SLOW =/= 0 ->
+    State;
+close(#state{gate = Gate} = State) ->
+    set_gate(Gate bor ?SLOW, State).
+
+-spec report(#state{}) -> #state{}.
+report(#state{gate = Gate} = State) ->
+    set_gate(Gate bor ?REPORT, State).
+
+-spec set_gate(non_neg_integer(), #state{}) -> #state{}.
+set_gate(Gate, #state{regs = Regs} = State) ->
+    true = ets:update_element(Regs, '$keeper', {3, Gate}),
+    State#state{gate = Gate}.
+
+%% The gate opens once nothing waits, and requests stop reporting their
+%% keys once the route is back under a quarter of its ceiling.
+-spec open_gate(#state{}) -> #state{}.
+open_gate(#state{gate = Gate, waiters = Waiters} = State) when
+    Gate band ?SLOW =/= 0, map_size(Waiters) =:= 0
+->
+    open_gate(set_gate(Gate band bnot ?SLOW, State));
+open_gate(#state{gate = Gate, slots = Slots, counts = Counts} = State) when
+    Gate band ?REPORT =/= 0
+->
+    case ets:info(Slots, size) * 4 < atomics:get(Counts, ?MAX) of
+        true -> set_gate(Gate band bnot ?REPORT, State);
+        false -> State
+    end;
+open_gate(State) ->
+    State.
+
+%% A request stops waiting: expired or gone. Its token stays in `order`
+%% until a pop reaches it.
+-spec forget_waiter(reference(), reference(), #state{}) -> #state{}.
 forget_waiter(Token, Mon, #state{waiters = Waiters, monitors = Monitors, counts = Counts} = State) ->
     ok = atomics:sub(Counts, ?QUEUED, 1),
     State#state{waiters = maps:remove(Token, Waiters), monitors = maps:remove(Mon, Monitors)}.
 
-%% A draining keeper with nothing running or waiting stops, in the same
-%% step it finds so: no request is let in after that. The listener deletes
-%% the table on its exit (`{shutdown, drained}`), or starts a new keeper on
-%% it when a reload brought the route back meanwhile. A request still
-%% asking sees the keeper go and is refused.
+%% The end of every step: the gate opens when it may, and a draining keeper
+%% with nothing running or waiting stops, in the same step it finds so: no
+%% request is let in after that. The listener deletes the tables on its
+%% exit (`{shutdown, drained}`), or starts a new keeper on them when a
+%% reload brought the route back meanwhile. A request still asking sees the
+%% keeper go and is refused.
 -spec noreply(#state{}) -> {noreply, #state{}} | {stop, {shutdown, drained}, #state{}}.
-noreply(#state{draining = true, slots = Slots, waiters = Waiters} = State) when
-    map_size(Waiters) =:= 0
-->
-    case ets:info(Slots, size) of
-        1 -> {stop, {shutdown, drained}, State};
-        _Busy -> {noreply, State}
-    end;
-noreply(State) ->
-    {noreply, State}.
+noreply(State0) ->
+    case open_gate(State0) of
+        #state{draining = true, slots = Slots, waiters = Waiters} = State when
+            map_size(Waiters) =:= 0
+        ->
+            case ets:info(Slots, size) of
+                0 -> {stop, {shutdown, drained}, State};
+                _Busy -> {noreply, State}
+            end;
+        State ->
+            {noreply, State}
+    end.

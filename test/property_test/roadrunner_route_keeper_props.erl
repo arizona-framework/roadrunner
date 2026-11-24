@@ -2,35 +2,47 @@
 -moduledoc """
 A model check of a route's `max_concurrent_requests` count
 (`roadrunner_route_keeper`), run against a real listener and its real
-keepers. Random sequences of operations are driven one at a time:
-requests asking for a slot (shedding, waiting long, waiting briefly, or
-waiting until their stream resets), releases, releases racing new
-requests and stream resets, holder and waiter deaths, a stream's
-connection going while it waits, keeper crashes
-(plain, with a release and a request landing while no keeper runs, and
-in the middle of a grant), reloads changing the ceiling and queue depth,
-reloads that move the route to a new key, drop and re-add it while its
-keeper is behind, drop it as a request still routed by the old table asks,
-or fail, and a listener stop with requests in flight.
-After each the system is let settle and checked against the model, table
-by table (a route moved to a new key keeps its old table until it drains):
+keepers. Two kinds of requesters drive it, one operation at a time:
+
+- HTTP/1.1 connections (`shed`, `long` and `short` waits): a process that
+  lives across its requests, so a kept-alive connection's next request
+  (`reuse`) takes its home slot without the keeper; refused or released,
+  it stays idle;
+- stream workers (`reset`) of fake connections that start and monitor
+  them, as HTTP/2 and HTTP/3 do: a worker waits until its stream resets
+  or its connection goes, and its request ends with it.
+
+The operations: requests, releases, releases racing new requests (a
+kept-alive connection's home racing the slot it frees, and any waiter's
+claim on it) and stream resets, holder and waiter deaths, a connection
+going with its workers waiting or running, keeper crashes (plain, with a
+release and a request landing while no keeper runs, and in the middle of
+a grant), reloads changing the ceiling and queue depth, reloads that move
+the route to a new key, drop and re-add it while its keeper is behind,
+drop it as a request still routed by the old table asks, or fail, and a
+listener stop with requests in flight.
+
+After each the system is let settle (every process at rest and two reads
+of the state alike) and checked against the model, table by table (a
+route moved to a new key keeps its old table until it drains):
 
 - a slot is granted only while fewer than the ceiling hold one, and a
   table never holds more rows than its ceiling, but after a reload that
   lowered it;
-- every slot is freed exactly once: once settled, each table's rows are
-  exactly the requests the model has running on it, and its keeper
-  watches exactly those;
+- every slot is freed exactly once: each table's rows are exactly the
+  requests the model has running on it, each held by a process the keeper
+  watches, and every connection the keeper registered is watched;
 - the keeper's waiting count is exactly the requests it has parked, and
   none is parked while a slot is free;
 - waiting requests are granted first in, first out: none is granted while
-  an older one that cannot time out still waits, even when a new request
-  reaches the keeper ahead of the release that freed the slot;
+  an older one that cannot time out still waits, even when a new request,
+  or a kept-alive connection's home, comes ahead of the release that
+  freed the slot;
 - no request waits past its timeout, and a long wait is never dropped
-  except by a keeper crash or the listener stopping (a drained notice that
-  reaches the listener while a request still waits does not stop it);
+  except by a keeper crash or the listener stopping;
 - a dropped route's keeper grants nothing once it has found the route
-  drained, and its count goes only after that;
+  drained, and its tables go only after that, never under a request still
+  running;
 - a request to a route without a ceiling is answered whatever the capped
   route is doing.
 
@@ -50,15 +62,23 @@ is refused and every holder's release returns.
 %% How late a timeout may answer on a loaded machine.
 -define(SLACK_MS, 2000).
 
+%% Where the keeper keeps what the model reads of it: its `#state{}` fields
+%% `counts`, `waiters` and `watched`, and a `#waiter{}`'s pid.
+-define(STATE_COUNTS, 4).
+-define(STATE_WAITERS, 8).
+-define(STATE_WATCHED, 10).
+-define(WAITER_PID, 2).
+
 -record(client, {
     mode :: shed | long | short | reset,
-    status :: asking | parked | running | gone,
-    %% Arrival order among the requests that waited.
+    kind :: h1 | worker,
+    status :: asking | parked | running | idle | gone,
+    %% Arrival order among the requests.
     seq :: non_neg_integer(),
     t0 :: integer(),
-    %% The slot table and counts the request asked.
-    table :: {ets:tid(), atomics:atomics_ref()},
-    %% The connection process a stream worker (`reset`) waits beside.
+    %% The tables and counts the request asked.
+    table :: {{ets:tid(), ets:tid()}, atomics:atomics_ref()},
+    %% The fake connection a stream worker belongs to.
     conn :: pid() | undefined,
     %% Set by a keeper crash while it waits: its refusal is expected.
     orphaned = false :: boolean()
@@ -71,6 +91,8 @@ is refused and every holder's release returns.
     methods = undefined :: undefined | [binary()],
     seq = 0 :: non_neg_integer(),
     clients = #{} :: #{pid() => #client{}},
+    %% The live fake connections.
+    conns = [] :: [pid()],
     %% The most rows each table may hold: its ceiling, or more after a
     %% reload lowered it below the requests already running.
     caps = #{} :: #{ets:tid() => pos_integer()}
@@ -78,21 +100,26 @@ is refused and every holder's release returns.
 
 op() ->
     frequency([
-        {8, {request, oneof([shed, long, long, short, reset])}},
+        {6, {request, oneof([shed, long, long, short, reset])}},
+        {5, {reuse, nat(), oneof([shed, long, short])}},
+        {4, {stream, nat()}},
         {5, {release, nat()}},
-        {3, {race, nat(), oneof([shed, long, short])}},
+        {3, {race, nat(), oneof([shed, long, short, reset])}},
+        {3, {race_reuse, nat(), nat(), oneof([shed, long, short])}},
         {2, {kill, nat()}},
         {2, {reset, nat()}},
         {1, {race_reset, nat(), nat()}},
+        {2, {conn_gone, nat()}},
+        {1, {kill_conn_and_worker, nat()}},
+        {2, {stream_then_kill_conn, nat()}},
         {1, crash_keeper},
         {1, {crash_window, nat(), oneof([shed, long])}},
         {1, half_grant},
         {1, {reload, integer(1, 4), integer(1, 4)}},
         {1, rekey},
         {1, drop_and_bring_back},
-        {1, straggler_at_drain},
+        {1, {straggler_at_drain, nat()}},
         {1, drained_before_waiter},
-        {1, {conn_gone, nat()}},
         {1, failed_reload},
         {1, cheap}
     ]).
@@ -153,32 +180,62 @@ reload(#model{max = Max, max_queued = MaxQueued, methods = Methods}) ->
 
 %% --- the steps ---
 
+step({request, reset}, Model) ->
+    {Conn, Model1} = new_conn(Model),
+    {Pid, Model2} = stream(Conn, Model1),
+    settle(await_asked(Pid, Model2));
 step({request, Mode}, Model) ->
-    {Pid, Model1} = request(Mode, Model),
+    {Pid, Model1} = h1_request(new_h1(), Mode, Model),
     settle(await_asked(Pid, Model1));
+step({reuse, N, Mode}, Model) ->
+    %% A kept-alive connection's next request: its home slot, when it has
+    %% one on the route's table and the gate is open.
+    case pick(idle, Model) of
+        [] ->
+            Model;
+        Idle ->
+            Pid = lists:nth(N rem length(Idle) + 1, Idle),
+            {Pid, Model1} = h1_request(Pid, Mode, Model),
+            settle(await_asked(Pid, Model1))
+    end;
+step({stream, N}, #model{conns = Conns} = Model) ->
+    case Conns of
+        [] ->
+            step({request, reset}, Model);
+        _ ->
+            Conn = lists:nth(N rem length(Conns) + 1, Conns),
+            {Pid, Model1} = stream(Conn, Model),
+            settle(await_asked(Pid, Model1))
+    end;
 step({release, N}, Model) ->
     case pick(running, Model) of
         [] ->
             Model;
         Running ->
             Pid = lists:nth(N rem length(Running) + 1, Running),
-            %% Out of the model before its slot is, so the model never
-            %% counts more than run.
-            Model1 = set_status(Pid, gone, Model),
-            Pid ! release,
-            settle(Model1)
+            settle(release(Pid, Model))
     end;
 step({race, N, Mode}, Model) ->
-    %% A release and a new request at once: the slot it frees goes to the
-    %% oldest waiter, whichever reaches the keeper first.
     case pick(running, Model) of
         [] ->
             Model;
         Running ->
             Pid = lists:nth(N rem length(Running) + 1, Running),
-            Model1 = set_status(Pid, gone, Model),
-            Pid ! release,
-            step({request, Mode}, Model1)
+            step({request, Mode}, release(Pid, Model))
+    end;
+step({race_reuse, N, M, Mode}, Model) ->
+    %% A release and a kept-alive connection's next request at once: the
+    %% home slot racing the slot the release frees, and any waiter's claim
+    %% on it.
+    case {pick(running, Model), pick(idle, Model)} of
+        {[_ | _] = Running, [_ | _] = Idle} ->
+            Holder = lists:nth(N rem length(Running) + 1, Running),
+            Client = lists:nth(M rem length(Idle) + 1, Idle),
+            Model1 = release(Holder, Model),
+            {Client, Model2} = h1_request(Client, Mode, Model1),
+            settle(await_asked(Client, Model2));
+        _ ->
+            Model
     end;
 step({kill, N}, Model) ->
     case pick(running, Model) ++ pick(parked, Model) of
@@ -197,22 +254,53 @@ step({reset, N}, Model) ->
         Waiting ->
             Pid = lists:nth(N rem length(Waiting) + 1, Waiting),
             Pid ! {reset, Pid},
-            %% Reset, or granted just before: either way it answers.
             settle(apply_result(receive_result(Pid), Model))
     end;
 step({race_reset, N, M}, Model) ->
-    %% A stream reset while the slot it waits for is being handed to it.
     case {[P || P <- pick(parked, Model), mode(P, Model) =:= reset], pick(running, Model)} of
         {[_ | _] = Waiting, [_ | _] = Running} ->
             Waiter = lists:nth(N rem length(Waiting) + 1, Waiting),
             Holder = lists:nth(M rem length(Running) + 1, Running),
-            Model1 = set_status(Holder, gone, Model),
-            Holder ! release,
+            Model1 = release(Holder, Model),
             Waiter ! {reset, Waiter},
             settle(apply_result(receive_result(Waiter), Model1));
         _ ->
             Model
     end;
+step({conn_gone, N}, #model{conns = Conns} = Model) ->
+    %% A connection goes: its waiting workers stop waiting (or were granted
+    %% just before), its running ones run on and stay counted.
+    case Conns of
+        [] ->
+            Model;
+        _ ->
+            Conn = lists:nth(N rem length(Conns) + 1, Conns),
+            settle(kill_conn(Conn, Model))
+    end;
+step({kill_conn_and_worker, N}, Model) ->
+    case [P || P <- pick(running, Model), kind(P, Model) =:= worker] of
+        [] ->
+            Model;
+        Running ->
+            Worker = lists:nth(N rem length(Running) + 1, Running),
+            Conn = (client(Worker, Model))#client.conn,
+            Model1 = set_status(Worker, gone, Model),
+            exit(Worker, kill),
+            settle(kill_conn(Conn, Model1))
+    end;
+step({stream_then_kill_conn, N}, Model) ->
+    %% A worker starts and its connection dies at once: whatever point of
+    %% its admission the worker is at, its slot is counted while it runs and
+    %% freed once.
+    {Conn, Model1} =
+        case Model#model.conns of
+            [] -> new_conn(Model);
+            Conns -> {lists:nth(N rem length(Conns) + 1, Conns), Model}
+        end,
+    {Pid, Model2} = stream(Conn, Model1),
+    exit(Conn, kill),
+    Model3 = Model2#model{conns = lists:delete(Conn, Model2#model.conns)},
+    settle(apply_result(receive_result(Pid), Model3));
 step(crash_keeper, Model) ->
     Keeper = keeper(),
     Model1 = orphan_waiters(Model),
@@ -220,9 +308,8 @@ step(crash_keeper, Model) ->
     ok = await_new_keeper(Keeper),
     settle(Model1);
 step({crash_window, N, Mode}, Model) ->
-    %% The keeper dies and, before the listener starts the next one, a
-    %% holder releases and a new request asks: it finds no keeper and is
-    %% refused, and the release is in the table for the next keeper.
+    %% While no keeper runs: a holder releases, and a connection without a
+    %% home asks, and is refused.
     Keeper = keeper(),
     Model1 = orphan_waiters(Model),
     ok = sys:suspend(?LISTENER),
@@ -237,20 +324,17 @@ step({crash_window, N, Mode}, Model) ->
                 Model1;
             Running ->
                 Holder = lists:nth(N rem length(Running) + 1, Running),
-                Holder ! release,
-                set_status(Holder, gone, Model1)
+                release(Holder, Model1)
         end,
-    {Pid, Model3} = request(Mode, Model2),
+    {Pid, Model3} = h1_request(new_h1(), Mode, Model2),
     {Pid, {refused, _}} = receive_result(Pid),
-    Model4 = set_status(Pid, gone, Model3),
+    Model4 = set_status(Pid, idle, Model3),
     ok = sys:resume(?LISTENER),
     ok = await_new_keeper(Keeper),
     settle(Model4);
 step(half_grant, Model) ->
-    %% The keeper adds a request's row and dies before answering it. The
-    %% next keeper takes the row over, and a request may park behind it;
-    %% the asker then sees the old keeper gone, removes the row, and the
-    %% next keeper must hand the slot on.
+    %% The keeper adds a row for a waiting request and dies before
+    %% answering: the asker removes it, the next keeper hands the slot on.
     #{in_flight := InFlight} = route_stats(),
     case InFlight < Model#model.max of
         false ->
@@ -259,15 +343,15 @@ step(half_grant, Model) ->
             Keeper = keeper(),
             Model1 = orphan_waiters(Model),
             ok = sys:suspend(Keeper),
-            {Asker, Model2} = request(long, Model1),
-            Token = await_mailbox(Keeper, Asker),
-            {Slots, _Counts} = route_counts(),
-            true = ets:insert(Slots, {Token, Asker}),
+            {Asker, Model2} = h1_request(new_h1(), long, Model1),
+            ok = await_mailbox(Keeper, Asker),
+            {{Slots, _Regs}, _Counts} = route_counts(),
+            true = ets:insert_new(Slots, {free_key(Slots, 1), Asker, Asker}),
             true = erlang:suspend_process(Asker),
             exit(Keeper, kill),
             ok = await_new_keeper(Keeper),
             Model3 = set_orphaned(Asker, Model2),
-            {Next, Model4} = request(long, Model3),
+            {Next, Model4} = h1_request(new_h1(), long, Model3),
             Model5 = await_asked(Next, Model4),
             true = erlang:resume_process(Asker),
             settle(apply_result(receive_result(Asker), Model5))
@@ -277,8 +361,6 @@ step({reload, Max, MaxQueued}, Model) ->
     ok = reload(Model1),
     settle(recap(Model1));
 step(rekey, #model{methods = Methods} = Model) ->
-    %% The route moves to a new key and gets a count of its own; the old
-    %% count drains with the requests it still runs.
     Model1 =
         case Methods of
             undefined -> Model#model{methods = [~"GET"]};
@@ -296,88 +378,78 @@ step(drop_and_bring_back, Model) ->
             Model;
         [] ->
             Keeper = keeper(),
-            Plain = [{~"/cheap", roadrunner_hello_handler}],
             ok = sys:suspend(Keeper),
-            ok = roadrunner_listener:reload_routes(?LISTENER, Plain),
+            ok = roadrunner_listener:reload_routes(?LISTENER, plain()),
             ok = reload(Model),
-            {Asker, Model1} = request(shed, Model),
-            _ = await_mailbox(Keeper, Asker),
+            {Asker, Model1} = h1_request(new_h1(), shed, Model),
+            ok = await_mailbox(Keeper, Asker),
             ok = sys:resume(Keeper),
             Model2 = apply_result(receive_result(Asker), Model1),
             ok = await_new_keeper(Keeper),
             settle(Model2)
     end;
-step(straggler_at_drain, Model) ->
+step({straggler_at_drain, N}, Model) ->
     %% A request still routed by the old table asks for a slot just as the
-    %% route, dropped by a reload, drains. Its keeper finds the route drained
-    %% and stops in that step, so the request is refused rather than let in
-    %% to run on a count the listener then deletes. A keeper that reported
-    %% the drain and served on until the listener stopped it could let it in
-    %% once the listener had found the route empty; that window is too short
-    %% to reach, so this checks what closes it: nothing is granted after the
-    %% keeper finds the route drained.
+    %% route, dropped by a reload, drains. A connection without a home there
+    %% asks the keeper, which finds the route drained and stops in that
+    %% step: the request is refused, rather than let in to run on tables the
+    %% listener then deletes. One with a home takes it before the keeper
+    %% hears of the drop, and runs counted on tables kept until it ends.
     case pick(running, Model) ++ pick(parked, Model) of
         [_ | _] ->
             Model;
         [] ->
             Keeper = keeper(),
-            {Slots, _Counts} = Old = route_counts(),
-            Plain = [{~"/cheap", roadrunner_hello_handler}],
+            {{Slots, _Regs}, _Counts} = Old = route_counts(),
+            {Straggler, Fresh} =
+                case pick(idle, Model) of
+                    [] -> {new_h1(), true};
+                    Idle -> {lists:nth(N rem length(Idle) + 1, Idle), false}
+                end,
             ok = sys:suspend(Keeper),
-            ok = roadrunner_listener:reload_routes(?LISTENER, Plain),
-            {Straggler, Model1} = request_on(Old, shed, Model),
-            _ = await_mailbox(Keeper, Straggler),
+            ok = roadrunner_listener:reload_routes(?LISTENER, plain()),
+            {Straggler, Model1} = h1_request_on(Straggler, Old, shed, Model),
+            ok = await_asked_or_mailbox(Keeper, Straggler),
             ok = sys:resume(Keeper),
-            case receive_result(Straggler) of
-                {Straggler, {refused, _}} -> ok;
-                {Straggler, Granted} -> error({granted_after_drain, Granted})
+            {Straggler, Result} = receive_result(Straggler),
+            case {Fresh, Result} of
+                {true, {ok, _}} -> error({granted_after_drain, Straggler});
+                _ -> ok
             end,
-            Model2 = set_status(Straggler, gone, Model1),
+            Model2 = apply_result({Straggler, Result}, Model1),
+            Model3 =
+                case Result of
+                    {ok, _} -> release(Straggler, Model2);
+                    {refused, _} -> Model2
+                end,
             ok = await_deleted(Slots),
-            ok = reload(Model2),
-            settle(Model2)
+            ok = reload(Model3),
+            settle(Model3)
     end;
 step(drained_before_waiter, Model) ->
     %% The route is dropped while one request runs and one waits. The
     %% runner releases while the keeper is behind, so the table empties with
     %% a request still waiting: the keeper hands it the slot rather than
-    %% stopping.
+    %% stopping. The holder frees its own row with the keeper suspended, so
+    %% it is an HTTP/1.1 connection (a worker's row is freed by the keeper).
     Long = [P || P <- pick(parked, Model), mode(P, Model) =/= short],
     case {pick(running, Model), Long, length(tables(Model))} of
-        {[Holder], [_ | _], 1} ->
+        {[Holder], [_ | _], 1} when (map_get(Holder, Model#model.clients))#client.kind =:= h1 ->
             Keeper = keeper(),
-            Plain = [{~"/cheap", roadrunner_hello_handler}],
-            ok = roadrunner_listener:reload_routes(?LISTENER, Plain),
+            ok = roadrunner_listener:reload_routes(?LISTENER, plain()),
             ok = sys:suspend(Keeper),
-            Model1 = set_status(Holder, gone, Model),
-            Mon = monitor(process, Holder),
-            Holder ! release,
-            receive
-                {'DOWN', Mon, process, Holder, _} -> ok
-            end,
+            Table = table(Holder, Model),
+            Model1 = release(Holder, Model),
+            ok = await_rows(Table, 0, 100000),
             ok = sys:resume(Keeper),
             _ = sys:get_state(Keeper),
-            is_process_alive(Keeper) orelse
-                error({keeper_stopped_with_waiters, Long}),
+            is_process_alive(Keeper) orelse error({keeper_stopped_with_waiters, Long}),
             ok = reload(Model1),
             settle(Model1);
         _ ->
             Model
     end;
-step({conn_gone, N}, Model) ->
-    %% A stream worker's connection goes while it waits: it stops waiting.
-    case [P || P <- pick(parked, Model), mode(P, Model) =:= reset] of
-        [] ->
-            Model;
-        Waiting ->
-            Pid = lists:nth(N rem length(Waiting) + 1, Waiting),
-            exit((client(Pid, Model))#client.conn, kill),
-            %% Reset, or granted just before: either way it answers.
-            settle(apply_result(receive_result(Pid), Model))
-    end;
 step(failed_reload, Model) ->
-    %% A table whose hook fails is refused whole, the keepers it started
-    %% with it.
     Bad = #{
         path => ~"/bad",
         handler => roadrunner_init_route_handler,
@@ -390,7 +462,6 @@ step(failed_reload, Model) ->
     ),
     settle(Model);
 step(cheap, Model) ->
-    %% A route without a ceiling answers whatever the capped one is doing.
     {ok, Sock} = gen_tcp:connect(
         {127, 0, 0, 1}, roadrunner_listener:port(?LISTENER), [binary, {active, false}], 5000
     ),
@@ -398,11 +469,29 @@ step(cheap, Model) ->
     <<"HTTP/1.1 200 ", _/binary>> = recv_until_closed(Sock, <<>>),
     Model.
 
+plain() ->
+    [{~"/cheap", roadrunner_hello_handler}].
+
 recv_until_closed(Sock, Acc) ->
     case gen_tcp:recv(Sock, 0, 5000) of
         {ok, Data} -> recv_until_closed(Sock, <<Acc/binary, Data/binary>>);
         {error, closed} -> Acc
     end.
+
+%% A request ends: an HTTP/1.1 connection releases and stays idle, a
+%% stream worker ends (the keeper frees its slot).
+release(Pid, Model) ->
+    Pid ! release,
+    case kind(Pid, Model) of
+        h1 -> set_status(Pid, idle, Model);
+        worker -> set_status(Pid, gone, Model)
+    end.
+
+kill_conn(Conn, #model{conns = Conns} = Model) ->
+    Parked = [P || P <- pick(parked, Model), (client(P, Model))#client.conn =:= Conn],
+    exit(Conn, kill),
+    Model1 = Model#model{conns = lists:delete(Conn, Conns)},
+    lists:foldl(fun(P, Acc) -> apply_result(receive_result(P), Acc) end, Model1, Parked).
 
 orphan_waiters(#model{clients = Clients} = Model) ->
     Model#model{
@@ -419,63 +508,105 @@ set_orphaned(Pid, #model{clients = Clients} = Model) ->
     #{Pid := C} = Clients,
     Model#model{clients = Clients#{Pid := C#client{orphaned = true}}}.
 
-%% After a reload: a table may hold more rows than its new ceiling only as
-%% many as already run.
 recap(#model{caps = Caps} = Model) ->
-    {Slots, Counts} = route_counts(),
+    {{Slots, _Regs}, Counts} = route_counts(),
     Max = atomics:get(Counts, 1),
-    Rows = rows(Slots),
+    Rows = ets:info(Slots, size),
     Model#model{caps = Caps#{Slots => max(Max, max(Rows, maps:get(Slots, Caps, Max)))}}.
 
-%% --- requests ---
+free_key(Slots, K) ->
+    case ets:member(Slots, K) of
+        true -> free_key(Slots, K + 1);
+        false -> K
+    end.
 
-%% A process asking for a slot as a connection or a stream worker does, on
-%% the route's table now.
-request(Mode, Model) ->
-    request_on(route_counts(), Mode, Model).
+%% --- requesters ---
+
+%% An HTTP/1.1 connection: asks for a slot when told, releases when told,
+%% and otherwise waits for its next request.
+new_h1() ->
+    Driver = self(),
+    Pid = spawn(fun() -> h1_idle(Driver) end),
+    ok = remember_client(Pid),
+    Pid.
+
+h1_idle(Driver) ->
+    receive
+        {acquire, Ceiling} ->
+            Result = roadrunner_route_keeper:acquire(Ceiling),
+            Driver ! {client, self(), Result},
+            case Result of
+                {ok, Token} ->
+                    receive
+                        release -> ok = roadrunner_route_keeper:release(Ceiling, Token)
+                    end;
+                {refused, _} ->
+                    ok
+            end,
+            h1_idle(Driver)
+    end.
+
+h1_request(Pid, Mode, Model) ->
+    h1_request_on(Pid, route_counts(), Mode, Model).
 
 %% The same on `Table`, one the route may no longer have.
-request_on({Slots, Counts} = Table, Mode, Model) ->
-    Driver = self(),
-    Ceiling = roadrunner_route_keeper:ceiling(Slots, Counts, wait(Mode), ?LISTENER),
-    Conn =
-        case Mode of
-            reset ->
-                C = spawn(fun() ->
-                    receive
-                        stop -> ok
-                    end
-                end),
-                ok = remember_client(C),
-                C;
-            _ ->
-                undefined
-        end,
-    Pid = spawn(fun() ->
-        Result =
-            case Mode of
-                reset -> roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Conn);
-                _ -> roadrunner_route_keeper:acquire(Ceiling)
-            end,
-        Driver ! {client, self(), Result},
-        case Result of
-            {ok, Token} ->
-                receive
-                    release -> ok = roadrunner_route_keeper:release(Ceiling, Token)
-                end;
-            {refused, _} ->
-                %% Refused, it lives on, as an HTTP/1.1 connection does
-                %% after its 503: its end must not be what frees anything.
-                receive
-                    stop -> ok
-                end;
-            reset ->
-                ok
-        end
-    end),
-    ok = remember_client(Pid),
+h1_request_on(Pid, Table, Mode, Model) ->
+    Pid ! {acquire, ceiling(Table, Mode)},
     Client = #client{
         mode = Mode,
+        kind = h1,
+        status = asking,
+        seq = Model#model.seq,
+        t0 = erlang:monotonic_time(millisecond),
+        table = Table
+    },
+    {Pid, Model#model{seq = Model#model.seq + 1, clients = (Model#model.clients)#{Pid => Client}}}.
+
+ceiling({Table, Counts}, Mode) ->
+    roadrunner_route_keeper:ceiling(Table, Counts, wait(Mode), ?LISTENER).
+
+%% A fake multiplexed connection: starts stream workers and monitors them.
+new_conn(#model{conns = Conns} = Model) ->
+    Conn = spawn(fun conn_loop/0),
+    ok = remember_client(Conn),
+    {Conn, Model#model{conns = [Conn | Conns]}}.
+
+conn_loop() ->
+    receive
+        {open, Ceiling, Driver, Ref} ->
+            Conn = self(),
+            {Pid, _Mon} = spawn_monitor(fun() -> worker(Ceiling, Conn, Driver) end),
+            Driver ! {Ref, Pid},
+            conn_loop();
+        {'DOWN', _Mon, process, _Worker, _Reason} ->
+            conn_loop()
+    end.
+
+worker(Ceiling, Conn, Driver) ->
+    Result = roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Conn),
+    Driver ! {client, self(), Result},
+    case Result of
+        {ok, _Token} ->
+            receive
+                release -> ok
+            end;
+        _ ->
+            ok
+    end.
+
+stream(Conn, Model) ->
+    Table = route_counts(),
+    Ref = make_ref(),
+    Conn ! {open, ceiling(Table, reset), self(), Ref},
+    Pid =
+        receive
+            {Ref, P} -> P
+        after 5000 -> error({conn_never_opened, Conn})
+        end,
+    ok = remember_client(Pid),
+    Client = #client{
+        mode = reset,
+        kind = worker,
         status = asking,
         seq = Model#model.seq,
         t0 = erlang:monotonic_time(millisecond),
@@ -498,8 +629,8 @@ await_asked(Pid, Model, Tries) ->
     receive
         {client, Pid, Result} -> apply_result({Pid, Result}, Model)
     after 0 ->
-        #client{table = {Slots, _}} = client(Pid, Model),
-        case lists:member(Pid, waiting(Slots)) of
+        #client{table = {{_Slots, Regs}, _}} = client(Pid, Model),
+        case lists:member(Pid, waiting(Regs)) of
             true ->
                 set_status(Pid, parked, Model);
             false ->
@@ -508,10 +639,8 @@ await_asked(Pid, Model, Tries) ->
         end
     end.
 
-%% A request's answer, checked against the model: a grant only while its
-%% table runs fewer than its ceiling.
 apply_result({Pid, Result}, #model{clients = Clients} = Model) ->
-    #{Pid := #client{table = {_Slots, Counts} = Table} = Client} = Clients,
+    #{Pid := #client{table = {_Table, Counts} = Table, kind = Kind} = Client} = Clients,
     case Result of
         {ok, _Token} ->
             Running = length([P || P <- pick(running, Model), table(P, Model) =:= Table]),
@@ -520,13 +649,17 @@ apply_result({Pid, Result}, #model{clients = Clients} = Model) ->
             set_status(Pid, running, Model);
         {refused, _} ->
             ok = check_refusal(Client),
-            set_status(Pid, gone, Model);
+            set_status(Pid, after_answer(Kind), Model);
         reset ->
             set_status(Pid, gone, Model)
     end.
 
-%% Refused while waiting: by its timeout, never late, or by a keeper crash.
-%% A long wait has no timeout to reach.
+after_answer(h1) -> idle;
+after_answer(worker) -> gone.
+
+%% A refusal is fine for a request still asking (the route was full), one
+%% orphaned by a keeper crash, or a short wait that timed out; a long wait
+%% must never be dropped.
 check_refusal(#client{status = asking}) ->
     ok;
 check_refusal(#client{orphaned = true}) ->
@@ -546,9 +679,10 @@ receive_result(Pid) ->
 
 %% --- settling ---
 
-%% Let every message in flight land, then check each table against the
-%% model: the requests that left a keeper's queue have their answers, the
-%% rows are exactly the requests running, and the keeper watches those.
+%% Answer every request the keeper has answered, then check a settled
+%% state: every process at rest, and the state read twice alike (a keeper
+%% handling a message between the reads of its state and of the tables
+%% gives a torn view).
 settle(Model) ->
     settle(Model, 100000).
 
@@ -558,33 +692,49 @@ settle(Model, Tries) ->
     Views = [view(Table, Model) || Table <- tables(Model)],
     case [P || {_Table, #{answering := A}} <- Views, P <- A] of
         [_ | _] = Answering ->
-            %% A waiter left a queue: its answer is on its way.
             receive
                 {client, Pid, Result} -> settle(apply_result({Pid, Result}, Model), Tries)
             after 10000 -> error({no_answer, Answering})
             end;
         [] ->
-            case lists:all(fun({_Table, V}) -> quiet(V) end, Views) of
+            case
+                lists:all(fun({_Table, V}) -> quiet(V) end, Views) andalso at_rest(Model) andalso
+                    [view(Table, Model) || Table <- tables(Model)] =:= Views andalso
+                    at_rest(Model)
+            of
                 true ->
                     ok = check_fifo(Model),
                     lists:foldl(fun check_table/2, Model, Views);
                 false ->
-                    %% A released or killed holder's slot is not freed yet,
-                    %% or its keeper has yet to hear of it.
                     erlang:yield(),
                     settle(Model, Tries - 1)
             end
     end.
 
-%% The tables the model's live requests are on, and the route's own.
+%% Every process of the run and every keeper waits in a receive with an
+%% empty mailbox: whatever a release or a death sent has been handled.
+at_rest(#model{clients = Clients, conns = Conns} = Model) ->
+    Keepers = [
+        ets:lookup_element(Regs, '$keeper', 2)
+     || {{_Slots, Regs}, _Counts} <- tables(Model),
+        ets:info(Regs, size) =/= undefined
+    ],
+    lists:all(fun resting/1, maps:keys(Clients) ++ Conns ++ Keepers).
+
+resting(Pid) ->
+    case erlang:process_info(Pid, [status, message_queue_len]) of
+        undefined -> true;
+        [{status, waiting}, {message_queue_len, 0}] -> true;
+        _ -> false
+    end.
+
 tables(Model) ->
     lists:usort([
         route_counts()
         | [table(P, Model) || P <- pick(running, Model) ++ pick(parked, Model)]
     ]).
 
-%% One table as its keeper and rows have it now.
-view({Slots, _Counts} = Table, Model) ->
+view({{Slots, Regs}, _Counts} = Table, Model) ->
     Live = [P || P <- pick(running, Model) ++ pick(parked, Model), table(P, Model) =:= Table],
     case ets:info(Slots, size) of
         undefined when Live =/= [] ->
@@ -592,36 +742,42 @@ view({Slots, _Counts} = Table, Model) ->
         undefined ->
             {Table, gone};
         _ ->
-            view(Table, Model, keeper_view(Slots))
+            {Table, view(Table, Model, keeper_view(Regs))}
     end.
 
-%% A table whose keeper has gone is changing hands: it is about to be
-%% deleted (its route drained) or served by a new keeper.
-view(Table, _Model, changing) ->
-    {Table, changing};
-view({Slots, Counts} = Table, Model, {Waiting, Watched, Queued}) ->
+%% A table whose keeper has gone is changing hands: about to be deleted
+%% (its route drained) or served by a new keeper.
+view(_Table, _Model, changing) ->
+    changing;
+view({{Slots, Regs}, Counts} = Table, Model, {Waiting, Watched, Queued}) ->
     Running = [P || P <- pick(running, Model), table(P, Model) =:= Table],
     Parked = [P || P <- pick(parked, Model), table(P, Model) =:= Table],
-    {Table, #{
+    Rows = ets:tab2list(Slots),
+    Registered = [C || {C, _Home} <- ets:tab2list(Regs)],
+    #{
         answering => [P || P <- Parked, not lists:member(P, Waiting)],
         waiting => Waiting,
-        watched => Watched,
+        %% Every row's holder is watched, and so is every registration.
+        unwatched_rows => [R || {_K, _O, H} = R <- Rows, not lists:member(H, Watched)],
+        unwatched_regs => [C || C <- Registered, not lists:member(C, Watched)],
         queued => Queued,
-        holding => lists:sort(holders(Slots)),
+        holding => lists:sort([H || {_K, _O, H} <- Rows]),
         running => lists:sort(Running),
         max => atomics:get(Counts, 1)
-    }}.
+    }.
 
 quiet(gone) ->
     true;
 quiet(changing) ->
     false;
-quiet(#{watched := Watched, holding := Holding, running := Running}) ->
-    Watched =:= length(Holding) andalso Holding =:= Running.
+quiet(#{unwatched_rows := [], unwatched_regs := [], holding := Holding, running := Running}) ->
+    Holding =:= Running;
+quiet(#{}) ->
+    false.
 
 check_table({_Table, gone}, Model) ->
     Model;
-check_table({{Slots, _}, V}, #model{caps = Caps} = Model) ->
+check_table({{{Slots, _Regs}, _}, V}, #model{caps = Caps} = Model) ->
     #{waiting := Waiting, queued := Queued, holding := Holding, max := Max} = V,
     Rows = length(Holding),
     Cap = maps:get(Slots, Caps, Max),
@@ -634,26 +790,18 @@ check_table({{Slots, _}, V}, #model{caps = Caps} = Model) ->
         false -> Model
     end.
 
-%% What keeps the system from settling, named.
 diagnose(Model) ->
-    [
-        {Table, diagnose_view(V)}
-     || {Table, V} <- [view(T, Model) || T <- tables(Model)], V =/= gone
-    ].
+    #{
+        views => [{Table, V} || {Table, V} <- [view(T, Model) || T <- tables(Model)], V =/= gone],
+        restless => [
+            {P, erlang:process_info(P, [status, messages, current_function])}
+         || P <- maps:keys(Model#model.clients) ++ Model#model.conns,
+            not resting(P)
+        ]
+    }.
 
-diagnose_view(#{watched := Watched, holding := Holding, running := Running}) when
-    Watched > length(Holding)
-->
-    {keeper_watches_freed_slots, Watched, Holding, Running};
-diagnose_view(#{holding := Holding, running := Running}) when Holding =/= Running ->
-    {slots_not_matching_requests, #{rows => Holding, running => Running}};
-diagnose_view(changing) ->
-    keeper_gone_with_its_table;
-diagnose_view(V) ->
-    {unexplained, V}.
-
-%% No running request was granted ahead of an older one still waiting on
-%% its table that could not have timed out.
+%% No waiting request is older than one already granted, but a short wait
+%% (it may have been granted after its timeout raced the grant).
 check_fifo(Model) ->
     lists:foreach(
         fun(Table) ->
@@ -677,7 +825,6 @@ check_fifo(Model) ->
         tables(Model)
     ).
 
-%% Release everything, letting the queues run dry.
 finish(Model0) ->
     Model = expire_short_waits(settle(Model0)),
     case {pick(running, Model), pick(parked, Model)} of
@@ -685,15 +832,11 @@ finish(Model0) ->
             #{in_flight := 0, queued := 0} = route_stats(),
             ok;
         {[Pid | _], _} ->
-            finish(step({release, index_of(Pid, pick(running, Model))}, Model));
+            finish(settle(release(Pid, Model)));
         {[], Parked} ->
-            %% Only short waits left with nothing running cannot happen:
-            %% with a free slot the keeper would have served them.
             error({parked_with_free_slots, Parked})
     end.
 
-%% With nothing released, every brief wait still waiting must time out,
-%% and in time.
 expire_short_waits(Model) ->
     lists:foldl(
         fun(Pid, Acc) ->
@@ -706,24 +849,54 @@ expire_short_waits(Model) ->
         [P || P <- pick(parked, Model), mode(P, Model) =:= short]
     ).
 
-%% The listener stops with requests running and waiting: every waiting one
-%% is refused, and every holder's release returns.
 stop_with_requests(Model) ->
     Parked = pick(parked, Model),
     Running = pick(running, Model),
-    Mons = [{P, monitor(process, P)} || P <- Running],
     ok = roadrunner_listener:stop(?LISTENER),
-    _ = [{P, {refused, _}} = receive_result(P) || P <- Parked],
+    _ = [{P, {refused, _}} = receive_result(P) || P <- Parked, kind(P, Model) =:= h1],
+    _ = [
+        case receive_result(P) of
+            {P, {refused, _}} -> ok;
+            {P, reset} -> ok
+        end
+     || P <- Parked, kind(P, Model) =:= worker
+    ],
+    %% Every holder's release returns: HTTP/1.1 connections stay alive,
+    %% workers end normally.
+    Mons = [{P, monitor(process, P)} || P <- Running],
     _ = [P ! release || P <- Running],
     _ = [
-        receive
-            {'DOWN', Mon, process, P, normal} -> ok;
-            {'DOWN', Mon, process, P, Reason} -> error({release_failed, P, Reason})
-        after 10000 -> error({release_hung, P})
+        case kind(P, Model) of
+            h1 ->
+                ok = await_idle(P),
+                true = demonitor(Mon, [flush]);
+            worker ->
+                receive
+                    {'DOWN', Mon, process, P, normal} -> ok;
+                    {'DOWN', Mon, process, P, Reason} -> error({release_failed, P, Reason})
+                after 10000 -> error({release_hung, P})
+                end
         end
      || {P, Mon} <- Mons
     ],
     ok.
+
+%% Until an HTTP/1.1 connection is back waiting for its next request.
+await_idle(Pid) ->
+    await_idle(Pid, 100000).
+
+await_idle(Pid, 0) ->
+    error({never_idle, Pid});
+await_idle(Pid, Tries) ->
+    case erlang:process_info(Pid, [current_function, message_queue_len]) of
+        [{current_function, {?MODULE, h1_idle, 1}}, {message_queue_len, 0}] ->
+            ok;
+        undefined ->
+            error({h1_client_died, Pid});
+        _ ->
+            erlang:yield(),
+            await_idle(Pid, Tries - 1)
+    end.
 
 %% --- the system under test ---
 
@@ -731,26 +904,32 @@ route_counts() ->
     {ok, _, _, _, _, {_Body, Ceiling}} = roadrunner_router:resolve(
         ~"GET", ~"/expensive", persistent_term:get({roadrunner_routes, ?LISTENER})
     ),
-    {element(2, Ceiling), element(3, Ceiling)}.
+    {{element(2, Ceiling), element(3, Ceiling)}, element(4, Ceiling)}.
 
 route_stats() ->
     roadrunner_route_keeper:stats(route_counts()).
 
 keeper() ->
-    {Slots, _Counts} = route_counts(),
-    ets:lookup_element(Slots, keeper, 2).
+    {{_Slots, Regs}, _Counts} = route_counts(),
+    ets:lookup_element(Regs, '$keeper', 2).
 
-%% The pids a table's keeper has waiting, the holders it watches and its
-%% waiting count, read in the keeper itself, after everything sent to it.
-keeper_view(Slots) ->
-    Keeper = ets:lookup_element(Slots, keeper, 2),
+%% The pids the keeper has waiting, the pids it watches and its waiting
+%% count, read in the keeper after everything sent to it before; or
+%% `changing` when it has gone.
+keeper_view(Regs) ->
+    Keeper = ets:lookup_element(Regs, '$keeper', 2),
     Self = self(),
     Ref = make_ref(),
     try
         sys:replace_state(Keeper, fun(State) ->
             Self !
-                {Ref, [element(2, W) || W <- maps:values(element(6, State))],
-                    map_size(element(8, State)), atomics:get(element(3, State), 3)},
+                {Ref,
+                    [
+                        element(?WAITER_PID, W)
+                     || W <- maps:values(element(?STATE_WAITERS, State))
+                    ],
+                    maps:keys(element(?STATE_WATCHED, State)),
+                    atomics:get(element(?STATE_COUNTS, State), 3)},
             State
         end)
     of
@@ -759,46 +938,25 @@ keeper_view(Slots) ->
                 {Ref, Waiting, Watched, Queued} -> {Waiting, Watched, Queued}
             end
     catch
-        exit:{noproc, _} -> changing
+        exit:{_Reason, {sys, _Request, _Args}} -> changing
     end.
 
-%% The requests `Slots`' keeper has waiting (none while it changes hands).
-waiting(Slots) ->
-    case keeper_view(Slots) of
+%% The requests `Regs`' keeper has waiting (none while it changes hands).
+waiting(Regs) ->
+    case keeper_view(Regs) of
         changing -> [];
         {Waiting, _Watched, _Queued} -> Waiting
     end.
 
-holders(Slots) ->
-    [Pid || {Token, Pid} <- ets:tab2list(Slots), is_reference(Token)].
-
-rows(Slots) ->
-    ets:info(Slots, size) - 1.
-
-await_new_keeper(Old) ->
-    await_new_keeper(Old, 100000).
-
-await_new_keeper(_Old, 0) ->
-    error(no_new_keeper);
-await_new_keeper(Old, Tries) ->
-    case keeper() of
-        Old ->
+await_rows(Table, N, 0) ->
+    error({rows_never, Table, N});
+await_rows({{Slots, _Regs}, _} = Table, N, Tries) ->
+    case ets:info(Slots, size) of
+        N ->
+            ok;
+        _ ->
             erlang:yield(),
-            await_new_keeper(Old, Tries - 1);
-        _New ->
-            ok
-    end.
-
-%% The token of `Pid`'s acquire, once it is in the (suspended) keeper's
-%% mailbox.
-await_mailbox(Keeper, Pid) ->
-    {messages, Messages} = erlang:process_info(Keeper, messages),
-    case [T || {acquire, T, P, _Wait} <- Messages, P =:= Pid] of
-        [Token] ->
-            Token;
-        [] ->
-            erlang:yield(),
-            await_mailbox(Keeper, Pid)
+            await_rows(Table, N, Tries - 1)
     end.
 
 %% Until the listener has deleted a slot table.
@@ -814,6 +972,47 @@ await_deleted(Slots, Tries) ->
         _ ->
             erlang:yield(),
             await_deleted(Slots, Tries - 1)
+    end.
+
+await_new_keeper(Old) ->
+    await_new_keeper(Old, 100000).
+
+await_new_keeper(_Old, 0) ->
+    error(no_new_keeper);
+await_new_keeper(Old, Tries) ->
+    case keeper() of
+        Old ->
+            erlang:yield(),
+            await_new_keeper(Old, Tries - 1);
+        _New ->
+            ok
+    end.
+
+%% Until `Pid`'s acquire is in the (suspended) keeper's mailbox.
+await_mailbox(Keeper, Pid) ->
+    {messages, Messages} = erlang:process_info(Keeper, messages),
+    case [P || {acquire, _Token, P, _Kind, _Wait} <- Messages, P =:= Pid] of
+        [_] ->
+            ok;
+        [] ->
+            erlang:yield(),
+            await_mailbox(Keeper, Pid)
+    end.
+
+%% Until `Pid` has its answer (it took its home) or its acquire is in the
+%% (suspended) keeper's mailbox.
+await_asked_or_mailbox(Keeper, Pid) ->
+    {messages, Messages} = erlang:process_info(self(), messages),
+    {messages, Asks} = erlang:process_info(Keeper, messages),
+    case
+        lists:member({client, Pid}, [{client, P} || {client, P, _} <- Messages]) orelse
+            [P || {acquire, _Token, P, _Kind, _Wait} <- Asks, P =:= Pid] =/= []
+    of
+        true ->
+            ok;
+        false ->
+            erlang:yield(),
+            await_asked_or_mailbox(Keeper, Pid)
     end.
 
 %% --- model helpers ---
@@ -834,6 +1033,9 @@ client(Pid, #model{clients = Clients}) ->
 mode(Pid, Model) ->
     (client(Pid, Model))#client.mode.
 
+kind(Pid, Model) ->
+    (client(Pid, Model))#client.kind.
+
 table(Pid, Model) ->
     (client(Pid, Model))#client.table.
 
@@ -841,11 +1043,6 @@ set_status(Pid, Status, #model{clients = Clients} = Model) ->
     #{Pid := Client} = Clients,
     Model#model{clients = Clients#{Pid := Client#client{status = Status}}}.
 
-index_of(Pid, List) ->
-    length(lists:takewhile(fun(P) -> P =/= Pid end, List)).
-
-%% Every request process of the run, ended once it is checked: refused
-%% ones are still waiting to be told to go.
 stop_clients() ->
     _ = [exit(P, kill) || P <- erase_clients()],
     ok.
@@ -860,7 +1057,6 @@ remember_client(Pid) ->
     _ = put(?MODULE, [Pid | erase_clients()]),
     ok.
 
-%% Answers of requests killed before they were read.
 flush_clients() ->
     receive
         {client, _, _} -> flush_clients()

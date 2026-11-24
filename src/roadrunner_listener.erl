@@ -1276,12 +1276,12 @@ An upgrade can set each of these for its own session
 }.
 
 %% The count of one route's `max_concurrent_requests`: its keeper, and the
-%% slot table and counts the listener owns so they outlive a keeper that
+%% tables and counts the listener owns so they outlive a keeper that
 %% crashes (`roadrunner_route_keeper`). A route a reload dropped keeps its
 %% count, `draining`, until the requests it still runs end.
 -record(route_keeper, {
     pid :: pid(),
-    slots :: roadrunner_route_keeper:table(),
+    table :: roadrunner_route_keeper:table(),
     counts :: atomics:atomics_ref(),
     draining = false :: boolean()
 }).
@@ -2001,8 +2001,8 @@ start_route_keepers(Specs, Keepers) ->
             ({Key, _Max, _Mode}, {Acc, Started}) when is_map_key(Key, Acc) ->
                 {Acc, Started};
             ({Key, Max, Mode}, {Acc, Started}) ->
-                {Pid, Slots, Counts} = roadrunner_route_keeper:new(Max, queue_depth(Mode), false),
-                {Acc#{Key => #route_keeper{pid = Pid, slots = Slots, counts = Counts}}, [
+                {Pid, Table, Counts} = roadrunner_route_keeper:new(Max, queue_depth(Mode), false),
+                {Acc#{Key => #route_keeper{pid = Pid, table = Table, counts = Counts}}, [
                     Key | Started
                 ]}
         end,
@@ -2021,9 +2021,9 @@ queue_depth({shed, _Shed}) -> 0.
 ) -> #{ceiling_key() => roadrunner_route_keeper:ceiling()}.
 route_ceiling_counts(Specs, Keepers, ListenerName) ->
     #{
-        Key => roadrunner_route_keeper:ceiling(Slots, Counts, Mode, ListenerName)
+        Key => roadrunner_route_keeper:ceiling(Table, Counts, Mode, ListenerName)
      || {Key, _Max, Mode} <- Specs,
-        #route_keeper{slots = Slots, counts = Counts} <- [maps:get(Key, Keepers)]
+        #route_keeper{table = Table, counts = Counts} <- [maps:get(Key, Keepers)]
     }.
 
 %% Once a reload's table compiled: the routes it keeps take their new
@@ -2073,9 +2073,9 @@ draining_route_keeper(_Was, Draining, Pid) ->
 stop_route_keepers(Keys, #state{route_keepers = Keepers, route_stopping = Stopping} = State) ->
     {Keepers1, Stopping1} = lists:foldl(
         fun(Key, {KeepersAcc, StoppingAcc}) ->
-            #{Key := #route_keeper{pid = Pid, slots = Slots}} = KeepersAcc,
+            #{Key := #route_keeper{pid = Pid, table = Table}} = KeepersAcc,
             true = exit(Pid, shutdown),
-            {maps:remove(Key, KeepersAcc), StoppingAcc#{Pid => Slots}}
+            {maps:remove(Key, KeepersAcc), StoppingAcc#{Pid => Table}}
         end,
         {Keepers, Stopping},
         Keys
@@ -3553,9 +3553,9 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     ].
 route_info(#state{route_ceilings = Keys, route_keepers = Keepers}) ->
     [
-        (roadrunner_route_keeper:stats({Slots, Counts}))#{path => Path, methods => Methods}
+        (roadrunner_route_keeper:stats({Table, Counts}))#{path => Path, methods => Methods}
      || {Path, Methods} = Key <- Keys,
-        #route_keeper{slots = Slots, counts = Counts} <- [maps:get(Key, Keepers)]
+        #route_keeper{table = Table, counts = Counts} <- [maps:get(Key, Keepers)]
     ].
 
 -spec do_reload_routes(#state{}, roadrunner_router:routes()) ->
@@ -3794,19 +3794,19 @@ handle_info({'EXIT', Pid, _Reason}, #state{route_stopping = Stopping} = State) w
     is_map_key(Pid, Stopping)
 ->
     %% A route keeper this process stopped is gone, and its count with it.
-    true = ets:delete(maps:get(Pid, Stopping)),
+    true = roadrunner_route_keeper:delete_table(maps:get(Pid, Stopping)),
     {noreply, State#state{route_stopping = maps:remove(Pid, Stopping)}};
 handle_info({'EXIT', Pid, Reason}, #state{route_keepers = Keepers} = State) ->
     case route_keeper_key(Pid, Keepers) of
         {ok, Key} ->
-            #{Key := #route_keeper{slots = Slots, counts = Counts, draining = Draining} = Keeper} =
+            #{Key := #route_keeper{table = Table, counts = Counts, draining = Draining} = Keeper} =
                 Keepers,
             case {Reason, Draining} of
                 {{shutdown, drained}, true} ->
                     %% A route the table dropped drained: its keeper stopped in
                     %% the step it found nothing running or waiting, so nothing
                     %% was let in since, and the count goes.
-                    true = ets:delete(Slots),
+                    true = roadrunner_route_keeper:delete_table(Table),
                     {noreply, State#state{route_keepers = maps:remove(Key, Keepers)}};
                 _ ->
                     %% A route keeper died, or drained after a reload brought
@@ -3814,7 +3814,7 @@ handle_info({'EXIT', Pid, Reason}, #state{route_keepers = Keepers} = State) ->
                     %% this process owns, so a new keeper takes over the same
                     %% route: it watches the holders the table has, and
                     %% nothing waiting for the old one is let in.
-                    {ok, NewPid} = roadrunner_route_keeper:start_link(Slots, Counts, Draining),
+                    {ok, NewPid} = roadrunner_route_keeper:start_link(Table, Counts, Draining),
                     {noreply, State#state{
                         route_keepers = Keepers#{Key := Keeper#route_keeper{pid = NewPid}}
                     }}
@@ -3896,7 +3896,7 @@ terminate(_Reason, #state{
     %% A link takes the keepers down when this process crashes, but not on a
     %% normal stop. Their tables go with this process.
     _ = [exit(Pid, shutdown) || _Key := #route_keeper{pid = Pid} <- RouteKeepers],
-    _ = [exit(Pid, shutdown) || Pid := _Slots <- RouteStopping],
+    _ = [exit(Pid, shutdown) || Pid := _Table <- RouteStopping],
     %% `drain/2` already closed the TCP socket on its way out
     %% (`closed`), and an HTTP/3-only listener never had one (`none`).
     close_tcp(LSocket).
