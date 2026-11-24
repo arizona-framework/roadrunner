@@ -1507,6 +1507,7 @@ into a single `reload_routes/2` rather than calling it per route.
     ok
     | {error, no_routes}
     | {error, roadrunner_router:validation_error()}
+    | {error, {route_queues_reach_max_concurrent_requests, pos_integer(), pos_integer()}}
     | {error, {init_failed, term()}}.
 reload_routes(Name, Routes) ->
     gen_server:call(Name, {reload_routes, Routes}).
@@ -1866,6 +1867,11 @@ setup_rate_limit_sweep(_ProtoOpts) ->
 %% table died with that listener.
 -spec publish_routes(atom(), opts(), roadrunner_conn:proto_opts()) -> ets:table() | undefined.
 publish_routes(ListenerName, #{routes := Routes} = Opts, ProtoOpts) when is_list(Routes) ->
+    ok =
+        case check_route_queues(Routes, ProtoOpts) of
+            ok -> ok;
+            {error, Reason} -> error(Reason)
+        end,
     Compiled = roadrunner_router:compile(
         Routes, maps:get(middlewares, Opts, []), maps:get(body_buffering, Opts, auto)
     ),
@@ -1881,6 +1887,32 @@ publish_routes(ListenerName, #{routes := Routes} = Opts, ProtoOpts) when is_list
     RouteBuckets;
 publish_routes(_ListenerName, _Opts, _ProtoOpts) ->
     undefined.
+
+%% A route queue waits while its request already holds a listener slot (on
+%% HTTP/2 and HTTP/3 the connection takes that slot before the request is
+%% routed), so the routes' queues and the requests they let run must leave
+%% the listener's ceiling room for the other routes: were they to fill it, a
+%% request to a cheap route would find no slot while every slot is held by
+%% a request running on, or waiting for, an expensive one. With a finite
+%% `max_concurrent_requests`, the sum over the queued routes of their
+%% `max_concurrent_requests` and `max_queued` must stay below it. A shed
+%% route waits for nothing.
+-spec check_route_queues(roadrunner_router:routes(), roadrunner_conn:proto_opts()) ->
+    ok | {error, {route_queues_reach_max_concurrent_requests, pos_integer(), pos_integer()}}.
+check_route_queues(_Routes, #proto_opts{max_concurrent_requests = infinity}) ->
+    ok;
+check_route_queues(Routes, #proto_opts{max_concurrent_requests = Max}) ->
+    case
+        lists:sum([
+            Running + Queued
+         || {_Key, Running, {queue, #{max_queued := Queued}}} <- roadrunner_router:ceilings(Routes)
+        ])
+    of
+        Held when Held >= Max ->
+            {error, {route_queues_reach_max_concurrent_requests, Held, Max}};
+        _Held ->
+            ok
+    end.
 
 %% Whether any route sets its own `rate_limit`.
 -spec route_rate_limited(roadrunner_router:routes()) -> boolean().
@@ -3305,7 +3337,14 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
     {reply, Reply, State}.
 
 -spec do_reload_routes(#state{}, roadrunner_router:routes()) ->
-    {ok | {error, no_routes} | {error, roadrunner_router:validation_error()}, #state{}}.
+    {
+        ok
+        | {error, no_routes}
+        | {error, roadrunner_router:validation_error()}
+        | {error, {route_queues_reach_max_concurrent_requests, pos_integer(), pos_integer()}}
+        | {error, {init_failed, term()}},
+        #state{}
+    }.
 do_reload_routes(
     #state{
         proto_opts =
@@ -3318,11 +3357,12 @@ do_reload_routes(
     %% table that cannot work, and raising from here would take down a listener
     %% (and the caller) that has a perfectly good table already published, so
     %% the verdict comes back as a value and a bad table is simply refused.
-    case roadrunner_router:validate(Routes) of
-        ok ->
-            reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws);
-        {error, _Reason} = Error ->
-            {Error, State}
+    maybe
+        ok ?= roadrunner_router:validate(Routes),
+        ok ?= check_route_queues(Routes, ProtoOpts),
+        reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws)
+    else
+        {error, _Reason} = Error -> {Error, State}
     end;
 do_reload_routes(#state{proto_opts = #proto_opts{dispatch = {handler, _, _, _}}} = State, _Routes) ->
     {{error, no_routes}, State}.

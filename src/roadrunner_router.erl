@@ -62,6 +62,7 @@ of trying every route in turn.
 """.
 
 -export([compile/2, compile/3, validate/1, match/3, resolve/3, init_handler_state/3]).
+-export([ceilings/1]).
 
 -export_type([
     route/0,
@@ -72,8 +73,16 @@ of trying every route in turn.
     rate_limit/0,
     validation_error/0,
     limits/0,
-    body_limit/0
+    body_limit/0,
+    overload_mode/0
 ]).
+
+%% The largest `max_concurrent_requests`, `max_queued` and `retry_after` a
+%% route takes, as for the listener's options (`t:roadrunner_listener:positive_limit/0`).
+-define(MAX_LIMIT, 16#7FFFFFFF).
+%% The longest queue `timeout`, as for the listener's timeouts
+%% (`t:roadrunner_listener:positive_timeout_ms/0`).
+-define(MAX_TIMEOUT_MS, 16#FFFFFFFF).
 
 -doc """
 A single route entry. Three shapes are accepted:
@@ -82,9 +91,10 @@ A single route entry. Three shapes are accepted:
 - `{Path, Handler, State}` — shorthand with state only.
 - `#{path := Path, handler := Handler, state => State,
    middlewares => Mws, methods => [~"GET", ...],
-   max_content_length => Bytes, rate_limit => RateLimit}` — map form; use
+   max_content_length => Bytes, rate_limit => RateLimit,
+   max_concurrent_requests => N, overload_mode => Mode}` — map form; use
   this to attach per-route middlewares, an HTTP-method allowlist, a
-  request-body cap or a request-rate limit.
+  request-body cap, a request-rate limit or a concurrency ceiling.
 
 
 `Path` is a binary pattern (literal segments, `:param` captures, or
@@ -102,6 +112,13 @@ a body the listener reads whole first (`auto`) keeps the listener's, so
 the memory a request may take stays bounded. `rate_limit` is the
 route's own per-client request rate (`t:rate_limit/0`), on top of the
 listener's `rate_limit`; unset → only the listener's.
+`max_concurrent_requests` is how many of the route's requests may run at
+once (a `t:roadrunner_listener:positive_limit/0`), on top of the
+listener's own ceiling; unset → no ceiling of its own. `overload_mode` is
+what happens to a request over it (`t:overload_mode/0`), by default
+`{shed, #{}}`; it needs `max_concurrent_requests`. Both take effect in a
+listener, which counts the route's requests (see
+`roadrunner_listener`'s `routes`).
 """.
 -type route() ::
     {Path :: binary(), Handler :: module()}
@@ -113,8 +130,53 @@ listener's `rate_limit`; unset → only the listener's.
         middlewares => roadrunner_middleware:middlewares(),
         methods => methods(),
         max_content_length => body_limit(),
-        rate_limit => rate_limit()
+        rate_limit => rate_limit(),
+        max_concurrent_requests => roadrunner_listener:positive_limit(),
+        overload_mode => overload_mode()
     }.
+
+-doc """
+What happens to a request that arrives while its route already runs
+`max_concurrent_requests` of them. The ceiling is checked once the request
+is routed and before any of its body is read, its middlewares or its
+handler run, so a request it turns away costs no more than its headers.
+
+- `{shed, #{retry_after => Secs}}`, the default: answer `503 Service
+  Unavailable` with `Retry-After: Secs` (default `1`) on every protocol.
+- `{queue, #{max_queued => N, timeout => Ms}}`: wait for a slot, first in
+  first out. A request still waiting after `Ms` (default the listener's
+  `request_timeout`), or one arriving while `N` (default the route's
+  `max_concurrent_requests`) already wait, gets the same `503` with
+  `Retry-After: 1`.
+
+There is no `refuse` mode for a route: refusing an HTTP/2 or HTTP/3 stream
+invites the client to send it again at once, which suits a listener that
+is full, not one route of it.
+""".
+-type overload_mode() ::
+    {shed, #{retry_after => roadrunner_listener:positive_limit()}}
+    | {queue, #{
+        max_queued => roadrunner_listener:positive_limit(),
+        timeout => roadrunner_listener:positive_timeout_ms()
+    }}.
+
+%% What identifies a route's concurrency ceiling across `reload_routes/2`:
+%% its path as written and its sorted method list (`undefined` for every
+%% method). A replacement table keeps the count of a route with the same key.
+-type ceiling_key() :: {binary(), [binary()] | undefined}.
+
+%% A route's ceiling as `ceilings/1` reads it: the key, the ceiling and the
+%% overload mode with its defaults filled in, except a queue's `timeout`,
+%% which defaults to the listener's `request_timeout`.
+-type ceiling_spec() :: {
+    ceiling_key(),
+    roadrunner_listener:positive_limit(),
+    {shed, #{retry_after := roadrunner_listener:positive_limit()}}
+    | {queue, #{
+        max_queued := roadrunner_listener:positive_limit(),
+        timeout => roadrunner_listener:positive_timeout_ms()
+    }}
+}.
 
 -doc """
 A route's own per-client request rate: `rate` requests per `period` seconds
@@ -160,6 +222,12 @@ Why a route table was rejected, as returned by `validate/1` and raised by
   is not a non-negative integer or `infinity`.
 - `{invalid_route_rate_limit, Value}` — a `rate_limit` key that is not a
   `t:rate_limit/0` map of positive integers with `rate` set.
+- `{invalid_route_max_concurrent_requests, Value}` — a
+  `max_concurrent_requests` key that is not a
+  `t:roadrunner_listener:positive_limit/0`.
+- `{invalid_route_overload_mode, Value}` — an `overload_mode` key that is
+  not a `t:overload_mode/0`, or `{Mode, requires_max_concurrent_requests}`
+  for one on a route without `max_concurrent_requests`.
 - `{invalid_route_path, Path, wildcard_not_last}` — a segment after the
   pattern's `*wildcard`, which no request could ever reach.
 - `{unreachable_route, Position, Path, ShadowedBy}` — the entries above this
@@ -172,6 +240,8 @@ Why a route table was rejected, as returned by `validate/1` and raised by
     | {invalid_route_methods, term()}
     | {invalid_route_max_content_length, term()}
     | {invalid_route_rate_limit, term()}
+    | {invalid_route_max_concurrent_requests, term()}
+    | {invalid_route_overload_mode, term()}
     | {invalid_route_path, binary(), wildcard_not_last}
     | {unreachable_route, pos_integer(), binary(), [{pos_integer(), binary()}]}.
 
@@ -600,6 +670,7 @@ route_spec(Route, Pos) ->
         {ok, Methods} ?= route_methods(Route),
         ok ?= check_max_content_length(Route),
         ok ?= check_rate_limit(Route),
+        ok ?= check_ceiling(Route),
         {ok, {Pos, Path, Pattern, Methods}}
     end.
 
@@ -643,6 +714,100 @@ check_rate_limit(#{rate_limit := RateLimit}) ->
     end;
 check_rate_limit(_Route) ->
     ok.
+
+%% A route's `max_concurrent_requests`, and the `overload_mode` that needs it.
+-spec check_ceiling(route()) -> ok | {error, validation_error()}.
+check_ceiling(#{max_concurrent_requests := Max} = Route) when
+    is_integer(Max), Max >= 1, Max =< ?MAX_LIMIT
+->
+    case Route of
+        #{overload_mode := Mode} ->
+            case overload_mode(Mode) of
+                {ok, _Normalized} -> ok;
+                error -> {error, {invalid_route_overload_mode, Mode}}
+            end;
+        #{} ->
+            ok
+    end;
+check_ceiling(#{max_concurrent_requests := Max}) ->
+    {error, {invalid_route_max_concurrent_requests, Max}};
+check_ceiling(#{overload_mode := Mode}) ->
+    {error, {invalid_route_overload_mode, {Mode, requires_max_concurrent_requests}}};
+check_ceiling(_Route) ->
+    ok.
+
+%% An `overload_mode` with the defaults filled in, but a queue's `timeout`,
+%% which the listener fills from its `request_timeout`. Only the keys a mode
+%% documents are taken: a misspelled one would otherwise leave its default in
+%% place without a word.
+-spec overload_mode(term()) ->
+    {ok,
+        {shed, #{retry_after := roadrunner_listener:positive_limit()}}
+        | {queue, #{
+            max_queued => roadrunner_listener:positive_limit(),
+            timeout => roadrunner_listener:positive_timeout_ms()
+        }}}
+    | error.
+overload_mode({shed, Opts}) when is_map(Opts) ->
+    case maps:without([retry_after], Opts) of
+        Rest when map_size(Rest) =:= 0 ->
+            case maps:get(retry_after, Opts, 1) of
+                Secs when is_integer(Secs), Secs >= 1, Secs =< ?MAX_LIMIT ->
+                    {ok, {shed, #{retry_after => Secs}}};
+                _ ->
+                    error
+            end;
+        _ ->
+            error
+    end;
+overload_mode({queue, Opts}) when is_map(Opts) ->
+    case maps:without([max_queued, timeout], Opts) of
+        Rest when map_size(Rest) =:= 0 ->
+            case lists:all(fun valid_queue_opt/1, maps:to_list(Opts)) of
+                true -> {ok, {queue, Opts}};
+                false -> error
+            end;
+        _ ->
+            error
+    end;
+overload_mode(_Mode) ->
+    error.
+
+-spec valid_queue_opt({max_queued | timeout, term()}) -> boolean().
+valid_queue_opt({max_queued, N}) ->
+    is_integer(N) andalso N >= 1 andalso N =< ?MAX_LIMIT;
+valid_queue_opt({timeout, Ms}) ->
+    is_integer(Ms) andalso Ms >= 1 andalso Ms =< ?MAX_TIMEOUT_MS.
+
+-doc false.
+%% The concurrency ceilings a valid table declares, in table order, for the
+%% listener to count them: each route's key, ceiling, and overload mode with
+%% its defaults filled in (a queue's `max_queued` follows the ceiling), but a
+%% queue's `timeout`, which follows the listener's `request_timeout`.
+-spec ceilings(routes()) -> [ceiling_spec()].
+ceilings(Routes) ->
+    [
+        {ceiling_key(Route), Max, ceiling_mode(Max, maps:get(overload_mode, Route, {shed, #{}}))}
+     || #{max_concurrent_requests := Max} = Route <- Routes
+    ].
+
+-spec ceiling_mode(roadrunner_listener:positive_limit(), overload_mode()) ->
+    {shed, #{retry_after := roadrunner_listener:positive_limit()}}
+    | {queue, #{
+        max_queued := roadrunner_listener:positive_limit(),
+        timeout => roadrunner_listener:positive_timeout_ms()
+    }}.
+ceiling_mode(Max, Mode) ->
+    case overload_mode(Mode) of
+        {ok, {shed, _} = Shed} -> Shed;
+        {ok, {queue, Opts}} -> {queue, maps:merge(#{max_queued => Max}, Opts)}
+    end.
+
+-spec ceiling_key(map()) -> ceiling_key().
+ceiling_key(#{path := Path, methods := Methods}) ->
+    {Path, lists:usort(Methods)};
+ceiling_key(#{path := Path}) ->
+    {Path, undefined}.
 
 %% `match_pattern/3` consumes a wildcard only as a pattern's final segment, so a
 %% route carrying anything after its `*` can never answer a request. That is a
