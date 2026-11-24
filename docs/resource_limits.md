@@ -746,9 +746,19 @@ against it. Size it from the memory you can give the route:
 For a JSON route that decodes a 1 MB body into about 6 MB of terms, 16
 requests take about 112 MB at most.
 
-The route's ceiling is checked once the request is routed, before any of
-its body is read, any `100 Continue` is sent, or its middlewares and
-handler run, so a request it turns away costs no more than its headers.
+The route's ceiling is checked once the request is routed, before its
+middlewares and handler run. When that is depends on how the body is read:
+
+- On HTTP/1.1, and on HTTP/2 and HTTP/3 with `body_buffering => manual`,
+  it is before any of the body is read or a `100 Continue` is sent, so a
+  request turned away costs no more than its headers, and one waiting in
+  a queue holds no body.
+- On HTTP/2 and HTTP/3 with `body_buffering => auto` (the default), the
+  connection reads the whole body first, up to the route's
+  `max_content_length`, and only then is the request checked. Those
+  bodies are bounded by the cap but not by the ceiling, so on an
+  expensive route keep `max_content_length` low, or use `manual`.
+
 `overload_mode` decides what happens to one over it:
 
 - `{shed, #{retry_after => Secs}}`, the default, answers `503` with
@@ -763,7 +773,7 @@ handler run, so a request it turns away costs no more than its headers.
 
 A request to a route with a ceiling takes the route's slot first and the
 listener's `max_concurrent_requests` slot second, and both must be free;
-a request no route answers (`404`, `405`) takes neither. On HTTP/2 and
+on HTTP/1.1 a request no route answers (`404`, `405`) takes neither. On HTTP/2 and
 HTTP/3 the connection takes the listener's slot before the request is
 routed, so a request waiting in a route's queue already holds one. The
 queued routes could then fill the listener's ceiling and leave no slot

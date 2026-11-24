@@ -718,8 +718,10 @@ roadrunner_grpc:routes(#{
 Each service counts its own calls, whatever method they name. A call over
 the ceiling is answered HTTP `503` with `Retry-After` before its method
 runs, which a gRPC client reports as `UNAVAILABLE`, a status clients may
-retry. In queue mode a call waits for a slot first, before any of its
-messages are read; the wait counts against its deadline. The health and
+retry. In queue mode a call waits for a slot first, and the wait counts
+against its deadline. With `body_buffering => manual` it waits before any
+of its messages are read; with `auto` the whole body is read first, up to
+`max_content_length`. The health and
 reflection services never take the ceiling, so health checks are answered
 while the services are at theirs.
 

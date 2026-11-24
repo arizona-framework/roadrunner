@@ -56,8 +56,9 @@ from starting:
   route (see `t:roadrunner_router:route/0`). Each service counts its own
   calls, whatever method they name. A call over it is answered `503`
   before its method runs, which a gRPC client reports as `UNAVAILABLE`,
-  a status it may retry; a call that waits in queue mode does so before
-  any of its messages are read. By default no ceiling
+  a status it may retry. With `body_buffering => manual` a call that waits
+  in queue mode does so before any of its messages are read; with `auto`
+  its whole body is read first. By default no ceiling
 
 The health and reflection routes keep the defaults: the other shared
 options apply to the services' routes. A ceiling never applies to them,

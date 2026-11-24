@@ -144,8 +144,13 @@ listener, which counts the route's requests (see
 -doc """
 What happens to a request that arrives while its route already runs
 `max_concurrent_requests` of them. The ceiling is checked once the request
-is routed and before any of its body is read, its middlewares or its
-handler run, so a request it turns away costs no more than its headers.
+is routed, before its middlewares and handler run. On HTTP/1.1, and on
+HTTP/2 and HTTP/3 with `body_buffering => manual`, that is also before any
+of its body is read or a `100 Continue` is sent, so a request it turns
+away costs no more than its headers. On HTTP/2 and HTTP/3 with `auto`
+buffering the connection reads the whole body first (up to the route's
+`max_content_length`), so give an expensive route a low
+`max_content_length` there, or use `manual`.
 
 - `{shed, #{retry_after => Secs}}`, the default: answer `503 Service
   Unavailable` with `Retry-After: Secs` (default `1`) on every protocol.
