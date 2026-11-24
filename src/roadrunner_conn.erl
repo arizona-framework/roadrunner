@@ -1140,6 +1140,10 @@ resolve_handler({router, ListenerName}, Req) ->
 -spec body_cap(resolved(), non_neg_integer()) -> roadrunner_router:body_limit().
 body_cap({ok, _Handler, _Bindings, _Pipeline, _State, undefined}, Default) ->
     Default;
+body_cap({ok, _Handler, _Bindings, _Pipeline, _State, {undefined, _Ceiling}}, Default) ->
+    Default;
+body_cap({ok, _Handler, _Bindings, _Pipeline, _State, {Max, _Ceiling}}, _Default) ->
+    Max;
 body_cap({ok, _Handler, _Bindings, _Pipeline, _State, Max}, _Default) ->
     Max;
 body_cap(_Resolved, Default) ->

@@ -48,7 +48,8 @@ Add a new property:
     quic_stream_reassembles/1,
     grpc_frame_round_trips/1,
     grpc_status_message_round_trips/1,
-    grpc_timeout_parse_never_crashes/1
+    grpc_timeout_parse_never_crashes/1,
+    route_keeper_model/1
 ]).
 
 suite() ->
@@ -87,7 +88,8 @@ all() ->
         quic_stream_reassembles,
         grpc_frame_round_trips,
         grpc_status_message_round_trips,
-        grpc_timeout_parse_never_crashes
+        grpc_timeout_parse_never_crashes,
+        route_keeper_model
     ].
 
 init_per_suite(Config) ->
@@ -278,3 +280,10 @@ grpc_status_message_round_trips(Config) ->
 
 grpc_timeout_parse_never_crashes(Config) ->
     ct_property_test:quickcheck(roadrunner_grpc_props:prop_timeout_parse_never_crashes(), Config).
+
+route_keeper_model(Config) ->
+    {ok, _} = roadrunner_test_event_handler:start(),
+    ct_property_test:quickcheck(
+        roadrunner_route_keeper_props:prop_model(),
+        Config
+    ).

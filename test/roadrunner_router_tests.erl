@@ -843,6 +843,19 @@ ceilings_fill_in_the_defaults_test() ->
         roadrunner_router:ceilings(Routes)
     ).
 
+ceiling_needs_a_listener_count_test() ->
+    %% Compiled outside a listener, a ceiling has nothing counting it: the
+    %% route carries its body cap alone.
+    Compiled = roadrunner_router:compile(
+        [
+            #{path => ~"/a", handler => h, max_concurrent_requests => 1},
+            #{path => ~"/b", handler => h, max_concurrent_requests => 1, max_content_length => 9}
+        ],
+        []
+    ),
+    ?assertMatch({ok, h, _, _, _, undefined}, roadrunner_router:resolve(~"GET", ~"/a", Compiled)),
+    ?assertMatch({ok, h, _, _, _, 9}, roadrunner_router:resolve(~"GET", ~"/b", Compiled)).
+
 validate_reports_a_bad_rate_limit_test() ->
     ?assertEqual(
         {error, {invalid_route_rate_limit, #{rate => 0}}},

@@ -1264,6 +1264,21 @@ An upgrade can set each of these for its own session
     heap_floor => heap_floor()
 }.
 
+%% The count of one route's `max_concurrent_requests`: its keeper, and the
+%% slot table and counts the listener owns so they outlive a keeper that
+%% crashes (`roadrunner_route_keeper`). A route a reload dropped keeps its
+%% count, `draining`, until the requests it still runs end.
+-record(route_keeper, {
+    pid :: pid(),
+    slots :: roadrunner_route_keeper:table(),
+    counts :: atomics:atomics_ref(),
+    draining = false :: boolean()
+}).
+
+%% What identifies a route's ceiling across reloads: its path and sorted
+%% methods (`roadrunner_router:ceiling_key/1`).
+-type ceiling_key() :: {binary(), [binary()] | undefined}.
+
 -record(state, {
     %% `none` when the listener serves HTTP/3 only (no TCP socket);
     %% `closed` after `drain/2` shuts the TCP socket on its way out.
@@ -1304,7 +1319,16 @@ An upgrade can set each of these for its own session
     %% result. The listener keeps answering calls (`status/1`, `info/1`)
     %% and checks its connections on a timer (`drain_check`).
     drain = undefined ::
-        undefined | #{deadline := integer(), waiters := [gen_server:from(), ...]}
+        undefined | #{deadline := integer(), waiters := [gen_server:from(), ...]},
+    %% The routes' ceilings: a keeper per route with a
+    %% `max_concurrent_requests`, those the table has dropped among them
+    %% until they drain, and the keys of the table's own, in table order.
+    route_keepers = #{} :: #{ceiling_key() => #route_keeper{}},
+    route_ceilings = [] :: [ceiling_key()],
+    %% Keepers told to stop (a route drained, or a reload that failed),
+    %% with their tables, until their exit arrives: the table goes then,
+    %% and the exit is known not to be a crash.
+    route_stopping = #{} :: #{pid() => roadrunner_route_keeper:table()}
 }).
 
 -doc """
@@ -1443,6 +1467,14 @@ Return runtime introspection for a listener:
   linger because `max_lingering` connections were already lingering. A
   rising `lingers_skipped` under normal traffic means the cap is too low
   for the refusals the listener sends.
+- `routes`: one map per route with its own `max_concurrent_requests`, in
+  table order: its `path` and `methods` (sorted, `undefined` for every
+  method) as the route declares them, the `max_concurrent_requests`, the
+  requests running now (`in_flight`) and waiting now (`queued`), and the
+  cumulative count turned away at the route's ceiling (`throttled`, also
+  emitted as `request_throttled` with the reason
+  `route_max_concurrent_requests`). Empty for a listener without such
+  routes.
 
 Useful for ops dashboards / health endpoints.
 """.
@@ -1457,7 +1489,17 @@ Useful for ops dashboards / health endpoints.
         rate_limited := non_neg_integer(),
         max_lingering := pos_integer(),
         lingering := non_neg_integer(),
-        lingers_skipped := non_neg_integer()
+        lingers_skipped := non_neg_integer(),
+        routes := [
+            #{
+                path := binary(),
+                methods := [binary()] | undefined,
+                max_concurrent_requests := pos_integer(),
+                in_flight := non_neg_integer(),
+                queued := non_neg_integer(),
+                throttled := non_neg_integer()
+            }
+        ]
     }.
 info(Name) ->
     gen_server:call(Name, info).
@@ -1525,7 +1567,7 @@ init(#{port := Port} = Opts) ->
     ok = ensure_ssl_started(Opts),
     ListenerName = listener_name(),
     ProtoOpts = build_proto_opts(Opts, ListenerName),
-    RouteBuckets = publish_routes(ListenerName, Opts, ProtoOpts),
+    {RouteBuckets, RouteKeepers, RouteCeilings} = publish_routes(ListenerName, Opts, ProtoOpts),
     proc_lib:set_label({roadrunner_listener, ListenerName, Port}),
     #proto_opts{protocols = Protocols} = ProtoOpts,
     %% TCP (`http1`/`http2`) and QUIC (`http3`) are independent
@@ -1546,6 +1588,8 @@ init(#{port := Port} = Opts) ->
                         proto_opts = ProtoOpts,
                         reconciliation = Reconciliation,
                         route_buckets = RouteBuckets,
+                        route_keepers = RouteKeepers,
+                        route_ceilings = RouteCeilings,
                         quic_accept_gate = QuicAcceptGate
                     }};
                 {error, Reason} ->
@@ -1864,16 +1908,24 @@ setup_rate_limit_sweep(_ProtoOpts) ->
 %% bucket store first (`new_route_buckets/2`), returned for the state. A
 %% store an earlier listener of this name left behind (one whose start
 %% failed ends without `terminate/2`) is dropped rather than reused: its
-%% table died with that listener.
--spec publish_routes(atom(), opts(), roadrunner_conn:proto_opts()) -> ets:table() | undefined.
+%% table died with that listener. The routes with a `max_concurrent_requests`
+%% get their keepers first, also returned for the state, with the keys of
+%% their ceilings in table order.
+-spec publish_routes(atom(), opts(), roadrunner_conn:proto_opts()) ->
+    {ets:table() | undefined, #{ceiling_key() => #route_keeper{}}, [ceiling_key()]}.
 publish_routes(ListenerName, #{routes := Routes} = Opts, ProtoOpts) when is_list(Routes) ->
     ok =
         case check_route_queues(Routes, ProtoOpts) of
             ok -> ok;
             {error, Reason} -> error(Reason)
         end,
+    Specs = route_ceilings(Routes, ProtoOpts),
+    {Keepers, _Started} = start_route_keepers(Specs, #{}),
     Compiled = roadrunner_router:compile(
-        Routes, maps:get(middlewares, Opts, []), maps:get(body_buffering, Opts, auto)
+        Routes,
+        maps:get(middlewares, Opts, []),
+        maps:get(body_buffering, Opts, auto),
+        route_ceiling_counts(Specs, Keepers, ListenerName)
     ),
     RouteBuckets =
         case route_rate_limited(Routes) of
@@ -1884,9 +1936,142 @@ publish_routes(ListenerName, #{routes := Routes} = Opts, ProtoOpts) when is_list
                 undefined
         end,
     persistent_term:put({roadrunner_routes, ListenerName}, Compiled),
-    RouteBuckets;
+    {RouteBuckets, Keepers, [Key || {Key, _Max, _Mode} <- Specs]};
 publish_routes(_ListenerName, _Opts, _ProtoOpts) ->
-    undefined.
+    {undefined, #{}, []}.
+
+%% The routes' ceilings, with a queue's `timeout` defaulting to the
+%% listener's `request_timeout` (at least 1 ms), as for the listener's own
+%% queue.
+-spec route_ceilings(roadrunner_router:routes(), roadrunner_conn:proto_opts()) ->
+    [
+        {
+            ceiling_key(),
+            pos_integer(),
+            {shed, #{retry_after := pos_integer()}}
+            | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}}
+        }
+    ].
+route_ceilings(Routes, #proto_opts{request_timeout = RequestTimeout}) ->
+    [
+        {Key, Max, queue_timeout(Mode, max(RequestTimeout, 1))}
+     || {Key, Max, Mode} <- roadrunner_router:ceilings(Routes)
+    ].
+
+-spec queue_timeout(
+    {shed, #{retry_after := pos_integer()}}
+    | {queue, #{max_queued := pos_integer(), timeout => pos_integer()}},
+    pos_integer()
+) ->
+    {shed, #{retry_after := pos_integer()}}
+    | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}}.
+queue_timeout({queue, Queue}, RequestTimeout) ->
+    {queue, maps:merge(#{timeout => RequestTimeout}, Queue)};
+queue_timeout(Shed, _RequestTimeout) ->
+    Shed.
+
+%% Start a keeper for each ceiling that has none yet, returning every
+%% keeper and the keys of the new ones.
+-spec start_route_keepers(
+    [{ceiling_key(), pos_integer(), term()}], #{ceiling_key() => #route_keeper{}}
+) -> {#{ceiling_key() => #route_keeper{}}, [ceiling_key()]}.
+start_route_keepers(Specs, Keepers) ->
+    lists:foldl(
+        fun
+            ({Key, _Max, _Mode}, {Acc, Started}) when is_map_key(Key, Acc) ->
+                {Acc, Started};
+            ({Key, Max, Mode}, {Acc, Started}) ->
+                {Pid, Slots, Counts} = roadrunner_route_keeper:new(
+                    Max, queue_depth(Mode), false, self()
+                ),
+                {Acc#{Key => #route_keeper{pid = Pid, slots = Slots, counts = Counts}}, [
+                    Key | Started
+                ]}
+        end,
+        {Keepers, []},
+        Specs
+    ).
+
+%% How many requests a route's mode lets wait: none when it sheds.
+-spec queue_depth({shed, map()} | {queue, #{max_queued := pos_integer()}}) -> non_neg_integer().
+queue_depth({queue, #{max_queued := MaxQueued}}) -> MaxQueued;
+queue_depth({shed, _Shed}) -> 0.
+
+%% The ceilings the compiled routes carry, by key.
+-spec route_ceiling_counts(
+    [{ceiling_key(), pos_integer(), term()}], #{ceiling_key() => #route_keeper{}}, atom()
+) -> #{ceiling_key() => roadrunner_route_keeper:ceiling()}.
+route_ceiling_counts(Specs, Keepers, ListenerName) ->
+    #{
+        Key => roadrunner_route_keeper:ceiling(Slots, Counts, Mode, ListenerName)
+     || {Key, _Max, Mode} <- Specs,
+        #route_keeper{slots = Slots, counts = Counts} <- [maps:get(Key, Keepers)]
+    }.
+
+%% Once a reload's table compiled: the routes it keeps take their new
+%% ceiling and queue depth, one it brings back stops draining, and one it
+%% dropped drains. A new route's keeper (`Started`) is already configured.
+-spec settle_route_keepers(
+    [{ceiling_key(), pos_integer(), term()}],
+    #{ceiling_key() => #route_keeper{}},
+    [ceiling_key()]
+) -> #{ceiling_key() => #route_keeper{}}.
+settle_route_keepers(Specs, Keepers, Started) ->
+    Kept = #{Key => {Max, queue_depth(Mode)} || {Key, Max, Mode} <- Specs},
+    maps:map(
+        fun(Key, #route_keeper{pid = Pid, counts = Counts, draining = Draining} = Keeper) ->
+            case {Kept, Draining} of
+                {#{Key := Limits}, _} ->
+                    ok = configure_route_keeper(lists:member(Key, Started), Pid, Counts, Limits),
+                    ok = draining_route_keeper(Draining, false, Pid),
+                    Keeper#route_keeper{draining = false};
+                {#{}, false} ->
+                    ok = roadrunner_route_keeper:set_draining(Pid, true),
+                    Keeper#route_keeper{draining = true};
+                {#{}, true} ->
+                    Keeper
+            end
+        end,
+        Keepers
+    ).
+
+-spec configure_route_keeper(
+    boolean(), pid(), atomics:atomics_ref(), {pos_integer(), non_neg_integer()}
+) -> ok.
+configure_route_keeper(true, _Pid, _Counts, _Limits) ->
+    ok;
+configure_route_keeper(false, Pid, Counts, Limits) ->
+    roadrunner_route_keeper:configure(Pid, Counts, Limits).
+
+-spec draining_route_keeper(boolean(), boolean(), pid()) -> ok.
+draining_route_keeper(Draining, Draining, _Pid) ->
+    ok;
+draining_route_keeper(_Was, Draining, Pid) ->
+    roadrunner_route_keeper:set_draining(Pid, Draining).
+
+%% Stop route keepers: those a failed reload started, or one whose route
+%% drained. Each moves to `route_stopping` until its exit arrives, when its
+%% table goes.
+-spec stop_route_keepers([ceiling_key()], #state{}) -> #state{}.
+stop_route_keepers(Keys, #state{route_keepers = Keepers, route_stopping = Stopping} = State) ->
+    {Keepers1, Stopping1} = lists:foldl(
+        fun(Key, {KeepersAcc, StoppingAcc}) ->
+            #{Key := #route_keeper{pid = Pid, slots = Slots}} = KeepersAcc,
+            true = exit(Pid, shutdown),
+            {maps:remove(Key, KeepersAcc), StoppingAcc#{Pid => Slots}}
+        end,
+        {Keepers, Stopping},
+        Keys
+    ),
+    State#state{route_keepers = Keepers1, route_stopping = Stopping1}.
+
+%% The route keeper `Pid` is, if any.
+-spec route_keeper_key(pid(), #{ceiling_key() => #route_keeper{}}) -> {ok, ceiling_key()} | error.
+route_keeper_key(Pid, Keepers) ->
+    case [Key || Key := #route_keeper{pid = P} <- Keepers, P =:= Pid] of
+        [Key] -> {ok, Key};
+        [] -> error
+    end.
 
 %% A route queue waits while its request already holds a listener slot (on
 %% HTTP/2 and HTTP/3 the connection takes that slot before the request is
@@ -3332,9 +3517,29 @@ handle_call(info, _From, #state{proto_opts = ProtoOpts} = State) ->
         rate_limited => atomics:get(RateLimitedCounter, 1),
         max_lingering => MaxLingering,
         lingering => Lingering,
-        lingers_skipped => LingersSkipped
+        lingers_skipped => LingersSkipped,
+        routes => route_info(State)
     },
     {reply, Reply, State}.
+
+%% What `info/1` reports of each route ceiling in the table, in table order.
+-spec route_info(#state{}) ->
+    [
+        #{
+            path := binary(),
+            methods := [binary()] | undefined,
+            max_concurrent_requests := pos_integer(),
+            in_flight := non_neg_integer(),
+            queued := non_neg_integer(),
+            throttled := non_neg_integer()
+        }
+    ].
+route_info(#state{route_ceilings = Keys, route_keepers = Keepers}) ->
+    [
+        (roadrunner_route_keeper:stats({Slots, Counts}))#{path => Path, methods => Methods}
+     || {Path, Methods} = Key <- Keys,
+        #route_keeper{slots = Slots, counts = Counts} <- [maps:get(Key, Keepers)]
+    ].
 
 -spec do_reload_routes(#state{}, roadrunner_router:routes()) ->
     {
@@ -3382,7 +3587,15 @@ do_reload_routes(#state{proto_opts = #proto_opts{dispatch = {handler, _, _, _}}}
 ) -> {ok | {error, {init_failed, term()}}, #state{}}.
 reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws) ->
     #proto_opts{body_buffering = BodyBuffering} = ProtoOpts,
-    try roadrunner_router:compile(Routes, ListenerMws, BodyBuffering) of
+    Specs = route_ceilings(Routes, ProtoOpts),
+    %% A route new to the table gets its keeper before the table compiles; a
+    %% table that fails to compile stops it again.
+    {Keepers, Started} = start_route_keepers(Specs, State#state.route_keepers),
+    try
+        roadrunner_router:compile(
+            Routes, ListenerMws, BodyBuffering, route_ceiling_counts(Specs, Keepers, Name)
+        )
+    of
         Compiled ->
             %% The first table with a route `rate_limit` gets the bucket
             %% store, published before the routes that use it.
@@ -3391,11 +3604,19 @@ reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws) ->
                     true -> new_route_buckets(Name, ProtoOpts);
                     false -> RouteBuckets
                 end,
+            Settled = settle_route_keepers(Specs, Keepers, Started),
             persistent_term:put({roadrunner_routes, Name}, Compiled),
-            {ok, State#state{route_buckets = RouteBuckets1}}
+            {ok, State#state{
+                route_buckets = RouteBuckets1,
+                route_keepers = Settled,
+                route_ceilings = [Key || {Key, _Max, _Mode} <- Specs]
+            }}
     catch
         _Class:Reason ->
-            {{error, {init_failed, Reason}}, State}
+            {
+                {error, {init_failed, Reason}},
+                stop_route_keepers(Started, State#state{route_keepers = Keepers})
+            }
     end.
 
 %% Stop taking new connections and tell the open ones to wind down; the
@@ -3552,14 +3773,49 @@ handle_info(route_rate_limit_sweep, #state{route_buckets = Table} = State) ->
     _ = roadrunner_route_rate_limit:evict_full(Table, erlang:monotonic_time(millisecond)),
     _ = erlang:send_after(?ROUTE_RATE_LIMIT_SWEEP_INTERVAL, self(), route_rate_limit_sweep),
     {noreply, State};
-handle_info({'EXIT', _Pid, normal}, State) ->
-    %% An acceptor ends normally once the listen socket is closed.
-    {noreply, State};
-handle_info({'EXIT', _Pid, Reason}, State) ->
-    %% A linked acceptor, overload queue or QUIC pool died: the listener
-    %% goes down with it, as it would without trapping exits, but through
-    %% `terminate/2`, and its supervisor restarts it.
-    {stop, Reason, State};
+handle_info({'EXIT', Pid, _Reason}, #state{route_stopping = Stopping} = State) when
+    is_map_key(Pid, Stopping)
+->
+    %% A route keeper this process stopped is gone, and its count with it.
+    true = ets:delete(maps:get(Pid, Stopping)),
+    {noreply, State#state{route_stopping = maps:remove(Pid, Stopping)}};
+handle_info({'EXIT', Pid, Reason}, #state{route_keepers = Keepers} = State) ->
+    case route_keeper_key(Pid, Keepers) of
+        {ok, Key} ->
+            %% A route keeper died. Its count is in the table and counts this
+            %% process owns, so a new keeper takes over the same route: it
+            %% watches the holders the table has, and nothing waiting for the
+            %% old one is let in.
+            #{Key := #route_keeper{slots = Slots, counts = Counts, draining = Draining} = Keeper} =
+                Keepers,
+            {ok, NewPid} = roadrunner_route_keeper:start_link(Slots, Counts, {Draining, self()}),
+            {noreply, State#state{
+                route_keepers = Keepers#{Key := Keeper#route_keeper{pid = NewPid}}
+            }};
+        error when Reason =:= normal ->
+            %% An acceptor ends normally once the listen socket is closed.
+            {noreply, State};
+        error ->
+            %% A linked acceptor, overload queue or QUIC pool died: the
+            %% listener goes down with it, as it would without trapping
+            %% exits, but through `terminate/2`, and its supervisor restarts
+            %% it.
+            {stop, Reason, State}
+    end;
+handle_info({route_keeper_drained, Pid}, #state{route_keepers = Keepers} = State) ->
+    %% A route the table dropped has nothing left running or waiting: its
+    %% count goes. One a reload brought back since keeps it.
+    case route_keeper_key(Pid, Keepers) of
+        {ok, Key} ->
+            case Keepers of
+                #{Key := #route_keeper{draining = true}} ->
+                    {noreply, stop_route_keepers([Key], State)};
+                #{} ->
+                    {noreply, State}
+            end;
+        error ->
+            {noreply, State}
+    end;
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -3615,11 +3871,19 @@ reclaim_request_slots(Cell, #proto_opts{
 -doc false.
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{
-    listen_socket = LSocket, quic_listener = QuicListener, proto_opts = ProtoOpts
+    listen_socket = LSocket,
+    quic_listener = QuicListener,
+    proto_opts = ProtoOpts,
+    route_keepers = RouteKeepers,
+    route_stopping = RouteStopping
 }) ->
     erase_routes(ProtoOpts),
     ok = stop_quic(QuicListener),
     ok = stop_slot_keeper(ProtoOpts),
+    %% A link takes the keepers down when this process crashes, but not on a
+    %% normal stop. Their tables go with this process.
+    _ = [exit(Pid, shutdown) || _Key := #route_keeper{pid = Pid} <- RouteKeepers],
+    _ = [exit(Pid, shutdown) || Pid := _Slots <- RouteStopping],
     %% `drain/2` already closed the TCP socket on its way out
     %% (`closed`), and an HTTP/3-only listener never had one (`none`).
     close_tcp(LSocket).

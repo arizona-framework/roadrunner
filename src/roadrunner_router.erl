@@ -62,7 +62,7 @@ of trying every route in turn.
 """.
 
 -export([compile/2, compile/3, validate/1, match/3, resolve/3, init_handler_state/3]).
--export([ceilings/1]).
+-export([compile/4, ceilings/1, ceiling_key/1]).
 
 -export_type([
     route/0,
@@ -257,11 +257,16 @@ A cap on a request body in bytes, or `infinity` for none.
 -doc """
 A route's request limits the connection reads before dispatch, carried in its
 compiled entry so the one dispatch match yields them: `undefined` for a route
-that sets none, else the body cap its `max_content_length` declares. A route's
+that sets none, else the body cap its `max_content_length` declares, paired
+with the count of its `max_concurrent_requests` when a listener keeps one
+(the body cap is then `undefined` when the route sets none). A route's
 `rate_limit` is not here: it is a stage of the route's pipeline
 (`roadrunner_route_rate_limit`).
 """.
--type limits() :: undefined | body_limit().
+-type limits() ::
+    undefined
+    | body_limit()
+    | {body_limit() | undefined, roadrunner_route_keeper:ceiling()}.
 
 -doc "An ordered list of routes; matched first-to-last.".
 -type routes() :: [route()].
@@ -379,13 +384,32 @@ listener's cap.
 -spec compile(
     routes(), roadrunner_middleware:middlewares(), roadrunner_listener:body_buffering()
 ) -> compiled().
-compile(Routes, ListenerMws, BodyBuffering) when
-    is_list(Routes), is_list(ListenerMws), (BodyBuffering =:= auto orelse BodyBuffering =:= manual)
+compile(Routes, ListenerMws, BodyBuffering) ->
+    compile(Routes, ListenerMws, BodyBuffering, #{}).
+
+%% `compile/3` with the counts a listener keeps for the routes'
+%% `max_concurrent_requests`, by `ceiling_key/1`. A route with a ceiling and
+%% no count compiles without one, as outside a listener.
+-doc false.
+-spec compile(
+    routes(),
+    roadrunner_middleware:middlewares(),
+    roadrunner_listener:body_buffering(),
+    #{ceiling_key() => roadrunner_route_keeper:ceiling()}
+) -> compiled().
+compile(Routes, ListenerMws, BodyBuffering, Ceilings) when
+    is_list(Routes),
+    is_list(ListenerMws),
+    (BodyBuffering =:= auto orelse BodyBuffering =:= manual),
+    is_map(Ceilings)
 ->
     case validate(Routes) of
         ok ->
             ResolvedListener = roadrunner_middleware:resolve(ListenerMws),
-            build_table([compile_route(R, ResolvedListener, BodyBuffering) || R <- Routes]);
+            build_table([
+                compile_route(R, ResolvedListener, BodyBuffering, Ceilings)
+             || R <- Routes
+            ]);
         {error, Reason} ->
             error(Reason)
     end.
@@ -413,18 +437,23 @@ validate(Routes) when is_list(Routes) ->
     end.
 
 -spec compile_route(
-    route(), [roadrunner_middleware:resolved()], roadrunner_listener:body_buffering()
+    route(),
+    [roadrunner_middleware:resolved()],
+    roadrunner_listener:body_buffering(),
+    #{ceiling_key() => roadrunner_route_keeper:ceiling()}
 ) ->
     {[segment()], module(), roadrunner_middleware:next(), term(), method_lookup(), limits()}.
-compile_route({Path, Handler}, ResolvedListener, _BodyBuffering) when
+compile_route({Path, Handler}, ResolvedListener, _BodyBuffering, _Ceilings) when
     is_binary(Path), is_atom(Handler)
 ->
     build_route(Path, Handler, no_state, [], undefined, undefined, ResolvedListener);
-compile_route({Path, Handler, State}, ResolvedListener, _BodyBuffering) when
+compile_route({Path, Handler, State}, ResolvedListener, _BodyBuffering, _Ceilings) when
     is_binary(Path), is_atom(Handler)
 ->
     build_route(Path, Handler, {state, State}, [], undefined, undefined, ResolvedListener);
-compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener, BodyBuffering) when
+compile_route(
+    #{path := Path, handler := Handler} = Route, ResolvedListener, BodyBuffering, Ceilings
+) when
     is_binary(Path), is_atom(Handler)
 ->
     StateArg =
@@ -438,7 +467,7 @@ compile_route(#{path := Path, handler := Handler} = Route, ResolvedListener, Bod
         StateArg,
         route_middlewares(Route),
         compile_methods(maps:get(methods, Route, undefined)),
-        route_limits(Route, BodyBuffering),
+        route_limits(Route, BodyBuffering, Ceilings),
         ResolvedListener
     ).
 
@@ -511,12 +540,27 @@ has_init_route(Handler) ->
         {error, _Reason} -> false
     end.
 
+%% A route's body cap, with the count of its ceiling when it has one.
+-spec route_limits(
+    map(),
+    roadrunner_listener:body_buffering(),
+    #{ceiling_key() => roadrunner_route_keeper:ceiling()}
+) -> limits().
+route_limits(#{max_concurrent_requests := _} = Route, BodyBuffering, Ceilings) ->
+    Body = body_limit(Route, BodyBuffering),
+    case maps:find(ceiling_key(Route), Ceilings) of
+        {ok, Ceiling} -> {Body, Ceiling};
+        error -> Body
+    end;
+route_limits(Route, BodyBuffering, _Ceilings) ->
+    body_limit(Route, BodyBuffering).
+
 %% A route's `max_content_length => infinity` holds for bodies read as they
 %% arrive; one the listener reads whole first keeps the listener's cap.
--spec route_limits(map(), roadrunner_listener:body_buffering()) -> limits().
-route_limits(#{max_content_length := infinity}, auto) -> undefined;
-route_limits(#{max_content_length := Max}, _BodyBuffering) -> Max;
-route_limits(_Route, _BodyBuffering) -> undefined.
+-spec body_limit(map(), roadrunner_listener:body_buffering()) -> body_limit() | undefined.
+body_limit(#{max_content_length := infinity}, auto) -> undefined;
+body_limit(#{max_content_length := Max}, _BodyBuffering) -> Max;
+body_limit(_Route, _BodyBuffering) -> undefined.
 
 %% A route's own middlewares, led by its `rate_limit` stage when it sets one:
 %% after the listener's middlewares (which still decorate a refusal) and ahead
@@ -803,6 +847,8 @@ ceiling_mode(Max, Mode) ->
         {ok, {queue, Opts}} -> {queue, maps:merge(#{max_queued => Max}, Opts)}
     end.
 
+-doc false.
+%% What identifies a route's ceiling across reloads (`t:ceiling_key/0`).
 -spec ceiling_key(map()) -> ceiling_key().
 ceiling_key(#{path := Path, methods := Methods}) ->
     {Path, lists:usort(Methods)};

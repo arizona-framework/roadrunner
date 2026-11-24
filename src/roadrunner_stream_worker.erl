@@ -317,6 +317,8 @@ raise_heap_floor(Cell, Floor, Heap, Cap) ->
     roadrunner_req:request() | too_large.
 route_body(undefined, Req) ->
     Req;
+route_body({Max, _Ceiling}, Req) ->
+    route_body(Max, Req);
 route_body(Max, #{body := Body} = Req) ->
     case iolist_size(Body) > Max of
         true -> too_large;

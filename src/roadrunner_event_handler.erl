@@ -100,8 +100,10 @@ tell listeners apart, match on the listener name the events carry.
   refused at a listener limit before any handler ran. `Reason` is
   `max_concurrent_requests` (a request over the in-flight ceiling: an
   HTTP/2 or HTTP/3 stream reset as retry-safe, or answered `503` on any
-  protocol when `overload_mode` is `shed`) or `rate_limit` (a peer over
-  its `rate_limit`, answered `429`).
+  protocol when `overload_mode` is `shed`), `route_max_concurrent_requests`
+  (a request over its route's own `max_concurrent_requests`, answered
+  `503` on any protocol) or `rate_limit` (a peer over its `rate_limit`,
+  answered `429`).
 - `response_send_failed`, `{Phase, Reason}`: a response write failed
   after the status line was already going out, so the connection is
   about to close. `Phase` is `buffered_response`, `interim_response`
@@ -371,7 +373,10 @@ event. See the module documentation for each event's arguments.
         {span(), error | exit | throw, term(), erlang:stacktrace()}
     ) -> term();
     (request_rejected, {atom(), peer(), term()}) -> term();
-    (request_throttled, {atom(), max_concurrent_requests | rate_limit}) -> term();
+    (
+        request_throttled,
+        {atom(), max_concurrent_requests | route_max_concurrent_requests | rate_limit}
+    ) -> term();
     (response_send_failed, {atom(), term()}) -> term();
     (listener_accept, {atom(), peer()}) -> span();
     (listener_conn_close, {span(), non_neg_integer(), close_reason()}) -> term();
