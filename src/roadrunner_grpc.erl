@@ -57,8 +57,9 @@ from starting:
   calls, whatever method they name. A call over it is answered `503`
   before its method runs, which a gRPC client reports as `UNAVAILABLE`,
   a status it may retry. With `body_buffering => manual` a call that waits
-  in queue mode does so before any of its messages are read; with `auto`
-  its whole body is read first. By default no ceiling
+  in queue mode holds at most one stream window of its messages (64 KB on
+  HTTP/2, 256 KB by default on HTTP/3); with `auto` its whole body is read
+  first. By default no ceiling
 
 The health and reflection routes keep the defaults: the other shared
 options apply to the services' routes. A ceiling never applies to them,

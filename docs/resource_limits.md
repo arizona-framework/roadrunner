@@ -749,10 +749,15 @@ requests take about 112 MB at most.
 The route's ceiling is checked once the request is routed, before its
 middlewares and handler run. When that is depends on how the body is read:
 
-- On HTTP/1.1, and on HTTP/2 and HTTP/3 with `body_buffering => manual`,
-  it is before any of the body is read or a `100 Continue` is sent, so a
-  request turned away costs no more than its headers, and one waiting in
-  a queue holds no body.
+- On HTTP/1.1 it is before any of the body is read or a `100 Continue` is
+  sent, so a request turned away costs no more than its headers, and one
+  waiting in a queue holds no body.
+- On HTTP/2 and HTTP/3 with `body_buffering => manual` it is before the
+  handler reads any of the body, but the connection still takes in what
+  the client sends up to the stream's flow-control window while the
+  request waits: at most 64 KB on HTTP/2 and, by default, 256 KB on
+  HTTP/3. A request that sends `Expect: 100-continue` holds none, as its
+  `100` comes only once the handler asks for the body.
 - On HTTP/2 and HTTP/3 with `body_buffering => auto` (the default), the
   connection reads the whole body first, up to the route's
   `max_content_length`, and only then is the request checked. Those
