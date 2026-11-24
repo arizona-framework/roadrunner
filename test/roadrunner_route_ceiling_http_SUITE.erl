@@ -750,55 +750,196 @@ h3_connection_gone_leaves_the_queue(Config) ->
 slot_and_down_share_every_receive(_Config) ->
     %% A stream worker that takes a slot of its route on its own tells the
     %% process that monitors it (the HTTP/2 connection, HTTP/3's loop) its
-    %% key, and that process frees the slot on the worker's `'DOWN'`: every
-    %% receive of theirs that takes a `'DOWN'` must also take the key, so
-    %% the key, sent first, is always handled first, however busy the
-    %% process was when both came.
-    lists:foreach(
-        fun(Mod) ->
-            Beam =
-                case code:which(Mod) of
-                    %% Cover compiles from the same beam on disk.
-                    cover_compiled ->
-                        filename:join([
-                            code:lib_dir(roadrunner), "ebin", atom_to_list(Mod) ++ ".beam"
-                        ]);
-                    Loaded ->
-                        Loaded
-                end,
-            {ok, {Mod, [{abstract_code, {raw_abstract_v1, Forms}}]}} =
-                beam_lib:chunks(Beam, [abstract_code]),
-            Receives = receives(Forms),
-            ?assertNotEqual([], [R || R <- Receives, takes('DOWN', R)]),
-            ?assertEqual(
-                [], [R || R <- Receives, takes('DOWN', R), not takes(roadrunner_route_slot, R)]
-            )
+    %% key, and that process frees the slot on the worker's `'DOWN'`, which
+    %% comes after. So every receive those processes may run, in any module,
+    %% that could take a worker's `'DOWN'` or a key must take both, each by
+    %% its own clause before any other that could take it: a catch-all, or
+    %% a `'DOWN'` taken apart from the keys, would handle a worker's
+    %% `'DOWN'` before the key it sent first, however busy the process was.
+    %% A `'DOWN'` of a monitor bound before the receive cannot be told from
+    %% a worker's here, so each such receive is listed with why it is not.
+    Allowed = [
+        %% A call to the QUIC connection, waiting on its own monitor of it.
+        {roadrunner_quic, await, 3},
+        %% Body reads, run by the stream worker on its own monitor of the
+        %% connection; reached here only through the readers the
+        %% connection builds for its workers.
+        {roadrunner_conn, await_reply, 4},
+        {roadrunner_conn, withdraw_demand, 3}
+    ],
+    {Checked, Bad} = owner_receives(),
+    ?assert(lists:member({roadrunner_conn_loop_http2, recv_more, 1}, Checked)),
+    ?assert(lists:member({roadrunner_conn_loop_http3, loop, 1}, Checked)),
+    ?assertEqual([], [B || {MFA, _Line, _Why} = B <- Bad, not lists:member(MFA, Allowed)]).
+
+%% The functions with a receive that could take a worker's `'DOWN'` or a
+%% key, among those the owners may run (every function the two loop
+%% modules call, transitively), and those whose receive could take one
+%% other than by its own clause, with why.
+owner_receives() ->
+    ok = load(roadrunner),
+    {ok, Mods} = application:get_key(roadrunner, modules),
+    Forms = maps:from_list([{M, abstract_code(M)} || M <- Mods]),
+    Roots = [
+        {M, F, A}
+     || M <- [roadrunner_conn_loop_http2, roadrunner_conn_loop_http3],
+        {function, _, F, A, _} <- maps:get(M, Forms)
+    ],
+    Found = [
+        {MFA, Line, Clauses}
+     || MFA <- reach(Roots, Forms, #{}), {Line, Clauses} <- receives(form(Forms, MFA))
+    ],
+    Taking = [{MFA, Line, Clauses} || {MFA, Line, Clauses} <- Found, takes_any(Clauses)],
+    {
+        [MFA || {MFA, _Line, _Clauses} <- Taking],
+        [{MFA, Line, Why} || {MFA, Line, Clauses} <- Taking, Why <- [verdict(Clauses)], Why =/= ok]
+    }.
+
+load(App) ->
+    case application:load(App) of
+        ok -> ok;
+        {error, {already_loaded, App}} -> ok
+    end.
+
+%% The abstract code of `Mod` as loaded (from its beam on disk when it is
+%% cover compiled).
+abstract_code(Mod) ->
+    Beam =
+        case code:which(Mod) of
+            cover_compiled ->
+                filename:join([code:lib_dir(roadrunner), "ebin", atom_to_list(Mod) ++ ".beam"]);
+            Loaded ->
+                Loaded
         end,
-        [roadrunner_conn_loop_http2, roadrunner_conn_loop_http3]
+    {ok, {Mod, [{abstract_code, {raw_abstract_v1, Forms}}]}} = beam_lib:chunks(Beam, [abstract_code]),
+    Forms.
+
+form(Forms, {M, F, A}) ->
+    [Form] = [Fn || {function, _, N, Ar, _} = Fn <- maps:get(M, Forms), N =:= F, Ar =:= A],
+    Form.
+
+%% Every function of the app reached from `Queue` by calls.
+reach([], _Forms, Seen) ->
+    maps:keys(Seen);
+reach([MFA | Rest], Forms, Seen) when is_map_key(MFA, Seen) ->
+    reach(Rest, Forms, Seen);
+reach([{M, F, A} = MFA | Rest], Forms, Seen) ->
+    case
+        is_map_key(M, Forms) andalso
+            [x || {function, _, F1, A1, _} <- maps:get(M, Forms), F1 =:= F, A1 =:= A]
+    of
+        [x] -> reach(called(M, form(Forms, MFA), Rest), Forms, Seen#{MFA => true});
+        _ -> reach(Rest, Forms, Seen)
+    end.
+
+called(M, {call, _, {atom, _, F}, Args} = Call, Acc) ->
+    [{M, F, length(Args)} | called(M, tl(tuple_to_list(Call)), Acc)];
+called(M, {call, _, {remote, _, {atom, _, M2}, {atom, _, F}}, Args} = Call, Acc) ->
+    [{M2, F, length(Args)} | called(M, tl(tuple_to_list(Call)), Acc)];
+called(M, {'fun', _, {function, F, A}}, Acc) ->
+    [{M, F, A} | Acc];
+called(_M, {'fun', _, {function, {atom, _, M2}, {atom, _, F}, {integer, _, A}}}, Acc) ->
+    [{M2, F, A} | Acc];
+called(M, Tuple, Acc) when is_tuple(Tuple) ->
+    called(M, tuple_to_list(Tuple), Acc);
+called(M, [Head | Tail], Acc) ->
+    called(M, Head, called(M, Tail, Acc));
+called(_M, _Other, Acc) ->
+    Acc.
+
+%% Each receive of a function, with each clause's pattern and the
+%% variables bound before it.
+receives(Form) ->
+    erl_syntax_lib:fold(
+        fun(Node, Acc) ->
+            case erl_syntax:type(Node) of
+                receive_expr ->
+                    Clauses = [
+                        {
+                            hd(erl_syntax:clause_patterns(C)),
+                            proplists:get_value(env, erl_syntax:get_ann(C), [])
+                        }
+                     || C <- erl_syntax:receive_expr_clauses(Node)
+                    ],
+                    [{erl_syntax:get_pos(Node), Clauses} | Acc];
+                _ ->
+                    Acc
+            end
+        end,
+        [],
+        erl_syntax_lib:annotate_bindings(Form, ordsets:new())
     ).
 
-%% The clauses of every `receive` in the abstract code `Term`.
-receives({'receive', _, Clauses}) ->
-    [Clauses | receives(Clauses)];
-receives({'receive', _, Clauses, After, Body}) ->
-    [Clauses | receives([Clauses, After, Body])];
-receives(Term) when is_tuple(Term) ->
-    receives(tuple_to_list(Term));
-receives(Terms) when is_list(Terms) ->
-    lists:flatmap(fun receives/1, Terms);
-receives(_Other) ->
-    [].
+takes_any(Clauses) ->
+    lists:any(
+        fun({P, Env}) ->
+            may_take(P, 'DOWN', 5, Env) orelse may_take(P, roadrunner_route_slot, 4, Env)
+        end,
+        Clauses
+    ).
 
-%% Whether one of the clauses takes a tuple tagged `Tag`.
-takes(Tag, Clauses) ->
-    lists:any(fun({clause, _, [Pattern], _, _}) -> tagged(Tag, Pattern) end, Clauses).
+%% `ok`, or which of a worker's `'DOWN'` and a key the receive could take
+%% other than by its own clause.
+verdict(Clauses) ->
+    case {first(Clauses, 'DOWN', 5), first(Clauses, roadrunner_route_slot, 4)} of
+        {named, named} -> ok;
+        Why -> Why
+    end.
 
-tagged(Tag, {tuple, _, [{atom, _, Tag} | _]}) ->
-    true;
-tagged(Tag, {match, _, Left, Right}) ->
-    tagged(Tag, Left) orelse tagged(Tag, Right);
-tagged(_Tag, _Pattern) ->
-    false.
+%% The first clause that could take a `{Tag, ...}` tuple of `Size`: one
+%% naming the tag, one that would take it otherwise, or none.
+first([], _Tag, _Size) ->
+    none;
+first([{P, Env} | Rest], Tag, Size) ->
+    case may_take(P, Tag, Size, Env) of
+        true ->
+            case names(P, Tag, Size) of
+                true -> named;
+                false -> unnamed
+            end;
+        false ->
+            first(Rest, Tag, Size)
+    end.
+
+%% Whether pattern `P` could match a `{Tag, ...}` tuple of `Size`: a free
+%% variable or `_`, or such a tuple whose first element is `Tag` or free.
+may_take(P, Tag, Size, Env) ->
+    case erl_syntax:type(P) of
+        underscore ->
+            true;
+        variable ->
+            not lists:member(erl_syntax:variable_name(P), Env);
+        match_expr ->
+            may_take(erl_syntax:match_expr_pattern(P), Tag, Size, Env) andalso
+                may_take(erl_syntax:match_expr_body(P), Tag, Size, Env);
+        tuple ->
+            case erl_syntax:tuple_elements(P) of
+                [First | _] = Elements when length(Elements) =:= Size ->
+                    may_take(First, Tag, 0, Env) orelse
+                        (erl_syntax:type(First) =:= atom andalso
+                            erl_syntax:atom_value(First) =:= Tag);
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end.
+
+names(P, Tag, Size) ->
+    case erl_syntax:type(P) of
+        match_expr ->
+            names(erl_syntax:match_expr_pattern(P), Tag, Size) orelse
+                names(erl_syntax:match_expr_body(P), Tag, Size);
+        tuple ->
+            case erl_syntax:tuple_elements(P) of
+                [First | _] = Elements when length(Elements) =:= Size ->
+                    erl_syntax:type(First) =:= atom andalso erl_syntax:atom_value(First) =:= Tag;
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end.
 
 %% --- helpers ---
 

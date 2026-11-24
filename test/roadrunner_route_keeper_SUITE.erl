@@ -82,7 +82,9 @@ watching a dead owner's workers before taking its registration.
     gone_table_refuses_and_releases/1,
     unknown_messages_are_ignored/1,
     idle_keeper_hibernates/1,
-    idle_connections_gone_leave_no_keys/1
+    idle_connections_gone_leave_no_keys/1,
+    worker_killed_after_its_insert_is_freed/1,
+    protocol_steps_keep_their_order/1
 ]).
 
 suite() ->
@@ -147,7 +149,9 @@ all() ->
         gone_table_refuses_and_releases,
         unknown_messages_are_ignored,
         idle_keeper_hibernates,
-        idle_connections_gone_leave_no_keys
+        idle_connections_gone_leave_no_keys,
+        worker_killed_after_its_insert_is_freed,
+        protocol_steps_keep_their_order
     ].
 
 init_per_suite(Config) ->
@@ -774,11 +778,10 @@ late_intent_is_swept(_Config) ->
     exit(Worker, kill),
     ?assertMatch([{Owner, Worker, _}], ets:tab2list(intents(C))),
     ?assertMatch(#{in_flight := 0}, stats(C)),
-    %% Another owner dies before the keeper looks again: it looks for both.
+    %% Another owner dies before the keeper looks again: it looks for both,
+    %% a second after the first died.
     ok = kill_owner(Keeper, C, registered_owner(Keeper, C)),
-    Keeper ! sweep,
-    _ = sys:get_state(Keeper),
-    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = wait_no_intents(C, erlang:monotonic_time(millisecond) + 10000),
     ok = stop_keeper(Keeper).
 
 drain_against_a_fast_worker(_Config) ->
@@ -1193,7 +1196,117 @@ idle_connections_gone_leave_no_keys(_Config) ->
     ok = stop_keeper(Fresh),
     ok = stop_keeper(Keeper).
 
+worker_killed_after_its_insert_is_freed(_Config) ->
+    %% A worker killed right after inserting its row, its owner alive: the
+    %% owner heard of the key before the row went in, and frees it on the
+    %% worker's `'DOWN'`.
+    {Keeper, C} = route(2, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = roadrunner_route_pause:arm(worker_inserted),
+    Worker = stream(Owner),
+    Worker = roadrunner_route_pause:await(worker_inserted),
+    exit(Worker, kill),
+    ok = wait_rows(C, 0),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    ok = stop_keeper(Keeper).
+
+protocol_steps_keep_their_order(_Config) ->
+    %% The order of these steps is what keeps a slot from leaking or a
+    %% request from waiting beside a free slot; the races it settles are
+    %% too short for a test to force between two steps with nothing in
+    %% between, so the order itself is checked, in the order each function
+    %% makes its calls.
+    Forms = abstract_code(roadrunner_route_keeper),
+    lists:foreach(
+        fun({Function, Steps}) ->
+            Calls = calls(function(Forms, Function)),
+            Positions = [index(Step, Calls) || Step <- Steps],
+            ?assertEqual(
+                {Function, Steps}, {Function, [S || {S, P} <- lists:zip(Steps, Positions), P > 0]}
+            ),
+            ?assertEqual({Function, lists:usort(Positions)}, {Function, Positions})
+        end,
+        [
+            %% A worker tells its owner the key, writes its intent, checks the
+            %% owner still registered, and only then inserts its row.
+            {{take_owned, 3}, [
+                {erlang, send, 'Owner'},
+                {ets, insert, 'Intents'},
+                {ets, member, 'Regs'},
+                {ets, insert_new, 'Slots'}
+            ]},
+            %% An owner frees a worker's row before its intent.
+            {{worker_down, 1}, [{ets, delete_object, 'Slots'}, {ets, delete_object, 'Intents'}]},
+            %% A dead owner's registration goes before its workers are watched.
+            {{watched_down, 3}, [{ets, take, 'Regs'}, adopt]},
+            %% A request that ends deletes its row before it reads the gate.
+            {{release, 2}, [{ets, delete_object, 'Slots'}, notify]},
+            %% The keeper closes the gate before its last look for room.
+            {{no_room, 5}, [close, last_look, park]},
+            %% A home is taken through an open gate, and checked after.
+            {{take_home, 2}, [open, {ets, insert_new, 'Slots'}, kept]},
+            %% A grant's row and registration go in before its answer.
+            {{grant, 5}, [claim, hold, {erlang, send, 'Token'}]}
+        ]
+    ).
+
 %% --- helpers ---
+
+%% The abstract code of `Mod` as loaded (from its beam on disk when it is
+%% cover compiled).
+abstract_code(Mod) ->
+    Beam =
+        case code:which(Mod) of
+            cover_compiled ->
+                filename:join([code:lib_dir(roadrunner), "ebin", atom_to_list(Mod) ++ ".beam"]);
+            Loaded ->
+                Loaded
+        end,
+    {ok, {Mod, [{abstract_code, {raw_abstract_v1, Forms}}]}} = beam_lib:chunks(Beam, [abstract_code]),
+    Forms.
+
+function(Forms, {Name, Arity}) ->
+    [Function] = [F || {function, _, N, A, _} = F <- Forms, N =:= Name, A =:= Arity],
+    Function.
+
+%% The calls in `Term` in the order they are made: a call's arguments
+%% before the call, left to right. A remote call is named with its first
+%% argument when that is a variable (the table or process it acts on).
+calls(Term) ->
+    lists:reverse(calls(Term, [])).
+
+calls({call, _, Fun, Args} = Call, Acc) ->
+    [call_name(Call) | calls(Args, calls(Fun, Acc))];
+calls(Tuple, Acc) when is_tuple(Tuple) ->
+    calls(tuple_to_list(Tuple), Acc);
+calls([Head | Tail], Acc) ->
+    calls(Tail, calls(Head, Acc));
+calls(_Other, Acc) ->
+    Acc.
+
+call_name({call, _, {remote, _, {atom, _, M}, {atom, _, F}}, [{var, _, V} | _]}) -> {M, F, V};
+call_name({call, _, {remote, _, {atom, _, M}, {atom, _, F}}, _Args}) -> {M, F};
+call_name({call, _, {atom, _, F}, _Args}) -> F;
+call_name(_Call) -> other.
+
+%% The position of the first `Step` in `Calls`, or 0.
+index(Step, Calls) ->
+    index(Step, Calls, 1).
+
+index(_Step, [], _N) -> 0;
+index(Step, [Step | _], N) -> N;
+index(Step, [_ | Rest], N) -> index(Step, Rest, N + 1).
+
+%% Until the route holds no intent, or `Deadline` (ms) passes.
+wait_no_intents(Ceiling, Deadline) ->
+    case ets:tab2list(intents(Ceiling)) of
+        [] ->
+            ok;
+        Intents ->
+            erlang:monotonic_time(millisecond) < Deadline orelse ct:fail({intents_kept, Intents}),
+            erlang:yield(),
+            wait_no_intents(Ceiling, Deadline)
+    end.
 
 %% A connection that forgot its home asks the keeper, which makes the key
 %% it grants the connection's home in both their views; killed holding it,
