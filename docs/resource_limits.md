@@ -799,24 +799,36 @@ before it hands the slot back and waits for the next request, so an idle
 keep-alive connection does not hold on to megabytes.
 
 A ceiling is meant for expensive routes, where a request takes
-milliseconds and megabytes. Taking and handing back a slot costs about
-11 µs of server CPU per request (measured on a trivial handler, about
-twice the cost of the request itself), and every request to the route
-passes through the one process that counts it. That is nothing next to a
-request that decodes a large body, but it would show on a hot, cheap
-route: leave those without a ceiling and bound them with the listener's
-`max_concurrent_requests` if needed.
+milliseconds and megabytes. Each route with a ceiling has a small process
+of its own that hands out its slots, linked to the listener, but most
+requests never reach it. A connection's first request to the route asks
+that process, which then knows the connection. On HTTP/1.1 it gives the
+connection a slot of its own, which the connection's later requests take
+and hand back themselves; on HTTP/2 and HTTP/3 the connection's later
+requests take a slot on their own while the route runs under half its
+ceiling. Requests go through the process while others wait for a slot,
+so they queue behind them, and HTTP/2 and HTTP/3 requests do from half
+the ceiling on, which costs a few microseconds of server CPU per request.
+That is nothing next to a request that decodes a large body, but it would
+show on a hot, cheap route: leave those without a ceiling and bound them
+with the listener's `max_concurrent_requests` if needed.
 
-Each route with a ceiling has a small process of its own that hands out
-its slots, linked to the listener. The count itself is kept by the
-listener, so if that process crashes the listener starts a new one on the
-same count: the requests still running keep their slots, and only those
-waiting are answered `503`. `reload_routes/2` keeps the count of a route
-whose path and methods are the same in the new table, and a new ceiling
-applies at once. A route the new table drops keeps counting the requests
-it still runs until they end. A route whose path or methods change is a
-new route with a count of its own, so until its old requests end the two
-can run up to twice the ceiling between them.
+That process keeps a small record of each connection that took a slot
+through it, for as long as the connection lives, and gives the memory back
+once it has been idle for a second. On HTTP/2 and HTTP/3, a stream killed at
+one exact point of taking its slot, as its connection dies too, can leave a
+few bytes behind, never a slot: the process removes them a second later, or,
+for a stream stalled longer than that, when the process restarts or the
+route is dropped. The count itself is kept by the listener, so if that
+process crashes the listener starts a new one on the same count: the
+requests still running keep their slots, connections go on taking their
+own slots meanwhile, and only the requests waiting are answered `503`.
+`reload_routes/2` keeps the count of a route whose path and methods are
+the same in the new table, and a new ceiling applies at once. A route the
+new table drops keeps counting the requests it still runs until they end.
+A route whose path or methods change is a new route with a count of its
+own, so until its old requests end the two can run up to twice the
+ceiling between them.
 
 `roadrunner_listener:info/1` reports each route with a ceiling under
 `routes`: its `in_flight` and `queued` requests and the `throttled` ones

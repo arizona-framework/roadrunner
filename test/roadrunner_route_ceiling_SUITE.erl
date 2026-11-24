@@ -427,7 +427,7 @@ release(Pid) ->
 keeper(Name, Path) ->
     {ok, _, _, _, _, {_Body, Ceiling}} =
         roadrunner_router:resolve(~"GET", Path, persistent_term:get({roadrunner_routes, Name})),
-    ets:lookup_element(element(2, Ceiling), keeper, 2).
+    ets:lookup_element(element(3, Ceiling), '$keeper', 2).
 
 route_info(Name) ->
     maps:get(routes, roadrunner_listener:info(Name)).
@@ -471,7 +471,7 @@ wait_acquire(_Keeper, Pid, 0) ->
     ct:fail({never_asked, Pid});
 wait_acquire(Keeper, Pid, Tries) ->
     {messages, Messages} = erlang:process_info(Keeper, messages),
-    case [P || {acquire, _Token, P, _Wait} <- Messages, P =:= Pid] of
+    case [P || {acquire, _Token, P, _Kind, _Wait} <- Messages, P =:= Pid] of
         [_] ->
             ok;
         [] ->

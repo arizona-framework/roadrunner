@@ -440,8 +440,18 @@ loop(#h3{conn = Conn} = State) ->
             loop(peer_changed(State, Peer));
         {quic, Conn, {closed, Reason}} ->
             terminate(State, closed_reason(Reason));
-        {'DOWN', MonRef, process, _Pid, Reason} ->
+        {'DOWN', MonRef, process, Pid, Reason} ->
+            ok = roadrunner_route_keeper:worker_down(Pid),
             loop(handle_worker_down(State, MonRef, Reason));
+        {roadrunner_route_slot, _Worker, _Ceiling, _K} = Note ->
+            %% A stream worker took a slot of its route's ceiling owned by this
+            %% process, without the route's keeper: it is freed on the worker's
+            %% `'DOWN'`, which comes after this message. Every receive of this
+            %% process that takes a worker's `'DOWN'` must take this message
+            %% too, so the two are handled in the order they came
+            %% (`roadrunner_route_keeper`).
+            ok = roadrunner_route_keeper:noted(Note),
+            loop(State);
         {roadrunner_body_demand, Worker, StreamId} ->
             loop(handle_body_demand(State, Worker, StreamId));
         {roadrunner_body_withdraw, Worker, StreamId} ->
