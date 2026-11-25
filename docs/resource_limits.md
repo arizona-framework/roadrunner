@@ -793,10 +793,22 @@ sent, a loop or stream response once it ends, a WebSocket upgrade once
 the `101` is out. A request whose process dies in any way (killed, over
 its `max_heap_size`, its connection gone) frees its slot as soon as it
 goes. On HTTP/1.1 the handler runs in the connection's process, so what
-it built stays on that process's heap until the next collection; for a
-route with a ceiling the connection collects it once the response is out,
-before it hands the slot back and waits for the next request, so an idle
-keep-alive connection does not hold on to megabytes.
+it built stays on that process's heap until the next collection. For a
+route with a ceiling the connection collects once the response is out,
+before it hands the slot back and waits for the next request, when the
+request grew its heap past the heap floor (its old heap included, under a
+generational `fullsweep_after`) or left 64 KB or more of binaries. After
+a cheap request a collection gives nothing back, and it would cost more
+than everything else the ceiling adds to the request. An idle keep-alive
+connection then keeps no more than its heap floor and less than 64 KB of
+binaries from the request.
+
+The check does not see memory held through other references: `atomics`
+and `counters` arrays and NIF resources, such as a `zlib` stream that
+was never closed. A request that leaves only those behind does not make
+the connection collect, so they stay until its next collection. A
+handler that drops one should free it itself where it can
+(`zlib:close/1`), or call `erlang:garbage_collect/0` before it returns.
 
 A ceiling is meant for expensive routes, where a request takes
 milliseconds and megabytes. Each route with a ceiling has a small process

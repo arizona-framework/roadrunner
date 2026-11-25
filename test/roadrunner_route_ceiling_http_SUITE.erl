@@ -31,6 +31,8 @@ alone.
     pipelined_requests_take_turns/1,
     pipelined_refusal_keeps_the_rest/1,
     idle_connection_drops_the_route_heap/1,
+    idle_connection_drops_the_route_binaries/1,
+    idle_generational_connection_drops_the_route_heap/1,
     wait_does_not_eat_the_body_deadline/1,
     h2_connection_gone_leaves_the_queue/1,
     h3_connection_gone_leaves_the_queue/1,
@@ -73,6 +75,8 @@ all() ->
         pipelined_requests_take_turns,
         pipelined_refusal_keeps_the_rest,
         idle_connection_drops_the_route_heap,
+        idle_connection_drops_the_route_binaries,
+        idle_generational_connection_drops_the_route_heap,
         wait_does_not_eat_the_body_deadline,
         h2_connection_gone_leaves_the_queue,
         h3_connection_gone_leaves_the_queue,
@@ -133,7 +137,19 @@ init_per_testcase(Case, Config) ->
                 handler => roadrunner_route_heap_handler,
                 max_concurrent_requests => 4
             },
-            {~"/heap_free", roadrunner_route_heap_handler}
+            {~"/heap_free", roadrunner_route_heap_handler},
+            #{
+                path => ~"/binary",
+                handler => roadrunner_route_binary_handler,
+                max_concurrent_requests => 4
+            },
+            {~"/binary_free", roadrunner_route_binary_handler},
+            #{
+                path => ~"/old_heap",
+                handler => roadrunner_route_old_heap_handler,
+                max_concurrent_requests => 4
+            },
+            {~"/old_heap_free", roadrunner_route_old_heap_handler}
         ]
     }),
     [{listener, Case}, {port, roadrunner_listener:port(Case)} | Config].
@@ -183,6 +199,8 @@ case_opts(queue_timeout_answers_503) ->
     {#{overload_mode => {queue, #{timeout => 50}}}, #{}};
 case_opts(queue_full_answers_503) ->
     {#{overload_mode => {queue, #{max_queued => 1}}}, #{}};
+case_opts(idle_generational_connection_drops_the_route_heap) ->
+    {#{}, #{handler_spawn => #{opts => [{fullsweep_after, 65535}]}}};
 case_opts(route_slot_comes_before_the_listener_slot) ->
     {#{}, #{max_concurrent_requests => 1, overload_mode => {shed, #{retry_after => 9}}}};
 case_opts(_Case) ->
@@ -477,6 +495,55 @@ idle_connection_drops_the_route_heap(Config) ->
     %% 400,000 list cells are 800,000 words.
     ?assert(FreeHeap > 800000),
     ?assert(CappedHeap < 100000).
+
+idle_connection_drops_the_route_binaries(Config) ->
+    %% The handler drops a 512 KB binary. A first request raised each
+    %% connection's heap floor to its cap, so the binary leaves garbage
+    %% only off the heap, within the floor: the capped connection collects
+    %% it before its next request all the same, while the connection on a
+    %% route without a ceiling keeps it while idle.
+    Capped = connect(Config),
+    ok = gen_tcp:send(Capped, get_request(~"/heap")),
+    {200, _, _} = recv_response(Capped),
+    ok = gen_tcp:send(Capped, get_request(~"/binary")),
+    {200, _, CappedConn} = recv_response(Capped),
+    Free = connect(Config),
+    ok = gen_tcp:send(Free, get_request(~"/heap_free")),
+    {200, _, _} = recv_response(Free),
+    ok = gen_tcp:send(Free, get_request(~"/binary_free")),
+    {200, _, FreeConn} = recv_response(Free),
+    CappedBytes = binary_bytes(CappedConn),
+    FreeBytes = binary_bytes(FreeConn),
+    ct:pal("idle binaries after the request: capped ~p bytes, uncapped ~p bytes", [
+        CappedBytes, FreeBytes
+    ]),
+    ?assert(FreeBytes >= 524288),
+    ?assert(CappedBytes < 65536).
+
+idle_generational_connection_drops_the_route_heap(Config) ->
+    %% Under the emulator's generational policy, what the handler builds
+    %% moves to the old heap at its minor collections, while the young
+    %% heap stays within the floor a first request raised to its cap: the
+    %% capped connection collects it before its next request all the
+    %% same, while the connection on a route without a ceiling keeps it.
+    Capped = connect(Config),
+    ok = gen_tcp:send(Capped, get_request(~"/heap")),
+    {200, _, _} = recv_response(Capped),
+    ok = gen_tcp:send(Capped, get_request(~"/old_heap")),
+    {200, _, CappedConn} = recv_response(Capped),
+    Free = connect(Config),
+    ok = gen_tcp:send(Free, get_request(~"/heap_free")),
+    {200, _, _} = recv_response(Free),
+    ok = gen_tcp:send(Free, get_request(~"/old_heap_free")),
+    {200, _, FreeConn} = recv_response(Free),
+    CappedHeap = heap_words(CappedConn),
+    FreeHeap = heap_words(FreeConn),
+    ct:pal("idle heap after the request: capped ~p words, uncapped ~p words", [
+        CappedHeap, FreeHeap
+    ]),
+    %% The floor's cap is 46,422 words.
+    ?assert(FreeHeap > 100000),
+    ?assert(CappedHeap < 50000).
 
 wait_does_not_eat_the_body_deadline(Config) ->
     %% A request that waited for its slot past its `request_timeout` still
@@ -1071,8 +1138,28 @@ ws_upgrade(Path) ->
     ].
 
 heap_words(PidBin) ->
-    {total_heap_size, Words} = process_info(list_to_pid(binary_to_list(PidBin)), total_heap_size),
+    {total_heap_size, Words} = process_info(idle_conn(PidBin), total_heap_size),
     Words.
+
+%% The connection sends its response before it collects: wait for it to
+%% wait for its next request.
+idle_conn(PidBin) ->
+    Pid = list_to_pid(binary_to_list(PidBin)),
+    wait_idle(Pid),
+    Pid.
+
+wait_idle(Pid) ->
+    case process_info(Pid, status) of
+        {status, waiting} ->
+            ok;
+        {status, _} ->
+            erlang:yield(),
+            wait_idle(Pid)
+    end.
+
+binary_bytes(PidBin) ->
+    {binary, Binaries} = process_info(idle_conn(PidBin), binary),
+    lists:sum([Size || {_Id, Size, _Refs} <- Binaries]).
 
 expect_handler() ->
     receive

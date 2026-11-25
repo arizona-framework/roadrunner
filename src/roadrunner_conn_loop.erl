@@ -670,6 +670,9 @@ proxy_protocol_stage(
 %% What a socket reads request heads with once one did not fit its
 %% `idle_recv_buffer` (`grow_for_head/1`).
 -define(HEAD_RECV_BUFFER, 16384).
+%% The bytes of binaries a request of a route with a ceiling leaves on its
+%% connection that make it collect (`collect_route_heap/1`).
+-define(ROUTE_BINARY_GARBAGE, 65536).
 
 %% Exact read for the TLS case. Six bytes tell v1 (`PROXY `) from v2 (the
 %% first six bytes of its signature); a v2 prefix then declares the length of
@@ -1412,13 +1415,34 @@ release_request_slot(S) ->
 %% process, so what it built (a decoded body, a parsed form) is garbage on
 %% this heap once it ends. Collected before the route's slot goes back, so
 %% a connection kept alive, or a WebSocket session, does not hold on to
-%% it; the ceiling then bounds that memory too.
+%% it; the ceiling then bounds that memory too. Only when a collection has
+%% something to give back: a heap, the old heap of a generational
+%% `fullsweep_after` included, grown past its `min_heap_size` (which the
+%% heap floor raises to the heap requests need, up to its cap), or
+%% binaries of `?ROUTE_BINARY_GARBAGE` bytes or more. A cheap request
+%% leaves neither, and collecting after it would cost more than the rest
+%% of what its route adds. Memory behind other references (`atomics`,
+%% NIF resources) is not listed with the binaries, so it does not count.
 -spec collect_route_heap(#loop_state{}) -> #loop_state{}.
 collect_route_heap(#loop_state{request_slot = {route, _Ceiling, _Token, _Slot}} = S) ->
-    true = erlang:garbage_collect(),
-    S;
+    [{total_heap_size, Heap}, {min_heap_size, Min}, {binary, Binaries}] =
+        erlang:process_info(self(), [total_heap_size, min_heap_size, binary]),
+    case (Heap > Min) orelse binary_bytes(Binaries, 0) >= ?ROUTE_BINARY_GARBAGE of
+        true ->
+            true = erlang:garbage_collect(),
+            S;
+        false ->
+            S
+    end;
 collect_route_heap(S) ->
     S.
+
+-spec binary_bytes([{non_neg_integer(), non_neg_integer(), pos_integer()}], non_neg_integer()) ->
+    non_neg_integer().
+binary_bytes([], Bytes) ->
+    Bytes;
+binary_bytes([{_Id, Size, _Refs} | Binaries], Bytes) ->
+    binary_bytes(Binaries, Bytes + Size).
 
 %% Over its rate (429) or shed (503): queued pipelined responses go out
 %% first so the response + close cannot overtake them, and the close
