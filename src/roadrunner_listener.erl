@@ -2309,7 +2309,7 @@ base_listen_opts(Opts, Buffer) ->
 %% set; every accepted socket inherits it from the listen socket. The inet
 %% `buffer` keeps its size: `recbuf` raises it only on a socket whose
 %% `buffer` was never set, and these listen options always set it.
--spec kernel_recv_buffer(opts(), [Opt]) -> [Opt | {recbuf, positive_limit()}].
+-spec kernel_recv_buffer(unchecked_opts(), [Opt]) -> [Opt | {recbuf, positive_limit()}].
 kernel_recv_buffer(Opts, SocketOpts) ->
     case Opts of
         #{kernel_recv_buffer := N} when is_integer(N), N >= 1, N =< ?MAX_LIMIT ->
@@ -2366,7 +2366,7 @@ unsent_opts(Bytes, {unix, darwin}) ->
 unsent_opts(_Bytes, _OsType) ->
     [].
 
--spec send_timeout(opts()) -> positive_limit() | infinity.
+-spec send_timeout(unchecked_opts()) -> positive_limit() | infinity.
 send_timeout(Opts) ->
     case maps:get(send_timeout, Opts, ?DEFAULT_SEND_TIMEOUT) of
         infinity -> infinity;
@@ -2374,7 +2374,7 @@ send_timeout(Opts) ->
         Other -> error({invalid_listener_opt, send_timeout, Other})
     end.
 
--spec max_unsent_bytes(opts()) -> positive_limit() | infinity.
+-spec max_unsent_bytes(unchecked_opts()) -> positive_limit() | infinity.
 max_unsent_bytes(Opts) ->
     case maps:get(max_unsent_bytes, Opts, ?DEFAULT_MAX_UNSENT_BYTES) of
         infinity -> infinity;
@@ -2535,7 +2535,7 @@ maybe_tls_upgrade(ProtoOpts, _Opts, _Protocols) ->
 
 %% A timeout option in ms, from `Min` up to the longest a `receive` waits
 %% (`?MAX_TIMEOUT_MS`), as every connection arms its waits from it.
--spec timeout_opt(atom(), opts(), non_neg_integer(), 0 | 1) -> non_neg_integer().
+-spec timeout_opt(atom(), unchecked_opts(), non_neg_integer(), 0 | 1) -> non_neg_integer().
 timeout_opt(Key, Opts, Default, Min) ->
     case maps:get(Key, Opts, Default) of
         Ms when is_integer(Ms), Ms >= Min, Ms =< ?MAX_TIMEOUT_MS -> Ms;
@@ -2653,7 +2653,7 @@ validate_quic_ip(#{}, _Protocols) ->
 is_port_number(N) -> is_integer(N) andalso N >= 0 andalso N =< 65535.
 
 %% Validate `max_keep_alive_requests`: a count of requests, or `infinity`.
--spec max_keep_alive_requests(map()) -> infinity | pos_integer().
+-spec max_keep_alive_requests(unchecked_opts()) -> infinity | pos_integer().
 max_keep_alive_requests(Opts) ->
     case maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE) of
         infinity -> infinity;
@@ -3550,7 +3550,7 @@ valid_compress_opt(_Key, _N) -> false.
 %% meaningless) rather than passing a bad value into `gen_tcp:listen/2`,
 %% where it would surface as an opaque `{listen_failed, _}`. Mirrors the
 %% strict `ws.recv_buffer` validation.
--spec validate_recv_buffer(map()) -> pos_integer().
+-spec validate_recv_buffer(unchecked_opts()) -> pos_integer().
 validate_recv_buffer(Opts) ->
     case maps:get(recv_buffer, Opts, ?DEFAULT_RECV_BUFFER) of
         N when is_integer(N), N >= 1, N =< ?MAX_LIMIT -> N;
@@ -3560,7 +3560,7 @@ validate_recv_buffer(Opts) ->
 %% The validated `idle_recv_buffer`, lowered to `recv_buffer` when above
 %% it: a listener that lowers `recv_buffer` for memory gets a socket
 %% buffer no larger than that.
--spec idle_recv_buffer(map()) -> pos_integer().
+-spec idle_recv_buffer(unchecked_opts()) -> pos_integer().
 idle_recv_buffer(Opts) ->
     case maps:get(idle_recv_buffer, Opts, ?DEFAULT_IDLE_RECV_BUFFER) of
         N when is_integer(N), N >= 1, N =< ?MAX_LIMIT -> min(N, validate_recv_buffer(Opts));
