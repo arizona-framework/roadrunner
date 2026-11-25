@@ -692,6 +692,10 @@ Optional middleware and timing knobs (durations in milliseconds):
 The inline source comments next to each field carry the deeper
 ops-tuning rationale.
 """.
+%% The listener options as the caller passed them, before the start
+%% checks each one against `t:opts/0`.
+-type unchecked_opts() :: #{atom() => term()}.
+
 -type opts() :: #{
     port := inet:port_number(),
     routes =>
@@ -2362,7 +2366,7 @@ bind_opts(Opts, SocketOpts) ->
 
 %% `ipv6_v6only` is an IPv6 socket option, so it needs an IPv6 `ip`: unset,
 %% the listener binds IPv4, where the option does not exist.
--spec validate_ipv6_v6only(map()) -> ok.
+-spec validate_ipv6_v6only(unchecked_opts()) -> ok.
 validate_ipv6_v6only(#{ipv6_v6only := V6Only} = Opts) when is_boolean(V6Only) ->
     case Opts of
         #{ip := {_, _, _, _, _, _, _, _}} -> ok;
@@ -2510,7 +2514,7 @@ timeout_opt(Key, Opts, Default, Min) ->
 %% A top-level option that is a whole number of at least `Min`, or
 %% `Default` when unset. A value of another type would compare above every
 %% integer (an atom, a binary), so a cap given as one would cap nothing.
--spec int_opt(atom(), map(), non_neg_integer(), 0 | 1) -> non_neg_integer().
+-spec int_opt(atom(), unchecked_opts(), non_neg_integer(), 0 | 1) -> non_neg_integer().
 int_opt(Key, Opts, Default, Min) ->
     case maps:get(Key, Opts, Default) of
         N when is_integer(N), N >= Min -> N;
@@ -2518,13 +2522,13 @@ int_opt(Key, Opts, Default, Min) ->
     end.
 
 %% The top-level `hibernate_after`, `0` when off (`infinity`, the default).
--spec hibernate_after(map()) -> non_neg_integer().
+-spec hibernate_after(unchecked_opts()) -> non_neg_integer().
 hibernate_after(#{hibernate_after := infinity}) -> 0;
 hibernate_after(#{hibernate_after := _} = Opts) -> timeout_opt(hibernate_after, Opts, 0, 1);
 hibernate_after(#{}) -> 0.
 
 %% Validate `max_concurrent_requests`: a count of requests, or `infinity`.
--spec max_concurrent_requests(map()) -> infinity | pos_integer().
+-spec max_concurrent_requests(unchecked_opts()) -> infinity | pos_integer().
 max_concurrent_requests(Opts) ->
     case maps:get(max_concurrent_requests, Opts, ?DEFAULT_MAX_CONCURRENT_REQUESTS) of
         infinity -> infinity;
@@ -2534,14 +2538,14 @@ max_concurrent_requests(Opts) ->
 
 %% The listener's `middlewares`: a list, whose entries the pipeline
 %% compile checks (`roadrunner_middleware`).
--spec listener_middlewares(map()) -> roadrunner_middleware:middlewares().
+-spec listener_middlewares(unchecked_opts()) -> roadrunner_middleware:middlewares().
 listener_middlewares(Opts) ->
     case maps:get(middlewares, Opts, []) of
         Middlewares when is_list(Middlewares) -> Middlewares;
         Other -> error({invalid_listener_opt, middlewares, Other})
     end.
 
--spec body_buffering(map()) -> body_buffering().
+-spec body_buffering(unchecked_opts()) -> body_buffering().
 body_buffering(Opts) ->
     case maps:get(body_buffering, Opts, auto) of
         auto -> auto;
@@ -2549,7 +2553,7 @@ body_buffering(Opts) ->
         Other -> error({invalid_listener_opt, body_buffering, Other})
     end.
 
--spec graceful_drain(map()) -> boolean().
+-spec graceful_drain(unchecked_opts()) -> boolean().
 graceful_drain(Opts) ->
     case maps:get(graceful_drain, Opts, true) of
         Drain when is_boolean(Drain) -> Drain;
@@ -2560,7 +2564,7 @@ graceful_drain(Opts) ->
 %% before the listener publishes anything, since they are read only once
 %% the routes are up: `port`, `ip`, `tls`, `num_acceptors` and
 %% `socket_backlog`.
--spec validate_socket_opts(map()) -> ok.
+-spec validate_socket_opts(unchecked_opts()) -> ok.
 validate_socket_opts(Opts) ->
     maybe
         ok ?= valid_socket_opt(port, Opts, fun is_port_number/1),
@@ -2575,11 +2579,11 @@ validate_socket_opts(Opts) ->
     end.
 
 %% A Unix domain socket has no port: `gen_tcp` binds one only with port 0.
--spec unix_socket_port(map()) -> ok | {conflict, pos_integer()}.
+-spec unix_socket_port(unchecked_opts()) -> ok | {conflict, pos_integer()}.
 unix_socket_port(#{ip := {local, _}, port := Port}) when Port =/= 0 -> {conflict, Port};
 unix_socket_port(#{}) -> ok.
 
--spec valid_socket_opt(atom(), map(), fun((term()) -> boolean())) -> ok | {atom(), term()}.
+-spec valid_socket_opt(atom(), unchecked_opts(), fun((term()) -> boolean())) -> ok | {atom(), term()}.
 valid_socket_opt(Key, Opts, Valid) ->
     case Opts of
         #{Key := Value} ->
@@ -2604,7 +2608,7 @@ is_socket_address(Ip) -> inet:is_ip_address(Ip).
 
 %% HTTP/3's UDP socket binds an address only: `any`, `loopback` and a
 %% Unix domain socket are for the TCP protocols.
--spec validate_quic_ip(map(), [http1 | http2 | http3, ...]) -> ok.
+-spec validate_quic_ip(unchecked_opts(), [http1 | http2 | http3, ...]) -> ok.
 validate_quic_ip(#{ip := Ip}, Protocols) ->
     case lists:member(http3, Protocols) andalso not inet:is_ip_address(Ip) of
         true -> error({listener_opt_conflict, ip, Ip, http3_needs_an_ip_address});
