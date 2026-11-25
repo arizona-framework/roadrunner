@@ -1012,6 +1012,7 @@ listener_timeouts_reject_values_a_receive_cannot_wait_test() ->
         request_timeout => 16#FFFFFFFF,
         keep_alive_timeout => 16#FFFFFFFF,
         tls_handshake_timeout => 16#FFFFFFFF,
+        hibernate_after => 16#FFFFFFFF,
         routes => roadrunner_hello_handler
     }),
     ok = roadrunner_listener:stop(listener_test_timeout_max).
@@ -1210,6 +1211,21 @@ listener_accepts_infinity_ws_idle_opts_test() ->
     ?assertMatch(#{ws_idle_timeout := infinity, ws_hibernate_after := infinity}, ProtoOpts),
     ok = roadrunner_listener:stop(Name).
 
+listener_accepts_longest_receive_wait_ws_idle_opts_test() ->
+    %% Both take what the top-level `hibernate_after` does: up to the
+    %% longest a `receive` waits.
+    Name = listener_test_ws_idle_max,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        ws => #{idle_timeout => 16#FFFFFFFF, hibernate_after => 16#FFFFFFFF},
+        routes => roadrunner_hello_handler
+    }),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(ListenerPid))),
+    ?assertMatch(
+        #{ws_idle_timeout := 16#FFFFFFFF, ws_hibernate_after := 16#FFFFFFFF}, ProtoOpts
+    ),
+    ok = roadrunner_listener:stop(Name).
+
 listener_rejects_invalid_ws_opt_test() ->
     %% Unknown keys, out-of-range / non-integer values, and non-map
     %% shapes in `ws` all reject (mirrors the strict `{http2, #{...}}`
@@ -1245,13 +1261,13 @@ listener_rejects_invalid_ws_opt_test() ->
             #{hibernate_after => 0},
             #{hibernate_after => -1},
             #{hibernate_after => bad},
-            #{hibernate_after => 16#80000000},
+            #{hibernate_after => 16#100000000},
             %% `compress` is a boolean; `idle_timeout` an interval like
             %% `hibernate_after`.
             #{compress => yes},
             #{idle_timeout => 0},
             #{idle_timeout => bad},
-            #{idle_timeout => 16#80000000},
+            #{idle_timeout => 16#100000000},
             %% `active` is `once` or a read count `inet:setopts/2` takes;
             %% `true` (unbounded unread data) rejects.
             #{active => true},

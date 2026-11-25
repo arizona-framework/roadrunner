@@ -369,7 +369,9 @@ conn has handed it over at its clean exit, never both).
 The `Max` and `Counter` are cached on the connection loop record at setup so
 the per-stream path passes them directly instead of re-reading `proto_opts`.
 """.
--spec try_acquire_request_slot(infinity | pos_integer(), counters:counters_ref() | undefined) ->
+-spec try_acquire_request_slot(
+    roadrunner_listener:request_cap(), counters:counters_ref() | undefined
+) ->
     boolean().
 try_acquire_request_slot(infinity, _Counter) ->
     true;
@@ -572,7 +574,7 @@ the request has to release it rather than ignore it.
 is the natural choice.
 """.
 -spec acquire_request_slot(
-    infinity | pos_integer(),
+    roadrunner_listener:request_cap(),
     counters:counters_ref() | undefined,
     slot_cell(),
     overload(),
@@ -619,7 +621,7 @@ so a listener in queue mode that is not at its ceiling pays one extra
 `atomics:get/2` per request and no message.
 """.
 -spec release_request_slot(
-    infinity | pos_integer(), counters:counters_ref() | undefined, slot_cell(), overload()
+    roadrunner_listener:request_cap(), counters:counters_ref() | undefined, slot_cell(), overload()
 ) -> ok.
 release_request_slot(infinity, _Counter, _Cell, _Overload) ->
     ok;
@@ -643,7 +645,10 @@ Release `N` in-flight slots at once, taken out of a conn's cell by
 no-ops.
 """.
 -spec release_request_slots(
-    infinity | pos_integer(), counters:counters_ref() | undefined, non_neg_integer(), overload()
+    roadrunner_listener:request_cap(),
+    counters:counters_ref() | undefined,
+    non_neg_integer(),
+    overload()
 ) -> ok.
 release_request_slots(_Max, _Counter, 0, _Overload) ->
     ok;
@@ -674,7 +679,7 @@ with no ceiling). The listener's reaper calls it for a conn that died
 without its exit path.
 """.
 -spec reclaim_request_slots(
-    slot_cell(), infinity | pos_integer(), counters:counters_ref() | undefined, overload()
+    slot_cell(), roadrunner_listener:request_cap(), counters:counters_ref() | undefined, overload()
 ) -> ok.
 reclaim_request_slots(undefined, _Max, _Counter, _Overload) ->
     ok;

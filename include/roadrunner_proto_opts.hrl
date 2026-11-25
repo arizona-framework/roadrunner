@@ -29,13 +29,13 @@
     ws_buffer = undefined :: pos_integer() | {adaptive, pos_integer(), pos_integer()} | undefined,
     %% Idle ms after which a WebSocket session hibernates; `infinity` never
     %% hibernates on idle.
-    ws_hibernate_after = infinity :: roadrunner_listener:idle_ms(),
+    ws_hibernate_after = infinity :: roadrunner_listener:wait_ms(),
     %% Whether a WebSocket upgrade accepts permessage-deflate, and with
     %% which zlib settings (`roadrunner_ws:compress_config/1`).
     ws_compress = false :: false | roadrunner_ws:compress_config(),
     %% Ms of client silence after which a WebSocket session closes;
     %% `infinity` never does.
-    ws_idle_timeout = infinity :: roadrunner_listener:idle_ms(),
+    ws_idle_timeout = infinity :: roadrunner_listener:wait_ms(),
     %% How a WebSocket session reads its socket: `once`, or up to `N` reads
     %% per arm (the listener's `ws.active`); `undefined` is `once` on plain
     %% TCP and `16` on TLS.
@@ -52,7 +52,7 @@
     %% `tls_handshake_timeout` listener opt.
     tls_handshake_timeout = 5000 :: pos_integer(),
     keep_alive_timeout = 60000 :: non_neg_integer(),
-    max_keep_alive_requests = infinity :: infinity | pos_integer(),
+    max_keep_alive_requests = infinity :: roadrunner_listener:request_cap(),
     max_clients = 16384 :: pos_integer(),
     client_counter :: counters:counters_ref(),
     %% Per-listener drain registry (`{Pid}` rows). The listener always sets
@@ -72,7 +72,7 @@
     %% `throttled_counter` is the cumulative count of streams refused at the
     %% ceiling. h1 is bounded by `max_clients` and uses these only in shed
     %% mode, where the ceiling is one budget across every protocol.
-    max_concurrent_requests = infinity :: infinity | pos_integer(),
+    max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
     %% What happens to a request over that ceiling.
     overload = refuse :: roadrunner_conn:overload(),
     %% The listener's slot keeper (`roadrunner_overload_queue`), started
@@ -137,7 +137,7 @@
     %% protocol is off. The user-facing nested shape
     %% (`{http2, #{conn_window => N, ...}}`) is documented in
     %% `t:roadrunner_listener:opts/0`.
-    protocols = [http1] :: [http1 | http2 | http3, ...],
+    protocols = [http1] :: [roadrunner_listener:protocol(), ...],
     %% HTTP/2 receive-window tuning (RFC 9113 §6.5.2 / §6.9.2).
     %% `http2_window_refill_threshold` is `undefined` unless set: each
     %% window then refills at half its peak.
@@ -160,7 +160,7 @@
     %% How long, in milliseconds, a stream's response may wait for the
     %% client's flow-control window with nothing sent before it is reset
     %% (the HTTP/2 `send_stall_timeout`), `infinity` for no limit.
-    http2_send_stall_timeout = 60000 :: 1..16#FFFFFFFF | infinity,
+    http2_send_stall_timeout = 60000 :: roadrunner_listener:wait_ms(),
     %% How long, in milliseconds, a connection closing after its GOAWAY
     %% reads and drops what the client still sends (the HTTP/2
     %% `linger_timeout`), `0` for none.

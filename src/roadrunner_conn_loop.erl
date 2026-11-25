@@ -121,7 +121,7 @@
     dispatch :: roadrunner_conn:dispatch() | undefined,
     middlewares = [] :: roadrunner_middleware:middlewares(),
     max_content_length = 0 :: non_neg_integer(),
-    max_keep_alive_requests = infinity :: infinity | pos_integer(),
+    max_keep_alive_requests = infinity :: roadrunner_listener:request_cap(),
     %% Read-phase deadlines: `request_timeout` for the first request on a
     %% fresh conn, `keep_alive_timeout` for keep-alive loop-backs. Picked
     %% by `phase_timeout/1` per `phase`.
@@ -225,7 +225,7 @@
 
 %% Idle ms before the conn hibernates (the listener's `hibernate_after`),
 %% `infinity` for never.
--type hibernate_after() :: pos_integer() | infinity.
+-type hibernate_after() :: roadrunner_listener:wait_ms().
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.

@@ -306,7 +306,7 @@
     %% (default) disables it; `inflight_counter` is the shared gauge. Read
     %% from proto_opts at `init/2` so the per-stream acquire/release passes
     %% them to `roadrunner_conn` directly. See `dispatch_decoded/5`.
-    max_concurrent_requests = infinity :: infinity | pos_integer(),
+    max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
     inflight_counter :: counters:counters_ref() | undefined,
     %% The loop's own count of the slots it holds
     %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.

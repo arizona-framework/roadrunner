@@ -58,7 +58,9 @@ reason (a bad route or middleware entry has an error of its own).
     positive_timeout_ms/0,
     limit/0,
     positive_limit/0,
-    idle_ms/0,
+    wait_ms/0,
+    request_cap/0,
+    protocol/0,
     active/0,
     heap_floor/0
 ]).
@@ -95,11 +97,19 @@ A size, count or time limit up to `2^31-1`, the largest HTTP/2 window
 -type positive_limit() :: 1..?MAX_LIMIT.
 
 -doc """
-The idle milliseconds before a WebSocket session hibernates or closes
-(`hibernate_after` and `idle_timeout` in `t:ws_opts/0`): a
-`t:positive_limit/0`, or `infinity` for never.
+How long a connection or WebSocket session waits before it acts: a
+`t:positive_timeout_ms/0`, or `infinity` to wait forever. It is what the
+idle and stall options take (`hibernate_after` in `t:opts/0` and in
+`t:ws_opts/0`, `idle_timeout` in `t:ws_opts/0`, `send_stall_timeout` in
+`t:http2_opts/0`), where `0` would mean nothing and is refused.
 """.
--type idle_ms() :: positive_limit() | infinity.
+-type wait_ms() :: positive_timeout_ms() | infinity.
+
+-doc """
+A cap on a count of requests (`max_keep_alive_requests` and
+`max_concurrent_requests` in `t:opts/0`), or `infinity` for none.
+""".
+-type request_cap() :: pos_integer() | infinity.
 
 -doc """
 How a connection or WebSocket session reads its socket: `once`, or up to
@@ -611,8 +621,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   own rate on top (`roadrunner_router:rate_limit()`).
 - `hibernate_after`: when set, idle conns hibernate after this
   many milliseconds of main-loop idle time, which sweeps and shrinks
-  the conn's heap. A `t:positive_timeout_ms/0`, or `infinity` (the
-  default) for never; `0` is refused rather than read as off. Pairs
+  the conn's heap. A `t:wait_ms/0`, `infinity` (the default) for
+  never; `0` is refused rather than read as off. Pairs
   with `handler_spawn` below for a pool of mostly-idle connections;
   waking a hibernated conn is charged to the request that wakes it. It
   covers roadrunner's own processes only; on TLS, see `tls` for the
@@ -727,9 +737,9 @@ ops-tuning rationale.
     keep_alive_timeout => timeout_ms(),
     num_acceptors => pos_integer(),
     accept_priority => high | normal,
-    max_keep_alive_requests => infinity | pos_integer(),
+    max_keep_alive_requests => request_cap(),
     max_clients => pos_integer(),
-    max_concurrent_requests => infinity | pos_integer(),
+    max_concurrent_requests => request_cap(),
     max_lingering => auto | positive_limit(),
     overload_mode =>
         refuse
@@ -827,7 +837,7 @@ ops-tuning rationale.
     %% through the active-mode `recv_active/3` path so the
     %% receive's `after` clause has a window to call
     %% `erlang:hibernate/3`.
-    hibernate_after => positive_timeout_ms() | infinity,
+    hibernate_after => wait_ms(),
     %% Spawn config for every handler-running process — the connection process
     %% and the HTTP/2/3 stream workers. `opts` is a passthrough to `spawn_opt`
     %% (default `[{fullsweep_after, 0}]`): the default reclaims the
@@ -931,7 +941,10 @@ same port. The QUIC handshake advertises the `h3` ALPN itself, so
 `http3` does not appear in the TCP `alpn_preferred_protocols`.
 """.
 -type protocol_entry() ::
-    http1 | http2 | http3 | {http1, http1_opts()} | {http2, http2_opts()} | {http3, http3_opts()}.
+    protocol() | {http1, http1_opts()} | {http2, http2_opts()} | {http3, http3_opts()}.
+
+-doc "A protocol a listener serves, as `t:protocol_entry/0` names it.".
+-type protocol() :: http1 | http2 | http3.
 
 -doc """
 HTTP/1.1 listener tunables (under `{http1, ThisMap}` in `protocols`).
@@ -1150,7 +1163,7 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
         },
     control_frame_policy =>
         false | #{max => positive_limit(), window => positive_timeout_ms()},
-    send_stall_timeout => positive_timeout_ms() | infinity,
+    send_stall_timeout => wait_ms(),
     linger_timeout => limit(),
     connection_age =>
         false | #{max := positive_timeout_ms(), grace => timeout_ms() | infinity}
@@ -1308,9 +1321,9 @@ An upgrade can set each of these for its own session
     max_frame_size => limit(),
     max_message_size => limit(),
     recv_buffer => positive_limit(),
-    hibernate_after => idle_ms(),
+    hibernate_after => wait_ms(),
     compress => roadrunner_ws:compress(),
-    idle_timeout => idle_ms(),
+    idle_timeout => wait_ms(),
     active => active(),
     heap_floor => heap_floor()
 }.
@@ -1331,7 +1344,7 @@ An upgrade can set each of these for its own session
 -type ceiling_key() :: {binary(), [binary()] | undefined}.
 
 %% A Unix domain socket's file, as `unix_socket_file/1` found it.
--type unix_socket_file() :: {file:name_all(), non_neg_integer(), non_neg_integer()} | undefined.
+-type unix_socket_file() :: {binary() | string(), non_neg_integer(), non_neg_integer()} | undefined.
 
 -record(state, {
     %% `none` when the listener serves HTTP/3 only (no TCP socket);
@@ -1547,7 +1560,7 @@ Useful for ops dashboards / health endpoints.
         max_clients := pos_integer(),
         requests_served := non_neg_integer(),
         rejected := non_neg_integer(),
-        max_concurrent_requests := infinity | pos_integer(),
+        max_concurrent_requests := request_cap(),
         throttled := non_neg_integer(),
         rate_limited := non_neg_integer(),
         max_lingering := pos_integer(),
@@ -1695,7 +1708,7 @@ ensure_ssl_started(#{}) ->
 %% any TCP protocol (`http1`/`http2`). An HTTP/3-only listener skips
 %% the TCP socket entirely and returns `none`.
 -spec start_tcp(
-    inet:port_number(), opts(), [http1 | http2 | http3, ...], roadrunner_conn:proto_opts()
+    inet:port_number(), opts(), [protocol(), ...], roadrunner_conn:proto_opts()
 ) -> {ok, roadrunner_transport:socket() | none} | {error, term()}.
 start_tcp(Port, Opts, Protocols, ProtoOpts) ->
     case [P || P <- Protocols, P =/= http3] of
@@ -1727,7 +1740,7 @@ start_tcp(Port, Opts, Protocols, ProtoOpts) ->
 -spec start_quic(
     inet:port_number(),
     opts(),
-    [http1 | http2 | http3, ...],
+    [protocol(), ...],
     roadrunner_conn:proto_opts(),
     roadrunner_quic_listener:accept_gate()
 ) -> {ok, pid() | undefined} | {error, term()}.
@@ -1860,7 +1873,7 @@ quic_pool_port(QuicPool) ->
 %% Only an `http3` listener has a QUIC accept gate, so a TCP-only listener
 %% never loads `roadrunner_quic_listener`: startup time is dominated by
 %% code loading.
--spec new_quic_accept_gate([http1 | http2 | http3, ...]) ->
+-spec new_quic_accept_gate([protocol(), ...]) ->
     roadrunner_quic_listener:accept_gate() | undefined.
 new_quic_accept_gate(Protocols) ->
     case lists:member(http3, Protocols) of
@@ -2494,7 +2507,7 @@ spawn_acceptors_loop(LSocket, ProtoOpts, I, N) ->
 %% Shed mode's `retry_after` defaults to one second: a slot frees as soon
 %% as one in-flight request ends, so the shortest wait `Retry-After` can
 %% express (RFC 9110 §10.2.3, whole seconds) is the one that fits.
--spec validate_overload_mode(term(), infinity | pos_integer(), pos_integer()) ->
+-spec validate_overload_mode(term(), request_cap(), pos_integer()) ->
     refuse
     | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}}
     | {shed, #{retry_after := pos_integer()}}.
@@ -2539,7 +2552,7 @@ validate_overload_mode(Other, _Max, _RequestTimeout) ->
     refuse
     | {queue, #{max_queued := pos_integer(), timeout := pos_integer()}}
     | {shed, #{retry_after := pos_integer()}},
-    infinity | pos_integer(),
+    request_cap(),
     counters:counters_ref()
 ) -> {roadrunner_conn:overload(), pid() | undefined}.
 setup_overload(refuse, infinity, _Counter) ->
@@ -2566,7 +2579,7 @@ start_slot_keeper(Max, Counter, MaxQueued) ->
 %% (`roadrunner_conn_loop:awaiting_shoot/3`). Every other listener leaves
 %% the field `undefined`, so the `ssl:listen` path is untouched.
 -spec maybe_tls_upgrade(
-    roadrunner_conn:proto_opts(), opts(), [http1 | http2 | http3, ...]
+    roadrunner_conn:proto_opts(), opts(), [protocol(), ...]
 ) -> roadrunner_conn:proto_opts().
 maybe_tls_upgrade(#proto_opts{proxy_protocol = true} = ProtoOpts, #{tls := UserTlsOpts}, Protocols) ->
     TcpProtocols = [P || P <- Protocols, P =/= http3],
@@ -2602,7 +2615,7 @@ hibernate_after(#{hibernate_after := _} = Opts) -> timeout_opt(hibernate_after, 
 hibernate_after(#{}) -> 0.
 
 %% Validate `max_concurrent_requests`: a count of requests, or `infinity`.
--spec max_concurrent_requests(unchecked_opts()) -> infinity | pos_integer().
+-spec max_concurrent_requests(unchecked_opts()) -> request_cap().
 max_concurrent_requests(Opts) ->
     case maps:get(max_concurrent_requests, Opts, ?DEFAULT_MAX_CONCURRENT_REQUESTS) of
         infinity -> infinity;
@@ -2683,7 +2696,7 @@ is_socket_address(Ip) -> inet:is_ip_address(Ip).
 
 %% HTTP/3's UDP socket binds an address only: `any`, `loopback` and a
 %% Unix domain socket are for the TCP protocols.
--spec validate_quic_ip(unchecked_opts(), [http1 | http2 | http3, ...]) -> ok.
+-spec validate_quic_ip(unchecked_opts(), [protocol(), ...]) -> ok.
 validate_quic_ip(#{ip := Ip}, Protocols) ->
     case lists:member(http3, Protocols) andalso not inet:is_ip_address(Ip) of
         true -> error({listener_opt_conflict, ip, Ip, http3_needs_an_ip_address});
@@ -2696,7 +2709,7 @@ validate_quic_ip(#{}, _Protocols) ->
 is_port_number(N) -> is_integer(N) andalso N >= 0 andalso N =< 65535.
 
 %% Validate `max_keep_alive_requests`: a count of requests, or `infinity`.
--spec max_keep_alive_requests(unchecked_opts()) -> infinity | pos_integer().
+-spec max_keep_alive_requests(unchecked_opts()) -> request_cap().
 max_keep_alive_requests(Opts) ->
     case maps:get(max_keep_alive_requests, Opts, ?DEFAULT_MAX_KEEP_ALIVE) of
         infinity -> infinity;
@@ -2710,7 +2723,7 @@ max_keep_alive_requests(Opts) ->
 %% listener the TCP side honors it and h3 ignores it. On a TLS listener the
 %% header precedes the ClientHello, which is why such a listener accepts
 %% plain TCP and upgrades per connection (`maybe_tls_upgrade/3`).
--spec validate_proxy_protocol(term(), [http1 | http2 | http3, ...]) -> boolean().
+-spec validate_proxy_protocol(term(), [protocol(), ...]) -> boolean().
 validate_proxy_protocol(false, _Protocols) ->
     false;
 validate_proxy_protocol(true, [http3]) ->
@@ -2989,14 +3002,14 @@ heap_floor(Opts) ->
 %% so h1/h2 responses advertise the h3 endpoint and browsers upgrade to
 %% QUIC. Skipped on ephemeral (`port => 0`) listeners: there is no
 %% stable port to advertise, and TCP/UDP would not even share one.
--spec maybe_alt_svc([http1 | http2 | http3, ...], opts()) -> binary() | undefined.
+-spec maybe_alt_svc([protocol(), ...], opts()) -> binary() | undefined.
 maybe_alt_svc(Protocols, #{port := Port}) ->
     case h3_co_served(Protocols) andalso is_integer(Port) andalso Port > 0 of
         true -> alt_svc_value(Port);
         false -> undefined
     end.
 
--spec h3_co_served([http1 | http2 | http3, ...]) -> boolean().
+-spec h3_co_served([protocol(), ...]) -> boolean().
 h3_co_served(Protocols) ->
     lists:member(http3, Protocols) andalso lists:any(fun(P) -> P =/= http3 end, Protocols).
 
@@ -3035,7 +3048,7 @@ alt_svc_value(Port) ->
 %%   entries.
 %% - `{listener_opt_conflict, protocols, V, http3_requires_tls}` for
 %%   `http3` on a listener without `tls`.
--spec normalize_protocols(opts()) -> {[http1 | http2 | http3, ...], [protocol_entry_norm(), ...]}.
+-spec normalize_protocols(opts()) -> {[protocol(), ...], [protocol_entry_norm(), ...]}.
 normalize_protocols(Opts) ->
     Raw = maps:get(protocols, Opts, [http1]),
     HasTls = maps:is_key(tls, Opts),
@@ -3052,7 +3065,7 @@ normalize_protocols(Opts) ->
 flatten_protocol_opts(Entries, ProtoOpts) ->
     lists:foldl(fun flatten_protocol_entry/2, ProtoOpts, Entries).
 
--spec require_tls_for_h3([http1 | http2 | http3, ...], boolean(), term()) -> ok.
+-spec require_tls_for_h3([protocol(), ...], boolean(), term()) -> ok.
 require_tls_for_h3(Names, HasTls, Raw) ->
     case lists:member(http3, Names) of
         true when not HasTls ->
@@ -3262,7 +3275,7 @@ validate_ping_policy(_Policy, Raw) ->
     error({invalid_listener_opt, protocols, Raw}).
 
 %% Milliseconds, or `infinity` for no limit.
--spec validate_send_stall_timeout(term(), term()) -> positive_timeout_ms() | infinity.
+-spec validate_send_stall_timeout(term(), term()) -> wait_ms().
 validate_send_stall_timeout(infinity, _Raw) ->
     infinity;
 validate_send_stall_timeout(Timeout, _Raw) when
@@ -3510,9 +3523,9 @@ ws_defaults() ->
         max_frame_size := non_neg_integer(),
         max_message_size := non_neg_integer(),
         recv_buffer := pos_integer() | undefined,
-        hibernate_after := idle_ms(),
+        hibernate_after := wait_ms(),
         compress := roadrunner_ws:compress(),
-        idle_timeout := idle_ms(),
+        idle_timeout := wait_ms(),
         active := active() | undefined,
         heap_floor := heap_floor() | undefined
     }.
@@ -3562,7 +3575,7 @@ valid_ws_opt(compress, V) when is_map(V) ->
 valid_ws_opt(compress, V) ->
     is_boolean(V);
 valid_ws_opt(idle_timeout, V) ->
-    valid_idle_ms(V);
+    valid_wait_ms(V);
 valid_ws_opt(recv_buffer, V) ->
     is_integer(V) andalso V >= 1 andalso V =< ?MAX_LIMIT;
 valid_ws_opt(heap_floor, false) ->
@@ -3572,14 +3585,16 @@ valid_ws_opt(heap_floor, V) when is_map(V) ->
 valid_ws_opt(heap_floor, _V) ->
     false;
 valid_ws_opt(hibernate_after, V) ->
-    valid_idle_ms(V);
+    valid_wait_ms(V);
 valid_ws_opt(_SizeCap, V) ->
     is_integer(V) andalso V >= 0 andalso V =< ?MAX_LIMIT.
 
-%% A `t:idle_ms/0`: `infinity`, the default, is never.
--spec valid_idle_ms(term()) -> boolean().
-valid_idle_ms(infinity) -> true;
-valid_idle_ms(V) -> is_integer(V) andalso V >= 1 andalso V =< ?MAX_LIMIT.
+%% A `t:wait_ms/0`: `infinity`, the default, is never. The cap is the
+%% longest a `receive` waits, as for the top-level `hibernate_after`, since
+%% the session's `hibernate_after` is a `receive` timeout.
+-spec valid_wait_ms(term()) -> boolean().
+valid_wait_ms(infinity) -> true;
+valid_wait_ms(V) -> is_integer(V) andalso V >= 1 andalso V =< ?MAX_TIMEOUT_MS.
 
 -spec valid_heap_floor_opt(term(), term()) -> boolean().
 valid_heap_floor_opt(max, V) -> is_integer(V) andalso V > 0;

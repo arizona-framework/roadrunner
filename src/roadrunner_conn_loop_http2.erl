@@ -470,7 +470,7 @@
     %% with nothing sent before it is reset (the `send_stall_timeout`), and
     %% the one timer that checks it, armed while a stream holds DATA back
     %% (`arm_stall_timer/1`). Read from proto_opts at `enter/6`.
-    send_stall_timeout = infinity :: pos_integer() | infinity,
+    send_stall_timeout = infinity :: roadrunner_listener:wait_ms(),
     stall_timer = undefined :: reference() | undefined,
     %% Since when a stream has held DATA back for the connection window
     %% with no DATA sent on the connection at all, or `undefined` once
@@ -485,7 +485,7 @@
     %% (default) disables it; `inflight_counter` is the shared gauge.
     %% Read from proto_opts at `enter/6` so the per-stream acquire/release
     %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
-    max_concurrent_requests = infinity :: infinity | pos_integer(),
+    max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
     inflight_counter :: counters:counters_ref() | undefined,
     %% The conn's own count of the slots it holds
     %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
