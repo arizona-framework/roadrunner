@@ -571,6 +571,33 @@ setopts_on_dead_socket_exits_silently_test() ->
     detach_telemetry(Tag),
     _ = Self.
 
+proxy_header_wait_on_dead_socket_closes_test() ->
+    %% The PROXY header wait arms the socket `{active, once}`; on a socket
+    %% that fails it, the conn reports the failure as a bad header and exits
+    %% cleanly, without an accept.
+    Tag = make_ref(),
+    DeadSink = spawn(fun() -> ok end),
+    DeadRef = monitor(process, DeadSink),
+    receive
+        {'DOWN', DeadRef, process, DeadSink, _} -> ok
+    after 1000 -> error(dead_sink_didnt_exit)
+    end,
+    attach_telemetry(Tag, [
+        [roadrunner, listener, accept],
+        [roadrunner, listener, accept_error]
+    ]),
+    Opts = fake_opts(deadproxy, #{proxy_protocol => true}),
+    {ok, Pid} = roadrunner_conn_loop:start({fake, DeadSink}, Opts),
+    Ref = monitor(process, Pid),
+    Pid ! shoot,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    after 2000 -> error(no_normal_exit)
+    end,
+    ?assertEqual([roadrunner, listener, accept_error], next_event_name(Tag, 200)),
+    ?assertEqual(timeout, next_event_name(Tag, 100)),
+    detach_telemetry(Tag).
+
 slowloris_during_passive_recv_drops_client_test() ->
     %% Passive recv path: a real slowloris client dribbles bytes — one
     %% byte inside the 1 s grace, then a second byte after the grace

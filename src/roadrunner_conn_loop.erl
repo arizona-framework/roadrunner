@@ -274,6 +274,10 @@ awaiting_shoot(Socket0, ProtoOpts, ListenerName) ->
                         {error, {handshake, _} = Reason} ->
                             handshake_failed(ProtoOpts, ListenerName, Reason)
                     end;
+                {close, drained} ->
+                    %% A drain while the header was still on its way: closed
+                    %% as a drain before `shoot` is.
+                    exit_unaccepted(Socket0, roadrunner_conn:close_opts(ProtoOpts));
                 {close, Reason} ->
                     %% Malformed/absent PROXY header on a proxy_protocol
                     %% listener, or a peer gone before sending one: a
@@ -625,7 +629,12 @@ request_slot(_ProtoOpts) ->
 %% The whole header shares one deadline, so a peer that dribbles it out a
 %% byte at a time cannot hold the connection past that budget by restarting
 %% a per-read timeout. On plain TCP the reads also count toward
-%% `min_bytes_per_second`, like the request head that follows.
+%% `min_bytes_per_second`, like the request head that follows, and a drain
+%% closes a connection still waiting for its header at once
+%% (`{close, drained}`, `await_proxy_bytes/6`). On TLS the header is read
+%% with plain reads, which take no byte of the handshake behind it but see
+%% no drain: a drain waits for such a connection until its
+%% `tls_handshake_timeout`, or kills it at the drain's own deadline.
 -spec proxy_protocol_stage(
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
@@ -733,8 +742,7 @@ read_proxy_v1_line(Socket, Timeout) ->
             E
     end.
 
-%% Plain TCP: the socket is passive at this phase, so read synchronously,
-%% accumulating until `roadrunner_proxy_protocol:parse/1` decides. The parser
+%% Plain TCP: read each arrival with `{active, once}`, accumulating until `roadrunner_proxy_protocol:parse/1` decides. The parser
 %% bounds the header size (v1 107 bytes, v2 by its declared length), so `Acc`
 %% cannot grow without bound. Every read waits only for what is left of the
 %% header's `Deadline`, and once the header has begun, only until the bytes
@@ -752,13 +760,34 @@ read_proxy_v1_line(Socket, Timeout) ->
     binary()
 ) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
 read_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
+    case roadrunner_transport:setopts(Socket, [{active, once}]) of
+        ok -> await_proxy_bytes(Socket, Deadline, MinRate, OsPeer, Start, Acc);
+        {error, Reason} -> {close, Reason}
+    end.
+
+%% The wait for the next bytes of the header, on a socket armed
+%% `{active, once}`: parked in `receive` with no wakeup until bytes, a
+%% close, a drain or the time is up, so a connection waiting for its
+%% header costs nothing while it waits and sees a drain at once. The
+%% socket is passive again once its bytes arrive, as the loops that read
+%% the first request expect.
+-spec await_proxy_bytes(
+    roadrunner_transport:socket(),
+    integer(),
+    non_neg_integer(),
+    {inet:ip_address(), inet:port_number()} | undefined,
+    integer(),
+    binary()
+) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+await_proxy_bytes(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
     Wake =
         case Acc of
             <<>> -> Deadline;
             _ -> min(Deadline, roadrunner_conn:rate_deadline(Start, byte_size(Acc), MinRate))
         end,
-    case roadrunner_transport:recv(Socket, 0, time_left(Wake)) of
-        {ok, Bytes} ->
+    {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
+    receive
+        {DataTag, _Sock, Bytes} ->
             %% No rate check here: more bytes only raise the average, and
             %% the next wait ends where the new total falls below it.
             Start1 =
@@ -769,10 +798,19 @@ read_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
             parsed_proxy_header(
                 Socket, Deadline, MinRate, OsPeer, Start1, <<Acc/binary, Bytes/binary>>
             );
-        {error, timeout} when Wake =/= Deadline ->
-            {close, slow_client};
-        {error, Reason} ->
-            {close, Reason}
+        {ClosedTag, _Sock} ->
+            {close, closed};
+        {ErrorTag, _Sock, Reason} ->
+            {close, Reason};
+        {roadrunner_drain, _DrainDeadline} ->
+            {close, drained};
+        _Stray ->
+            await_proxy_bytes(Socket, Deadline, MinRate, OsPeer, Start, Acc)
+    after time_left(Wake) ->
+        case Wake of
+            Deadline -> {close, timeout};
+            _RateDeadline -> {close, slow_client}
+        end
     end.
 
 -spec parsed_proxy_header(

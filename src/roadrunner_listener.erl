@@ -1373,7 +1373,10 @@ HTTP/2 the close takes two steps (RFC 9113 §6.8): a first GOAWAY that
 refuses nothing and a PING, then, once the client answers the PING (or
 after `keep_alive_timeout` if it never does), the GOAWAY that names the
 last request served, so a request the client sent before it saw the
-first GOAWAY is served rather than refused. The
+first GOAWAY is served rather than refused. A conn still waiting for its
+PROXY protocol header (`proxy_protocol`) closes too on plain TCP; on a
+TLS listener it is read without looking for the drain, so it ends at
+its `tls_handshake_timeout`, or is killed at the drain's deadline. The
 handler of every in-flight request gets the same message on every
 protocol: on HTTP/1.1 it runs in the conn process itself, and an HTTP/2
 or HTTP/3 conn passes the message on to each of its stream workers, so
