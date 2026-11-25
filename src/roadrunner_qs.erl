@@ -85,11 +85,6 @@ parse(Bin, Opts) when is_binary(Bin), is_map(Opts) ->
             %% short holds at most `MaxPairs` pairs: no need to count.
             {ok, parse(Bin)};
         false ->
-            PlusCp =
-                case has_trigger(Bin) of
-                    false -> false;
-                    true -> persistent_term:get(?PLUS_KEY)
-                end,
             case
                 pairs(
                     Bin,
@@ -97,47 +92,51 @@ parse(Bin, Opts) when is_binary(Bin), is_map(Opts) ->
                     MaxPairs,
                     Window,
                     persistent_term:get(?AMP_KEY),
-                    persistent_term:get(?EQ_KEY),
-                    PlusCp
+                    persistent_term:get(?EQ_KEY)
                 )
             of
-                Pairs when is_list(Pairs) -> {ok, Pairs};
+                {ok, _Pairs} = Ok -> Ok;
                 {error, too_many_pairs} = Error -> Error
             end
     end.
+
+%% What counting returns: the pairs tagged with the `+` pattern, or
+%% `false` when the string has no `+` or `%`, so the windows before can
+%% decode theirs the same way; `ok` instead for the first window, whose
+%% result is the answer. Or the refusal.
+-type counted() ::
+    {binary:cp() | false | ok, [{binary(), binary() | true}]} | {error, too_many_pairs}.
 
 %% The pairs from byte `Off` on, `Left` of them still allowed. `Bin` is
 %% split on `&` a window of `Window` bytes at a time: one global split is
 %% about twice as fast as a split per pair, and a window of twice the cap
 %% holds at most the cap's worth of pairs, so a string of many tiny pairs
 %% is never split past the window that crosses the cap. A window's last
-%% piece may be cut short, so it starts the next window. `PlusCp` is
-%% `false` when the string has no `+` or `%`, so nothing needs decoding.
+%% piece may be cut short, so it starts the next window. The string is
+%% scanned for `+` and `%` only once every window is counted, so a string
+%% over the cap is refused without that scan.
 -spec pairs(
     binary(),
     non_neg_integer(),
     non_neg_integer(),
     pos_integer(),
     binary:cp(),
-    binary:cp(),
-    binary:cp() | false
+    binary:cp()
 ) ->
-    [{binary(), binary() | true}] | {error, too_many_pairs}.
-pairs(Bin, Off, Left, Window, AmpCp, EqCp, PlusCp) ->
+    counted().
+pairs(Bin, Off, Left, Window, AmpCp, EqCp) ->
     case byte_size(Bin) - Off =< Window of
         true ->
             <<_:Off/binary, Tail/binary>> = Bin,
-            window(
-                binary:split(Tail, AmpCp, [global]), all, Bin, Left, Window, AmpCp, EqCp, PlusCp
-            );
+            window(binary:split(Tail, AmpCp, [global]), Off, all, Bin, Left, Window, AmpCp, EqCp);
         false ->
             <<_:Off/binary, Win:Window/binary, _/binary>> = Bin,
             case binary:split(Win, AmpCp, [global]) of
                 [_Cut] ->
                     %% One pair longer than the window: find its end.
-                    long_pair(Bin, Off, Left, Window, AmpCp, EqCp, PlusCp);
+                    long_pair(Bin, Off, Left, Window, AmpCp, EqCp);
                 Pieces ->
-                    window(Pieces, Off + Window, Bin, Left, Window, AmpCp, EqCp, PlusCp)
+                    window(Pieces, Off, Off + Window, Bin, Left, Window, AmpCp, EqCp)
             end
     end.
 
@@ -147,53 +146,61 @@ pairs(Bin, Off, Left, Window, AmpCp, EqCp, PlusCp) ->
     non_neg_integer(),
     pos_integer(),
     binary:cp(),
-    binary:cp(),
-    binary:cp() | false
+    binary:cp()
 ) ->
-    [{binary(), binary() | true}] | {error, too_many_pairs}.
-long_pair(Bin, Off, Left, Window, AmpCp, EqCp, PlusCp) ->
+    counted().
+long_pair(Bin, Off, Left, Window, AmpCp, EqCp) ->
     From = Off + Window,
     case binary:match(Bin, AmpCp, [{scope, {From, byte_size(Bin) - From}}]) of
         nomatch ->
             <<_:Off/binary, Pair/binary>> = Bin,
-            window([Pair], all, Bin, Left, Window, AmpCp, EqCp, PlusCp);
+            window([Pair], Off, all, Bin, Left, Window, AmpCp, EqCp);
         {End, _} ->
             Len = End - Off,
             <<_:Off/binary, Pair:Len/binary, _/binary>> = Bin,
-            window([Pair, <<>>], End + 1, Bin, Left, Window, AmpCp, EqCp, PlusCp)
+            window([Pair, <<>>], Off, End + 1, Bin, Left, Window, AmpCp, EqCp)
     end.
 
-%% The pairs of one window's `Pieces`, then the rest of the string. `End`
-%% is where the window ends, so its last piece, cut short, starts the
-%% rest; or `all` when the window runs to the string's end and its last
-%% piece is a whole pair. Counted before anything is built, so an
-%% over-cap window fails without decoding.
+%% The pairs of the window from byte `Off`, its `Pieces`, then the rest
+%% of the string. `End` is where the window ends, so its last piece, cut
+%% short, starts the rest; or `all` when the window runs to the string's
+%% end and its last piece is a whole pair. Counted before anything is
+%% built, so an over-cap window fails without decoding. The last window,
+%% once counted, scans the whole string for `+` and `%`.
 -spec window(
     [binary()],
+    non_neg_integer(),
     non_neg_integer() | all,
     binary(),
     non_neg_integer(),
     pos_integer(),
     binary:cp(),
-    binary:cp(),
-    binary:cp() | false
+    binary:cp()
 ) ->
-    [{binary(), binary() | true}] | {error, too_many_pairs}.
-window(Pieces, all, _Bin, Left, _Window, _AmpCp, EqCp, PlusCp) ->
+    counted().
+window(Pieces, Off, all, Bin, Left, _Window, _AmpCp, EqCp) ->
     case count(Pieces, 0) =< Left of
-        true -> emit(Pieces, true, [], EqCp, PlusCp);
-        false -> {error, too_many_pairs}
+        true ->
+            PlusCp =
+                case has_trigger(Bin) of
+                    false -> false;
+                    true -> persistent_term:get(?PLUS_KEY)
+                end,
+            tag(Off, PlusCp, emit(Pieces, true, [], EqCp, PlusCp));
+        false ->
+            {error, too_many_pairs}
     end;
-window(Pieces, End, Bin, Left, Window, AmpCp, EqCp, PlusCp) ->
-    case count_cut(Pieces, 0, End) of
-        {Count, _Next} when Count > Left ->
-            {error, too_many_pairs};
-        {Count, Next} ->
-            case pairs(Bin, Next, Left - Count, Window, AmpCp, EqCp, PlusCp) of
-                Rest when is_list(Rest) -> emit(Pieces, false, Rest, EqCp, PlusCp);
-                {error, too_many_pairs} = Error -> Error
-            end
+window(Pieces, Off, End, Bin, Left, Window, AmpCp, EqCp) ->
+    case count_cut(Pieces, Left, End, Bin, Window, AmpCp, EqCp) of
+        {error, too_many_pairs} = Error -> Error;
+        {PlusCp, Rest} -> tag(Off, PlusCp, emit(Pieces, false, Rest, EqCp, PlusCp))
     end.
+
+%% A window's pairs, tagged for the window before (see `t:counted/0`).
+-spec tag(non_neg_integer(), binary:cp() | false, [{binary(), binary() | true}]) ->
+    counted().
+tag(0, _PlusCp, Pairs) -> {ok, Pairs};
+tag(_Off, PlusCp, Pairs) -> {PlusCp, Pairs}.
 
 %% The non-empty pieces.
 -spec count([binary()], non_neg_integer()) -> non_neg_integer().
@@ -201,12 +208,27 @@ count([], N) -> N;
 count([<<>> | Pieces], N) -> count(Pieces, N);
 count([_ | Pieces], N) -> count(Pieces, N + 1).
 
-%% The non-empty pieces but the last, cut one, and where that one starts.
--spec count_cut([binary()], non_neg_integer(), non_neg_integer()) ->
-    {non_neg_integer(), non_neg_integer()}.
-count_cut([Cut], N, End) -> {N, End - byte_size(Cut)};
-count_cut([<<>> | Pieces], N, End) -> count_cut(Pieces, N, End);
-count_cut([_ | Pieces], N, End) -> count_cut(Pieces, N + 1, End).
+%% Takes one of the `Left` allowed pairs for each non-empty piece but the
+%% last, cut one, refusing the string at the first one past the cap; then
+%% counts the rest of the string from where the cut piece starts.
+-spec count_cut(
+    [binary()],
+    non_neg_integer(),
+    non_neg_integer(),
+    binary(),
+    pos_integer(),
+    binary:cp(),
+    binary:cp()
+) ->
+    counted().
+count_cut([Cut], Left, End, Bin, Window, AmpCp, EqCp) ->
+    pairs(Bin, End - byte_size(Cut), Left, Window, AmpCp, EqCp);
+count_cut([<<>> | Pieces], Left, End, Bin, Window, AmpCp, EqCp) ->
+    count_cut(Pieces, Left, End, Bin, Window, AmpCp, EqCp);
+count_cut([_ | _], 0, _End, _Bin, _Window, _AmpCp, _EqCp) ->
+    {error, too_many_pairs};
+count_cut([_ | Pieces], Left, End, Bin, Window, AmpCp, EqCp) ->
+    count_cut(Pieces, Left - 1, End, Bin, Window, AmpCp, EqCp).
 
 %% The pairs of the non-empty pieces, the last one only when `Last`,
 %% consed onto `Rest`.
