@@ -13,8 +13,9 @@ sendfile_loop_stops_on_send_error_test() ->
     ok = file:write_file(Path, binary:copy(~"x", 200000)),
     {ok, IoDev} = file:open(Path, [read, raw, binary]),
     Self = self(),
+    Tag = make_ref(),
     Send = fun(Data, nofin) ->
-        Self ! {sent, byte_size(Data)},
+        Self ! {sent, Tag, byte_size(Data)},
         {error, closed}
     end,
     try
@@ -25,7 +26,7 @@ sendfile_loop_stops_on_send_error_test() ->
     end,
     %% Exactly one chunk was attempted; the {error, closed} stopped the loop
     %% before reading or sending the rest of the file.
-    ?assertEqual(1, count_sent(0)).
+    ?assertEqual(1, count_sent(Tag, 0)).
 
 %% A successful loop sends every chunk and finishes with the FIN.
 sendfile_loop_sends_all_chunks_on_success_test() ->
@@ -33,8 +34,9 @@ sendfile_loop_sends_all_chunks_on_success_test() ->
     ok = file:write_file(Path, binary:copy(~"x", 200000)),
     {ok, IoDev} = file:open(Path, [read, raw, binary]),
     Self = self(),
+    Tag = make_ref(),
     Send = fun(Data, Flag) ->
-        Self ! {sent, byte_size(Data), Flag},
+        Self ! {sent, Tag, byte_size(Data), Flag},
         ok
     end,
     try
@@ -43,19 +45,21 @@ sendfile_loop_sends_all_chunks_on_success_test() ->
         _ = file:close(IoDev),
         _ = file:delete(Path)
     end,
-    Sends = collect_sends([]),
+    Sends = collect_sends(Tag, []),
     %% 200000 / 65536 = 3 full chunks + a 3392-byte remainder carrying the FIN.
     ?assertEqual(200000, lists:sum([Size || {Size, _Flag} <- Sends])),
     ?assertEqual([fin], [Flag || {_Size, Flag} <- Sends, Flag =:= fin]).
 
-count_sent(N) ->
+%% Each test tags its sends with its own reference, so a `sent` message left
+%% in the test process's mailbox by another eunit module is never counted.
+count_sent(Tag, N) ->
     receive
-        {sent, _} -> count_sent(N + 1)
+        {sent, Tag, _} -> count_sent(Tag, N + 1)
     after 0 -> N
     end.
 
-collect_sends(Acc) ->
+collect_sends(Tag, Acc) ->
     receive
-        {sent, Size, Flag} -> collect_sends([{Size, Flag} | Acc])
+        {sent, Tag, Size, Flag} -> collect_sends(Tag, [{Size, Flag} | Acc])
     after 0 -> lists:reverse(Acc)
     end.
