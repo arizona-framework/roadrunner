@@ -66,6 +66,8 @@ is refused and every holder's release returns.
 -define(LONG_MS, 600000).
 %% How late a timeout may answer on a loaded machine.
 -define(SLACK_MS, 2000).
+%% How long a poll for a message to arrive waits before it fails.
+-define(AWAIT_MS, 5000).
 
 %% Where the keeper keeps what the model reads of it: its `#state{}` fields
 %% `counts`, `waiters` and `watched`, and a `#waiter{}`'s pid.
@@ -367,10 +369,18 @@ step({rehome_crash, N, Registered}, Model) ->
     %% here), which adds another key's row for it and, when `Registered`,
     %% makes that key its home, then dies before answering. The connection
     %% is refused; whatever it takes next must be freed when it dies, so it
-    %% and the keeper taking over must agree on its home.
+    %% and the keeper taking over must agree on its home. The route has room,
+    %% or the connection, its queue full too, is refused without asking.
     {{Slots, Regs, _Intents}, Counts} = route_counts(),
     Max = atomics:get(Counts, 1),
-    Homes = [{P, H} || P <- pick(idle, Model), H <- [home(P, Slots)], is_integer(H), H =< Max],
+    Homes = [
+        {P, H}
+     || ets:info(Slots, size) < Max,
+        P <- pick(idle, Model),
+        H <- [home(P, Slots)],
+        is_integer(H),
+        H =< Max
+    ],
     case Homes of
         [] ->
             Model;
@@ -1078,18 +1088,25 @@ await_new_keeper(Old, Tries) ->
 
 %% Until `Pid`'s acquire is in the (suspended) keeper's mailbox.
 await_mailbox(Keeper, Pid) ->
+    await_mailbox(Keeper, Pid, deadline()).
+
+await_mailbox(Keeper, Pid, Deadline) ->
     {messages, Messages} = erlang:process_info(Keeper, messages),
     case [P || {acquire, _Token, P, _Kind, _Wait} <- Messages, P =:= Pid] of
         [_] ->
             ok;
         [] ->
+            ok = before(Deadline, {never_asked_keeper, Pid, Keeper, Messages}),
             erlang:yield(),
-            await_mailbox(Keeper, Pid)
+            await_mailbox(Keeper, Pid, Deadline)
     end.
 
 %% Until `Pid` has its answer (it took its home) or its acquire is in the
 %% (suspended) keeper's mailbox.
 await_asked_or_mailbox(Keeper, Pid) ->
+    await_asked_or_mailbox(Keeper, Pid, deadline()).
+
+await_asked_or_mailbox(Keeper, Pid, Deadline) ->
     {messages, Messages} = erlang:process_info(self(), messages),
     {messages, Asks} = erlang:process_info(Keeper, messages),
     case
@@ -1099,8 +1116,27 @@ await_asked_or_mailbox(Keeper, Pid) ->
         true ->
             ok;
         false ->
+            ok = before(Deadline, {never_answered_nor_asked, Pid, Keeper, Asks}),
             erlang:yield(),
-            await_asked_or_mailbox(Keeper, Pid)
+            await_asked_or_mailbox(Keeper, Pid, Deadline)
+    end.
+
+deadline() ->
+    erlang:monotonic_time(millisecond) + ?AWAIT_MS.
+
+%% A poll past its deadline fails with what it waited for, the state of
+%% the requester and the driver's own mailbox (an answer the requester got
+%% without asking shows there).
+before(Deadline, Waited) ->
+    case erlang:monotonic_time(millisecond) > Deadline of
+        false ->
+            ok;
+        true ->
+            Pid = element(2, Waited),
+            error(
+                {Waited, erlang:process_info(Pid, [current_stacktrace, messages]),
+                    erlang:process_info(self(), messages)}
+            )
     end.
 
 %% --- model helpers ---
