@@ -385,15 +385,19 @@ keeper_crash_refuses_the_waiting_request(Config) ->
 websocket_releases_at_the_101(Config) ->
     %% A session is a connection, not a request: the upgrade hands the slot
     %% back, so a second upgrade gets in while the first session is open.
+    %% The slot goes just after the 101 is written.
+    Name = ?config(listener, Config),
     First = connect(Config),
     ok = gen_tcp:send(First, ws_upgrade(~"/ws")),
     ?assertMatch(<<"HTTP/1.1 101 ", _/binary>>, recv_head(First, <<>>)),
+    ok = wait_in_flight(Name, ~"/ws", 0),
     Second = connect(Config),
     ok = gen_tcp:send(Second, ws_upgrade(~"/ws")),
     ?assertMatch(<<"HTTP/1.1 101 ", _/binary>>, recv_head(Second, <<>>)),
+    ok = wait_in_flight(Name, ~"/ws", 0),
     ?assertMatch(
         #{routes := [_, _, #{path := ~"/ws", in_flight := 0, throttled := 0} | _]},
-        roadrunner_listener:info(?config(listener, Config))
+        roadrunner_listener:info(Name)
     ).
 
 loop_response_holds_until_it_ends(Config) ->
