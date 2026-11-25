@@ -146,11 +146,14 @@
     recv = 0 :: non_neg_integer()
 }).
 
--record(data, {
+%% What the session decides once, in `serve/2`, and never changes: the
+%% socket and how it is read, the handler and the callbacks it exports,
+%% the negotiated compression, the listener's caps and the connection's
+%% close path. Kept apart from `#data{}` so each update of that record,
+%% several per message, copies one field for all of them.
+-record(ws_cfg, {
     socket :: roadrunner_transport:socket(),
-    buffer :: binary(),
     mod :: module(),
-    mod_state :: term(),
     %% The event handler's WebSocket span, from `ws_upgrade`.
     span :: roadrunner_event_handler:span(),
     callbacks :: #callbacks{},
@@ -160,6 +163,36 @@
     pmd_params :: roadrunner_ws:permessage_deflate_params() | undefined,
     inflate_z :: zlib:zstream() | undefined,
     deflate_z :: zlib:zstream() | undefined,
+    %% Inbound size caps (from listener `proto_opts`, set once in
+    %% `init/1`). `max_frame_size` bounds a single frame's declared
+    %% payload — enforced in `process_buffer/2` against the peeked
+    %% header before the body is buffered. `max_message_size` bounds a
+    %% reassembled message via `msg_size`, the running charged size of
+    %% the fragments (each charged at least `?WS_FRAGMENT_OVERHEAD` so
+    %% empty/tiny fragments can't grow `msg_acc` unbounded); under
+    %% permessage-deflate it also caps the decompressed size
+    %% (`finalize_message/3`). Over either cap closes with 1009.
+    max_frame_size :: non_neg_integer(),
+    max_message_size :: non_neg_integer(),
+    %% Idle hibernation timeout (from the listener's `ws.hibernate_after`
+    %% opt, set once in `init/1`). `infinity` (the default) makes the
+    %% recv_loop's `after` clause dead by the receive's own semantics —
+    %% the timer never arms, so the default costs nothing per message.
+    hibernate_after :: roadrunner_listener:wait_ms(),
+    %% How the socket is read: `once` re-arms after every message, `N`
+    %% arms `{active, N}` and re-arms on the transport's passive message
+    %% (the `active` option, `arm_active/1`).
+    active :: roadrunner_listener:active(),
+    %% The connection's close path, called by `guarded/2` once the
+    %% session has ended.
+    finish :: finish()
+}).
+
+-record(data, {
+    %% The session's fixed settings, see `#ws_cfg{}`.
+    cfg :: #ws_cfg{},
+    buffer :: binary(),
+    mod_state :: term(),
     %% In-progress message reassembly state. WebSocket data messages
     %% (text / binary) MAY span multiple fragments at the wire level
     %% (RFC 6455 §5.4). The session reassembles them before dispatch
@@ -185,22 +218,6 @@
     msg_pieces_count = 0 :: non_neg_integer(),
     msg_opcode :: undefined | text | binary,
     msg_compressed :: boolean(),
-    %% Inbound size caps (from listener `proto_opts`, set once in
-    %% `init/1`). `max_frame_size` bounds a single frame's declared
-    %% payload — enforced in `process_buffer/2` against the peeked
-    %% header before the body is buffered. `max_message_size` bounds a
-    %% reassembled message via `msg_size`, the running charged size of
-    %% the fragments (each charged at least `?WS_FRAGMENT_OVERHEAD` so
-    %% empty/tiny fragments can't grow `msg_acc` unbounded); under
-    %% permessage-deflate it also caps the decompressed size
-    %% (`finalize_message/3`). Over either cap closes with 1009.
-    max_frame_size :: non_neg_integer(),
-    max_message_size :: non_neg_integer(),
-    %% Idle hibernation timeout (from the listener's `ws.hibernate_after`
-    %% opt, set once in `init/1`). `infinity` (the default) makes the
-    %% recv_loop's `after` clause dead by the receive's own semantics —
-    %% the timer never arms, so the default costs nothing per message.
-    hibernate_after :: roadrunner_listener:wait_ms(),
     idle :: #idle{},
     msg_size = 0 :: non_neg_integer(),
     %% Trailing UTF-8 bytes carried over from a previous fragment that
@@ -247,10 +264,6 @@
     %% (`queue_pong/2`).
     pongs = 0 :: non_neg_integer(),
     pong = undefined :: binary() | undefined,
-    %% How the socket is read: `once` re-arms after every message, `N`
-    %% arms `{active, N}` and re-arms on the transport's passive message
-    %% (the `active` option, `arm_active/1`).
-    active :: roadrunner_listener:active(),
     %% The adaptive inet `buffer` (`arm_and_recv/2`): the size set now, the
     %% size the session falls back to and the cap it grows to, in one field
     %% so the record every message updates stays small. `undefined` when
@@ -276,10 +289,7 @@
             Cap :: pos_integer(),
             Min :: non_neg_integer()
         }
-        | undefined,
-    %% The connection's close path, called by `guarded/2` once the
-    %% session has ended.
-    finish :: finish()
+        | undefined
 }).
 
 %% Per-message DEFLATE trailer (RFC 7692 §7.2.1). Sender strips it
@@ -545,26 +555,29 @@ serve(
     Buf = adaptive_buf(WsBuffer, Mode, Socket),
     {PmdParams, InflateZ, DeflateZ} = init_pmd(Negotiated),
     Data = #data{
-        socket = Socket,
-        buffer = Buffered,
-        mod = Mod,
-        mod_state = State,
-        span = Span,
-        callbacks = #callbacks{
-            init = erlang:function_exported(Mod, init, 1),
-            handle_info = erlang:function_exported(Mod, handle_info, 2),
-            handle_drain = erlang:function_exported(Mod, handle_drain, 2),
-            handle_control = erlang:function_exported(Mod, handle_control, 2),
-            terminate = erlang:function_exported(Mod, terminate, 2)
+        cfg = #ws_cfg{
+            socket = Socket,
+            mod = Mod,
+            span = Span,
+            callbacks = #callbacks{
+                init = erlang:function_exported(Mod, init, 1),
+                handle_info = erlang:function_exported(Mod, handle_info, 2),
+                handle_drain = erlang:function_exported(Mod, handle_drain, 2),
+                handle_control = erlang:function_exported(Mod, handle_control, 2),
+                terminate = erlang:function_exported(Mod, terminate, 2)
+            },
+            pmd_params = PmdParams,
+            inflate_z = InflateZ,
+            deflate_z = DeflateZ,
+            max_frame_size = MaxFrame,
+            max_message_size = MaxMsg,
+            hibernate_after = HibernateAfter,
+            active = Mode,
+            finish = Finish
         },
-        pmd_params = PmdParams,
-        inflate_z = InflateZ,
-        deflate_z = DeflateZ,
-        max_frame_size = MaxFrame,
-        max_message_size = MaxMsg,
-        hibernate_after = HibernateAfter,
+        buffer = Buffered,
+        mod_state = State,
         idle = #idle{timeout = IdleTimeout},
-        active = Mode,
         buf = Buf,
         heap_floor = HeapFloor,
         msg_acc = undefined,
@@ -574,8 +587,7 @@ serve(
         utf8_pending = <<>>,
         frame_validated = 0,
         unmasked_buf = <<>>,
-        out = [],
-        finish = Finish
+        out = []
     },
     guarded(fun() -> start_session(Data) end, Data).
 
@@ -602,7 +614,7 @@ start_session(Data) ->
 %% the stack, `try` included, so the session resumes through `resume/1`,
 %% which guards again.
 -spec guarded(fun(() -> finished), #data{}) -> no_return().
-guarded(Body, #data{finish = Finish} = Data) ->
+guarded(Body, #data{cfg = #ws_cfg{finish = Finish}} = Data) ->
     try Body() of
         finished -> ok
     catch
@@ -652,7 +664,9 @@ init_pmd({permessage_deflate, Params, _ResponseValue}) ->
 %% The optional handler `init/1` runs once, before any frame. A drain or
 %% stray message that arrived first stays queued for `recv_loop/1`.
 -spec begin_session(#data{}) -> finished.
-begin_session(#data{callbacks = #callbacks{init = true}, mod = Mod, mod_state = State} = Data) ->
+begin_session(
+    #data{cfg = #ws_cfg{callbacks = #callbacks{init = true}, mod = Mod}, mod_state = State} = Data
+) ->
     apply_handler_result(Mod:init(State), Data, false, fun enter_frame_loop/2, normal);
 begin_session(Data) ->
     enter_frame_loop(Data, false).
@@ -674,9 +688,9 @@ read_mode(Active, _Socket) -> Active.
 %% passive (`recv_loop/1`), so no message pays a re-arm. An `once`
 %% session is armed per message by `arm_and_recv/2` instead.
 -spec arm_active(#data{}) -> #data{} | finished.
-arm_active(#data{active = once} = Data) ->
+arm_active(#data{cfg = #ws_cfg{active = once}} = Data) ->
     Data;
-arm_active(#data{socket = Socket, active = N} = Data) ->
+arm_active(#data{cfg = #ws_cfg{socket = Socket, active = N}} = Data) ->
     case roadrunner_transport:setopts(Socket, [{active, N}]) of
         ok -> Data;
         {error, Reason} -> exit_clean({error, Reason}, Data)
@@ -686,7 +700,7 @@ arm_active(#data{socket = Socket, active = N} = Data) ->
 -spec arm_idle(#data{}) -> #data{} | finished.
 arm_idle(#data{idle = #idle{timeout = infinity}} = Data) ->
     Data;
-arm_idle(#data{socket = Socket} = Data) ->
+arm_idle(#data{cfg = #ws_cfg{socket = Socket}} = Data) ->
     case roadrunner_transport:recv_count(Socket) of
         {ok, Count} -> rearm_idle(Count, Data);
         {error, Reason} -> exit_clean({error, Reason}, Data)
@@ -701,7 +715,7 @@ rearm_idle(Count, #data{idle = #idle{timeout = Timeout} = Idle} = Data) ->
 %% The idle timer fired: close with 1001 if the client sent nothing since
 %% the last fire, else wait another interval.
 -spec idle_check(#data{}) -> finished.
-idle_check(#data{socket = Socket, idle = #idle{recv = Last}} = Data) ->
+idle_check(#data{cfg = #ws_cfg{socket = Socket}, idle = #idle{recv = Last}} = Data) ->
     case roadrunner_transport:recv_count(Socket) of
         {ok, Last} -> flush_and_exit(timeout, queue_frame(Data, close, <<1001:16>>));
         {ok, Count} -> recv_loop(rearm_idle(Count, Data));
@@ -726,11 +740,12 @@ enter_frame_loop(Data, Hibernate) ->
 %% system message never leaks to the handler's `handle_info/2`. Only a
 %% data message consumes the active-once; sys / cast / info do not, so
 %% those clauses loop without re-arming. `_Sock` is discarded — one socket
-%% per session, captured in `#data.socket` at init.
+%% per session, captured in `#data.cfg#ws_cfg.socket` at init.
 -spec recv_loop(#data{}) -> finished.
 recv_loop(
     #data{
-        socket = Socket, hibernate_after = HibernateAfter, idle = #idle{timer = IdleTimer}
+        cfg = #ws_cfg{socket = Socket, hibernate_after = HibernateAfter},
+        idle = #idle{timer = IdleTimer}
     } = Data
 ) ->
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
@@ -785,7 +800,7 @@ recv_loop(
 %% Releasing the zlib contexts here frees their working buffers now, not
 %% when the process exits.
 -spec exit_clean(roadrunner_ws_handler:terminate_reason(), #data{}) -> finished.
-exit_clean(Reason, #data{inflate_z = InflateZ, deflate_z = DeflateZ} = Data) ->
+exit_clean(Reason, #data{cfg = #ws_cfg{inflate_z = InflateZ, deflate_z = DeflateZ}} = Data) ->
     ok = terminate(Reason, Data),
     close_zlib(InflateZ),
     close_zlib(DeflateZ),
@@ -797,7 +812,9 @@ exit_clean(Reason, #data{inflate_z = InflateZ, deflate_z = DeflateZ} = Data) ->
 %% when the session had a process of its own; anything else is logged like
 %% an HTTP handler crash.
 -spec session_crashed(error | exit | throw, term(), list(), #data{}) -> ok.
-session_crashed(Class, Reason, Stack, #data{mod = Mod, inflate_z = InflateZ, deflate_z = DeflateZ}) ->
+session_crashed(Class, Reason, Stack, #data{
+    cfg = #ws_cfg{mod = Mod, inflate_z = InflateZ, deflate_z = DeflateZ}
+}) ->
     ok = log_crash(Class, Reason, Stack, Mod),
     close_zlib(InflateZ),
     close_zlib(DeflateZ).
@@ -819,10 +836,12 @@ log_crash(Class, Reason, Stack, Mod) ->
     }).
 
 -spec terminate(roadrunner_ws_handler:terminate_reason(), #data{}) -> ok.
-terminate(Reason, #data{callbacks = #callbacks{terminate = true}, mod = Mod, mod_state = State}) ->
+terminate(Reason, #data{
+    cfg = #ws_cfg{callbacks = #callbacks{terminate = true}, mod = Mod}, mod_state = State
+}) ->
     _ = Mod:terminate(Reason, State),
     ok;
-terminate(_Reason, #data{callbacks = #callbacks{terminate = false}}) ->
+terminate(_Reason, #data{cfg = #ws_cfg{callbacks = #callbacks{terminate = false}}}) ->
     ok.
 
 -spec close_zlib(zlib:zstream() | undefined) -> ok.
@@ -888,7 +907,7 @@ process_input(Data, Bytes) ->
 %% that path fires for it.
 -spec whole_frame(binary(), #data{}) ->
     {text | binary, boolean(), binary(), binary()} | partial.
-whole_frame(Buf, #data{pmd_params = Pmd, max_message_size = MaxMsg} = Data) ->
+whole_frame(Buf, #data{cfg = #ws_cfg{pmd_params = Pmd, max_message_size = MaxMsg}} = Data) ->
     case roadrunner_ws:match_data_frame(Buf, Pmd =/= undefined) of
         {Opcode, Compressed, MaskKey, Masked, Rest} ->
             Size = byte_size(Masked),
@@ -927,10 +946,10 @@ charged_size(true, Size) -> max(Size, ?WS_FRAGMENT_OVERHEAD).
 -spec dispatch_whole_frame(text | binary, boolean(), binary(), binary(), #data{}, boolean()) ->
     finished.
 dispatch_whole_frame(Opcode, false, Payload, Rest, Data, Hibernate) ->
-    ok = roadrunner_event:ws_frame_in(Data#data.span, Opcode, byte_size(Payload)),
+    ok = roadrunner_event:ws_frame_in(Data#data.cfg#ws_cfg.span, Opcode, byte_size(Payload)),
     dispatch_message(Opcode, Payload, Rest, Data, Hibernate);
 dispatch_whole_frame(Opcode, true, Compressed, Rest, Data, Hibernate) ->
-    ok = roadrunner_event:ws_frame_in(Data#data.span, Opcode, byte_size(Compressed)),
+    ok = roadrunner_event:ws_frame_in(Data#data.cfg#ws_cfg.span, Opcode, byte_size(Compressed)),
     case complete_message(Opcode, true, Compressed, Data) of
         {ok, Payload} -> dispatch_message(Opcode, Payload, Rest, Data, Hibernate);
         finished -> finished
@@ -941,7 +960,12 @@ dispatch_whole_frame(Opcode, true, Compressed, Rest, Data, Hibernate) ->
 %% goes out directly instead of through `#data.out`.
 -spec dispatch_message(text | binary, binary(), binary(), #data{}, boolean()) -> finished.
 dispatch_message(Opcode, Payload, Rest, Data, Hibernate) ->
-    #data{socket = Socket, span = Span, mod = Mod, mod_state = State, out = Out, pong = Pong} =
+    #data{
+        cfg = #ws_cfg{socket = Socket, span = Span, mod = Mod},
+        mod_state = State,
+        out = Out,
+        pong = Pong
+    } =
         Data,
     Frame = #{fin => true, rsv1 => false, opcode => Opcode, payload => Payload},
     case Mod:handle_frame(Frame, State) of
@@ -987,7 +1011,7 @@ dispatch_message(Opcode, Payload, Rest, Data, Hibernate) ->
     end.
 
 -spec process_partial(#data{}, boolean()) -> finished.
-process_partial(#data{buffer = Buf, pmd_params = Pmd} = Data, HibernateAcc) ->
+process_partial(#data{cfg = #ws_cfg{pmd_params = Pmd}, buffer = Buf} = Data, HibernateAcc) ->
     Opts =
         case Pmd of
             undefined -> #{};
@@ -1033,7 +1057,7 @@ process_parsed_frame(Data1, Buf, Header, HibernateAcc) ->
     case roadrunner_ws:parse_frame_known(Buf, Header, pre_unmasked(Data1, Header)) of
         {ok, #{opcode := Opcode} = Frame, NewBuffer} ->
             ok = roadrunner_event:ws_frame_in(
-                Data1#data.span, Opcode, payload_size(Frame)
+                Data1#data.cfg#ws_cfg.span, Opcode, payload_size(Frame)
             ),
             %% Frame parsed. The start of a fragmented text message was
             %% already validated as it arrived (`early_validate_text`),
@@ -1057,7 +1081,7 @@ process_parsed_frame(Data1, Buf, Header, HibernateAcc) ->
 %% message, the final frame completing it.
 -spec continuation_frame(#data{}, binary(), map(), boolean()) -> finished.
 continuation_frame(Data, Buf, #{total_payload_len := Len} = Header, Hibernate) ->
-    #data{msg_size = Size, max_message_size = MaxMsg} = Data,
+    #data{cfg = #ws_cfg{max_message_size = MaxMsg}, msg_size = Size} = Data,
     case Size + max(Len, ?WS_FRAGMENT_OVERHEAD) of
         NewSize when NewSize > MaxMsg ->
             close_oversize(max_message_size, NewSize, Data);
@@ -1065,7 +1089,7 @@ continuation_frame(Data, Buf, #{total_payload_len := Len} = Header, Hibernate) -
             #{payload_offset := Off, mask_key := <<MaskKey:32>>, fin := Fin} = Header,
             case Buf of
                 <<_:Off/binary, Masked:Len/binary, Rest/binary>> ->
-                    ok = roadrunner_event:ws_frame_in(Data#data.span, continuation, Len),
+                    ok = roadrunner_event:ws_frame_in(Data#data.cfg#ws_cfg.span, continuation, Len),
                     add_continuation(
                         Fin,
                         roadrunner_ws:unmask_words(Masked, MaskKey),
@@ -1129,11 +1153,11 @@ validate_piece(_Op, _Compressed, _Pending, _P) ->
 -spec add_piece(binary(), #data{}) -> #data{}.
 add_piece(P, Data) ->
     #data{
+        cfg = #ws_cfg{max_message_size = MaxMsg},
         msg_acc = Acc,
         msg_pieces = Pieces,
         msg_pieces_size = Size,
-        msg_pieces_count = Count,
-        max_message_size = MaxMsg
+        msg_pieces_count = Count
     } = Data,
     case {Size + byte_size(P), Count + 1} of
         {NewSize, NewCount} when
@@ -1172,7 +1196,7 @@ pre_unmasked(_Data, _Header) ->
 %% `{more, _}` re-arm reads the whole payload. Only reached once the peek
 %% has a full header, so the length is always known here.
 -spec frame_within_cap(non_neg_integer(), #data{}) -> boolean().
-frame_within_cap(TotalLen, #data{max_frame_size = Max}) ->
+frame_within_cap(TotalLen, #data{cfg = #ws_cfg{max_frame_size = Max}}) ->
     TotalLen =< Max.
 
 %% Sneak-peek a partially-buffered frame and validate any NEW
@@ -1273,7 +1297,7 @@ append_buffer(#data{buffer = Buf} = Data, Bytes) ->
 %% (a peer-closed socket mid-frame is a normal end-of-session event, not a
 %% crash). Mirrors the conn-loop `arm_and_recv` + `recv_more_hib` pattern.
 -spec arm_and_recv(#data{}, boolean()) -> finished.
-arm_and_recv(#data{active = N} = Data, Hibernate) when is_integer(N) ->
+arm_and_recv(#data{cfg = #ws_cfg{active = N}} = Data, Hibernate) when is_integer(N) ->
     %% Read with `{active, N}`: the socket stays armed until the
     %% transport reports it passive (`arm_active/1`), so there is nothing
     %% to re-arm per message.
@@ -1329,7 +1353,7 @@ arm_after_message(_Size, Data, Hibernate) ->
     arm_and_recv(Data, Hibernate).
 
 -spec arm_once([gen_tcp:option()], #data{}, boolean()) -> finished.
-arm_once(Opts, #data{socket = Socket} = Data0, Hibernate) ->
+arm_once(Opts, #data{cfg = #ws_cfg{socket = Socket}} = Data0, Hibernate) ->
     %% Everything queued during the drain pass that led here goes out
     %% in one write before the park — see `flush_out/1`.
     Data = flush_out(Data0),
@@ -1492,7 +1516,8 @@ handle_frame(#{opcode := pong} = Frame, Data, Hibernate) ->
     control_frame(Frame, Data, Hibernate);
 handle_frame(
     #{fin := true, rsv1 := false, opcode := Op, payload := P} = Frame,
-    #data{msg_acc = undefined, utf8_pending = Pending, max_message_size = MaxMsg} = Data,
+    #data{cfg = #ws_cfg{max_message_size = MaxMsg}, msg_acc = undefined, utf8_pending = Pending} =
+        Data,
     Hibernate
 ) when
     (Op =:= text orelse Op =:= binary), byte_size(P) =< MaxMsg
@@ -1554,7 +1579,9 @@ classify_data_frame(#{rsv1 := Rsv1, opcode := Op}, Data) when Op =:= text orelse
 %% FIN=0 that more fragments will follow, or a whole message that is
 %% compressed or over `max_message_size`.
 -spec start_message(roadrunner_ws:frame(), #data{}, boolean()) -> finished.
-start_message(#{payload := P}, #data{max_message_size = MaxMsg} = Data, _Hibernate) when
+start_message(
+    #{payload := P}, #data{cfg = #ws_cfg{max_message_size = MaxMsg}} = Data, _Hibernate
+) when
     max(byte_size(P), ?WS_FRAGMENT_OVERHEAD) > MaxMsg
 ->
     %% The frame alone takes the charged message size over
@@ -1705,7 +1732,9 @@ incomplete_is_provably_invalid(_) -> false.
 finalize_message(_Data, Iolist, false) ->
     {ok, iolist_to_binary(Iolist)};
 finalize_message(
-    #data{inflate_z = Z, pmd_params = Params, max_message_size = MaxMsg}, Iolist, true
+    #data{cfg = #ws_cfg{inflate_z = Z, pmd_params = Params, max_message_size = MaxMsg}},
+    Iolist,
+    true
 ) ->
     %% zlib takes iodata, so the deflate tail rides along without copying
     %% the compressed payload into a new binary first.
@@ -1788,7 +1817,7 @@ error_reason(<<1007:16>>) -> invalid_payload.
 %% doesn't distinguish a cap rejection from a normal close.
 -spec close_oversize(max_frame_size | max_message_size, non_neg_integer(), #data{}) ->
     finished.
-close_oversize(Reason, Size, #data{span = Span} = Data) ->
+close_oversize(Reason, Size, #data{cfg = #ws_cfg{span = Span}} = Data) ->
     ok = roadrunner_event:ws_frame_rejected(Span, Reason, Size),
     close_with(Reason, close_message_too_big(), reset_msg(Data)).
 
@@ -1828,17 +1857,21 @@ is_valid_utf8(Bin) ->
 -spec control_frame(roadrunner_ws:frame(), #data{}, boolean()) -> finished.
 control_frame(
     Frame,
-    #data{callbacks = #callbacks{handle_control = true}, mod = Mod, mod_state = State} = Data,
+    #data{
+        cfg = #ws_cfg{callbacks = #callbacks{handle_control = true}, mod = Mod}, mod_state = State
+    } = Data,
     Hibernate
 ) ->
     apply_handler_result(
         Mod:handle_control(Frame, State), Data, Hibernate, fun process_buffer/2, normal
     );
-control_frame(_Frame, #data{callbacks = #callbacks{handle_control = false}} = Data, Hibernate) ->
+control_frame(
+    _Frame, #data{cfg = #ws_cfg{callbacks = #callbacks{handle_control = false}}} = Data, Hibernate
+) ->
     process_buffer(Data, Hibernate).
 
 -spec dispatch_data_frame(roadrunner_ws:frame(), #data{}, boolean()) -> finished.
-dispatch_data_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate) ->
+dispatch_data_frame(Frame, #data{cfg = #ws_cfg{mod = Mod}, mod_state = State} = Data, Hibernate) ->
     apply_handler_result(
         Mod:handle_frame(Frame, State), Data, Hibernate, fun process_buffer/2, normal
     ).
@@ -1846,25 +1879,29 @@ dispatch_data_frame(Frame, #data{mod = Mod, mod_state = State} = Data, Hibernate
 -spec handle_info_msg(term(), #data{}, boolean()) -> finished.
 handle_info_msg(
     Msg,
-    #data{callbacks = #callbacks{handle_info = true}, mod = Mod, mod_state = State} = Data,
+    #data{cfg = #ws_cfg{callbacks = #callbacks{handle_info = true}, mod = Mod}, mod_state = State} =
+        Data,
     Hibernate
 ) ->
     Result = Mod:handle_info(Msg, State),
     apply_handler_result(Result, raise_heap_floor(Data), Hibernate, fun flush_and_wait/2, normal);
-handle_info_msg(_Msg, #data{callbacks = #callbacks{handle_info = false}} = Data, _Hibernate) ->
+handle_info_msg(
+    _Msg, #data{cfg = #ws_cfg{callbacks = #callbacks{handle_info = false}}} = Data, _Hibernate
+) ->
     recv_loop(Data).
 
 -spec handle_drain_msg(integer(), #data{}, boolean()) -> finished.
 handle_drain_msg(
     Deadline,
-    #data{callbacks = #callbacks{handle_drain = true}, mod = Mod, mod_state = State} = Data,
+    #data{cfg = #ws_cfg{callbacks = #callbacks{handle_drain = true}, mod = Mod}, mod_state = State} =
+        Data,
     Hibernate
 ) ->
     apply_handler_result(
         Mod:handle_drain(Deadline, State), Data, Hibernate, fun flush_and_wait/2, shutdown
     );
 handle_drain_msg(
-    _Deadline, #data{callbacks = #callbacks{handle_drain = false}} = Data, _Hibernate
+    _Deadline, #data{cfg = #ws_cfg{callbacks = #callbacks{handle_drain = false}}} = Data, _Hibernate
 ) ->
     recv_loop(Data).
 
@@ -1979,7 +2016,9 @@ queue_frame(#data{pong = Pong} = Data, close, Payload) when is_binary(Pong) ->
     %% The held pong goes out before the close, after which nothing may
     %% be sent (RFC 6455 §5.5.1).
     queue_frame(release_pong(Data), close, Payload);
-queue_frame(#data{span = Span, out = Out, out_size = OutSize} = Data, Opcode, Payload) ->
+queue_frame(
+    #data{cfg = #ws_cfg{span = Span}, out = Out, out_size = OutSize} = Data, Opcode, Payload
+) ->
     Size = iolist_size(Payload),
     ok = roadrunner_event:ws_frame_out(Span, Opcode, Size),
     Data#data{
@@ -1992,7 +2031,7 @@ queue_frame(#data{span = Span, out = Out, out_size = OutSize} = Data, Opcode, Pa
 %% and `{close, Data, Payload}` hands the close to `close_after/3`.
 -spec queue_frames(#data{}, [{roadrunner_ws:opcode(), iodata()}]) ->
     #data{} | {close, #data{}, iodata()}.
-queue_frames(#data{span = Span, out = Out, out_size = OutSize} = Data, OutFrames) ->
+queue_frames(#data{cfg = #ws_cfg{span = Span}, out = Out, out_size = OutSize} = Data, OutFrames) ->
     case encode_frames(Data, Span, OutFrames) of
         {Encoded, Size} ->
             Data#data{out = [Out | Encoded], out_size = OutSize + Size};
@@ -2007,7 +2046,12 @@ queue_frames(#data{span = Span, out = Out, out_size = OutSize} = Data, OutFrames
 %% A `close` frame in the list ends it, as in `queue_frames/2`.
 -spec queue_reply(#data{}, binary(), [{roadrunner_ws:opcode(), iodata()}], term()) ->
     #data{} | {close, #data{}, iodata()}.
-queue_reply(#data{span = Span, out = Out, out_size = OutSize} = Data, Buffer, OutFrames, NewState) ->
+queue_reply(
+    #data{cfg = #ws_cfg{span = Span}, out = Out, out_size = OutSize} = Data,
+    Buffer,
+    OutFrames,
+    NewState
+) ->
     case encode_frames(Data, Span, OutFrames) of
         {Encoded, Size} ->
             Data#data{
@@ -2038,7 +2082,9 @@ queue_reply(#data{span = Span, out = Out, out_size = OutSize} = Data, Buffer, Ou
 -spec flush_out(#data{}) -> #data{}.
 flush_out(#data{out = [], pong = undefined} = Data) ->
     Data;
-flush_out(#data{socket = Socket, out = Out, out_size = OutSize, pong = undefined} = Data) ->
+flush_out(
+    #data{cfg = #ws_cfg{socket = Socket}, out = Out, out_size = OutSize, pong = undefined} = Data
+) ->
     _ = roadrunner_transport:send(Socket, Out, OutSize),
     Data#data{out = [], out_size = 0, pongs = 0};
 flush_out(Data) ->
@@ -2055,7 +2101,9 @@ flush_out(Data) ->
 %% between whole frames (the session never fragments what it sends). The
 %% pong and its count go in one `#data{}` update.
 -spec queue_pong(#data{}, binary()) -> #data{}.
-queue_pong(#data{pongs = N, span = Span, out = Out, out_size = OutSize} = Data, Payload) when
+queue_pong(
+    #data{cfg = #ws_cfg{span = Span}, pongs = N, out = Out, out_size = OutSize} = Data, Payload
+) when
     N < ?MAX_PONGS
 ->
     Size = byte_size(Payload),
@@ -2069,7 +2117,7 @@ queue_pong(Data, Payload) ->
     Data#data{pong = Payload}.
 
 -spec release_pong(#data{}) -> #data{}.
-release_pong(#data{span = Span, out = Out, out_size = OutSize, pong = Pong} = Data) ->
+release_pong(#data{cfg = #ws_cfg{span = Span}, out = Out, out_size = OutSize, pong = Pong} = Data) ->
     Size = byte_size(Pong),
     ok = roadrunner_event:ws_frame_out(Span, pong, Size),
     Data#data{
@@ -2118,7 +2166,7 @@ encode_frames(Data, Span, [{Op, Payload} | Rest], Acc, AccSize) ->
 %% `Size` is the payload's, measured once by the caller for its event; only the
 %% compressed path needs another, of its deflated bytes.
 -spec encode_outbound(#data{}, roadrunner_ws:opcode(), iodata(), non_neg_integer()) -> iodata().
-encode_outbound(#data{pmd_params = undefined}, Opcode, Payload, Size) ->
+encode_outbound(#data{cfg = #ws_cfg{pmd_params = undefined}}, Opcode, Payload, Size) ->
     %% No PMD negotiated — straight encode.
     roadrunner_ws:encode_frame_sized(Opcode, Payload, Size);
 encode_outbound(_Data, Opcode, Payload, Size) when
@@ -2139,7 +2187,7 @@ encode_outbound(Data, Opcode, Payload, _Size) ->
 %% Strips the trailing 4-byte deflate tail per RFC 7692 §7.2.1 —
 %% receivers append it back before inflating.
 -spec deflate_message(#data{}, iodata()) -> binary().
-deflate_message(#data{deflate_z = Z, pmd_params = Params}, Payload) ->
+deflate_message(#data{cfg = #ws_cfg{deflate_z = Z, pmd_params = Params}}, Payload) ->
     Iolist = zlib:deflate(Z, Payload, sync),
     case Params of
         #{server_no_context_takeover := true} -> ok = zlib:deflateReset(Z);
