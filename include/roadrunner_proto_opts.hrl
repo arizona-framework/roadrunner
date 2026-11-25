@@ -84,7 +84,7 @@
     %% set per connection as it starts when the ceiling is finite. The
     %% listener's copy carries `undefined`.
     slot_cell = undefined :: roadrunner_conn:slot_cell(),
-    inflight_counter = undefined :: counters:counters_ref() | undefined,
+    inflight_counter = undefined :: roadrunner_conn:inflight_counter(),
     throttled_counter :: atomics:atomics_ref(),
     %% Per-peer request-rate guard (off by default). `rate_limit` carries the
     %% resolved config + per-listener ETS bucket store when the `rate_limit`

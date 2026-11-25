@@ -486,7 +486,7 @@
     %% Read from proto_opts at `enter/6` so the per-stream acquire/release
     %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
     max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
-    inflight_counter :: counters:counters_ref() | undefined,
+    inflight_counter :: roadrunner_conn:inflight_counter(),
     %% The conn's own count of the slots it holds
     %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
     slot_cell = undefined :: roadrunner_conn:slot_cell(),

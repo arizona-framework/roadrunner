@@ -130,6 +130,7 @@
     rate_limit_bucket/0,
     overload/0,
     slot_cell/0,
+    inflight_counter/0,
     linger_budget/0,
     resolved/0,
     body_reader/0,
@@ -160,6 +161,10 @@
 %% A conn's own count of the in-flight slots it holds (`with_slot_cell/1`),
 %% or `undefined` when the listener has no ceiling.
 -type slot_cell() :: atomics:atomics_ref() | undefined.
+
+%% The listener's live count of in-flight requests under
+%% `max_concurrent_requests`, or `undefined` when the listener has no ceiling.
+-type inflight_counter() :: counters:counters_ref() | undefined.
 
 %% The listener's cap on connections lingering at once (`linger/3`): a
 %% table with a row per connection lingering now, the cumulative count of
@@ -370,7 +375,7 @@ The `Max` and `Counter` are cached on the connection loop record at setup so
 the per-stream path passes them directly instead of re-reading `proto_opts`.
 """.
 -spec try_acquire_request_slot(
-    roadrunner_listener:request_cap(), counters:counters_ref() | undefined
+    roadrunner_listener:request_cap(), inflight_counter()
 ) ->
     boolean().
 try_acquire_request_slot(infinity, _Counter) ->
@@ -575,7 +580,7 @@ is the natural choice.
 """.
 -spec acquire_request_slot(
     roadrunner_listener:request_cap(),
-    counters:counters_ref() | undefined,
+    inflight_counter(),
     slot_cell(),
     overload(),
     term()
@@ -621,7 +626,7 @@ so a listener in queue mode that is not at its ceiling pays one extra
 `atomics:get/2` per request and no message.
 """.
 -spec release_request_slot(
-    roadrunner_listener:request_cap(), counters:counters_ref() | undefined, slot_cell(), overload()
+    roadrunner_listener:request_cap(), inflight_counter(), slot_cell(), overload()
 ) -> ok.
 release_request_slot(infinity, _Counter, _Cell, _Overload) ->
     ok;
@@ -646,7 +651,7 @@ no-ops.
 """.
 -spec release_request_slots(
     roadrunner_listener:request_cap(),
-    counters:counters_ref() | undefined,
+    inflight_counter(),
     non_neg_integer(),
     overload()
 ) -> ok.
@@ -679,7 +684,7 @@ with no ceiling). The listener's reaper calls it for a conn that died
 without its exit path.
 """.
 -spec reclaim_request_slots(
-    slot_cell(), roadrunner_listener:request_cap(), counters:counters_ref() | undefined, overload()
+    slot_cell(), roadrunner_listener:request_cap(), inflight_counter(), overload()
 ) -> ok.
 reclaim_request_slots(undefined, _Max, _Counter, _Overload) ->
     ok;
