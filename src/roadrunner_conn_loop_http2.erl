@@ -1914,14 +1914,8 @@ finalize_headers(
                     %% (decode succeeded, so the connection is intact), and
                     %% drop the stream; no worker is dispatched until
                     %% END_STREAM.
-                    Resp = ~"Request Header Fields Too Large",
-                    State2 = encode_and_send_response_atomic(
-                        State1,
-                        StreamId,
-                        431,
-                        [{~"content-type", ~"text/plain"}],
-                        Resp,
-                        byte_size(Resp)
+                    State2 = refuse_request(
+                        State1, StreamId, 431, ~"Request Header Fields Too Large"
                     ),
                     _ = send_rst_stream(State2, StreamId, no_error),
                     frame_loop(remove_reset_stream(State2, StreamId));
@@ -1990,12 +1984,27 @@ send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
 %% dispatch is at END_STREAM).
 -spec reject_too_large(#loop{}, stream_id()) -> no_return().
 reject_too_large(State, StreamId) ->
-    Resp = ~"Payload Too Large",
-    State1 = encode_and_send_response_atomic(
-        State, StreamId, 413, [{~"content-type", ~"text/plain"}], Resp, byte_size(Resp)
-    ),
+    State1 = refuse_request(State, StreamId, 413, ~"Payload Too Large"),
     _ = send_rst_stream(State1, StreamId, no_error),
     frame_loop(remove_reset_stream(State1, StreamId)).
+
+%% The answer the conn gives a request it refuses itself, before any
+%% handler runs (431, 413): its status and a short text when the client's
+%% flow-control windows take the text (RFC 9113 §6.9.1), else the status
+%% alone. The stream is reset right after, so a text held back for a
+%% window to open would never be sent.
+-spec refuse_request(#loop{}, stream_id(), 413 | 431, binary()) -> #loop{}.
+refuse_request(#loop{streams = Streams} = State, StreamId, Status, Text) ->
+    #{StreamId := Stream} = Streams,
+    Len = byte_size(Text),
+    case window_budget(State, Stream) of
+        Budget when Budget >= Len ->
+            encode_and_send_response_atomic(
+                State, StreamId, Status, [{~"content-type", ~"text/plain"}], Text, Len
+            );
+        _Short ->
+            encode_and_send_headers(State, StreamId, Status, [], true)
+    end.
 
 %% --- DATA ---
 
