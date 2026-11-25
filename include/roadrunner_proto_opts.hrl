@@ -116,6 +116,12 @@
     %% The compiled `real_ip` listener option (`roadrunner_real_ip:compile/1`),
     %% `undefined` when the option is off.
     real_ip = undefined :: roadrunner_real_ip:config() | undefined,
+    %% Whether the listener is bound to a Unix domain socket, an `ip` of
+    %% `{local, Path}`, whose clients have no address: `real_ip` trusts them
+    %% as the nearest hop (`roadrunner_real_ip:unix_trust/1`), and the
+    %% listener's `rate_limit` puts the ones without a resolved address in
+    %% one bucket.
+    unix_socket = false :: boolean(),
     %% TLS options for a TLS listener that also reads the PROXY protocol: it
     %% accepts plain TCP (the header comes before any TLS bytes) and the conn
     %% upgrades each socket with these once the header is in. `undefined` on

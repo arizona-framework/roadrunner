@@ -226,7 +226,8 @@ deadline in milliseconds. The shed form answers it `503` with the
         pos_integer(),
         ets:table(),
         atomics:atomics_ref(),
-        inet:ip_address()
+        %% `local`: the one bucket of a Unix domain socket's clients.
+        inet:ip_address() | local
     }
     | undefined.
 
@@ -387,6 +388,18 @@ resolve_rate_limit(
     %% per-request `rate_limit_check/6` does no arithmetic.
     {Rate, Cap, Cost} = roadrunner_rate_limit:bucket(RateLimit),
     {Rate, Cap, Cost, Table, Counter, roadrunner_rate_limit:client_key(IP)};
+resolve_rate_limit(
+    #proto_opts{
+        rate_limit = #{table := Table} = RateLimit,
+        rate_limited_counter = Counter,
+        unix_socket = true
+    },
+    undefined
+) ->
+    %% A Unix domain socket's clients have no address: the ones `real_ip`
+    %% resolves none for share one bucket, so the limit still holds.
+    {Rate, Cap, Cost} = roadrunner_rate_limit:bucket(RateLimit),
+    {Rate, Cap, Cost, Table, Counter, local};
 resolve_rate_limit(_ProtoOpts, _Peer) ->
     undefined.
 
@@ -400,6 +413,8 @@ resolve_rate_limit(_ProtoOpts, _Peer) ->
 ) -> undefined | roadrunner_real_ip:config().
 resolve_real_ip(#proto_opts{real_ip = undefined}, _Peer) ->
     undefined;
+resolve_real_ip(#proto_opts{real_ip = RealIp, unix_socket = true}, undefined) ->
+    roadrunner_real_ip:unix_trust(RealIp);
 resolve_real_ip(#proto_opts{real_ip = RealIp}, Peer) ->
     roadrunner_real_ip:peer_trust(RealIp, Peer).
 
@@ -419,7 +434,8 @@ rate_limit({Rate, Cap, Cost, Table, Counter, PeerKey}, Req, ListenerName) ->
 
 %% The bucket key of one request: its resolved client IP's key
 %% (`roadrunner_rate_limit:client_key/1`), else the peer's.
--spec rate_limit_key(roadrunner_req:request(), inet:ip_address()) -> inet:ip_address().
+-spec rate_limit_key(roadrunner_req:request(), inet:ip_address() | local) ->
+    inet:ip_address() | local.
 rate_limit_key(#{client_ip := IP}, _PeerKey) -> roadrunner_rate_limit:client_key(IP);
 rate_limit_key(_Req, PeerKey) -> PeerKey.
 
@@ -431,7 +447,7 @@ rate_limit_key(_Req, PeerKey) -> PeerKey.
 -doc false.
 -spec rate_limit_spend(
     ets:table(),
-    inet:ip_address() | {term(), inet:ip_address()},
+    inet:ip_address() | local | {term(), inet:ip_address()},
     pos_integer(),
     pos_integer(),
     pos_integer(),
@@ -461,7 +477,7 @@ deterministically testable).
 """.
 -spec rate_limit_check(
     ets:table(),
-    inet:ip_address() | {term(), inet:ip_address()},
+    inet:ip_address() | local | {term(), inet:ip_address()},
     pos_integer(),
     pos_integer(),
     pos_integer(),
@@ -1225,6 +1241,13 @@ expect_answer(ProtoOpts, Headers, MaxCL) ->
 ) -> roadrunner_req:request().
 with_client_ip(Req, undefined, _Peer) ->
     Req;
+with_client_ip(#{headers := Headers} = Req, RealIp, undefined) ->
+    %% A Unix domain socket's client, trusted as the nearest hop: a client
+    %% address only when the header names one.
+    case roadrunner_real_ip:resolve(RealIp, undefined, Headers) of
+        undefined -> Req;
+        IP -> Req#{client_ip => IP}
+    end;
 with_client_ip(#{headers := Headers} = Req, RealIp, {PeerIP, _Port}) ->
     Req#{client_ip => roadrunner_real_ip:resolve(RealIp, PeerIP, Headers)}.
 

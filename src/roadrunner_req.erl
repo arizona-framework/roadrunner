@@ -760,8 +760,10 @@ header: the chain is read right to left, skipping trusted proxies, and the
 first untrusted hop is the client (see `t:roadrunner_listener:opts/0`). In
 every other case it is the peer's address (`peer/1`), which on a
 `proxy_protocol` listener is already the client the balancer reported.
-Returns `undefined` when the request has no peer, as on a Unix domain
-socket: there `real_ip` and the listener's `rate_limit` do not apply.
+Returns `undefined` when the request has no peer. On a listener bound to
+a Unix domain socket the peer has no address, so this is the address
+`real_ip` resolves (the socket's client counts as the nearest hop: see
+`ip` in `t:roadrunner_listener:opts/0`), or `undefined` without one.
 
 This is the address to use for per-client decisions: rate limiting, access
 logs, geolocation. Unlike `forwarded_for/1`, it reads only the hops the

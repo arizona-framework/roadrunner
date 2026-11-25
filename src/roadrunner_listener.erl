@@ -495,9 +495,14 @@ Optional middleware and timing knobs (durations in milliseconds):
   listener binds: plain TCP, TLS, and the HTTP/3 UDP socket. It takes
   what `gen_tcp`'s `ip` option takes: an address, `any`, `loopback`, or
   `{local, Path}` to serve HTTP/1.1 or HTTP/2 on a Unix domain socket.
-  Its clients have no address, so `roadrunner_req:peer/1` and
-  `client_ip/1` are `undefined` there, and `real_ip` and `rate_limit`
-  do not apply. A Unix domain socket has no port, so it needs
+  Its clients have no address, so `roadrunner_req:peer/1` is
+  `undefined` there. Such a client is usually a reverse proxy: with
+  `real_ip` it is the nearest hop, trusted with `trusted_hops`, and with
+  `trusted_proxies` only when the list has a `~"unix:"` entry, so
+  `client_ip/1` is the client the header names, and `undefined` when
+  there is no such header. The listener's `rate_limit` keys on that
+  client, and the requests with none share one bucket. A route's own
+  `rate_limit` skips them. A Unix domain socket has no port, so it needs
   `port => 0`; any other port fails the start with
   `{listener_opt_conflict, port, Port, unix_socket_needs_port_0}`. The
   listener removes the socket's file when it closes its socket (on
@@ -588,7 +593,8 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `real_ip`: the real client IP behind HTTP reverse proxies, read from
   `X-Forwarded-For` (default) or `Forwarded` (`header => forwarded`).
   Set exactly one trust mode: `trusted_proxies => [CIDR]` (for example
-  `[~"10.0.0.0/8"]`; `/0` is refused) or `trusted_hops => N`. The
+  `[~"10.0.0.0/8"]`; `/0` is refused; `~"unix:"` trusts the clients of a
+  Unix domain socket listener) or `trusted_hops => N`. The
   resolved address feeds `roadrunner_req:client_ip/1`, the `rate_limit`
   key, and `client_ip` in logger and telemetry metadata. Use
   `trusted_hops` only when clients can reach the listener through the
@@ -598,8 +604,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   (`period` default 1, `burst` default `rate`, `sweep_interval` default
   10000). A client over the rate gets `429 Too Many Requests` with
   `Retry-After` before the handler runs. Keyed on the real client IP;
-  an IPv6 client is keyed by its /64. A route can add its own rate on
-  top (`roadrunner_router:rate_limit()`).
+  an IPv6 client is keyed by its /64. On a Unix domain socket the
+  requests with no client address share one bucket. A route can add its
+  own rate on top (`roadrunner_router:rate_limit()`).
 - `hibernate_after`: when set, idle conns hibernate after this
   many milliseconds of main-loop idle time, which sweeps and shrinks
   the conn's heap. A `t:positive_timeout_ms/0`, or `infinity` (the
@@ -768,7 +775,8 @@ ops-tuning rationale.
     %% header. Exactly one trust mode: `trusted_proxies` lists the proxies'
     %% addresses as CIDR binaries (`~"10.0.0.0/8"`, `~"2001:db8::/32"`, or a
     %% bare address for one host; `/0`, or `::ffff:0.0.0.0/96` for all of
-    %% IPv4, is refused, as it would trust hops a client writes), or
+    %% IPv4, is refused, as it would trust hops a client writes; `~"unix:"`
+    %% trusts the clients of a listener on a Unix domain socket), or
     %% `trusted_hops => N` trusts the `N` nearest hops
     %% whatever their address, for platforms that don't publish their proxy
     %% addresses. `header` reads `x_forwarded_for` (the default) or
@@ -2834,6 +2842,11 @@ build_proto_opts(Opts, ListenerName) ->
                     roadrunner_real_ip:compile(RealIpOpts);
                 #{} ->
                     undefined
+            end,
+        unix_socket =
+            case Opts of
+                #{ip := {local, _}} -> true;
+                #{} -> false
             end
     },
     maybe_tls_upgrade(flatten_protocol_opts(Entries, Base), Opts, Protocols).
