@@ -783,6 +783,19 @@ Only the calls the grace cuts short fail, reset with `CANCEL`; new calls
 go to the new connection. Their `grpc_call_stop` says so with the reason
 `connection_age_grace` (see [Telemetry](#telemetry)).
 
+A response the client takes nothing of is not kept waiting for good: a
+stream whose response has waited `send_stall_timeout` (60 s unless set)
+for a client that keeps its flow-control window shut is reset with
+`CANCEL`. A gRPC client may hold a server stream's window shut on purpose
+while it is busy; for clients that consume a stream that slowly, raise it
+or set it to `infinity`:
+
+```erlang
+protocols => [{http2, #{send_stall_timeout => 600_000}}]
+```
+
+HTTP/3 has no such timeout yet.
+
 ## Telemetry
 
 Each call emits events to roadrunner's event handler (see
