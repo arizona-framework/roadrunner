@@ -325,7 +325,16 @@ How a gRPC call ended, as carried by `grpc_call_stop`, with the
   connection went away before it could read the call's status: a write
   or read failed with it, or it was seen before a Trailers-Only status,
   which goes out without waiting (including when `roadrunner_grpc:info/2`
-  or `cancelled/2` told the method); `Status` is `cancelled`
+  or `cancelled/2` told the method); `Status` is `cancelled`. A
+  connection process that crashed or was killed is reported so too, as
+  it leaves no word of why the call's stream went
+- `send_stall`: as `cancelled`, but roadrunner reset the stream itself,
+  the client having held the call's response back for the listener's
+  `send_stall_timeout`; `Status` is `cancelled`, as the client reads the
+  reset (`CANCEL`)
+- `connection_age_grace`: as `send_stall`, but the call was still
+  running as the `connection_age` grace ran out, which reset its stream;
+  `Status` is `cancelled`
 - `deadline`: as `cancelled`, but from 50 ms before the call's
   `grpc-timeout` ran out on: roadrunner cancelled it a second after the
   deadline, or the client did at its own deadline; `Status` is
@@ -343,7 +352,8 @@ How a gRPC call ended, as carried by `grpc_call_stop`, with the
   what a gRPC client reads then: `unknown` before a response started
   (an HTTP `500`), `internal` after (a stream ended without trailers)
 """.
--type grpc_stop_reason() :: normal | error | cancelled | deadline | stopped.
+-type grpc_stop_reason() ::
+    normal | error | cancelled | send_stall | connection_age_grace | deadline | stopped.
 
 -doc """
 A gRPC call's messages: `{Received, ReceivedBytes, Sent, SentBytes}`,

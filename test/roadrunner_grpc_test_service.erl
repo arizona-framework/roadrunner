@@ -292,7 +292,9 @@ read_watch_late(Request, Stream) ->
 %% The keys the call keeps in its process dictionary, sorted, after
 %% `cancelled/2` told it a reset arrived when the request is `cancelled`.
 keys(Request, Stream) ->
-    _ = Request =:= ~"cancelled" andalso roadrunner_grpc:cancelled({h2_stream_reset, 1}, Stream),
+    _ =
+        Request =:= ~"cancelled" andalso
+            roadrunner_grpc:cancelled({h2_stream_reset, 1, peer}, Stream),
     {reply, term_to_binary(lists:sort([Key || {{roadrunner_grpc, Key}, _} <- get()])), Stream}.
 
 %% `Sum`, reading with `recv_async/1` and `info/2`. Asking twice before a

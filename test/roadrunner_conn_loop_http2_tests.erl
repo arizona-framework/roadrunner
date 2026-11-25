@@ -3082,7 +3082,7 @@ synthetic_send_data_after_reset() ->
     %% Open a stream, then RST it. Stream is removed from the
     %% map. Sending a synthetic `h2_send_data` for that stream id
     %% takes the not_open branch in `handle_send_data/7` and
-    %% returns `{h2_stream_reset, _}` to the would-be worker.
+    %% returns `{h2_stream_reset, _, _}` to the would-be worker.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
@@ -3100,7 +3100,7 @@ synthetic_send_data_after_reset() ->
     DRef = make_ref(),
     ConnPid ! {h2_send_data, self(), DRef, 1, ~"x", 1, false},
     receive
-        {h2_stream_reset, 1} -> ok
+        {h2_stream_reset, 1, peer} -> ok
     after 500 -> error(no_reset)
     end,
     cleanup(Pid, Ref).
@@ -3123,7 +3123,7 @@ synthetic_send_headers_after_reset() ->
     DRef = make_ref(),
     ConnPid ! {h2_send_headers, self(), DRef, 1, 200, [], true},
     receive
-        {h2_stream_reset, 1} -> ok
+        {h2_stream_reset, 1, peer} -> ok
     after 500 -> error(no_reset)
     end,
     cleanup(Pid, Ref).
@@ -3152,7 +3152,7 @@ synthetic_send_response_after_reset() ->
     serve_recv(ConnPid, Ping),
     ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
     receive
-        {h2_stream_reset, 1} -> error(unexpected_reset)
+        {h2_stream_reset, 1, _} -> error(unexpected_reset)
     after 0 -> ok
     end,
     cleanup(Pid, Ref).
@@ -3175,7 +3175,7 @@ synthetic_send_trailers_after_reset() ->
     DRef = make_ref(),
     ConnPid ! {h2_send_trailers, self(), DRef, 1, []},
     receive
-        {h2_stream_reset, 1} -> ok
+        {h2_stream_reset, 1, peer} -> ok
     after 500 -> error(no_reset)
     end,
     cleanup(Pid, Ref).
@@ -3208,7 +3208,7 @@ synthetic_send_data_to_closed_stream() ->
     DRef2 = make_ref(),
     ConnPid ! {h2_send_data, self(), DRef2, 1, ~"x", 1, false},
     receive
-        {h2_stream_reset, 1} -> ok
+        {h2_stream_reset, 1, peer} -> ok
     after 500 -> error(no_reset)
     end,
     cleanup(Pid, Ref).
@@ -3688,7 +3688,7 @@ rst_during_stream_response_unwinds_worker() ->
     %% A `{stream, _}` handler pauses mid-response. Peer sends
     %% RST_STREAM during the pause. Conn's `reset_stream/2` tells
     %% the worker; the worker is parked in `sync/2` waiting for
-    %% the next ack — the `{h2_stream_reset, _}` arm fires and the
+    %% the next ack — the `{h2_stream_reset, _, _}` arm fires and the
     %% worker exits with reason `stream_reset`. Conn's
     %% `handle_worker_down/4` observes the non-normal exit and
     %% emits `RST_STREAM(internal_error)` (no-op for the peer

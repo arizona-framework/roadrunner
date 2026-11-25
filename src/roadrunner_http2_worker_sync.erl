@@ -6,7 +6,9 @@
 %% `roadrunner_http2_stream_worker:send_buffered/5`).
 %% `sync/2` sends a frame request to the conn (via `SendFun`) and blocks
 %% for the conn's `{h2_send_ack, Ref}`; a conn-side stream reset
-%% (`{h2_stream_reset, _}`) exits the worker with `stream_reset`.
+%% (`{h2_stream_reset, _, Why}`) exits the worker with `stream_reset`,
+%% the reset put back in the mailbox for the code the exit unwinds to
+%% learn why (`roadrunner_grpc` reports a call the server cut).
 %%
 %% `monitor_conn/1` is called once per worker by the stream / loop
 %% emitters, before their first sync (a buffered response never waits on
@@ -31,9 +33,13 @@ sync(ConnPid, SendFun) ->
     Ref = make_ref(),
     ok = SendFun(Ref),
     receive
-        {h2_send_ack, Ref} -> ok;
-        {h2_stream_reset, _StreamId} -> exit(stream_reset);
-        {'DOWN', _MonRef, process, ConnPid, _Reason} -> exit(conn_down)
+        {h2_send_ack, Ref} ->
+            ok;
+        {h2_stream_reset, _StreamId, _Why} = Reset ->
+            _ = (self() ! Reset),
+            exit(stream_reset);
+        {'DOWN', _MonRef, process, ConnPid, _Reason} ->
+            exit(conn_down)
     end.
 
 %% Send a HEADERS frame for `StreamId` and wait for the conn's ack.

@@ -245,7 +245,7 @@
     %% Worker monitor ref => StreamId, for correlating `'DOWN'`.
     worker_refs = #{} :: #{reference() => non_neg_integer()},
     %% StreamId => worker pid, so a peer reset of a dispatched stream can
-    %% be routed to its worker (`{roadrunner_stream_reset, _}`).
+    %% be routed to its worker (`{roadrunner_stream_reset, _, _}`).
     worker_pids = #{} :: #{non_neg_integer() => pid()},
     %% Dispatched streams whose response was cancelled (`cancel_response/2`):
     %% released to the QUIC connection once their worker ends
@@ -1378,7 +1378,7 @@ handle_stream_reset(#h3{uni = Uni} = State0, StreamId) ->
                     %% exit then releases the slot and drops the stream via
                     %% `handle_worker_down/3`.
                     ok = cancel_response(State, StreamId),
-                    _ = (WorkerPid ! {roadrunner_stream_reset, StreamId}),
+                    _ = (WorkerPid ! {roadrunner_stream_reset, StreamId, peer}),
                     Cancelled = State#h3.cancelled,
                     reading_reset(State#h3{cancelled = Cancelled#{StreamId => []}}, StreamId);
                 _ ->
@@ -1415,7 +1415,7 @@ handle_stop_sending(#h3{streams = Streams, worker_pids = WorkerPids} = State, St
     ok = release_unwritten(State, StreamId),
     case WorkerPids of
         #{StreamId := WorkerPid} ->
-            _ = (WorkerPid ! {roadrunner_stream_reset, StreamId}),
+            _ = (WorkerPid ! {roadrunner_stream_reset, StreamId, peer}),
             Cancelled = State#h3.cancelled,
             reading_stopped(State#h3{cancelled = Cancelled#{StreamId => []}}, StreamId);
         #{} ->
@@ -1442,7 +1442,7 @@ cancel_stream(#h3{worker_pids = WorkerPids, cancelled = Cancelled} = State, Stre
     case WorkerPids of
         #{StreamId := WorkerPid} when not is_map_key(StreamId, Cancelled) ->
             ok = cancel_response(State, StreamId),
-            _ = (WorkerPid ! {roadrunner_stream_reset, StreamId}),
+            _ = (WorkerPid ! {roadrunner_stream_reset, StreamId, deadline}),
             reading_stopped(State#h3{cancelled = Cancelled#{StreamId => []}}, StreamId);
         #{} ->
             State

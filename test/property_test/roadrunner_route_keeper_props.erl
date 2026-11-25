@@ -261,7 +261,7 @@ step({reset, N}, Model) ->
             Model;
         Waiting ->
             Pid = lists:nth(N rem length(Waiting) + 1, Waiting),
-            Pid ! {reset, Pid},
+            Pid ! {reset, Pid, peer},
             settle(apply_result(receive_result(Pid), Model))
     end;
 step({race_reset, N, M}, Model) ->
@@ -270,7 +270,7 @@ step({race_reset, N, M}, Model) ->
             Waiter = lists:nth(N rem length(Waiting) + 1, Waiting),
             Holder = lists:nth(M rem length(Running) + 1, Running),
             Model1 = release(Holder, Model),
-            Waiter ! {reset, Waiter},
+            Waiter ! {reset, Waiter, peer},
             settle(apply_result(receive_result(Waiter), Model1));
         _ ->
             Model

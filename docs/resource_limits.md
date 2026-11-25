@@ -266,7 +266,8 @@ own window counts from when nothing more was sent on it; one waiting
 for the connection window counts from when no DATA at all went out on
 the connection, so the streams queued behind one the client is reading
 are not reset. Its handler, if it is still sending, stops as on a client
-reset, and keeps its in-flight slot until it ends. Each DATA frame sent
+reset, and keeps its in-flight slot until it ends. A gRPC call reset so
+ends `CANCELLED` with the stop reason `send_stall` (see the [gRPC guide](grpc.md#telemetry)). Each DATA frame sent
 starts the wait over, so a slow client that keeps reading is not reset,
 nor is a stream with nothing to send, such as an event stream between
 events. A minute with nothing read is far longer than a client that is
@@ -282,7 +283,8 @@ within `grace` (`infinity` unless set), after which they are reset with
 `CANCEL`. Behind a load balancer this moves long-lived clients onto
 servers added since they connected. `listener_conn_close` carries the
 reason `connection_age`, or `connection_age_grace` when the grace ran
-out.
+out. A gRPC call the grace cuts short ends `CANCELLED` with the stop
+reason `connection_age_grace`.
 
 A request whose header block (HEADERS plus its CONTINUATION frames) is
 over `max_header_block`, or whose decoded headers are over the

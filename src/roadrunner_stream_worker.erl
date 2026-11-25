@@ -12,7 +12,7 @@
 
 -export([run/7]).
 -export([conn_heap_floor/1, heap_floor/3, spawn_opts/2]).
--export_type([conn_heap_floor/0, heap_floor/0, peer_limit/0]).
+-export_type([conn_heap_floor/0, heap_floor/0, peer_limit/0, reset_why/0]).
 
 %% Where a `{send, ...}` fun's worker keeps its reductions as its streamed
 %% body starts, and the most that body may take for the worker to still
@@ -24,6 +24,16 @@
 %% SETTINGS_MAX_HEADER_LIST_SIZE, HTTP/3 SETTINGS_MAX_FIELD_SECTION_SIZE),
 %% or `infinity` when it set none.
 -type peer_limit() :: non_neg_integer() | infinity.
+
+%% Why a connection reset a stream, the last element of the message it
+%% tells the stream's worker (`{h2_stream_reset, StreamId, Why}` over
+%% HTTP/2, `{roadrunner_stream_reset, StreamId, Why}` over HTTP/3): the
+%% client reset it, or its connection is closing for a reason of its own
+%% (`peer`); the worker's deadline passed
+%% (`roadrunner_send_writer:cancel_after/2`, `deadline`); the client held
+%% the stream's response back for `send_stall_timeout` (`send_stall`); or
+%% the `connection_age` grace ran out (`connection_age_grace`).
+-type reset_why() :: peer | deadline | send_stall | connection_age_grace.
 
 %% The heap floor of a connection: the min_heap_size it starts its stream
 %% workers at, in an atomics cell its workers raise (see conn_heap_floor/1).
@@ -359,9 +369,10 @@ route_slot(_Limits, _Protocol, _Conn, _StreamId) ->
 slot_owner(h2, Conn) -> Conn;
 slot_owner(h3, _Conn) -> roadrunner_http3_stream_worker:loop().
 
-%% The message the connection sends a worker whose stream was reset.
+%% The tag and stream id of the message the connection sends a worker
+%% whose stream was reset, `{Tag, StreamId, Why}` (`reset_why()`).
 -spec stream_reset(h2 | h3, non_neg_integer()) ->
-    {h2_stream_reset, non_neg_integer()} | {roadrunner_stream_reset, non_neg_integer()}.
+    {h2_stream_reset | roadrunner_stream_reset, non_neg_integer()}.
 stream_reset(h2, StreamId) -> {h2_stream_reset, StreamId};
 stream_reset(h3, StreamId) -> {roadrunner_stream_reset, StreamId}.
 
@@ -595,7 +606,7 @@ send_emit(Worker, Protocol, Conn, StreamId, Handler, HeapFloor) ->
     end.
 
 %% A timer that has the loop holding the stream cancel it: the h2
-%% connection (`roadrunner_conn_loop_http2:cancel_stream/2`), or the h3 loop
+%% connection (`roadrunner_conn_loop_http2:cancel_stream/3`), or the h3 loop
 %% the worker was started from (`roadrunner_conn_loop_http3`), as an h3
 %% worker's `Conn` is the QUIC connection.
 -spec cancel_after(h2 | h3, pid(), non_neg_integer(), non_neg_integer()) ->

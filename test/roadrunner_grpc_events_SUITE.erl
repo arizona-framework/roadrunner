@@ -32,6 +32,10 @@ call emitted.
     client_cancels_a_write/1,
     client_cancels_a_read/1,
     connection_gone/1,
+    connection_killed/1,
+    send_stall_resets/1,
+    connection_age_grace_resets/1,
+    connection_age_grace_resets_without_linger/1,
     deadline_cancels/1,
     deadline_ends_a_read/1,
     compressed/1,
@@ -100,6 +104,10 @@ groups() ->
             client_cancels_a_write,
             client_cancels_a_read,
             connection_gone,
+            connection_killed,
+            send_stall_resets,
+            connection_age_grace_resets,
+            connection_age_grace_resets_without_linger,
             deadline_cancels,
             deadline_ends_a_read,
             compressed,
@@ -143,7 +151,7 @@ init_per_testcase(Case, Config) ->
     Protocols =
         case atom_to_list(Case) of
             "h3_" ++ _ -> [http3];
-            _ -> [http2]
+            _ -> [{http2, http2_opts(Case)}]
         end,
     {ok, _} = roadrunner_listener:start_link(?MODULE, (tls(Protocols))#{
         port => 0,
@@ -170,6 +178,17 @@ middlewares(reset_in_a_slow_middleware_is_the_deadline) ->
     ];
 middlewares(_Case) ->
     [].
+
+%% The HTTP/2 options a case runs with: a short `send_stall_timeout`, or a
+%% `connection_age` whose grace runs out while a call still runs.
+http2_opts(send_stall_resets) ->
+    #{send_stall_timeout => 300};
+http2_opts(connection_age_grace_resets) ->
+    #{connection_age => #{max => 200, grace => 200}};
+http2_opts(connection_age_grace_resets_without_linger) ->
+    #{connection_age => #{max => 200, grace => 200}, linger_timeout => 0};
+http2_opts(_Case) ->
+    #{}.
 
 tls([http3]) -> #{tls => roadrunner_test_certs:server_opts()};
 tls(_Protocols) -> #{}.
@@ -362,6 +381,40 @@ connection_gone(Config) ->
     {stop, _, Md} = ending(Pid),
     ?assertMatch(#{status := cancelled, reason := cancelled}, Md).
 
+%% A connection process killed leaves no word of why the call's stream
+%% went: the call is reported `cancelled`, as for a client gone.
+connection_killed(Config) ->
+    _ = flood(Config, []),
+    {Pid, _Start} = started(),
+    {monitors, Monitors} = erlang:process_info(Pid, monitors),
+    [Conn] = lists:usort([P || {process, P} <- Monitors]),
+    true = exit(Conn, kill),
+    {stop, _, Md} = ending(Pid),
+    ?assertMatch(#{status := cancelled, message := <<>>, reason := cancelled}, Md).
+
+%% A call whose client holds its window shut for the `send_stall_timeout`
+%% is reset by roadrunner: `send_stall`, with the status the client reads
+%% from the reset (`CANCEL`).
+send_stall_resets(Config) ->
+    _ = flood(Config, []),
+    {Pid, _Start} = started(),
+    {stop, M, Md} = ending(Pid),
+    ?assertMatch(#{status := cancelled, message := <<>>, reason := send_stall}, Md),
+    ?assert(maps:get(messages_sent, M) > 0).
+
+%% A call still running as the `connection_age` grace runs out is reset by
+%% roadrunner: `connection_age_grace`.
+connection_age_grace_resets(Config) ->
+    _ = flood(Config, []),
+    {Pid, _Start} = started(),
+    {stop, _, Md} = ending(Pid),
+    ?assertMatch(#{status := cancelled, message := <<>>, reason := connection_age_grace}, Md).
+
+%% Likewise when the connection closes without lingering, which would
+%% tell its calls nothing but its exit.
+connection_age_grace_resets_without_linger(Config) ->
+    connection_age_grace_resets(Config).
+
 %% A call still writing past its deadline is cancelled.
 deadline_cancels(Config) ->
     _ = flood(Config, [{~"grpc-timeout", ~"100m"}]),
@@ -405,7 +458,7 @@ cancelled_before_trailers_only(Config) ->
     Pid = held(),
     _ = roadrunner_grpc_test_client:reset(C, 1),
     ok = let_go(Pid, fun
-        ({h2_stream_reset, _}) -> true;
+        ({h2_stream_reset, _, _}) -> true;
         (_) -> false
     end),
     {stop, _, Md} = ending(Pid),
@@ -483,7 +536,7 @@ reset_in_a_slow_middleware_is_the_deadline(Config) ->
     end,
     _ = roadrunner_grpc_test_client:reset(C, 1),
     ok = let_go(Pid, fun
-        ({h2_stream_reset, _}) -> true;
+        ({h2_stream_reset, _, _}) -> true;
         (_) -> false
     end),
     {_, {stop, _, Md}} = ended(),
@@ -500,7 +553,7 @@ reset_before_the_deadline(Config, Before) ->
     Pid = held(),
     _ = roadrunner_grpc_test_client:reset(C, 1),
     ok = let_go(Pid, fun
-        ({h2_stream_reset, _}) -> true;
+        ({h2_stream_reset, _, _}) -> true;
         (_) -> false
     end),
     ending(Pid).
@@ -590,7 +643,7 @@ no_handler_cancelled_before_trailers_only(Config) ->
     MRef = monitor(process, Pid),
     _ = roadrunner_grpc_test_client:reset(C, 1),
     ok = let_go(Pid, fun
-        ({h2_stream_reset, _}) -> true;
+        ({h2_stream_reset, _, _}) -> true;
         (_) -> false
     end),
     receive
@@ -608,7 +661,7 @@ h3_cancelled_before_trailers_only(Config) ->
     Pid = held(),
     _ = roadrunner_quic_test_h3:cancel(Conn, StreamId),
     ok = let_go(Pid, fun
-        ({roadrunner_stream_reset, _}) -> true;
+        ({roadrunner_stream_reset, _, _}) -> true;
         (_) -> false
     end),
     {stop, _, Md} = ending(Pid),

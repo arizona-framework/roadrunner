@@ -343,10 +343,11 @@ acquire(#ceiling{slots = Slots} = Ceiling) ->
 %% that monitors it: the HTTP/2 connection, or HTTP/3's loop) frees it when
 %% the worker ends: one owned by `Owner` while that owner is registered and
 %% the route under half its ceiling, else through the keeper. Waiting, the
-%% worker also stops on `Reset`, the message that says its stream was
-%% reset, or when its connection process `Conn` goes: it returns `reset` and
-%% ends, which frees a slot granted in the meantime (the keeper watches it).
--spec acquire(ceiling(), term(), pid(), pid()) ->
+%% worker also stops on the message that says its stream was reset
+%% (`{Tag, StreamId, _Why}` for `Reset` `{Tag, StreamId}`), or when its
+%% connection process `Conn` goes: it returns `reset` and ends, which frees
+%% a slot granted in the meantime (the keeper watches it).
+-spec acquire(ceiling(), {atom(), term()}, pid(), pid()) ->
     {ok, token()} | {refused, pos_integer()} | reset.
 acquire(#ceiling{} = Ceiling, Reset, Conn, Owner) ->
     case take_owned(Ceiling, Owner) of
@@ -566,7 +567,7 @@ notify(#ceiling{regs = Regs}, K) ->
     end.
 
 %% A stream worker asks the keeper, which registers its owner.
--spec ask_worker(ceiling(), term(), pid(), pid()) ->
+-spec ask_worker(ceiling(), {atom(), term()}, pid(), pid()) ->
     {ok, token()} | {refused, pos_integer()} | reset.
 ask_worker(#ceiling{slots = Slots, counts = Counts} = Ceiling, Reset, Conn, Owner) ->
     ask_worker(
@@ -574,10 +575,10 @@ ask_worker(#ceiling{slots = Slots, counts = Counts} = Ceiling, Reset, Conn, Owne
     ).
 
 -spec ask_worker(
-    ceiling(), non_neg_integer() | undefined, pos_integer(), term(), pid(), pid()
+    ceiling(), non_neg_integer() | undefined, pos_integer(), {atom(), term()}, pid(), pid()
 ) ->
     {ok, token()} | {refused, pos_integer()} | reset.
-ask_worker(Ceiling, Rows, Max, Reset, Conn, Owner) ->
+ask_worker(Ceiling, Rows, Max, {ResetTag, ResetId}, Conn, Owner) ->
     case ask(Ceiling, {worker, Owner}, Rows, Max) of
         {asked, Token} ->
             ConnMon = erlang:monitor(process, Conn),
@@ -589,7 +590,7 @@ ask_worker(Ceiling, Rows, Max, Reset, Conn, Owner) ->
                         refuse(Ceiling);
                     {'DOWN', Token, process, _Keeper, _Reason} ->
                         keeper_gone(Ceiling);
-                    Reset ->
+                    {ResetTag, ResetId, _Why} ->
                         true = erlang:demonitor(Token, [flush]),
                         reset;
                     {'DOWN', ConnMon, process, Conn, _Reason} ->
