@@ -72,12 +72,12 @@ listener_listen_failure_returns_error_test() ->
     %% Bind listener A to an ephemeral port, then try to bind B to the
     %% same port — second listen() must fail with eaddrinuse.
     {ok, _} = roadrunner_listener:start_link(listener_test_busy_a, #{
-        port => 0, routes => roadrunner_hello_handler
+        port => 0, num_listen_sockets => 2, routes => roadrunner_hello_handler
     }),
     Port = roadrunner_listener:port(listener_test_busy_a),
     process_flag(trap_exit, true),
     Result = roadrunner_listener:start_link(listener_test_busy_b, #{
-        port => Port, routes => roadrunner_hello_handler
+        port => Port, num_listen_sockets => 2, routes => roadrunner_hello_handler
     }),
     ?assertMatch({error, _}, Result),
     ok = roadrunner_listener:stop(listener_test_busy_a).
@@ -101,6 +101,44 @@ listener_honors_num_acceptors_opt_test() ->
     }),
     ?assert(roadrunner_listener:port(listener_test_pool) > 0),
     ok = roadrunner_listener:stop(listener_test_pool).
+
+listener_port_sharing_test() ->
+    %% `SO_REUSEPORT` spreads a port's connections on Linux with either
+    %% backend, `SO_REUSEPORT_LB` on FreeBSD with the `inet` one only.
+    Sharing = fun roadrunner_listener:port_sharing/2,
+    ?assertEqual({reuseport, true}, Sharing({unix, linux}, inet)),
+    ?assertEqual({reuseport, true}, Sharing({unix, linux}, socket)),
+    ?assertEqual({reuseport_lb, true}, Sharing({unix, freebsd}, inet)),
+    ?assertEqual(none, Sharing({unix, freebsd}, socket)),
+    ?assertEqual(none, Sharing({unix, darwin}, inet)),
+    ?assertEqual(none, Sharing({win32, nt}, inet)).
+
+listener_checked_sharing_test() ->
+    %% Sharing needs the `socket` module the port check binds through; a
+    %% listener that wants one socket keeps one and shares nothing.
+    Shared = {reuseport, true},
+    ?assertEqual({Shared, 4}, roadrunner_listener:checked_sharing(Shared, 4, true)),
+    ?assertEqual({none, 1}, roadrunner_listener:checked_sharing(Shared, 4, false)),
+    ?assertEqual({none, 1}, roadrunner_listener:checked_sharing(Shared, 1, true)),
+    ?assertEqual({none, 1}, roadrunner_listener:checked_sharing(Shared, 1, false)),
+    ?assertEqual({none, 1}, roadrunner_listener:checked_sharing(none, 1, true)).
+
+listener_num_listen_sockets_test() ->
+    %% `auto` gives every acceptor a socket where the port can be shared,
+    %% except a TLS listener without a PROXY header first; a count is taken
+    %% as given there. One where the port cannot be shared, and for a Unix
+    %% domain socket, whatever the setting.
+    Shared = {reuseport, true},
+    Tls = roadrunner_test_certs:server_opts(),
+    Count = fun(Opts, Sharing) -> roadrunner_listener:num_listen_sockets(Opts, Sharing, 4) end,
+    ?assertEqual(4, Count(#{}, Shared)),
+    ?assertEqual(4, Count(#{num_listen_sockets => auto}, Shared)),
+    ?assertEqual(2, Count(#{num_listen_sockets => 2}, Shared)),
+    ?assertEqual(1, Count(#{tls => Tls}, Shared)),
+    ?assertEqual(3, Count(#{tls => Tls, num_listen_sockets => 3}, Shared)),
+    ?assertEqual(4, Count(#{tls => Tls, proxy_protocol => true}, Shared)),
+    ?assertEqual(1, Count(#{num_listen_sockets => 8}, none)),
+    ?assertEqual(1, Count(#{ip => {local, ~"/tmp/rr.sock"}, num_listen_sockets => 8}, Shared)).
 
 listener_honors_socket_backlog_opt_test() ->
     %% A custom `socket_backlog` must flow into `gen_tcp:listen` (the
@@ -427,6 +465,9 @@ listener_rejects_invalid_max_concurrent_requests_test() ->
 
 listener_rejects_invalid_num_acceptors_test() ->
     rejects(num_acceptors, [foo, 0]).
+
+listener_rejects_invalid_num_listen_sockets_test() ->
+    rejects(num_listen_sockets, [foo, 0, -1, 1.5]).
 
 listener_rejects_invalid_socket_backlog_test() ->
     rejects(socket_backlog, [foo, 0, -1]).
@@ -1380,7 +1421,10 @@ listener_socket_buffer_by_transport_test() ->
                 Name, Extra#{port => 0, routes => roadrunner_hello_handler}
             ),
             State = sys:get_state(ListenerPid),
-            ?assertEqual({ok, [{buffer, SocketBuffer}]}, listen_buffer(element(2, State))),
+            _ = [
+                ?assertEqual({ok, [{buffer, SocketBuffer}]}, listen_buffer(LSocket))
+             || LSocket <- element(2, State)
+            ],
             ?assertEqual(Grow, roadrunner_test_proto_opts:get(grow_recv_buffer, element(4, State))),
             ok = roadrunner_listener:stop(Name)
         end,

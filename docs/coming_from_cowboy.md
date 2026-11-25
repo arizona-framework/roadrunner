@@ -88,6 +88,7 @@ Common Ranch and Cowboy options and where they live in Roadrunner:
 | `{ip, IP}` | `ip => IP` |
 | `{backlog, N}` | `socket_backlog => N` |
 | `num_acceptors` | `num_acceptors` |
+| `num_listen_sockets` | `num_listen_sockets` (sets `SO_REUSEPORT` itself; `auto` binds one per acceptor on Linux and FreeBSD, one on a TLS listener without `proxy_protocol`) |
 | `max_connections` | `max_clients` |
 | TLS options in the transport options | `tls => [...]` |
 | `max_keepalive` | `max_keep_alive_requests` |

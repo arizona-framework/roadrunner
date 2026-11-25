@@ -356,18 +356,19 @@ handlers that never fall behind, and it is new API.
 
 ### Cheaper accepts under load — medium
 
-**What:** acceptors run at high priority by default (`accept_priority`),
-so a busy server takes new connections from the kernel queue promptly.
-Each accept still gives up the scheduler a few times
-(`controlling_process` and the inet port calls on the shared listen
-socket), and on a TLS listener it also waits on the `ssl` application's
-own processes, which run at normal priority. Two ways to remove most of
-that cost: the acceptor becomes the connection and spawns its
-replacement (no handoff), or one listen socket per scheduler with
-`reuseport`.
+**What:** acceptors run at high priority by default (`accept_priority`)
+and, on a plain-TCP listener on Linux or FreeBSD, each has a listen
+socket of its own (`num_listen_sockets`), so a busy server takes new
+connections in promptly and in parallel. Each accept still costs the acceptor a few
+round trips: `gen_tcp:accept` reads 11 options off the listen socket and
+writes them to the new one, and `controlling_process` hands the socket
+over; on a TLS listener it also waits on the `ssl` application's own
+processes, which run at normal priority. The acceptor could become the
+connection and spawn its replacement instead (no handoff).
 
-**Why deferred:** high priority already removes most of the wait on
-plain TCP; both remaining options change the acceptor pool's design.
+**Why deferred:** the listen sockets already remove the shared-socket
+wait; the remaining cost is per connection, and removing it changes the
+acceptor pool's design.
 
 **Scope:** medium.
 

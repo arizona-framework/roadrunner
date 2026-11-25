@@ -396,7 +396,8 @@ table.
 
 | Limit | Default | Configurable | Purpose |
 |---|---|---|---|
-| `socket_backlog` | 1024 | yes | TCP listen backlog (kernel SYN/accept queue depth) |
+| `socket_backlog` | 1024 | yes | TCP listen backlog (kernel SYN/accept queue depth) of each listen socket |
+| `num_listen_sockets` | `auto`: one per acceptor on Linux and FreeBSD, one on a TLS listener without `proxy_protocol` and elsewhere | yes | how many listen sockets share the TCP port, so new connections do not queue on one; see [Listen sockets](#listen-sockets) |
 | `accept_priority` | `high` | yes | how quickly new connections leave the kernel queue under load (TCP only); see [Accepting connections](#accepting-connections) |
 | `recv_buffer` | 64 KB | yes | the most one read takes: every read on TLS, a plain-TCP connection once a large request body comes in, a large WebSocket frame |
 | `idle_recv_buffer` | 4 KB | yes | the read buffer a plain-TCP connection starts with, and what it holds while it waits for the next request or message |
@@ -549,9 +550,10 @@ starts new ones when they change.
 ## Accepting connections
 
 A new connection reaches roadrunner in two steps. First the kernel
-completes the TCP handshake and puts the connection in the listen
+completes the TCP handshake and puts the connection in a listen
 socket's queue, which holds up to `socket_backlog` connections (Linux
-caps it at `net.core.somaxconn`). From that moment the client sees
+caps it at `net.core.somaxconn`; see [Listen sockets](#listen-sockets)
+for listeners with several). From that moment the client sees
 itself as connected, and it has often sent its first request already.
 Then one of roadrunner's acceptors takes the connection from the queue
 and starts a process to serve it. Until that second step the server
@@ -633,13 +635,85 @@ roadrunner:start_listener(api, #{
 
 On HTTP/1.1, two settings decide how many clients get in: `max_clients`
 caps the connections being served, and `socket_backlog` caps the
-connections waiting in the kernel queue. `max_concurrent_requests` does
+connections waiting in each listen socket's kernel queue. `max_concurrent_requests` does
 not limit HTTP/1.1 connections. In its default `refuse` mode and in
 `queue` mode it only counts HTTP/2 and HTTP/3 requests. In `shed` mode
 it counts HTTP/1.1 requests too, but it answers the ones over the
 ceiling with a `503`. It does not keep their connections out. See
 [Connection and slow-client guards](#connection-and-slow-client-guards)
 for these options.
+
+### Listen sockets
+
+One listen socket hands out its connections one at a time: the
+acceptors on it take turns to take the next one. On a server with many
+cores and many new connections a second, that is the limit on how fast
+the listener takes clients in. Once new connections arrive faster than
+that, the queue fills, and every new client waits in it with its first
+request sent, for as long as it takes the acceptors to reach it: the
+number of clients ahead of it divided by the rate they are taken at. A
+fleet of clients that open thousands of connections and reconnect
+after a few requests sees it as a slow first request on every
+connection, while the rest are fast.
+
+`num_listen_sockets` binds several listen sockets to the port instead.
+The kernel spreads new connections over them, and each socket has its
+own queue and its own acceptors, so connections are taken in parallel.
+That needs a kernel that spreads a port's connections over the sockets
+bound to it: Linux (`SO_REUSEPORT`), and FreeBSD with the default
+`inet` backend (`SO_REUSEPORT_LB`). Elsewhere, and for a Unix domain
+socket, a listener binds one socket whatever the setting.
+
+The default, `auto`, binds one socket per acceptor (`num_acceptors`),
+except on a TLS listener without `proxy_protocol`, which binds one. OTP
+keeps the TLS session cache and the TLS 1.3 ticket keys of a TLS
+listener per listen socket, so with several sockets a returning client
+mostly reaches another socket and makes a full handshake instead of
+resuming its session. A TLS listener behind the PROXY protocol
+(`proxy_protocol => true`) keeps one socket per acceptor: its sockets
+are plain TCP until each connection starts TLS, so they do not split
+the session cache. Set a count on a TLS listener only when session
+resumption does not matter, or with TLS 1.3 stateless tickets that
+every socket can read: `{session_tickets, stateless}` and one
+`{stateless_tickets_seed, Seed}` in `tls` (TLS 1.2 session IDs stay per
+socket).
+
+Every socket gets at least one acceptor, so a `num_listen_sockets`
+above `num_acceptors` raises the acceptor count to it. A connection the
+kernel puts in one socket's queue waits for that socket's acceptors,
+even when another socket's are free. They run at high priority
+(`accept_priority`), so each queue is taken from promptly. With `auto`
+each socket has one acceptor, so an acceptor whose scheduler is stuck
+(in a long NIF, say) can delay the new connections that land on its
+socket.
+
+`socket_backlog` applies to each socket, so the kernel holds up to
+`num_listen_sockets` times `socket_backlog` connections waiting. Lower
+`socket_backlog` if that total matters more than how well each queue
+absorbs a burst. When the listener stops, connections still waiting in
+those queues are dropped, as with one socket.
+
+The listener checks that the port is free before it binds, so a
+listener started on a port that something already holds fails with
+`eaddrinuse`. That check only sees sockets bound at start.
+`SO_REUSEPORT` lets any program of the same OS user that sets it join
+the port later and take a share of its connections: HAProxy, Envoy, or
+nginx with `reuseport`, for example. The check and the binding are also
+two steps, so two instances started at the same moment on one host
+(overlapping restarts, or replicas on host networking) can both start
+and split the traffic. On a shared host or with host networking, use
+`num_listen_sockets => 1` or run each program as its own user. A
+container with its own network namespace (Docker bridge networking, a
+Kubernetes pod) is not affected.
+
+```erlang
+%% One listen socket, as on systems that cannot share a port.
+roadrunner:start_listener(api, #{
+    port => 8080,
+    routes => my_handler,
+    num_listen_sockets => 1
+}).
+```
 
 ## Bounding total memory
 

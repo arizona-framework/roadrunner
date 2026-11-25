@@ -1,6 +1,6 @@
 -module(roadrunner_listener).
 -moduledoc """
-Listener gen_server — owns the listening socket and the acceptor pool
+Listener gen_server — owns the listen sockets and the acceptor pool
 for one named roadrunner instance.
 
 Plain TCP is backed by `gen_tcp` with the legacy `inet_drv` backend.
@@ -10,11 +10,12 @@ per-socket-option lookups. TLS is backed by `ssl`, gated by the
 `tls` opt.
 Both paths share the same `roadrunner_transport` tagged-socket abstraction.
 
-On `init/1` the listener opens the listen socket, builds the shared
+On `init/1` the listener opens its listen sockets (`num_listen_sockets`,
+several sharing the port where the system allows it), builds the shared
 connection options (dispatch + body limits + timeouts + `max_clients`
-counter), and spawn-links `num_acceptors` (default: one per
-online scheduler, at most 10)
-`roadrunner_acceptor` processes that pull from the same listen socket.
+counter), and spawn-links its `roadrunner_acceptor` processes
+(`num_acceptors`, default one per online scheduler, at most 10, and at
+least one per listen socket), dealt over the sockets.
 Connection workers are unlinked from the acceptor so a single
 connection crash doesn't take the pool down.
 
@@ -50,6 +51,8 @@ reason (a bad route or middleware entry has an error of its own).
 -export([resolve_quic_port/3]).
 %% Exported for a direct test of the socket options on each OS.
 -export([send_opts/3]).
+%% Exported for a direct test of the listen socket count on each system.
+-export([port_sharing/2, checked_sharing/3, num_listen_sockets/3]).
 
 -export_type([
     opts/0,
@@ -342,10 +345,43 @@ Optional middleware and timing knobs (durations in milliseconds):
   waiting on a response keeps it open, as RFC 9114 §5.1 expects of it,
   while the server does not). Default 60 s, a `t:timeout_ms/0`.
 - `num_acceptors`: size of the acceptor pool. Default: one per online
-  scheduler, at most 10. Every acceptor waits on the same listen socket, so
-  more acceptors than schedulers only adds contention: on one or two
-  schedulers, matching them accepts more connections a second than 10
-  does, with lower tail latency.
+  scheduler, at most 10. Acceptors on the same listen socket contend for
+  it (with one socket, all of them do), so more acceptors than
+  schedulers only adds contention: on one or two schedulers, matching
+  them accepts more connections a second than 10 does, with lower tail
+  latency.
+- `num_listen_sockets`: how many listen sockets the TCP side binds to
+  its port, `auto` (the default) or a positive integer. The sockets
+  share the port, the kernel spreads new connections over them, and
+  each socket has acceptors of its own, so taking connections in does
+  not queue on one socket. Sharing needs a kernel that spreads a port's
+  connections over its sockets: Linux (`SO_REUSEPORT`), and FreeBSD with
+  the default `inet` backend (`SO_REUSEPORT_LB`). Elsewhere, and for a
+  Unix domain socket, the listener binds one socket whatever the value.
+  `auto` binds one socket per acceptor, except on a TLS listener without
+  `proxy_protocol`, which binds one: OTP keeps the TLS session cache and
+  the TLS 1.3 ticket keys per listen socket, so with several sockets a
+  returning client mostly reaches another socket and cannot resume its
+  session. Give a TLS listener a count only when resumption does not
+  matter, or with TLS 1.3 stateless tickets that every socket can read:
+  `{session_tickets, stateless}` and one `{stateless_tickets_seed, Seed}`
+  in `tls`. Every socket gets at
+  least one acceptor, so a count above `num_acceptors` raises the
+  acceptor count to it, and `socket_backlog` applies to each socket.
+  With `auto` each socket has one acceptor, so an acceptor whose
+  scheduler is stuck (in a long NIF, say) can delay the new connections
+  that land on its socket. A listener started on a port that something
+  already holds fails with `eaddrinuse`, but that check runs only at
+  start. Any program of the same OS user that sets `SO_REUSEPORT` and
+  binds the port later (HAProxy, Envoy, or nginx with `reuseport`, for
+  example) joins it and takes a share of the connections, and two
+  listeners started at the same moment on one host can both start and
+  split the traffic. On a shared host or with host networking, use
+  `num_listen_sockets => 1` or run each program as its own user; a
+  container with its own network namespace is not affected. When the
+  listener stops, connections still waiting in the kernel queues are
+  dropped, as with one socket. See "Listen sockets" in
+  [Resource limits](resource_limits.md).
 - `accept_priority`: `high` (the default) or `normal`. At `high` the
   acceptors run at high process priority, so a new connection is taken
   from the kernel queue promptly even when the server is busy. While
@@ -482,9 +518,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   tick; with the reaper off (`graceful_drain => false`), it counts until
   the listener restarts.
 - `socket_backlog`: TCP listen backlog (kernel SYN/accept queue
-  depth). Default 1024. Raise it for connection bursts (load tests,
-  health-check storms); Linux clamps the effective value at
-  `net.core.somaxconn`.
+  depth) of each listen socket, so the kernel holds up to
+  `num_listen_sockets` times this many connections waiting. Default
+  1024. Raise it for connection bursts (load tests, health-check
+  storms); Linux clamps the effective value at `net.core.somaxconn`.
 - `send_timeout`: how long, in milliseconds, a write may wait for a
   client that takes none of it before the connection closes, or
   `infinity` for no limit. Default `60000` (60 s), the default
@@ -752,6 +789,7 @@ ops-tuning rationale.
     tls_handshake_timeout => positive_timeout_ms(),
     keep_alive_timeout => timeout_ms(),
     num_acceptors => pos_integer(),
+    num_listen_sockets => auto | pos_integer(),
     accept_priority => high | normal,
     max_keep_alive_requests => request_cap(),
     max_clients => pos_integer(),
@@ -1362,10 +1400,15 @@ An upgrade can set each of these for its own session
 %% A Unix domain socket's file, as `unix_socket_file/1` found it.
 -type unix_socket_file() :: {binary() | string(), non_neg_integer(), non_neg_integer()} | undefined.
 
+%% The option that lets a listener's listen sockets share its port and its
+%% new connections (`port_sharing/2`, `checked_sharing/3`), or `none` where
+%% the kernel or this OTP cannot.
+-type port_sharing() :: {reuseport | reuseport_lb, true} | none.
+
 -record(state, {
     %% `none` when the listener serves HTTP/3 only (no TCP socket);
-    %% `closed` after `drain/2` shuts the TCP socket on its way out.
-    listen_socket :: roadrunner_transport:socket() | closed | none,
+    %% `closed` after `drain/2` shuts the TCP sockets on its way out.
+    listen_sockets :: [roadrunner_transport:socket(), ...] | closed | none,
     port :: inet:port_number(),
     proto_opts :: roadrunner_conn:proto_opts(),
     phase = accepting :: accepting | draining | stopped,
@@ -1433,7 +1476,7 @@ stop(Name) ->
     gen_server:stop(Name).
 
 -doc """
-Graceful shutdown. Closes the listen socket immediately so no new
+Graceful shutdown. Closes the listen sockets immediately so no new
 connections are accepted, broadcasts `{roadrunner_drain, Deadline}` to
 every active conn, and then polls the live-connection counter until it
 hits zero or `Timeout` milliseconds elapse. Conns still alive at the
@@ -1600,7 +1643,7 @@ info(Name) ->
 Return the listener's lifecycle phase:
 
 - `accepting` — normal serving; new connections are being accepted.
-- `draining` — `drain/2` is in progress; the listen socket is
+- `draining` — `drain/2` is in progress; the listen sockets are
   closed and active conns are finishing.
 
 After `drain/2` (or `stop/1`) returns the listener has exited and
@@ -1678,17 +1721,17 @@ init(#{port := Port} = Opts) ->
     %% has no TCP socket (`none`), and a TCP-only listener no QUIC pid.
     QuicAcceptGate = new_quic_accept_gate(Protocols),
     case start_tcp(Port, Opts, Protocols, ProtoOpts) of
-        {ok, LSocket} ->
+        {ok, LSockets} ->
             UnixFile = unix_socket_file(Opts),
             case start_quic(Port, Opts, Protocols, ProtoOpts, QuicAcceptGate) of
                 {ok, QuicListener} ->
                     Reconciliation = setup_reconciliation(Opts),
                     ok = setup_rate_limit_sweep(ProtoOpts),
                     {ok, #state{
-                        listen_socket = LSocket,
+                        listen_sockets = LSockets,
                         unix_socket_file = UnixFile,
                         quic_listener = QuicListener,
-                        port = bound_port(Opts, LSocket, QuicListener),
+                        port = bound_port(Opts, LSockets, QuicListener),
                         proto_opts = ProtoOpts,
                         reconciliation = Reconciliation,
                         route_buckets = RouteBuckets,
@@ -1699,7 +1742,7 @@ init(#{port := Port} = Opts) ->
                 {error, Reason} ->
                     %% TCP bound but QUIC failed — release the TCP port
                     %% so the failed start doesn't leave it held.
-                    ok = close_tcp(LSocket, UnixFile),
+                    ok = close_tcp(LSockets, UnixFile),
                     ok = erase_routes(ProtoOpts),
                     {stop, {listen_failed, Reason}}
             end;
@@ -1720,29 +1763,182 @@ ensure_ssl_started(#{tls := _}) ->
 ensure_ssl_started(#{}) ->
     ok.
 
-%% Open the TCP listen socket + acceptor pool when the listener serves
+%% Open the TCP listen sockets + acceptor pool when the listener serves
 %% any TCP protocol (`http1`/`http2`). An HTTP/3-only listener skips
 %% the TCP socket entirely and returns `none`.
 -spec start_tcp(
     inet:port_number(), opts(), [protocol(), ...], roadrunner_conn:proto_opts()
-) -> {ok, roadrunner_transport:socket() | none} | {error, term()}.
+) -> {ok, [roadrunner_transport:socket(), ...] | none} | {error, term()}.
 start_tcp(Port, Opts, Protocols, ProtoOpts) ->
     case [P || P <- Protocols, P =/= http3] of
         [] ->
             {ok, none};
         TcpProtocols ->
-            case open_listen_socket(Port, Opts, TcpProtocols) of
-                {ok, LSocket} ->
-                    NumAcceptors =
-                        case Opts of
-                            #{num_acceptors := N} -> N;
-                            #{} -> default_num_acceptors()
-                        end,
-                    ok = spawn_acceptors(LSocket, ProtoOpts, NumAcceptors),
-                    {ok, LSocket};
+            Acceptors =
+                case Opts of
+                    #{num_acceptors := N} -> N;
+                    #{} -> default_num_acceptors()
+                end,
+            {OsType, _OsVersion} = listen_os(),
+            Sharing0 = port_sharing(OsType, application:get_env(kernel, inet_backend, inet)),
+            Wanted = num_listen_sockets(Opts, Sharing0, Acceptors),
+            %% Only a listener that shares its port asks whether this OTP
+            %% has the `socket` module its port check binds through.
+            {Sharing, NumSockets} = checked_sharing(
+                Sharing0,
+                Wanted,
+                Wanted > 1 andalso socket:is_supported(options, {socket, reuseaddr})
+            ),
+            case open_listen_sockets(Port, Opts, TcpProtocols, Sharing, NumSockets) of
+                {ok, LSockets} ->
+                    %% Every socket needs an acceptor, or the connections the
+                    %% kernel gives it would never be taken.
+                    ok = spawn_acceptors(LSockets, ProtoOpts, max(Acceptors, NumSockets)),
+                    {ok, LSockets};
                 {error, _} = Error ->
                     Error
             end
+    end.
+
+%% The socket option that lets the listener's sockets share its port and
+%% spreads new connections over them, or `none` where the kernel does not:
+%% `SO_REUSEPORT` does on Linux, with either `inet_backend`, and
+%% `SO_REUSEPORT_LB` (`reuseport_lb`, which the `socket` backend does not
+%% take) on FreeBSD. Exported for a direct test of each system.
+-doc false.
+-spec port_sharing({atom(), atom()}, inet | socket) -> port_sharing().
+port_sharing({unix, linux}, _Backend) -> {reuseport, true};
+port_sharing({unix, freebsd}, inet) -> {reuseport_lb, true};
+port_sharing(_OsType, _Backend) -> none.
+
+%% The sharing and socket count a listener ends up with: the port check
+%% before sharing (`port_free/2`) binds through the `socket` module, so an
+%% OTP built without it (`SocketModule` false) binds one socket. A listener
+%% that wants one socket does not ask. Exported for a direct test of each
+%% case.
+-doc false.
+-spec checked_sharing(port_sharing(), pos_integer(), boolean()) ->
+    {port_sharing(), pos_integer()}.
+checked_sharing(_Sharing, 1, _SocketModule) -> {none, 1};
+checked_sharing(Sharing, Wanted, true) -> {Sharing, Wanted};
+checked_sharing(_Sharing, _Wanted, false) -> {none, 1}.
+
+%% How many listen sockets the TCP side binds. One where the port cannot be
+%% shared (`port_sharing/2`) and for a Unix domain socket. `auto` gives every
+%% acceptor a socket of its own: acceptors on one socket take its
+%% connections one at a time, and under connection churn on a many-core
+%% server that single queue limits how many connections a second the
+%% listener takes in, while the ones not taken yet wait with their first
+%% request sent. A TLS listener (no PROXY header first) binds one under
+%% `auto`: OTP keeps the TLS session cache and the TLS 1.3 ticket keys per
+%% listen socket, so a client could not resume its session on another one.
+%% Exported for a direct test of each case.
+-doc false.
+-spec num_listen_sockets(unchecked_opts(), port_sharing(), pos_integer()) ->
+    pos_integer().
+num_listen_sockets(_Opts, none, _Acceptors) ->
+    1;
+num_listen_sockets(#{ip := {local, _}}, _Sharing, _Acceptors) ->
+    1;
+num_listen_sockets(#{num_listen_sockets := N}, _Sharing, _Acceptors) when is_integer(N) ->
+    N;
+num_listen_sockets(#{tls := _} = Opts, _Sharing, Acceptors) ->
+    case Opts of
+        #{proxy_protocol := true} -> Acceptors;
+        #{} -> 1
+    end;
+num_listen_sockets(#{}, _Sharing, Acceptors) ->
+    Acceptors.
+
+%% Bind the listen sockets. More than one share the port (`Sharing`), the
+%% first one binding `Port` (port 0 picks a free one) and the rest the port
+%% it got. A second listener on a port must fail to start, as it does when a
+%% single socket holds the port, instead of joining these sockets and taking
+%% a share of their connections, so a fixed port is checked first
+%% (`port_free/2`).
+-spec open_listen_sockets(
+    inet:port_number(),
+    opts(),
+    [http1 | http2, ...],
+    port_sharing(),
+    pos_integer()
+) ->
+    {ok, [roadrunner_transport:socket(), ...]} | {error, term()}.
+open_listen_sockets(Port, Opts, Protocols, _Sharing, 1) ->
+    case open_listen_socket(Port, Opts, Protocols, none) of
+        {ok, LSocket} -> {ok, [LSocket]};
+        {error, _} = Error -> Error
+    end;
+open_listen_sockets(Port, Opts, Protocols, Sharing, NumSockets) ->
+    maybe
+        ok ?= port_free(Port, Opts),
+        open_shared_listen_sockets(Port, Opts, Protocols, Sharing, NumSockets, [])
+    end.
+
+%% Bind `N` more sockets that share the port, each on the port the one
+%% before it got (so the first one's port when `Port` is 0). A failure closes
+%% the ones already bound, so a listener that fails to start holds none of
+%% them and its start returns the reason as a single socket's would.
+-spec open_shared_listen_sockets(
+    inet:port_number(),
+    opts(),
+    [http1 | http2, ...],
+    port_sharing(),
+    non_neg_integer(),
+    [roadrunner_transport:socket()]
+) -> {ok, [roadrunner_transport:socket()]} | {error, term()}.
+open_shared_listen_sockets(_Port, _Opts, _Protocols, _Sharing, 0, Bound) ->
+    {ok, Bound};
+open_shared_listen_sockets(Port, Opts, Protocols, Sharing, N, Bound) ->
+    case open_listen_socket(Port, Opts, Protocols, Sharing) of
+        {ok, LSocket} ->
+            {ok, BoundPort} = roadrunner_transport:port(LSocket),
+            open_shared_listen_sockets(
+                BoundPort, Opts, Protocols, Sharing, N - 1, [LSocket | Bound]
+            );
+        {error, _} = Error ->
+            _ = [ok = roadrunner_transport:close(S) || S <- Bound],
+            Error
+    end.
+
+%% Whether a socket that does not share the port could bind `Port` at the
+%% listener's address: `{error, eaddrinuse}` when something listens there,
+%% another listener's shared sockets included, which a socket that shares
+%% the port would join instead. `SO_REUSEADDR`, as the listener's own
+%% sockets set it, so connections of an earlier run waiting out TIME_WAIT
+%% do not count. The probe binds and closes without listening, so a client
+%% connecting meanwhile is refused, as it is by a free port. Port 0 always
+%% gets a free port.
+-spec port_free(inet:port_number(), opts()) -> ok | {error, term()}.
+port_free(0, _Opts) ->
+    ok;
+port_free(Port, Opts) ->
+    Ip = maps:get(ip, Opts, any),
+    Family =
+        case Ip of
+            {_, _, _, _, _, _, _, _} -> inet6;
+            _ -> inet
+        end,
+    maybe
+        {ok, Probe} ?= socket:open(Family, stream, tcp),
+        try
+            probe_bind(Probe, Family, Ip, Port, Opts)
+        after
+            socket:close(Probe)
+        end
+    end.
+
+-spec probe_bind(socket:socket(), inet | inet6, inet:socket_address(), inet:port_number(), opts()) ->
+    ok | {error, term()}.
+probe_bind(Probe, Family, Ip, Port, Opts) ->
+    maybe
+        ok ?= socket:setopt(Probe, {socket, reuseaddr}, true),
+        ok ?=
+            case Opts of
+                #{ipv6_v6only := V6Only} -> socket:setopt(Probe, {ipv6, v6only}, V6Only);
+                #{} -> ok
+            end,
+        socket:bind(Probe, #{family => Family, addr => Ip, port => Port})
     end.
 
 %% Start the native QUIC listener pool roadrunner owns when `http3` is
@@ -1870,13 +2066,13 @@ close_quic_probe(Probe) -> gen_udp:close(Probe).
 %% present (co-listen reuses the same number for UDP); an HTTP/3-only
 %% listener reads it back from the QUIC listener. A Unix domain socket has
 %% no port: `0`, the `port` it was given.
--spec bound_port(opts(), roadrunner_transport:socket() | none, pid() | undefined) ->
+-spec bound_port(opts(), [roadrunner_transport:socket(), ...] | none, pid() | undefined) ->
     inet:port_number().
-bound_port(#{ip := {local, _}}, _LSocket, _QuicListener) ->
+bound_port(#{ip := {local, _}}, _LSockets, _QuicListener) ->
     0;
 bound_port(_Opts, none, QuicPool) ->
     quic_pool_port(QuicPool);
-bound_port(_Opts, LSocket, _QuicListener) ->
+bound_port(_Opts, [LSocket | _], _QuicListener) ->
     {ok, BoundPort} = roadrunner_transport:port(LSocket),
     BoundPort.
 
@@ -1901,13 +2097,13 @@ new_quic_accept_gate(Protocols) ->
 close_quic_accept_gate(undefined) -> ok;
 close_quic_accept_gate(Gate) -> roadrunner_quic_listener:close_accept_gate(Gate).
 
--spec close_tcp(roadrunner_transport:socket() | none | closed, unix_socket_file()) -> ok.
+-spec close_tcp([roadrunner_transport:socket(), ...] | none | closed, unix_socket_file()) -> ok.
 close_tcp(none, _UnixFile) ->
     ok;
 close_tcp(closed, _UnixFile) ->
     ok;
-close_tcp(LSocket, UnixFile) ->
-    ok = roadrunner_transport:close(LSocket),
+close_tcp(LSockets, UnixFile) ->
+    _ = [ok = roadrunner_transport:close(LSocket) || LSocket <- LSockets],
     remove_unix_socket(UnixFile).
 
 %% The file a Unix domain socket listener made at its path when it bound,
@@ -2279,17 +2475,17 @@ listener_name() ->
     Name.
 
 -spec open_listen_socket(
-    inet:port_number(), opts(), [http1 | http2, ...]
+    inet:port_number(), opts(), [http1 | http2, ...], port_sharing()
 ) -> {ok, roadrunner_transport:socket()} | {error, term()}.
-open_listen_socket(Port, #{tls := _, proxy_protocol := true} = Opts, _Protocols) ->
+open_listen_socket(Port, #{tls := _, proxy_protocol := true} = Opts, _Protocols, Share) ->
     %% TLS behind a PROXY-protocol balancer: the header arrives in plaintext
     %% before the ClientHello, so the listen socket is plain TCP and the conn
     %% reads the header off the raw stream, then upgrades the socket with the
     %% `tls_upgrade` options carried in proto_opts (`maybe_tls_upgrade/3`).
     roadrunner_transport:listen(
-        Port, slice_sends(base_listen_opts(Opts, validate_recv_buffer(Opts)))
+        Port, slice_sends(share(Share, base_listen_opts(Opts, validate_recv_buffer(Opts))))
     );
-open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
+open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols, Share) ->
     %% TLS path — caller supplies cert/key. ALPN is derived from the
     %% normalized `protocols` list (`http2` → `~"h2"`, `http1` →
     %% `~"http/1.1"`) unless the user supplied
@@ -2299,9 +2495,10 @@ open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     %% top so accepted sockets behave like the plain-TCP variant.
     TlsOpts = roadrunner_transport:build_tls_opts(Protocols, UserTlsOpts),
     roadrunner_transport:listen_tls(
-        Port, slice_sends(TlsOpts ++ base_listen_opts(Opts, validate_recv_buffer(Opts)))
+        Port,
+        slice_sends(TlsOpts ++ share(Share, base_listen_opts(Opts, validate_recv_buffer(Opts))))
     );
-open_listen_socket(Port, Opts, _Protocols) ->
+open_listen_socket(Port, Opts, _Protocols, Share) ->
     %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
     %% lower per-call overhead than the OTP-27 `socket` backend on
     %% short-lived connections. fprof on `connection_storm` shows the
@@ -2313,7 +2510,15 @@ open_listen_socket(Port, Opts, _Protocols) ->
     %%
     %% A plain-TCP socket starts at `idle_recv_buffer` and its connection
     %% grows it to `recv_buffer` for a large request body (`maybe_grow/1`).
-    roadrunner_transport:listen(Port, slice_sends(base_listen_opts(Opts, idle_recv_buffer(Opts)))).
+    roadrunner_transport:listen(
+        Port, slice_sends(share(Share, base_listen_opts(Opts, idle_recv_buffer(Opts))))
+    ).
+
+%% `ListenOpts` with the option that shares the port with the listener's
+%% other listen sockets (`port_sharing/2`), when there are others.
+-spec share(port_sharing(), [Opt]) -> [Opt | port_sharing()].
+share(none, ListenOpts) -> ListenOpts;
+share(Sharing, ListenOpts) -> [Sharing | ListenOpts].
 
 %% A listen socket's final options, the user's `tls` ones among them, once
 %% they have turned on sliced sends where they carry the emulator's own
@@ -2533,31 +2738,41 @@ validate_ipv6_v6only(#{}) ->
     ok.
 
 %% One acceptor per online scheduler, at most ?MAX_DEFAULT_NUM_ACCEPTORS.
-%% Every acceptor waits on the one listen socket, so acceptors beyond the
-%% schedulers contend for it: measured over sustained connection churn,
-%% matching one or two schedulers accepted 35-55% more connections a second
-%% than 10 acceptors, with less CPU per connection and a third of the p99;
-%% at eight schedulers eight and 10 were even, so larger machines keep 10.
+%% Acceptors that share a listen socket contend for it (a listener has one
+%% where its port is not shared, and by default on TLS), so acceptors beyond the
+%% schedulers only add contention: measured on one socket over sustained
+%% connection churn, matching one or two schedulers accepted 35-55% more
+%% connections a second than 10 acceptors, with less CPU per connection and a
+%% third of the p99; at eight schedulers eight and 10 were even, so larger
+%% machines keep 10.
 -spec default_num_acceptors() -> pos_integer().
 default_num_acceptors() ->
     min(erlang:system_info(schedulers_online), ?MAX_DEFAULT_NUM_ACCEPTORS).
 
-%% Multiple acceptor processes all calling gen_tcp:accept on the same listen
-%% socket — Linux/BSD accept is thread-safe and avoids thundering-herd via
-%% kernel-side queueing.
--spec spawn_acceptors(roadrunner_transport:socket(), roadrunner_conn:proto_opts(), pos_integer()) ->
-    ok.
-spawn_acceptors(LSocket, ProtoOpts, N) when is_integer(N), N >= 0 ->
-    spawn_acceptors_loop(LSocket, ProtoOpts, 1, N).
+%% The acceptors, dealt over the listen sockets in turn, so each socket
+%% gets `N div length(LSockets)` of them or one more. Acceptors on one
+%% socket all call accept on it; the kernel hands each pending connection
+%% to one of them.
+-spec spawn_acceptors(
+    [roadrunner_transport:socket(), ...], roadrunner_conn:proto_opts(), pos_integer()
+) -> ok.
+spawn_acceptors(LSockets, ProtoOpts, N) ->
+    spawn_acceptors_loop(LSockets, LSockets, ProtoOpts, 1, N).
 
 -spec spawn_acceptors_loop(
-    roadrunner_transport:socket(), roadrunner_conn:proto_opts(), pos_integer(), non_neg_integer()
+    [roadrunner_transport:socket()],
+    [roadrunner_transport:socket(), ...],
+    roadrunner_conn:proto_opts(),
+    pos_integer(),
+    pos_integer()
 ) -> ok.
-spawn_acceptors_loop(_LSocket, _ProtoOpts, I, N) when I > N ->
+spawn_acceptors_loop(_Next, _LSockets, _ProtoOpts, I, N) when I > N ->
     ok;
-spawn_acceptors_loop(LSocket, ProtoOpts, I, N) ->
+spawn_acceptors_loop([], LSockets, ProtoOpts, I, N) ->
+    spawn_acceptors_loop(LSockets, LSockets, ProtoOpts, I, N);
+spawn_acceptors_loop([LSocket | Next], LSockets, ProtoOpts, I, N) ->
     {ok, _Pid} = roadrunner_acceptor:start_link(LSocket, ProtoOpts, I),
-    spawn_acceptors_loop(LSocket, ProtoOpts, I + 1, N).
+    spawn_acceptors_loop(Next, LSockets, ProtoOpts, I + 1, N).
 
 %% Queue and shed modes only mean something when there is a ceiling to
 %% queue behind or shed at, so asking for either without
@@ -2715,10 +2930,10 @@ graceful_drain(Opts) ->
         Other -> error({invalid_listener_opt, graceful_drain, Other})
     end.
 
-%% The options the listen socket and the acceptors are made from, checked
+%% The options the listen sockets and the acceptors are made from, checked
 %% before the listener publishes anything, since they are read only once
-%% the routes are up: `port`, `ip`, `tls`, `num_acceptors` and
-%% `socket_backlog`.
+%% the routes are up: `port`, `ip`, `tls`, `num_acceptors`,
+%% `num_listen_sockets` and `socket_backlog`.
 -spec validate_socket_opts(unchecked_opts()) -> ok.
 validate_socket_opts(Opts) ->
     maybe
@@ -2726,6 +2941,7 @@ validate_socket_opts(Opts) ->
         ok ?= valid_socket_opt(ip, Opts, fun is_socket_address/1),
         ok ?= valid_socket_opt(tls, Opts, fun is_list/1),
         ok ?= valid_socket_opt(num_acceptors, Opts, fun is_pos_integer/1),
+        ok ?= valid_socket_opt(num_listen_sockets, Opts, fun is_auto_or_pos_integer/1),
         ok ?= valid_socket_opt(socket_backlog, Opts, fun is_pos_integer/1),
         ok ?= unix_socket_port(Opts)
     else
@@ -2753,6 +2969,10 @@ valid_socket_opt(Key, Opts, Valid) ->
 
 -spec is_pos_integer(term()) -> boolean().
 is_pos_integer(N) -> is_integer(N) andalso N >= 1.
+
+-spec is_auto_or_pos_integer(term()) -> boolean().
+is_auto_or_pos_integer(auto) -> true;
+is_auto_or_pos_integer(N) -> is_pos_integer(N).
 
 %% What `gen_tcp`'s `ip` option takes: an address, `any`, `loopback`, or
 %% `{local, Path}` for a Unix domain socket.
@@ -3946,7 +4166,7 @@ reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws) ->
 -spec start_drain(#state{}, non_neg_integer(), gen_server:from()) -> #state{}.
 start_drain(
     #state{
-        listen_socket = LSocket,
+        listen_sockets = LSockets,
         unix_socket_file = UnixFile,
         quic_accept_gate = QuicAcceptGate,
         proto_opts = #proto_opts{drain_table = Table}
@@ -3955,18 +4175,18 @@ start_drain(
     From
 ) ->
     %% Stop taking new connections on both transports first. Close the TCP
-    %% listen socket so accept fails and acceptors exit, and close the QUIC
+    %% listen sockets so accept fails and acceptors exit, and close the QUIC
     %% accept gate so a new client's Initial is dropped. Existing TCP conns
     %% keep their own sockets, and existing h3 conns keep routing, so both
     %% drain below. A connection started after the broadcast would never
     %% hear it and would hold the drain to its deadline.
-    ok = close_tcp(LSocket, UnixFile),
+    ok = close_tcp(LSockets, UnixFile),
     ok = close_quic_accept_gate(QuicAcceptGate),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     notify_conns(Table, Deadline),
     self() ! drain_check,
     State#state{
-        listen_socket = closed,
+        listen_sockets = closed,
         phase = draining,
         drain = #{deadline => Deadline, waiters => [From]}
     }.
@@ -4125,7 +4345,7 @@ handle_info({'EXIT', Pid, Reason}, #state{route_keepers = Keepers} = State) ->
                     }}
             end;
         error when Reason =:= normal ->
-            %% An acceptor ends normally once the listen socket is closed.
+            %% An acceptor ends normally once its listen socket is closed.
             {noreply, State};
         error ->
             %% A linked acceptor, overload queue or QUIC pool died: the
@@ -4189,7 +4409,7 @@ reclaim_request_slots(Cell, #proto_opts{
 -doc false.
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{
-    listen_socket = LSocket,
+    listen_sockets = LSockets,
     unix_socket_file = UnixFile,
     quic_listener = QuicListener,
     proto_opts = ProtoOpts,
@@ -4203,9 +4423,9 @@ terminate(_Reason, #state{
     %% normal stop. Their tables go with this process.
     _ = [exit(Pid, shutdown) || _Key := #route_keeper{pid = Pid} <- RouteKeepers],
     _ = [exit(Pid, shutdown) || Pid := _Table <- RouteStopping],
-    %% `drain/2` already closed the TCP socket on its way out
+    %% `drain/2` already closed the TCP sockets on its way out
     %% (`closed`), and an HTTP/3-only listener never had one (`none`).
-    close_tcp(LSocket, UnixFile).
+    close_tcp(LSockets, UnixFile).
 
 -spec stop_quic(pid() | undefined) -> ok.
 stop_quic(undefined) ->
