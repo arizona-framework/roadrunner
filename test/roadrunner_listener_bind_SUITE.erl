@@ -22,6 +22,8 @@ over UDP, needs an address.
     unix_socket_rate_limit/1,
     unix_socket_rate_limit_over_h2/1,
     unix_socket_restarts_on_its_path/1,
+    unix_socket_leaves_a_file_another_server_took/1,
+    abstract_unix_socket/1,
     http3_needs_an_ip_address/1
 ]).
 
@@ -40,6 +42,8 @@ all() ->
         unix_socket_rate_limit,
         unix_socket_rate_limit_over_h2,
         unix_socket_restarts_on_its_path,
+        unix_socket_leaves_a_file_another_server_took,
+        abstract_unix_socket,
         http3_needs_an_ip_address
     ].
 
@@ -208,6 +212,46 @@ unix_socket_restarts_on_its_path(Config) ->
         ok = roadrunner_listener:stop(bind_unix_again)
     end,
     ?assertEqual({error, enoent}, file:read_file_info(Path)).
+
+%% A server that took the path over (removed the file and bound again, as
+%% a redeploy can) keeps its file when the old listener stops.
+unix_socket_leaves_a_file_another_server_took(Config) ->
+    Path = unix_path(Config),
+    {ok, _} = roadrunner_listener:start_link(
+        bind_unix_old, opts(#{port => 0, ip => {local, Path}})
+    ),
+    ok = file:delete(Path),
+    {ok, _} = roadrunner_listener:start_link(
+        bind_unix_new, opts(#{port => 0, ip => {local, Path}})
+    ),
+    try
+        ok = roadrunner_listener:stop(bind_unix_old),
+        ?assertMatch({ok, _}, file:read_link_info(Path)),
+        ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, get({local, Path}, 0))
+    after
+        ok = roadrunner_listener:stop(bind_unix_new)
+    end,
+    ?assertEqual({error, enoent}, file:read_link_info(Path)).
+
+%% An abstract socket (Linux: a path that starts with a zero byte) has no
+%% file to remove, given as a binary or as a string.
+abstract_unix_socket(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            {ok, _} = roadrunner_listener:start_link(
+                bind_unix_abstract, opts(#{port => 0, ip => {local, Name}})
+            ),
+            try
+                ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, get({local, Name}, 0))
+            after
+                ok = roadrunner_listener:stop(bind_unix_abstract)
+            end
+        end,
+        [
+            <<0, "roadrunner-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>,
+            [0 | "roadrunner-" ++ integer_to_list(erlang:unique_integer([positive]))]
+        ]
+    ).
 
 http3_needs_an_ip_address(Config) ->
     process_flag(trap_exit, true),

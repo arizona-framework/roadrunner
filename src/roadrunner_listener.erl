@@ -30,6 +30,7 @@ reason (a bad route or middleware entry has an error of its own).
 -behaviour(gen_server).
 
 -include("roadrunner_proto_opts.hrl").
+-include_lib("kernel/include/file.hrl").
 
 -export([
     start_link/2,
@@ -506,9 +507,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   `port => 0`; any other port fails the start with
   `{listener_opt_conflict, port, Port, unix_socket_needs_port_0}`. The
   listener removes the socket's file when it closes its socket (on
-  `stop/1`, a drain or a crash), so it can start on the same path again.
-  A file left by an exit that ran no cleanup (the node killed, say) must
-  be removed before the path can be bound again. A
+  `stop/1`, a drain or a crash), so it can start on the same path again,
+  unless another server has taken the path over meanwhile: that file is
+  left alone. A file left by an exit that ran no cleanup (the node
+  killed, say) must be removed before the path can be bound again. A
   listener with `http3` needs an address, or it fails to start with
   `{listener_opt_conflict, ip, Ip, http3_needs_an_ip_address}`.
 - `ipv6_v6only`: with an IPv6 `ip`, `true` serves IPv6 clients only,
@@ -1328,6 +1330,9 @@ An upgrade can set each of these for its own session
 %% methods (`roadrunner_router:ceiling_key/1`).
 -type ceiling_key() :: {binary(), [binary()] | undefined}.
 
+%% A Unix domain socket's file, as `unix_socket_file/1` found it.
+-type unix_socket_file() :: {file:name_all(), non_neg_integer(), non_neg_integer()} | undefined.
+
 -record(state, {
     %% `none` when the listener serves HTTP/3 only (no TCP socket);
     %% `closed` after `drain/2` shuts the TCP socket on its way out.
@@ -1377,7 +1382,10 @@ An upgrade can set each of these for its own session
     %% Keepers a failed reload started, told to stop, with their tables,
     %% until their exit arrives: the table goes then, and the exit is known
     %% not to be a crash.
-    route_stopping = #{} :: #{pid() => roadrunner_route_keeper:table()}
+    route_stopping = #{} :: #{pid() => roadrunner_route_keeper:table()},
+    %% The file a listener on a Unix domain socket made when it bound
+    %% (`unix_socket_file/1`), removed when it closes its socket.
+    unix_socket_file = undefined :: unix_socket_file()
 }).
 
 -doc """
@@ -1642,12 +1650,14 @@ init(#{port := Port} = Opts) ->
     QuicAcceptGate = new_quic_accept_gate(Protocols),
     case start_tcp(Port, Opts, Protocols, ProtoOpts) of
         {ok, LSocket} ->
+            UnixFile = unix_socket_file(Opts),
             case start_quic(Port, Opts, Protocols, ProtoOpts, QuicAcceptGate) of
                 {ok, QuicListener} ->
                     Reconciliation = setup_reconciliation(Opts),
                     ok = setup_rate_limit_sweep(ProtoOpts),
                     {ok, #state{
                         listen_socket = LSocket,
+                        unix_socket_file = UnixFile,
                         quic_listener = QuicListener,
                         port = bound_port(Opts, LSocket, QuicListener),
                         proto_opts = ProtoOpts,
@@ -1660,7 +1670,7 @@ init(#{port := Port} = Opts) ->
                 {error, Reason} ->
                     %% TCP bound but QUIC failed — release the TCP port
                     %% so the failed start doesn't leave it held.
-                    ok = close_tcp(LSocket),
+                    ok = close_tcp(LSocket, UnixFile),
                     ok = erase_routes(ProtoOpts),
                     {stop, {listen_failed, Reason}}
             end;
@@ -1862,27 +1872,47 @@ new_quic_accept_gate(Protocols) ->
 close_quic_accept_gate(undefined) -> ok;
 close_quic_accept_gate(Gate) -> roadrunner_quic_listener:close_accept_gate(Gate).
 
--spec close_tcp(roadrunner_transport:socket() | none | closed) -> ok.
-close_tcp(none) ->
+-spec close_tcp(roadrunner_transport:socket() | none | closed, unix_socket_file()) -> ok.
+close_tcp(none, _UnixFile) ->
     ok;
-close_tcp(closed) ->
+close_tcp(closed, _UnixFile) ->
     ok;
-close_tcp(LSocket) ->
-    Local = roadrunner_transport:sockname(LSocket),
+close_tcp(LSocket, UnixFile) ->
     ok = roadrunner_transport:close(LSocket),
-    remove_unix_socket(Local).
+    remove_unix_socket(UnixFile).
+
+%% The file a Unix domain socket listener made at its path when it bound,
+%% as `{Path, Inode, Device}`, so that closing removes that file and no
+%% other: a server that took the path over meanwhile (one that removes the
+%% file and binds again, as a redeploy can) keeps its own. `undefined` for
+%% any other listener, and for an abstract socket (a path that starts with
+%% a zero byte, Linux), which has no file.
+-spec unix_socket_file(unchecked_opts()) -> unix_socket_file().
+unix_socket_file(#{ip := {local, <<0, _/binary>>}}) ->
+    undefined;
+unix_socket_file(#{ip := {local, [0 | _]}}) ->
+    undefined;
+unix_socket_file(#{ip := {local, Path}}) ->
+    {ok, #file_info{inode = Inode, major_device = Device}} = file:read_link_info(Path),
+    {Path, Inode, Device};
+unix_socket_file(#{}) ->
+    undefined.
 
 %% A Unix domain socket's file outlives its socket, and would make the
 %% next listener on its path fail with `eaddrinuse`. The listener made it
-%% when it bound, so it removes it once its socket is closed, and never
-%% before it binds: a file there may be another server's live socket.
--spec remove_unix_socket(
-    {ok, {inet:ip_address(), inet:port_number()} | {local, binary()}} | {error, term()}
-) -> ok.
-remove_unix_socket({ok, {local, Path}}) ->
-    _ = file:delete(Path),
-    ok;
-remove_unix_socket(_Local) ->
+%% when it bound, so it removes it once its socket is closed, while the file
+%% at the path is still that one, and never before it binds: a file there
+%% may be another server's live socket.
+-spec remove_unix_socket(unix_socket_file()) -> ok.
+remove_unix_socket({Path, Inode, Device}) ->
+    case file:read_link_info(Path) of
+        {ok, #file_info{inode = Inode, major_device = Device}} ->
+            _ = file:delete(Path),
+            ok;
+        {_, _} ->
+            ok
+    end;
+remove_unix_socket(undefined) ->
     ok.
 
 %% Extract the leaf cert, its intermediate chain, and the decoded
@@ -3829,6 +3859,7 @@ reload_compiled(State, Routes, Name, ProtoOpts, RouteBuckets, ListenerMws) ->
 start_drain(
     #state{
         listen_socket = LSocket,
+        unix_socket_file = UnixFile,
         quic_accept_gate = QuicAcceptGate,
         proto_opts = #proto_opts{drain_table = Table}
     } = State,
@@ -3841,7 +3872,7 @@ start_drain(
     %% keep their own sockets, and existing h3 conns keep routing, so both
     %% drain below. A connection started after the broadcast would never
     %% hear it and would hold the drain to its deadline.
-    ok = close_tcp(LSocket),
+    ok = close_tcp(LSocket, UnixFile),
     ok = close_quic_accept_gate(QuicAcceptGate),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     notify_conns(Table, Deadline),
@@ -4071,6 +4102,7 @@ reclaim_request_slots(Cell, #proto_opts{
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{
     listen_socket = LSocket,
+    unix_socket_file = UnixFile,
     quic_listener = QuicListener,
     proto_opts = ProtoOpts,
     route_keepers = RouteKeepers,
@@ -4085,7 +4117,7 @@ terminate(_Reason, #state{
     _ = [exit(Pid, shutdown) || Pid := _Table <- RouteStopping],
     %% `drain/2` already closed the TCP socket on its way out
     %% (`closed`), and an HTTP/3-only listener never had one (`none`).
-    close_tcp(LSocket).
+    close_tcp(LSocket, UnixFile).
 
 -spec stop_quic(pid() | undefined) -> ok.
 stop_quic(undefined) ->
