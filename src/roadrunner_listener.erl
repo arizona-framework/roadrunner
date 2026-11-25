@@ -58,6 +58,7 @@ reason (a bad route or middleware entry has an error of its own).
     positive_timeout_ms/0,
     limit/0,
     positive_limit/0,
+    positive_limit_or_infinity/0,
     wait_ms/0,
     request_cap/0,
     protocol/0,
@@ -95,6 +96,9 @@ A size, count or time limit up to `2^31-1`, the largest HTTP/2 window
 
 -doc "A `t:limit/0` of at least 1.".
 -type positive_limit() :: 1..?MAX_LIMIT.
+
+-doc "A `t:positive_limit/0`, or `infinity` for no limit.".
+-type positive_limit_or_infinity() :: positive_limit() | infinity.
 
 -doc """
 How long a connection or WebSocket session waits before it acts: a
@@ -746,8 +750,8 @@ ops-tuning rationale.
         | {queue, #{max_queued => pos_integer(), timeout => pos_integer()}}
         | {shed, #{retry_after => pos_integer()}},
     socket_backlog => pos_integer(),
-    send_timeout => positive_limit() | infinity,
-    max_unsent_bytes => positive_limit() | infinity,
+    send_timeout => positive_limit_or_infinity(),
+    max_unsent_bytes => positive_limit_or_infinity(),
     %% Local interface to bind. Unset means every IPv4 interface
     %% (`0.0.0.0`). Set to `{127,0,0,1}` to restrict the listener to
     %% loopback, or `{local, Path}` for a Unix domain socket.
@@ -2400,7 +2404,7 @@ send_opts(Opts, OsType) ->
         send_timeout(Opts), OsType, unsent_opts(max_unsent_bytes(Opts), OsType)
     ).
 
--spec send_timeout_opts(pos_integer() | infinity, {atom(), atom()}, [gen_tcp:option()]) ->
+-spec send_timeout_opts(positive_limit_or_infinity(), {atom(), atom()}, [gen_tcp:option()]) ->
     [gen_tcp:option()].
 %% `TCP_USER_TIMEOUT` is Linux's option 18, at the TCP level (6).
 send_timeout_opts(infinity, _OsType, Rest) ->
@@ -2412,7 +2416,7 @@ send_timeout_opts(Timeout, _OsType, Rest) ->
 
 %% `TCP_NOTSENT_LOWAT` is Linux's option 25 and macOS's 0x201, at the TCP
 %% level (6). Other systems keep their default.
--spec unsent_opts(pos_integer() | infinity, {atom(), atom()}) -> [gen_tcp:option()].
+-spec unsent_opts(positive_limit_or_infinity(), {atom(), atom()}) -> [gen_tcp:option()].
 unsent_opts(infinity, _OsType) ->
     [];
 unsent_opts(Bytes, {unix, linux}) ->
@@ -2422,7 +2426,7 @@ unsent_opts(Bytes, {unix, darwin}) ->
 unsent_opts(_Bytes, _OsType) ->
     [].
 
--spec send_timeout(unchecked_opts()) -> positive_limit() | infinity.
+-spec send_timeout(unchecked_opts()) -> positive_limit_or_infinity().
 send_timeout(Opts) ->
     case maps:get(send_timeout, Opts, ?DEFAULT_SEND_TIMEOUT) of
         infinity -> infinity;
@@ -2430,7 +2434,7 @@ send_timeout(Opts) ->
         Other -> error({invalid_listener_opt, send_timeout, Other})
     end.
 
--spec max_unsent_bytes(unchecked_opts()) -> positive_limit() | infinity.
+-spec max_unsent_bytes(unchecked_opts()) -> positive_limit_or_infinity().
 max_unsent_bytes(Opts) ->
     case maps:get(max_unsent_bytes, Opts, ?DEFAULT_MAX_UNSENT_BYTES) of
         infinity -> infinity;

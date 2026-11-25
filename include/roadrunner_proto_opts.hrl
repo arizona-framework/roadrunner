@@ -115,7 +115,7 @@
     proxy_protocol = false :: boolean(),
     %% The compiled `real_ip` listener option (`roadrunner_real_ip:compile/1`),
     %% `undefined` when the option is off.
-    real_ip = undefined :: roadrunner_real_ip:config() | undefined,
+    real_ip = undefined :: roadrunner_real_ip:trust(),
     %% Whether the listener is bound to a Unix domain socket, an `ip` of
     %% `{local, Path}`, whose clients have no address: `real_ip` trusts them
     %% as the nearest hop (`roadrunner_real_ip:unix_trust/1`), and the

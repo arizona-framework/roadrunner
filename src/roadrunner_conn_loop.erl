@@ -775,10 +775,10 @@ read_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
     roadrunner_transport:socket(),
     integer(),
     non_neg_integer(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     integer(),
     binary()
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+) -> {ok, roadrunner_event_handler:peer(), binary()} | {close, term()}.
 await_proxy_bytes(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
     Wake =
         case Acc of
