@@ -25,6 +25,10 @@ frames.
 -export([compress_config/1]).
 -export([unmask_words/2]).
 
+%% Internal types that `-doc false` exported functions take: hidden from
+%% the docs like those functions.
+-compile({nowarn_hidden_doc, [{compress_config, 0}, {frame_error, 0}]}).
+
 -export_type([
     opcode/0,
     frame/0,
@@ -138,6 +142,7 @@ traffic that repeats content more than 4 KB back.
 -type compress() :: boolean() | compress_opts().
 
 %% `compress_opts()` with every setting present (`compress_config/1`).
+-doc false.
 -type compress_config() :: #{
     server_window_bits := 9..15,
     client_window_bits := window_bits(),
@@ -627,6 +632,7 @@ format_pmd_kv(Name, Value, _Default) -> [~"; ", Name, ~"=", integer_to_binary(Va
 %% Protocol-violation reasons the frame parse/peek entry points reject
 %% (documented per-atom on `parse_frame/1` below). The inner helpers
 %% return narrower subsets of these.
+-doc false.
 -type frame_error() ::
     bad_opcode
     | bad_rsv

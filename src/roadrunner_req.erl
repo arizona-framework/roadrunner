@@ -136,6 +136,7 @@ care which protocol delivered the bytes.
     multipart => term()
 }.
 
+-doc "Header fields as `{Name, Value}` pairs (`t:roadrunner_http:headers/0`).".
 -type headers() :: roadrunner_http:headers().
 
 -doc """
@@ -145,6 +146,7 @@ connection by the framework; it reads the connection only when called.
 """.
 -type conn_info() :: fun((sockname | peercert | tls_info) -> {ok, term()} | {error, term()}).
 
+-doc "The request's HTTP version (`t:roadrunner_http:version/0`).".
 -type version() :: roadrunner_http:version().
 
 -doc """

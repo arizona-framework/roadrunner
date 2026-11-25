@@ -63,6 +63,7 @@ belong on a protocol switch.
 
 -export([init/1, call/3]).
 
+-doc "The headers an entry sets, each `false` to leave it out (see the moduledoc for the defaults).".
 -type config() :: #{
     content_type_options => binary() | false,
     frame_options => binary() | false,
@@ -70,6 +71,7 @@ belong on a protocol switch.
     hsts => boolean() | hsts_config(),
     content_security_policy => binary() | false
 }.
+-doc "How `Strict-Transport-Security` is tuned when `hsts` is a map.".
 -type hsts_config() :: #{
     max_age => non_neg_integer(),
     include_subdomains => boolean(),
@@ -93,6 +95,7 @@ belong on a protocol switch.
 
 %% Resolve every default and the HSTS value once, at pipeline-compile time, and
 %% pre-build the scheme-independent set so a request only prepends HSTS.
+-doc "Build the header set once, when the pipeline compiles (`roadrunner_middleware` callback).".
 -spec init(config()) -> state().
 init(Config) ->
     Static = roadrunner_http:drop_unset([
@@ -113,6 +116,7 @@ compile_hsts(Config) ->
         HstsConfig when is_map(HstsConfig) -> hsts_value(HstsConfig)
     end.
 
+-doc "Add the headers the handler's response does not set (`roadrunner_middleware` callback).".
 -spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
     roadrunner_handler:result().
 call(Req, Next, #sec{} = State) ->

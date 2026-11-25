@@ -47,6 +47,7 @@ where skipping the body on revalidation is worth the hash.
 %% No per-instance config — the validator is derived from the response body
 %% and the request's `If-None-Match` per request. With no `init/1`, the entry's
 %% config reaches `call/3` as `State`, which is ignored.
+-doc "Add an `ETag` to the response and answer a matching `If-None-Match` with `304` (`roadrunner_middleware` callback).".
 -spec call(roadrunner_req:request(), roadrunner_middleware:next(), roadrunner_middleware:state()) ->
     roadrunner_handler:result().
 call(Req, Next, _State) ->

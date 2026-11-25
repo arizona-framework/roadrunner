@@ -47,6 +47,7 @@ WebSocket-upgrade handlers build their own tuple directly; see
 
 -export_type([buffered_response/0]).
 
+-doc "A buffered response, `{Status, Headers, Body}`, as the builders here return it.".
 -type buffered_response() :: {roadrunner_http:status(), roadrunner_http:headers(), iodata()}.
 
 -doc """

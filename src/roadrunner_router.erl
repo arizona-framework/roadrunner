@@ -70,6 +70,10 @@ of trying every route in turn.
 -export([compile/2, compile/3, validate/1, match/3, resolve/3, init_handler_state/3]).
 -export([compile/4, ceilings/1, ceiling_key/1, compiled_ceilings/1]).
 
+%% An internal type that `-doc false` exported functions take: hidden from
+%% the docs like those functions.
+-compile({nowarn_hidden_doc, [{ceiling_key, 0}]}).
+
 -export_type([
     route/0,
     routes/0,
@@ -176,6 +180,7 @@ is full, not one route of it.
 %% What identifies a route's concurrency ceiling across `reload_routes/2`:
 %% its path as written and its sorted method list (`undefined` for every
 %% method). A replacement table keeps the count of a route with the same key.
+-doc false.
 -type ceiling_key() :: {binary(), [binary()] | undefined}.
 
 %% A route's ceiling as `ceilings/1` reads it: the key, the ceiling and the
