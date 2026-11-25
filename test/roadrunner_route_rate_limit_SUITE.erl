@@ -184,7 +184,7 @@ stale_bucket_store_is_not_reused(Config) ->
     Dead = ets:new(dead, []),
     true = ets:delete(Dead),
     Key = {roadrunner_route_rate_limit, ?MODULE},
-    persistent_term:put(Key, {Dead, atomics:new(1, [])}),
+    persistent_term:put(Key, {Dead, atomics:new(1, []), false}),
     Port = start(Config, #{}, [{~"/login", roadrunner_client_ip_handler}]),
     ?assertEqual(undefined, persistent_term:get(Key, undefined)),
     ok = roadrunner_listener:reload_routes(?MODULE, routes()),
@@ -201,7 +201,7 @@ sweep_drops_only_full_buckets(Config) ->
     Port = start(Config, #{}, [Fast | routes()]),
     ?assertMatch({200, _}, request(Config, Port, ~"/fast")),
     ?assertMatch({200, _}, request(Config, Port, ~"/login")),
-    {Table, _Counter} = persistent_term:get({roadrunner_route_rate_limit, ?MODULE}),
+    {Table, _Counter, false} = persistent_term:get({roadrunner_route_rate_limit, ?MODULE}),
     ?assertEqual(2, ets:info(Table, size)),
     ok = sweep_until(Table, 1, erlang:monotonic_time(millisecond) + 5000),
     ?assertMatch([{{{~"/login", _, _}, _}, _, _}], ets:tab2list(Table)).

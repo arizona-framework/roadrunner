@@ -21,6 +21,8 @@ over UDP, needs an address.
     unix_socket_client_ip_over_h2/1,
     unix_socket_rate_limit/1,
     unix_socket_rate_limit_over_h2/1,
+    unix_socket_route_rate_limit/1,
+    unix_socket_route_rate_limit_over_h2/1,
     unix_socket_restarts_on_its_path/1,
     unix_socket_leaves_a_file_another_server_took/1,
     abstract_unix_socket/1,
@@ -41,6 +43,8 @@ all() ->
         unix_socket_client_ip_over_h2,
         unix_socket_rate_limit,
         unix_socket_rate_limit_over_h2,
+        unix_socket_route_rate_limit,
+        unix_socket_route_rate_limit_over_h2,
         unix_socket_restarts_on_its_path,
         unix_socket_leaves_a_file_another_server_took,
         abstract_unix_socket,
@@ -212,6 +216,30 @@ unix_socket_restarts_on_its_path(Config) ->
         ok = roadrunner_listener:stop(bind_unix_again)
     end,
     ?assertEqual({error, enoent}, file:read_file_info(Path)).
+
+%% So does a route's own `rate_limit`: the requests with no client share
+%% one bucket of the route's.
+unix_socket_route_rate_limit(Config) ->
+    route_rate_limit_cases(Config, fun h1_request/2).
+
+unix_socket_route_rate_limit_over_h2(Config) ->
+    route_rate_limit_cases(Config, fun h2_request/2).
+
+route_rate_limit_cases(Config, Request) ->
+    Path = unix_path(Config),
+    Route = #{
+        path => ~"/",
+        handler => roadrunner_addr_handler,
+        rate_limit => #{rate => 1, period => 3600}
+    },
+    {ok, _} = roadrunner_listener:start_link(
+        bind_unix_route_rate, (addr_opts(Path, #{}))#{routes => [Route]}
+    ),
+    try
+        ?assertEqual([200, 429], [element(1, Request(Path, [])) || _ <- [1, 2]])
+    after
+        ok = roadrunner_listener:stop(bind_unix_route_rate)
+    end.
 
 %% A server that took the path over (removed the file and bound again, as
 %% a redeploy can) keeps its file when the old listener stops.

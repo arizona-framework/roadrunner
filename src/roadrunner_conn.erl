@@ -447,7 +447,7 @@ rate_limit_key(_Req, PeerKey) -> PeerKey.
 -doc false.
 -spec rate_limit_spend(
     ets:table(),
-    inet:ip_address() | local | {term(), inet:ip_address()},
+    inet:ip_address() | local | {term(), inet:ip_address() | local},
     pos_integer(),
     pos_integer(),
     pos_integer(),
@@ -477,7 +477,7 @@ deterministically testable).
 """.
 -spec rate_limit_check(
     ets:table(),
-    inet:ip_address() | local | {term(), inet:ip_address()},
+    inet:ip_address() | local | {term(), inet:ip_address() | local},
     pos_integer(),
     pos_integer(),
     pos_integer(),

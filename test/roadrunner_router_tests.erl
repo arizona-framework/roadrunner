@@ -703,7 +703,9 @@ rate_limit_is_a_pipeline_stage_test() ->
     %% decorated by the listener's middlewares and never reaches the route's.
     {ok, _} = roadrunner_test_event_handler:start(),
     Table = ets:new(router_rl, [public]),
-    persistent_term:put({roadrunner_route_rate_limit, router_rl}, {Table, atomics:new(1, [])}),
+    persistent_term:put(
+        {roadrunner_route_rate_limit, router_rl}, {Table, atomics:new(1, []), false}
+    ),
     Tag = fun(Name) ->
         fun(Req, Next, _State) ->
             {{Status, Headers, Body}, Req2} = Next(Req),

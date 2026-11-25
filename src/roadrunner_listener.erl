@@ -502,8 +502,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   `trusted_proxies` only when the list has a `~"unix:"` entry, so
   `client_ip/1` is the client the header names, and `undefined` when
   there is no such header. The listener's `rate_limit` keys on that
-  client, and the requests with none share one bucket. A route's own
-  `rate_limit` skips them. A Unix domain socket has no port, so it needs
+  client, and the requests with none share one bucket, as they do in a
+  route's own `rate_limit`. A Unix domain socket has no port, so it needs
   `port => 0`; any other port fails the start with
   `{listener_opt_conflict, port, Port, unix_socket_needs_port_0}`. The
   listener removes the socket's file when it closes its socket (on
@@ -2231,9 +2231,13 @@ route_rate_limited(Routes) ->
 %% listener's own store, the table is owned by this gen_server and dies with
 %% it, and the sweep timer cancels itself.
 -spec new_route_buckets(atom(), roadrunner_conn:proto_opts()) -> ets:table().
-new_route_buckets(ListenerName, #proto_opts{rate_limited_counter = Counter}) ->
+new_route_buckets(
+    ListenerName, #proto_opts{rate_limited_counter = Counter, unix_socket = Unix}
+) ->
     Table = ets:new(roadrunner_route_rate_limit, [set, public, {write_concurrency, auto}]),
-    persistent_term:put({roadrunner_route_rate_limit, ListenerName}, {Table, Counter}),
+    %% `Unix`: a Unix domain socket listener, whose requests with no client
+    %% address share one bucket per route (`roadrunner_route_rate_limit`).
+    persistent_term:put({roadrunner_route_rate_limit, ListenerName}, {Table, Counter, Unix}),
     _ = erlang:send_after(?ROUTE_RATE_LIMIT_SWEEP_INTERVAL, self(), route_rate_limit_sweep),
     Table.
 
