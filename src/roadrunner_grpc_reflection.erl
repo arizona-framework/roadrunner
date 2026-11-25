@@ -58,6 +58,10 @@ cannot. Two files of the same name are one: the first given is kept.
     extension_numbers :: #{binary() => [non_neg_integer()]}
 }).
 
+-doc """
+What reflection answers from, built when the routes compile: the services'
+files and the names they declare. Treat as opaque.
+""".
 -opaque index() :: #index{}.
 
 %% NOT_FOUND and INVALID_ARGUMENT, as an ErrorResponse's `error_code`.

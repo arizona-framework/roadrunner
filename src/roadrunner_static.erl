@@ -404,6 +404,7 @@ init_route(Opts) when is_map(Opts) ->
 init_route(Opts) ->
     error({invalid_static_opts, Opts}).
 
+-doc "Serve the route's file or directory (`roadrunner_handler` callback).".
 -spec handle(roadrunner_req:request()) -> roadrunner_handler:result().
 handle(Req) ->
     case roadrunner_req:state(Req) of

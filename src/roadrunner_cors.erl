@@ -59,7 +59,12 @@ without credentials emits the literal `*`.
 
 -export([init/1, call/3]).
 
+-doc """
+The origins allowed: `any`, a list of exact origins, or a fun that says
+whether an origin is allowed.
+""".
 -type origins() :: any | [binary()] | fun((binary()) -> boolean()).
+-doc "The CORS policy an entry takes (see the moduledoc for each option).".
 -type config() :: #{
     origins := origins(),
     methods => [binary()],
@@ -90,6 +95,7 @@ without credentials emits the literal `*`.
 %% Validate the policy and pre-build every static header once, at
 %% pipeline-compile time. A bad value crashes here (listener start) with a
 %% clear `{invalid_cors_opt, Key, Value}`, not on a request.
+-doc "Check the policy and build its state once, when the pipeline compiles (`roadrunner_middleware` callback).".
 -spec init(config()) -> state().
 init(Config) ->
     Origins = origins(Config),
@@ -126,6 +132,7 @@ compile_allow_headers(Config) ->
         List -> {false, join(List)}
     end.
 
+-doc "Answer a preflight, or add the CORS headers to the handler's response (`roadrunner_middleware` callback).".
 -spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
     roadrunner_handler:result().
 call(Req, Next, #cors{} = State) ->

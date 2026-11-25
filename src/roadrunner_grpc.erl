@@ -285,6 +285,10 @@ A gRPC status (gRPC's statuscodes.md), the codes 0 to 16 by name: `ok` is
     events = false :: boolean()
 }).
 
+-doc """
+A gRPC call as a method sees it: what it reads the call's messages and
+metadata from, and what it replies through. Treat as opaque.
+""".
 -opaque stream() :: #stream{}.
 
 %% How a call ended with a status, or with none: for its events.

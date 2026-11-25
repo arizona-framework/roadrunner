@@ -93,6 +93,7 @@ end.
 %% No per-instance config — encoding is negotiated per request from
 %% `Accept-Encoding`, and the match patterns are compiled at load. With no
 %% `init/1`, the entry's config reaches `call/3` as `State`, which is ignored.
+-doc "Compress the response the rest of the pipeline returns (`roadrunner_middleware` callback).".
 -spec call(roadrunner_req:request(), roadrunner_middleware:next(), roadrunner_middleware:state()) ->
     roadrunner_handler:result().
 call(Req, Next, _State) ->

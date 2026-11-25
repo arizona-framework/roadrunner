@@ -59,6 +59,10 @@ accessors that operate on it.
 
 -export_type([headers/0, status/0, redirect_status/0, version/0, request_context/0]).
 
+%% An internal type that `-doc false` exported functions take: hidden from
+%% the docs like those functions.
+-compile({nowarn_hidden_doc, [{request_context, 0}]}).
+
 -include("roadrunner_swar.hrl").
 
 %% Lanes holding a byte of at least `N` (`N` =< 0x80), exactly: each
@@ -69,10 +73,15 @@ accessors that operate on it.
     ((((X) bor ?SWAR_BYTES(128)) - ?SWAR_BYTES(N)) band ?SWAR_BYTES(128))
 ).
 
+-doc "Header fields as `{Name, Value}` pairs, in order. Request names are lowercase.".
 -type headers() :: [{Name :: binary(), Value :: binary()}].
+-doc "An HTTP status code.".
 -type status() :: 100..599.
+-doc "A redirect status code, such as `301` or `302`.".
 -type redirect_status() :: 300..399.
+-doc "An HTTP version as `{Major, Minor}`: HTTP/1.0, HTTP/1.1, HTTP/2 or HTTP/3.".
 -type version() :: {1, 0} | {1, 1} | {2, 0} | {3, 0}.
+
 %% The per-connection fields an HTTP/2 or HTTP/3 connection passes to
 %% build a request.
 -record(request_context, {
@@ -85,7 +94,11 @@ accessors that operate on it.
     %% `erlang:monotonic_time(millisecond)`.
     headers_at :: integer()
 }).
+
+%% A `#request_context{}`, opaque to the connection loops.
+-doc false.
 -opaque request_context() :: #request_context{}.
+
 %% Why `request_pseudo_headers/1` rejects an HTTP/2 or HTTP/3 request's
 %% pseudo-header section.
 -type pseudo_error() ::
