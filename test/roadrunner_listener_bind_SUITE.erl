@@ -18,6 +18,7 @@ over UDP, needs an address.
     unix_socket_needs_port_0/1,
     unix_socket_port_is_0/1,
     unix_socket_peer_has_no_address/1,
+    unix_socket_restarts_on_its_path/1,
     http3_needs_an_ip_address/1
 ]).
 
@@ -32,6 +33,7 @@ all() ->
         unix_socket_needs_port_0,
         unix_socket_port_is_0,
         unix_socket_peer_has_no_address,
+        unix_socket_restarts_on_its_path,
         http3_needs_an_ip_address
     ].
 
@@ -122,6 +124,22 @@ unix_socket_peer_has_no_address(_Config) ->
             #{real_ip => #{trusted_proxies => [~"127.0.0.1/32"]}}
         ]
     ).
+
+%% Stopping removes the socket's file, so a listener starts on the same
+%% path again.
+unix_socket_restarts_on_its_path(_Config) ->
+    Path = unix_path(),
+    Opts = opts(#{port => 0, ip => {local, Path}}),
+    {ok, _} = roadrunner_listener:start_link(bind_unix_again, Opts),
+    ok = roadrunner_listener:stop(bind_unix_again),
+    ?assertEqual({error, enoent}, file:read_file_info(Path)),
+    {ok, _} = roadrunner_listener:start_link(bind_unix_again, Opts),
+    try
+        ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, get({local, Path}, 0))
+    after
+        ok = roadrunner_listener:stop(bind_unix_again)
+    end,
+    ?assertEqual({error, enoent}, file:read_file_info(Path)).
 
 http3_needs_an_ip_address(_Config) ->
     process_flag(trap_exit, true),

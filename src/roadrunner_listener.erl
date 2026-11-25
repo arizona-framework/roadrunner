@@ -499,7 +499,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   `client_ip/1` are `undefined` there, and `real_ip` and `rate_limit`
   do not apply. A Unix domain socket has no port, so it needs
   `port => 0`; any other port fails the start with
-  `{listener_opt_conflict, port, Port, unix_socket_needs_port_0}`. A
+  `{listener_opt_conflict, port, Port, unix_socket_needs_port_0}`. The
+  listener removes the socket's file when it closes its socket (on
+  `stop/1`, a drain or a crash), so it can start on the same path again.
+  A file left by an exit that ran no cleanup (the node killed, say) must
+  be removed before the path can be bound again. A
   listener with `http3` needs an address, or it fails to start with
   `{listener_opt_conflict, ip, Ip, http3_needs_an_ip_address}`.
 - `ipv6_v6only`: with an IPv6 `ip`, `true` serves IPv6 clients only,
@@ -1850,9 +1854,27 @@ close_quic_accept_gate(undefined) -> ok;
 close_quic_accept_gate(Gate) -> roadrunner_quic_listener:close_accept_gate(Gate).
 
 -spec close_tcp(roadrunner_transport:socket() | none | closed) -> ok.
-close_tcp(none) -> ok;
-close_tcp(closed) -> ok;
-close_tcp(LSocket) -> roadrunner_transport:close(LSocket).
+close_tcp(none) ->
+    ok;
+close_tcp(closed) ->
+    ok;
+close_tcp(LSocket) ->
+    Local = roadrunner_transport:sockname(LSocket),
+    ok = roadrunner_transport:close(LSocket),
+    remove_unix_socket(Local).
+
+%% A Unix domain socket's file outlives its socket, and would make the
+%% next listener on its path fail with `eaddrinuse`. The listener made it
+%% when it bound, so it removes it once its socket is closed, and never
+%% before it binds: a file there may be another server's live socket.
+-spec remove_unix_socket(
+    {ok, {inet:ip_address(), inet:port_number()} | {local, binary()}} | {error, term()}
+) -> ok.
+remove_unix_socket({ok, {local, Path}}) ->
+    _ = file:delete(Path),
+    ok;
+remove_unix_socket(_Local) ->
+    ok.
 
 %% Extract the leaf cert, its intermediate chain, and the decoded
 %% private key from the user's `tls` opts for the QUIC listener, which
