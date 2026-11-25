@@ -20,14 +20,23 @@
 %% compressed, and its bytes.
 -type wire_message() :: {identity | gzip | deflate | unsupported, binary()}.
 
--record(stream, {
+%% What a call holds from when it is made and never changes: its
+%% reference and owner, its request headers, and its deadline and the
+%% timer for it. Kept apart from `#stream{}` so each update of that
+%% record, several per message, copies one field for all of them.
+-record(call_cfg, {
     ref :: reference(),
     owner :: pid(),
     %% The request headers: the pseudo-headers and `te`, then the rest;
     %% `grpc-timeout` goes between them as the stream opens.
     fields :: {roadrunner_grpc_client:metadata(), roadrunner_grpc_client:metadata()},
     deadline :: integer() | infinity,
-    timer :: undefined | reference(),
+    timer :: undefined | reference()
+}).
+
+-record(stream, {
+    %% The call's fixed settings, see `#call_cfg{}`.
+    cfg :: #call_cfg{},
     id :: undefined | pos_integer(),
     %% The request side: `closing` once its END_STREAM is queued, `closed`
     %% once it is on the wire or the stream is reset.
