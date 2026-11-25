@@ -21,6 +21,10 @@ connection crash doesn't take the pool down.
 All duration and interval values in `opts()` are in milliseconds —
 `request_timeout`, `keep_alive_timeout`, `hibernate_after`, and
 `slot_reconciliation.interval`.
+
+An option set to a value its type in `t:opts/0` does not take stops the
+listener from starting, with `{invalid_listener_opt, Key, Value}` as the
+reason (a bad route or middleware entry has an error of its own).
 """.
 
 -behaviour(gen_server).
@@ -257,9 +261,11 @@ Optional middleware and timing knobs (durations in milliseconds):
 - `middlewares`: listener-wide pipeline applied to every request.
 - `max_content_length`: request-body cap across HTTP/1.1, HTTP/2, and
   HTTP/3; an over-cap body answers `413 Payload Too Large` (and resets
-  the stream on h2/h3). Default 10 MB. A route can set its own, larger or
-  smaller, or `infinity` for bodies its handler reads as they arrive with
-  `body_buffering => manual` (`t:roadrunner_router:route/0`).
+  the stream on h2/h3). A non-negative integer, default 10 MB. The
+  listener's cap takes no `infinity`, since it also bounds the bodies the
+  listener reads whole before the handler runs. A route can set its own,
+  larger or smaller, or `infinity` for bodies its handler reads as they
+  arrive with `body_buffering => manual` (`t:roadrunner_router:route/0`).
 - `ws`: WebSocket session tunables as a nested map (see
   `t:ws_opts/0`): `max_frame_size` (per-frame payload cap) and
   `max_message_size` (reassembled + decompressed message cap), both
@@ -485,7 +491,14 @@ Optional middleware and timing knobs (durations in milliseconds):
   IPv6 interface, or a specific address such as `{127,0,0,1}` to
   restrict the listener to loopback, e.g. a dev/admin/metrics endpoint
   that must not be reachable from the LAN. Applies to every socket the
-  listener binds: plain TCP, TLS, and the HTTP/3 UDP socket.
+  listener binds: plain TCP, TLS, and the HTTP/3 UDP socket. It takes
+  what `gen_tcp`'s `ip` option takes: an address, `any`, `loopback`, or
+  `{local, Path}` to serve HTTP/1.1 or HTTP/2 on a Unix domain socket.
+  A Unix domain socket has no port, so it needs `port => 0`; any other
+  port fails the start with
+  `{listener_opt_conflict, port, Port, unix_socket_needs_port_0}`. A
+  listener with `http3` needs an address, or it fails to start with
+  `{listener_opt_conflict, ip, Ip, http3_needs_an_ip_address}`.
 - `ipv6_v6only`: with an IPv6 `ip`, `true` serves IPv6 clients only,
   and `false` serves IPv4 clients too, as IPv4-mapped addresses
   (`::ffff:a.b.c.d`). Unset, the operating system decides (on Linux,
@@ -582,8 +595,9 @@ Optional middleware and timing knobs (durations in milliseconds):
   top (`roadrunner_router:rate_limit()`).
 - `hibernate_after`: when set, idle conns hibernate after this
   many milliseconds of main-loop idle time, which sweeps and shrinks
-  the conn's heap. Pairs with `handler_spawn` below for a pool of
-  mostly-idle connections; waking a hibernated conn is charged to the
+  the conn's heap. A `t:positive_timeout_ms/0`, or `infinity` (the
+  default) for never; `0` is refused rather than read as off. Pairs
+  with `handler_spawn` below for a pool of mostly-idle connections; waking a hibernated conn is charged to the
   request that wakes it. It covers roadrunner's own processes only; on
   TLS, see `tls` for the processes `ssl` runs per connection.
 - `handler_spawn`: spawn config for every handler-running process (the
@@ -709,8 +723,8 @@ ops-tuning rationale.
     max_unsent_bytes => positive_limit() | infinity,
     %% Local interface to bind. Unset means every IPv4 interface
     %% (`0.0.0.0`). Set to `{127,0,0,1}` to restrict the listener to
-    %% loopback.
-    ip => inet:ip_address(),
+    %% loopback, or `{local, Path}` for a Unix domain socket.
+    ip => inet:socket_address(),
     %% With an IPv6 `ip`, whether its sockets serve IPv6 clients only.
     %% Unset, the operating system decides.
     ipv6_v6only => boolean(),
@@ -795,7 +809,7 @@ ops-tuning rationale.
     %% through the active-mode `recv_active/3` path so the
     %% receive's `after` clause has a window to call
     %% `erlang:hibernate/3`.
-    hibernate_after => pos_integer(),
+    hibernate_after => positive_timeout_ms() | infinity,
     %% Spawn config for every handler-running process — the connection process
     %% and the HTTP/2/3 stream workers. `opts` is a passthrough to `spawn_opt`
     %% (default `[{fullsweep_after, 0}]`): the default reclaims the
@@ -1590,6 +1604,7 @@ init(#{port := Port} = Opts) ->
     %% (acceptor, overload queue, QUIC pool) exiting abnormally still takes
     %% the listener down with it (`handle_info/2`).
     _ = process_flag(trap_exit, true),
+    ok = validate_socket_opts(Opts),
     ok = validate_ipv6_v6only(Opts),
     ok = ensure_ssl_started(Opts),
     ListenerName = listener_name(),
@@ -2335,7 +2350,8 @@ max_unsent_bytes(Opts) ->
 %% `{ip, IP}` and `{ipv6_v6only, Bool}`, each only when the caller set it,
 %% so the default bind (every IPv4 interface) is unchanged. The TCP listen
 %% socket and the QUIC port probe both bind with them.
--spec bind_opts(opts(), [Opt]) -> [Opt | {ip, inet:ip_address()} | {ipv6_v6only, boolean()}].
+-spec bind_opts(opts(), [Opt]) ->
+    [Opt | {ip, inet:socket_address()} | {ipv6_v6only, boolean()}].
 bind_opts(Opts, SocketOpts) ->
     maps:fold(
         fun(Key, Value, Acc) -> [{Key, Value} | Acc] end,
@@ -2345,7 +2361,7 @@ bind_opts(Opts, SocketOpts) ->
 
 %% `ipv6_v6only` is an IPv6 socket option, so it needs an IPv6 `ip`: unset,
 %% the listener binds IPv4, where the option does not exist.
--spec validate_ipv6_v6only(opts()) -> ok.
+-spec validate_ipv6_v6only(map()) -> ok.
 validate_ipv6_v6only(#{ipv6_v6only := V6Only} = Opts) when is_boolean(V6Only) ->
     case Opts of
         #{ip := {_, _, _, _, _, _, _, _}} -> ok;
@@ -2490,6 +2506,106 @@ timeout_opt(Key, Opts, Default, Min) ->
         Other -> error({invalid_listener_opt, Key, Other})
     end.
 
+%% A top-level option that is a whole number of at least `Min`, or
+%% `Default` when unset. A value of another type would compare above every
+%% integer (an atom, a binary), so a cap given as one would cap nothing.
+-spec int_opt(atom(), map(), non_neg_integer(), 0 | 1) -> non_neg_integer().
+int_opt(Key, Opts, Default, Min) ->
+    case maps:get(Key, Opts, Default) of
+        N when is_integer(N), N >= Min -> N;
+        Other -> error({invalid_listener_opt, Key, Other})
+    end.
+
+%% The top-level `hibernate_after`, `0` when off (`infinity`, the default).
+-spec hibernate_after(map()) -> non_neg_integer().
+hibernate_after(#{hibernate_after := infinity}) -> 0;
+hibernate_after(#{hibernate_after := _} = Opts) -> timeout_opt(hibernate_after, Opts, 0, 1);
+hibernate_after(#{}) -> 0.
+
+%% Validate `max_concurrent_requests`: a count of requests, or `infinity`.
+-spec max_concurrent_requests(map()) -> infinity | pos_integer().
+max_concurrent_requests(Opts) ->
+    case maps:get(max_concurrent_requests, Opts, ?DEFAULT_MAX_CONCURRENT_REQUESTS) of
+        infinity -> infinity;
+        N when is_integer(N), N >= 1 -> N;
+        Bad -> error({invalid_listener_opt, max_concurrent_requests, Bad})
+    end.
+
+-spec body_buffering(map()) -> body_buffering().
+body_buffering(Opts) ->
+    case maps:get(body_buffering, Opts, auto) of
+        auto -> auto;
+        manual -> manual;
+        Other -> error({invalid_listener_opt, body_buffering, Other})
+    end.
+
+-spec graceful_drain(map()) -> boolean().
+graceful_drain(Opts) ->
+    case maps:get(graceful_drain, Opts, true) of
+        Drain when is_boolean(Drain) -> Drain;
+        Other -> error({invalid_listener_opt, graceful_drain, Other})
+    end.
+
+%% The options the listen socket and the acceptors are made from, checked
+%% before the listener publishes anything, since they are read only once
+%% the routes are up: `port`, `ip`, `tls`, `num_acceptors` and
+%% `socket_backlog`.
+-spec validate_socket_opts(map()) -> ok.
+validate_socket_opts(Opts) ->
+    maybe
+        ok ?= valid_socket_opt(port, Opts, fun is_port_number/1),
+        ok ?= valid_socket_opt(ip, Opts, fun is_socket_address/1),
+        ok ?= valid_socket_opt(tls, Opts, fun is_list/1),
+        ok ?= valid_socket_opt(num_acceptors, Opts, fun is_pos_integer/1),
+        ok ?= valid_socket_opt(socket_backlog, Opts, fun is_pos_integer/1),
+        ok ?= unix_socket_port(Opts)
+    else
+        {conflict, Port} -> error({listener_opt_conflict, port, Port, unix_socket_needs_port_0});
+        {Key, Bad} -> error({invalid_listener_opt, Key, Bad})
+    end.
+
+%% A Unix domain socket has no port: `gen_tcp` binds one only with port 0.
+-spec unix_socket_port(map()) -> ok | {conflict, pos_integer()}.
+unix_socket_port(#{ip := {local, _}, port := Port}) when Port =/= 0 -> {conflict, Port};
+unix_socket_port(#{}) -> ok.
+
+-spec valid_socket_opt(atom(), map(), fun((term()) -> boolean())) -> ok | {atom(), term()}.
+valid_socket_opt(Key, Opts, Valid) ->
+    case Opts of
+        #{Key := Value} ->
+            case Valid(Value) of
+                true -> ok;
+                false -> {Key, Value}
+            end;
+        #{} ->
+            ok
+    end.
+
+-spec is_pos_integer(term()) -> boolean().
+is_pos_integer(N) -> is_integer(N) andalso N >= 1.
+
+%% What `gen_tcp`'s `ip` option takes: an address, `any`, `loopback`, or
+%% `{local, Path}` for a Unix domain socket.
+-spec is_socket_address(term()) -> boolean().
+is_socket_address(any) -> true;
+is_socket_address(loopback) -> true;
+is_socket_address({local, Path}) -> is_binary(Path) orelse is_list(Path);
+is_socket_address(Ip) -> inet:is_ip_address(Ip).
+
+%% HTTP/3's UDP socket binds an address only: `any`, `loopback` and a
+%% Unix domain socket are for the TCP protocols.
+-spec validate_quic_ip(map(), [http1 | http2 | http3, ...]) -> ok.
+validate_quic_ip(#{ip := Ip}, Protocols) ->
+    case lists:member(http3, Protocols) andalso not inet:is_ip_address(Ip) of
+        true -> error({listener_opt_conflict, ip, Ip, http3_needs_an_ip_address});
+        false -> ok
+    end;
+validate_quic_ip(#{}, _Protocols) ->
+    ok.
+
+-spec is_port_number(term()) -> boolean().
+is_port_number(N) -> is_integer(N) andalso N >= 0 andalso N =< 65535.
+
 %% Validate `max_keep_alive_requests`: a count of requests, or `infinity`.
 -spec max_keep_alive_requests(map()) -> infinity | pos_integer().
 max_keep_alive_requests(Opts) ->
@@ -2533,6 +2649,7 @@ build_proto_opts(Opts, ListenerName) ->
     %% its `http1_*` / `http2_*` / `http3_*` fields so the hot path reads
     %% each knob without a nested map dive.
     {Protocols, Entries} = normalize_protocols(Opts),
+    ok = validate_quic_ip(Opts, Protocols),
     %% Per-listener counters: live-connection counter (acceptors bump on
     %% accept; conns decrement on exit), a cumulative requests-served
     %% counter (conn bumps on each handler dispatch), and a cumulative
@@ -2546,7 +2663,7 @@ build_proto_opts(Opts, ListenerName) ->
     ClientCounter = counters:new(1, [write_concurrency]),
     RequestsCounter = atomics:new(1, [{signed, false}]),
     RejectedCounter = atomics:new(1, [{signed, false}]),
-    MaxClients = maps:get(max_clients, Opts, ?DEFAULT_MAX_CLIENTS),
+    MaxClients = int_opt(max_clients, Opts, ?DEFAULT_MAX_CLIENTS, 1),
     %% Per-listener drain registry: every conn inserts its own pid as it
     %% starts and deletes it on exit, which is how `drain/2` and
     %% `notify_drain/2` find the processes to notify. A `write_concurrency`
@@ -2572,8 +2689,7 @@ build_proto_opts(Opts, ListenerName) ->
     %% store is created only when `rate_limit` is configured.
     RateLimitedCounter = atomics:new(1, [{signed, false}]),
     RateLimit = build_rate_limit(maps:get(rate_limit, Opts, undefined)),
-    MaxConcurrentRequests =
-        maps:get(max_concurrent_requests, Opts, ?DEFAULT_MAX_CONCURRENT_REQUESTS),
+    MaxConcurrentRequests = max_concurrent_requests(Opts),
     %% `overload_mode` decides what happens to a request that arrives over
     %% the ceiling. A finite ceiling needs the slot keeper (queue mode parks
     %% waiters in it too); it is started here, linked to the listener, and
@@ -2610,7 +2726,7 @@ build_proto_opts(Opts, ListenerName) ->
     Base = #proto_opts{
         dispatch = build_dispatch(Opts, ListenerName),
         middlewares = maps:get(middlewares, Opts, []),
-        max_content_length = maps:get(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH),
+        max_content_length = int_opt(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH, 0),
         ws_max_frame_size = WsFrame,
         ws_max_message_size = WsMsg,
         ws_buffer = ws_buffer(WsBuffer, idle_recv_buffer(Opts), validate_recv_buffer(Opts)),
@@ -2643,10 +2759,10 @@ build_proto_opts(Opts, ListenerName) ->
         rate_limited_counter = RateLimitedCounter,
         rate_limit = RateLimit,
         min_bytes_per_second =
-            maps:get(min_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND),
-        body_buffering = maps:get(body_buffering, Opts, auto),
+            int_opt(min_bytes_per_second, Opts, ?DEFAULT_MIN_BYTES_PER_SECOND, 0),
+        body_buffering = body_buffering(Opts),
         listener_name = ListenerName,
-        graceful_drain = maps:get(graceful_drain, Opts, true),
+        graceful_drain = graceful_drain(Opts),
         handler_spawn_opts = HandlerSpawnOpts,
         proxy_protocol = validate_proxy_protocol(maps:get(proxy_protocol, Opts, false), Protocols),
         protocols = Protocols,
@@ -2659,11 +2775,7 @@ build_proto_opts(Opts, ListenerName) ->
         %% has a per-wake CPU cost (~tens of microseconds for the GC); only
         %% worth enabling for workloads with mostly-idle keep-alive conns
         %% where the heap-shrink win dominates.
-        hibernate_after =
-            case Opts of
-                #{hibernate_after := Ms} when is_integer(Ms), Ms > 0 -> Ms;
-                #{} -> 0
-            end,
+        hibernate_after = hibernate_after(Opts),
         %% Optional `real_ip`, compiled (and validated) here so a bad config
         %% fails the listener start; `undefined` when off, the default, so a
         %% listener without it never loads `roadrunner_real_ip`.
