@@ -249,7 +249,8 @@ send(Socket, Data) ->
 `send/2` for data whose size the caller already knows, so it is not
 measured again. `Size` only decides whether the data is sliced, so a
 size that leaves out a few bytes (a response head before a measured
-body) is fine.
+body) is fine, and a response head or control frame alone, far under a
+slice, goes with 0.
 """.
 -spec send(socket(), iodata(), non_neg_integer()) -> ok | {error, term()}.
 send({gen_tcp, S}, Data, Size) when Size =< ?SEND_SLICE ->

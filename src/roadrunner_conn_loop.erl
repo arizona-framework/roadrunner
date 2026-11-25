@@ -2020,7 +2020,9 @@ send_interim(_Socket, _Status, _Headers, _AltSvc, #{version := {1, 0}}) ->
     ok;
 send_interim(Socket, Status, Headers, AltSvc, _Req) ->
     roadrunner_event:response_send(
-        roadrunner_transport:send(Socket, roadrunner_http1:response(Status, Headers, ~"", AltSvc)),
+        roadrunner_transport:send(
+            Socket, roadrunner_http1:response(Status, Headers, ~"", AltSvc), 0
+        ),
         interim_response
     ).
 
@@ -2227,7 +2229,7 @@ dispatch_response(
     S = flush_out(S0),
     Head = roadrunner_http1:response(Status, Headers0, ~"", AltSvc),
     _ = roadrunner_event:response_send(
-        roadrunner_transport:send(Socket, Head), sendfile_response_head
+        roadrunner_transport:send(Socket, Head, 0), sendfile_response_head
     ),
     ok =
         case roadrunner_req:method(Req) of

@@ -2386,7 +2386,7 @@ send_status(Socket, Status) ->
         ~"",
         undefined
     ),
-    roadrunner_transport:send(Socket, Resp).
+    roadrunner_transport:send(Socket, Resp, 0).
 
 %% Map an `roadrunner_http1:parse_request/2` error reason to its HTTP
 %% status. Size-limit overruns get the RFC-specific codes (414 URI Too
@@ -2524,7 +2524,7 @@ send_payload_too_large(Socket) ->
         ~"",
         undefined
     ),
-    roadrunner_transport:send(Socket, Resp).
+    roadrunner_transport:send(Socket, Resp, 0).
 
 %% A `429` (over the per-peer rate) or `503` (shed at the in-flight
 %% ceiling) that tells the client when to come back, then closes.
@@ -2541,7 +2541,7 @@ send_retry_later(Socket, Status, RetryAfterSecs) ->
         ~"",
         undefined
     ),
-    roadrunner_transport:send(Socket, Resp).
+    roadrunner_transport:send(Socket, Resp, 0).
 
 -doc false.
 -spec send_not_found(roadrunner_transport:socket()) -> ok | {error, term()}.
@@ -2552,7 +2552,7 @@ send_not_found(Socket) ->
         ~"",
         undefined
     ),
-    roadrunner_transport:send(Socket, Resp).
+    roadrunner_transport:send(Socket, Resp, 0).
 
 -doc false.
 -spec send_method_not_allowed(roadrunner_transport:socket(), [binary()]) -> ok | {error, term()}.
@@ -2567,7 +2567,7 @@ send_method_not_allowed(Socket, Allowed) ->
         ~"",
         undefined
     ),
-    roadrunner_transport:send(Socket, Resp).
+    roadrunner_transport:send(Socket, Resp, 0).
 
 -doc false.
 -spec send_request_timeout(roadrunner_transport:socket()) -> ok | {error, term()}.
@@ -2578,7 +2578,7 @@ send_request_timeout(Socket) ->
         ~"",
         undefined
     ),
-    roadrunner_transport:send(Socket, Resp).
+    roadrunner_transport:send(Socket, Resp, 0).
 
 -doc false.
 -spec send_internal_error(roadrunner_transport:socket()) -> ok | {error, term()}.
@@ -2589,4 +2589,4 @@ send_internal_error(Socket) ->
         ~"",
         undefined
     ),
-    roadrunner_transport:send(Socket, Resp).
+    roadrunner_transport:send(Socket, Resp, 0).

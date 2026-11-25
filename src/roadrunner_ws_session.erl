@@ -419,7 +419,7 @@ send_upgrade_required(Socket) ->
         ~"",
         undefined
     ),
-    roadrunner_transport:send(Socket, Resp).
+    roadrunner_transport:send(Socket, Resp, 0).
 
 -spec upgrade(
     roadrunner_transport:socket(),
@@ -444,7 +444,7 @@ upgrade(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) -
             {ListenerName, Peer, RequestId} = ws_context(Req),
             Span = roadrunner_event:ws_upgrade(ListenerName, Peer, RequestId, Mod),
             _ = roadrunner_event:response_send(
-                roadrunner_transport:send(Socket, UpgradeResp), websocket_upgrade_response
+                roadrunner_transport:send(Socket, UpgradeResp, 0), websocket_upgrade_response
             ),
             Args = {Socket, Mod, State, {ListenerName, Span}, Negotiated, Buffered, ProtoOpts},
             {upgrade, fun(Finish) -> serve(Finish, Args) end};

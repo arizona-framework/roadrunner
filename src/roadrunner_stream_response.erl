@@ -65,7 +65,7 @@ start(Socket, Status, UserHeaders) ->
     Headers = [{~"transfer-encoding", ~"chunked"}, {~"connection", ~"close"} | UserHeaders],
     Head = roadrunner_http1:response(Status, Headers, ~""),
     Result = roadrunner_event:response_send(
-        roadrunner_transport:send(Socket, Head), stream_response_head
+        roadrunner_transport:send(Socket, Head, 0), stream_response_head
     ),
     _ = erase(?FIN_KEY),
     Send = fun
