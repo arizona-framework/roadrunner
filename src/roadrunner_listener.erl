@@ -2583,7 +2583,8 @@ validate_socket_opts(Opts) ->
 unix_socket_port(#{ip := {local, _}, port := Port}) when Port =/= 0 -> {conflict, Port};
 unix_socket_port(#{}) -> ok.
 
--spec valid_socket_opt(atom(), unchecked_opts(), fun((term()) -> boolean())) -> ok | {atom(), term()}.
+-spec valid_socket_opt(atom(), unchecked_opts(), fun((term()) -> boolean())) ->
+    ok | {atom(), term()}.
 valid_socket_opt(Key, Opts, Valid) ->
     case Opts of
         #{Key := Value} ->
