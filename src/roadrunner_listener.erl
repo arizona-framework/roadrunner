@@ -604,9 +604,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   many milliseconds of main-loop idle time, which sweeps and shrinks
   the conn's heap. A `t:positive_timeout_ms/0`, or `infinity` (the
   default) for never; `0` is refused rather than read as off. Pairs
-  with `handler_spawn` below for a pool of mostly-idle connections; waking a hibernated conn is charged to the
-  request that wakes it. It covers roadrunner's own processes only; on
-  TLS, see `tls` for the processes `ssl` runs per connection.
+  with `handler_spawn` below for a pool of mostly-idle connections;
+  waking a hibernated conn is charged to the request that wakes it. It
+  covers roadrunner's own processes only; on TLS, see `tls` for the
+  processes `ssl` runs per connection.
 - `handler_spawn`: spawn config for every handler-running process (the
   connection process and HTTP/2/3 stream workers) as a nested map with
   `opts` (`spawn_opt` / `proc_lib` options, default
