@@ -2052,10 +2052,19 @@ flush_out(Data) ->
 %% later ping replacing it, and `release_pong/1` queues its pong after
 %% everything queued so far, when the session flushes or queues a close.
 %% A write thus carries at most `?MAX_PONGS + 1` pongs, each a whole frame
-%% between whole frames (the session never fragments what it sends).
+%% between whole frames (the session never fragments what it sends). The
+%% pong and its count go in one `#data{}` update.
 -spec queue_pong(#data{}, binary()) -> #data{}.
-queue_pong(#data{pongs = N} = Data, Payload) when N < ?MAX_PONGS ->
-    queue_frame(Data#data{pongs = N + 1}, pong, Payload);
+queue_pong(#data{pongs = N, span = Span, out = Out, out_size = OutSize} = Data, Payload) when
+    N < ?MAX_PONGS
+->
+    Size = byte_size(Payload),
+    ok = roadrunner_event:ws_frame_out(Span, pong, Size),
+    Data#data{
+        out = [Out | encode_outbound(Data, pong, Payload, Size)],
+        out_size = OutSize + Size,
+        pongs = N + 1
+    };
 queue_pong(Data, Payload) ->
     Data#data{pong = Payload}.
 
