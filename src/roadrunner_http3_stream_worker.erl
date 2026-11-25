@@ -98,7 +98,7 @@ start(
     Conn,
     StreamId,
     Req,
-    #proto_opts{handler_spawn_opts = SpawnOpts, dispatch = Dispatch},
+    #proto_opts{dispatch = Dispatch} = ProtoOpts,
     MaxFieldSection,
     HeapFloor
 ) ->
@@ -108,7 +108,7 @@ start(
         ?MODULE,
         init,
         [self(), Conn, StreamId, Req, Dispatch, MaxFieldSection, HeapFloor],
-        roadrunner_stream_worker:spawn_opts(SpawnOpts, HeapFloor)
+        roadrunner_stream_worker:spawn_opts(ProtoOpts, HeapFloor)
     ).
 
 -doc false.

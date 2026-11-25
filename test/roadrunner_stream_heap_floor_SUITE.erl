@@ -25,6 +25,7 @@ request.
     floor_off_under_a_max_heap_size/1,
     floor_off_follows_the_max_heap_size/1,
     spawn_follows_a_changed_default_max_heap_size/1,
+    spawn_opts_put_the_floor_in_place_of_the_listener_min_heap_size/1,
     worker_at_the_cap_drops_its_min_heap_size/1,
     long_streams_leave_the_floor/1,
     long_send_streams_leave_the_floor/1,
@@ -53,6 +54,7 @@ all() ->
         floor_off_under_a_max_heap_size,
         floor_off_follows_the_max_heap_size,
         spawn_follows_a_changed_default_max_heap_size,
+        spawn_opts_put_the_floor_in_place_of_the_listener_min_heap_size,
         worker_at_the_cap_drops_its_min_heap_size,
         long_streams_leave_the_floor,
         long_send_streams_leave_the_floor,
@@ -216,22 +218,60 @@ floor_off_follows_the_max_heap_size(_Config) ->
 %% floor, and one spawned after it is cleared gets the floor again.
 spawn_follows_a_changed_default_max_heap_size(_Config) ->
     HeapFloor = {atomics:new(1, []), 40000, base(), 46422, false},
-    ?assertEqual(
-        [monitor, {min_heap_size, 40000}], roadrunner_stream_worker:spawn_opts([], HeapFloor)
-    ),
+    ProtoOpts = proto_opts([]),
+    SpawnOpts = fun() -> roadrunner_stream_worker:spawn_opts(ProtoOpts, HeapFloor) end,
+    ?assertEqual([monitor, {min_heap_size, 40000}], SpawnOpts()),
     Default = erlang:system_flag(max_heap_size, 30000),
     try
-        ?assertEqual([monitor], roadrunner_stream_worker:spawn_opts([], HeapFloor)),
-        {Pid, Ref} = spawn_opt(fun() -> ok end, roadrunner_stream_worker:spawn_opts([], HeapFloor)),
+        ?assertEqual([monitor], SpawnOpts()),
+        {Pid, Ref} = spawn_opt(fun() -> ok end, SpawnOpts()),
         receive
             {'DOWN', Ref, process, Pid, normal} -> ok
         end
     after
         erlang:system_flag(max_heap_size, Default)
     end,
+    ?assertEqual([monitor, {min_heap_size, 40000}], SpawnOpts()).
+
+%% The floor takes the place of the listener's own `min_heap_size`, and a
+%% listener `max_heap_size` of 0 (no limit) keeps the floor whatever the
+%% emulator's default.
+spawn_opts_put_the_floor_in_place_of_the_listener_min_heap_size(_Config) ->
+    HeapFloor = {atomics:new(1, []), 40000, base(), 46422, false},
+    Listener = [{min_heap_size, 1000}, {fullsweep_after, 0}, {max_heap_size, 0}],
+    ProtoOpts = proto_opts(Listener),
     ?assertEqual(
-        [monitor, {min_heap_size, 40000}], roadrunner_stream_worker:spawn_opts([], HeapFloor)
+        {own_max_heap_size, [{fullsweep_after, 0}, {max_heap_size, 0}]},
+        roadrunner_test_proto_opts:get(floor_spawn_opts, ProtoOpts)
+    ),
+    Default = erlang:system_flag(max_heap_size, 30000),
+    try
+        ?assertEqual(
+            [monitor, {min_heap_size, 40000}, {fullsweep_after, 0}, {max_heap_size, 0}],
+            roadrunner_stream_worker:spawn_opts(ProtoOpts, HeapFloor)
+        )
+    after
+        erlang:system_flag(max_heap_size, Default)
+    end,
+    %% At the base, or with no floor, the listener's options go as they are.
+    ?assertEqual(
+        [monitor | Listener],
+        roadrunner_stream_worker:spawn_opts(
+            ProtoOpts, {atomics:new(1, []), base(), base(), 46422, false}
+        )
+    ),
+    ?assertEqual(
+        [monitor | Listener],
+        roadrunner_stream_worker:spawn_opts(ProtoOpts, undefined)
     ).
+
+%% Connection options with `SpawnOpts` as the listener's `handler_spawn`
+%% options, made ready for a floor as the listener does.
+proto_opts(SpawnOpts) ->
+    roadrunner_test_proto_opts:new(#{
+        handler_spawn_opts => SpawnOpts,
+        floor_spawn_opts => roadrunner_stream_worker:floor_spawn_opts(SpawnOpts)
+    }).
 
 %% A worker started at the cap lowers its `min_heap_size` to the base, so
 %% one that lives on does not hold the cap's heap after it collects.

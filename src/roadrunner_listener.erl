@@ -2875,6 +2875,7 @@ build_proto_opts(Opts, ListenerName) ->
         listener_name = ListenerName,
         graceful_drain = graceful_drain(Opts),
         handler_spawn_opts = HandlerSpawnOpts,
+        floor_spawn_opts = roadrunner_stream_worker:floor_spawn_opts(HandlerSpawnOpts),
         proxy_protocol = validate_proxy_protocol(maps:get(proxy_protocol, Opts, false), Protocols),
         protocols = Protocols,
         alt_svc = maybe_alt_svc(Protocols, Opts),
