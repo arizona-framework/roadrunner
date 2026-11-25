@@ -47,7 +47,8 @@ What a call returns and when it raises:
   answered `500` in its place.
 - It raises `already_sent` for a final response, or an `inform/3`,
   after the final response; and `not_in_send_fun` when called outside
-  the fun's process, such as from a process the fun spawns. The `Send`
+  the fun's process, such as from a process the fun spawns, or with a
+  request no fun holds, such as the one a middleware's `call/3` gets. The `Send`
   fun `stream/3` returns is the fun's too: call it from the fun's
   process.
 
@@ -202,7 +203,7 @@ end
 ```
 
 Like the other calls, it raises `not_in_send_fun` when called outside the
-fun's process.
+fun's process or with a request no fun holds.
 """.
 -spec status(roadrunner_req:request()) -> none | streaming | sent.
 status(Req) ->

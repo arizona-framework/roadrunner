@@ -95,3 +95,13 @@ caught_writer_crash_is_a_handler_bug_test() ->
         unfinished_response,
         roadrunner_send_writer:run(?MODULE, Fun, [], #{method => ~"GET"}, Emit)
     ).
+
+%% A request no `{send, ...}` fun holds, such as the one a middleware
+%% sees, raises `not_in_send_fun` too.
+calls_outside_a_send_fun_raise_test() ->
+    Req = #{method => ~"GET"},
+    ?assertError(not_in_send_fun, roadrunner_send:status(Req)),
+    ?assertError(not_in_send_fun, roadrunner_send:inform(103, [], Req)),
+    ?assertError(not_in_send_fun, roadrunner_send:reply(200, [], ~"", Req)),
+    ?assertError(not_in_send_fun, roadrunner_send:stream(200, [], Req)),
+    ?assertError(not_in_send_fun, roadrunner_send_writer:monitor_connection(Req)).

@@ -75,7 +75,7 @@ inform(Status, Headers, #{send := #writer{emit = Emit, owner = Owner}} = Req) wh
             ok = log_unsafe(Kind),
             {error, unsafe_header}
     end;
-inform(_Status, _Headers, #{send := #writer{}}) ->
+inform(_Status, _Headers, #{}) ->
     error(not_in_send_fun).
 
 %% Where the final response stands, read from what went out so far. One
@@ -89,7 +89,9 @@ status(#{send := #writer{owner = Owner}}) when Owner =:= self() ->
         {open, _Status, _Headers, _Send} -> streaming;
         _ -> sent
     end;
-status(#{send := #writer{}}) ->
+status(#{}) ->
+    %% Another process's, or a request outside any `{send, ...}` fun (a
+    %% middleware's, say).
     error(not_in_send_fun).
 
 %% Cancel the request's stream after `Ms` milliseconds, unless the timer
@@ -115,7 +117,7 @@ cancel_after(_Ms, #{send := #writer{owner = Owner}}) when Owner =/= self() ->
 -spec monitor_connection(roadrunner_req:request()) -> {ok, reference()} | {error, not_supported}.
 monitor_connection(#{send := #writer{emit = Emit, owner = Owner}} = Req) when Owner =:= self() ->
     Emit(monitor_connection, Req);
-monitor_connection(#{send := #writer{}}) ->
+monitor_connection(#{}) ->
     error(not_in_send_fun).
 
 %% The final response, with the tuple's headers added: sent, or answered
@@ -147,7 +149,7 @@ final(Kind, Op0, #{send := #writer{emit = Emit, headers = Extra, owner = Owner}}
             ok = internal_error(Emit, Req),
             Error
     end;
-final(_Kind, _Op, #{send := #writer{}}) ->
+final(_Kind, _Op, #{}) ->
     error(not_in_send_fun).
 
 %% What keeps a final response from going out, found before any of it
