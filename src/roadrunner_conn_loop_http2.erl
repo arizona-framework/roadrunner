@@ -42,7 +42,12 @@
 %%
 %% The conn replies `{h2_send_ack, Ref}` once the corresponding
 %% frame(s) are on the wire — so workers are synchronously
-%% back-pressured against flow control without buffering. The
+%% back-pressured against flow control without buffering. When the
+%% stream is reset with the write unsent (or was already gone), it
+%% answers `{h2_send_reset, Ref, StreamId, Why}` instead: every write
+%% gets one answer, tagged with its `Ref`, while the conn lives, so no
+%% worker waits on a write the conn dropped
+%% (`roadrunner_http2_worker_sync:sync/2`). The
 %% buffered `h2_send_response` is the exception: it is the worker's
 %% final message, so it carries no ack and the conn owns whatever of
 %% the body flow control still holds after the worker exits.
@@ -2754,7 +2759,7 @@ handle_send_response(State, StreamId, Status, Headers, Body, BodyLen) ->
 handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
     case stream_open(State, StreamId) of
         not_open ->
-            _ = (From ! not_open_reset(StreamId)),
+            _ = (From ! not_open_reset(Ref, StreamId)),
             State;
         _Stream ->
             State1 = encode_and_send_headers(State, StreamId, Status, Headers, EndStream),
@@ -2765,7 +2770,7 @@ handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
 handle_send_data(State, From, Ref, StreamId, Data, Size, EndStream) ->
     case stream_open(State, StreamId) of
         not_open ->
-            _ = (From ! not_open_reset(StreamId)),
+            _ = (From ! not_open_reset(Ref, StreamId)),
             State;
         Stream ->
             try_send_data(State, Stream, StreamId, From, Ref, Data, Size, EndStream)
@@ -2774,7 +2779,7 @@ handle_send_data(State, From, Ref, StreamId, Data, Size, EndStream) ->
 handle_send_trailers(State, From, Ref, StreamId, Trailers) ->
     case stream_open(State, StreamId) of
         not_open ->
-            _ = (From ! not_open_reset(StreamId)),
+            _ = (From ! not_open_reset(Ref, StreamId)),
             State;
         _Stream ->
             State1 = encode_and_send_trailers(State, StreamId, Trailers),
@@ -2908,9 +2913,10 @@ stream_open(#loop{streams = Streams}, StreamId) ->
 %% one, was told to the worker as it happened (`drop_reset_stream/3`), with
 %% why, ahead of this answer: the stream is forgotten now, so this one says
 %% `peer`.
--spec not_open_reset(stream_id()) -> {h2_stream_reset, stream_id(), peer}.
-not_open_reset(StreamId) ->
-    {h2_stream_reset, StreamId, peer}.
+-spec not_open_reset(reference(), stream_id()) ->
+    {h2_send_reset, reference(), stream_id(), peer}.
+not_open_reset(Ref, StreamId) ->
+    {h2_send_reset, Ref, StreamId, peer}.
 
 %% The response field section as sent, built by the function the worker
 %% sizes it with against the client's SETTINGS_MAX_HEADER_LIST_SIZE, so the
@@ -3014,7 +3020,7 @@ encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     close_stream_send_side(State1, StreamId).
 
 %% Mark the send side closed. Future worker writes on this stream
-%% get `{h2_stream_reset, _, _}` so they unwind cleanly. Every path that
+%% get `{h2_send_reset, Ref, _, _}` so they unwind cleanly. Every path that
 %% puts the response's final END_STREAM on the wire funnels through
 %% here, so this is also where the stream stops counting toward the
 %% advertised concurrency limit: with the peer's END_STREAM already
@@ -3634,8 +3640,8 @@ notify_pending_reset(StreamId, Why, Pending) ->
         {{value, {data, _Ref, undefined, _Bin, _Es}}, Rest} ->
             %% A buffered response's body: its worker is already gone.
             notify_pending_reset(StreamId, Why, Rest);
-        {{value, {data, _Ref, From, _Bin, _Es}}, Rest} ->
-            _ = (From ! {h2_stream_reset, StreamId, Why}),
+        {{value, {data, Ref, From, _Bin, _Es}}, Rest} ->
+            _ = (From ! {h2_send_reset, Ref, StreamId, Why}),
             notify_pending_reset(StreamId, Why, Rest)
     end.
 
@@ -3907,7 +3913,8 @@ exit_clean(
     exit(normal).
 
 %% Tell each worker still running that its stream is reset, before the
-%% conn goes. The conn answers none of its workers while it lingers, so
+%% conn goes, and answer every write it holds or has queued for it with
+%% the reset. The conn answers none of its workers while it lingers, so
 %% one waiting on the conn ends now rather than when the conn exits, as a
 %% client reset ends it. The `connection_age` grace cut tells them with or
 %% without a linger: the conn's exit alone would not say why their streams
@@ -3922,16 +3929,38 @@ tell_reset(State, _Reason, _Linger) ->
 
 -spec tell_workers(#loop{}, reset_why()) -> ok.
 tell_workers(#loop{streams = Streams}, Why) ->
-    maps:foreach(
+    ok = maps:foreach(
         fun
-            (StreamId, #stream{worker_pid = Pid, worker_ref = MonRef}) when is_reference(MonRef) ->
+            (StreamId, #stream{worker_pid = Pid, worker_ref = MonRef, pending_sends = Pending}) when
+                is_reference(MonRef)
+            ->
                 _ = (Pid ! {h2_stream_reset, StreamId, Why}),
-                ok;
-            (_StreamId, _Stream) ->
-                ok
+                notify_pending_reset(StreamId, Why, Pending);
+            (StreamId, #stream{pending_sends = Pending}) ->
+                notify_pending_reset(StreamId, Why, Pending)
         end,
         Streams
-    ).
+    ),
+    answer_queued_writes(Why).
+
+%% Answer the writes still queued to the conn with the reset, as it goes
+%% without reading them. One sent after this is answered by the conn's
+%% exit (`'DOWN'`).
+-spec answer_queued_writes(reset_why()) -> ok.
+answer_queued_writes(Why) ->
+    receive
+        {h2_send_headers, From, Ref, StreamId, _Status, _Headers, _EndStream} ->
+            _ = (From ! {h2_send_reset, Ref, StreamId, Why}),
+            answer_queued_writes(Why);
+        {h2_send_data, From, Ref, StreamId, _Data, _Size, _EndStream} ->
+            _ = (From ! {h2_send_reset, Ref, StreamId, Why}),
+            answer_queued_writes(Why);
+        {h2_send_trailers, From, Ref, StreamId, _Trailers} ->
+            _ = (From ! {h2_send_reset, Ref, StreamId, Why}),
+            answer_queued_writes(Why)
+    after 0 ->
+        ok
+    end.
 
 %% Linger over the socket (`roadrunner_conn:linger/3`), its workers told
 %% first (`tell_reset/3`). The route slots its workers took on their own,

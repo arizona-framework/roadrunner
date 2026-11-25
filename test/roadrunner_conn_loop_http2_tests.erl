@@ -125,6 +125,8 @@ all_test_() ->
         fun oldest_reset_stream_is_forgotten/0,
         fun headers_for_already_open_stream_without_end_stream_protocol_error/0,
         fun synthetic_send_data_after_reset/0,
+        fun held_write_answered_on_every_drop_path/0,
+        fun queued_write_answered_before_linger/0,
         fun synthetic_send_headers_after_reset/0,
         fun synthetic_send_response_after_reset/0,
         fun synthetic_send_trailers_after_reset/0,
@@ -3078,11 +3080,138 @@ headers_for_already_open_stream_without_end_stream_protocol_error() ->
     after 500 -> error(process_did_not_exit)
     end.
 
+held_write_answered_on_every_drop_path() ->
+    %% A write flow control holds is answered with its own tag on every
+    %% path that drops its stream, with why, with or without messages
+    %% queued ahead of the answer, and a conn that dies wakes it: no path
+    %% leaves it waiting.
+    Paths = [
+        {peer, #{}, fun(ConnPid) ->
+            serve_recv(ConnPid, roadrunner_http2_frame:encode({rst_stream, 1, cancel}))
+        end},
+        {deadline, #{}, fun(ConnPid) -> ConnPid ! {roadrunner_cancel_stream, 1} end},
+        {send_stall, #{http2_send_stall_timeout => 200}, fun(_ConnPid) -> ok end},
+        %% A connection error (PING on a stream), its GOAWAY then a linger
+        %% far longer than the test waits.
+        {peer, #{http2_linger_timeout => 60_000}, fun(ConnPid) ->
+            serve_recv(ConnPid, <<0, 0, 8, 6, 0, 1:32, 0:64>>)
+        end},
+        {connection_age_grace, #{}, fun(ConnPid) ->
+            ConnPid ! {timeout, make_ref(), {roadrunner_conn_loop_http2, connection_age_grace}}
+        end},
+        {conn_down, #{}, fun(ConnPid) -> exit(ConnPid, kill) end}
+    ],
+    lists:foreach(
+        fun({Why, Extra, Drop}) ->
+            lists:foreach(
+                fun(Backlog) ->
+                    {Pid, Ref, ConnPid} = post_handshake_conn(Extra),
+                    serve_recv(ConnPid, roadrunner_http2_frame:encode({settings, 0, [{4, 0}]})),
+                    _ = expect_send(),
+                    serve_recv(ConnPid, open_headers(1, ~"/")),
+                    {Worker, WorkerRef} = held_writer(ConnPid, Backlog),
+                    Drop(ConnPid),
+                    ?assertEqual(expected_exit(Why), held_writer_exit(Worker, WorkerRef)),
+                    cleanup(Pid, Ref)
+                end,
+                [0, 100]
+            )
+        end,
+        Paths
+    ).
+
+%% A process that writes one byte on stream 1, the window closed, with
+%% `Backlog` messages queued ahead; the conn has taken the write once a
+%% PING round trip behind it is done. It exits with why its write ended
+%% and the reset it was left in its mailbox.
+held_writer(ConnPid, Backlog) ->
+    Parent = self(),
+    {Worker, WorkerRef} = spawn_monitor(fun() ->
+        _ = roadrunner_http2_worker_sync:monitor_conn(ConnPid),
+        _ = [self() ! {backlog, N} || N <- lists:seq(1, Backlog)],
+        try
+            roadrunner_http2_worker_sync:sync(ConnPid, fun(WRef) ->
+                _ = (ConnPid ! {h2_send_data, self(), WRef, 1, ~"x", 1, false}),
+                _ = (Parent ! {sent, self()}),
+                ok
+            end)
+        catch
+            exit:Reason ->
+                Told =
+                    receive
+                        {h2_stream_reset, 1, Why} -> Why
+                    after 0 -> none
+                    end,
+                exit({Reason, Told})
+        end
+    end),
+    receive
+        {sent, Worker} -> ok
+    after 1_000 -> error(write_not_sent)
+    end,
+    ok = ping_roundtrip(ConnPid, 1),
+    {Worker, WorkerRef}.
+
+held_writer_exit(Worker, WorkerRef) ->
+    receive
+        {'DOWN', WorkerRef, process, Worker, Reason} -> Reason
+    after 1_000 -> error(writer_not_answered)
+    end.
+
+expected_exit(conn_down) -> {conn_down, none};
+expected_exit(Why) -> {stream_reset, Why}.
+
+queued_write_answered_before_linger() ->
+    %% A write still queued to the conn as it starts to close is answered
+    %% before the linger, not when the conn exits after it, whatever the
+    %% write is.
+    Writes = [
+        fun(From, WRef) -> {h2_send_headers, From, WRef, 1, 200, [], false} end,
+        fun(From, WRef) -> {h2_send_data, From, WRef, 1, ~"x", 1, false} end,
+        fun(From, WRef) -> {h2_send_trailers, From, WRef, 1, []} end
+    ],
+    lists:foreach(
+        fun(Write) ->
+            {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_linger_timeout => 60_000}),
+            serve_recv(ConnPid, open_headers(1, ~"/")),
+            ok = ping_roundtrip(ConnPid, 1),
+            Parent = self(),
+            true = erlang:suspend_process(ConnPid),
+            ConnPid ! {timeout, make_ref(), {roadrunner_conn_loop_http2, connection_age_grace}},
+            {Worker, WorkerRef} = spawn_monitor(fun() ->
+                _ = roadrunner_http2_worker_sync:monitor_conn(ConnPid),
+                try
+                    roadrunner_http2_worker_sync:sync(ConnPid, fun(WRef) ->
+                        _ = (ConnPid ! Write(self(), WRef)),
+                        _ = (Parent ! {queued, self()}),
+                        ok
+                    end)
+                catch
+                    exit:Reason ->
+                        receive
+                            {h2_stream_reset, 1, Why} -> exit({Reason, Why})
+                        after 0 -> exit({Reason, none})
+                        end
+                end
+            end),
+            receive
+                {queued, Worker} -> ok
+            after 1_000 -> error(write_not_queued)
+            end,
+            true = erlang:resume_process(ConnPid),
+            ?assertEqual(
+                {stream_reset, connection_age_grace}, held_writer_exit(Worker, WorkerRef)
+            ),
+            cleanup(Pid, Ref)
+        end,
+        Writes
+    ).
+
 synthetic_send_data_after_reset() ->
     %% Open a stream, then RST it. Stream is removed from the
     %% map. Sending a synthetic `h2_send_data` for that stream id
     %% takes the not_open branch in `handle_send_data/7` and
-    %% returns `{h2_stream_reset, _, _}` to the would-be worker.
+    %% returns `{h2_send_reset, DRef, _, _}` to the would-be worker.
     {ok, _} = roadrunner_test_event_handler:start(),
     drain_mailbox(),
     {Pid, Ref, ConnPid} = start_http2_conn(),
@@ -3100,7 +3229,7 @@ synthetic_send_data_after_reset() ->
     DRef = make_ref(),
     ConnPid ! {h2_send_data, self(), DRef, 1, ~"x", 1, false},
     receive
-        {h2_stream_reset, 1, peer} -> ok
+        {h2_send_reset, DRef, 1, peer} -> ok
     after 500 -> error(no_reset)
     end,
     cleanup(Pid, Ref).
@@ -3123,7 +3252,7 @@ synthetic_send_headers_after_reset() ->
     DRef = make_ref(),
     ConnPid ! {h2_send_headers, self(), DRef, 1, 200, [], true},
     receive
-        {h2_stream_reset, 1, peer} -> ok
+        {h2_send_reset, DRef, 1, peer} -> ok
     after 500 -> error(no_reset)
     end,
     cleanup(Pid, Ref).
@@ -3152,7 +3281,7 @@ synthetic_send_response_after_reset() ->
     serve_recv(ConnPid, Ping),
     ?assertMatch(<<_:24, 6, 1, _/binary>>, expect_send()),
     receive
-        {h2_stream_reset, 1, _} -> error(unexpected_reset)
+        {h2_send_reset, _, 1, _} -> error(unexpected_reset)
     after 0 -> ok
     end,
     cleanup(Pid, Ref).
@@ -3175,7 +3304,7 @@ synthetic_send_trailers_after_reset() ->
     DRef = make_ref(),
     ConnPid ! {h2_send_trailers, self(), DRef, 1, []},
     receive
-        {h2_stream_reset, 1, peer} -> ok
+        {h2_send_reset, DRef, 1, peer} -> ok
     after 500 -> error(no_reset)
     end,
     cleanup(Pid, Ref).
@@ -3208,7 +3337,7 @@ synthetic_send_data_to_closed_stream() ->
     DRef2 = make_ref(),
     ConnPid ! {h2_send_data, self(), DRef2, 1, ~"x", 1, false},
     receive
-        {h2_stream_reset, 1, peer} -> ok
+        {h2_send_reset, DRef2, 1, peer} -> ok
     after 500 -> error(no_reset)
     end,
     cleanup(Pid, Ref).

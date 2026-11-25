@@ -48,8 +48,8 @@ empty_push_skips_data_frame_test() ->
 %% --- sync exits on h2_stream_reset ---
 
 sync_exits_on_stream_reset_test() ->
-    %% When the conn replies `{h2_stream_reset, StreamId, Why}` instead of
-    %% `{h2_send_ack, Ref}`, `sync/1` raises `exit(stream_reset)`. The
+    %% When the conn replies `{h2_send_reset, Ref, StreamId, Why}` instead
+    %% of `{h2_send_ack, Ref}`, `sync/2` raises `exit(stream_reset)`. The
     %% conn drives this when the peer has cancelled the stream.
     {FakeConn, Worker} = spawn_loop([{push, ~"hi"}, stop]),
     %% Tell the fake conn to RST_STREAM the next send_data instead of
@@ -161,7 +161,7 @@ fake_conn_loop(Reporter, Sends) ->
 
 %% ResetStreamId = undefined means ack every h2_send_data normally;
 %% set to a stream id by `{reset_next, _}` to make the next matching
-%% h2_send_data reply with `{h2_stream_reset, StreamId, peer}` instead.
+%% h2_send_data reply with `{h2_send_reset, Ref, StreamId, peer}` instead.
 fake_conn_loop(Reporter, Sends, ResetStreamId) ->
     receive
         stop ->
@@ -178,10 +178,10 @@ fake_conn_loop(Reporter, Sends, ResetStreamId) ->
                 [{send_headers, StreamId, Status, Headers, EndStream} | Sends],
                 ResetStreamId
             );
-        {h2_send_data, From, _Ref, StreamId, _Bin, _Size, _EndStream} when
+        {h2_send_data, From, Ref, StreamId, _Bin, _Size, _EndStream} when
             StreamId =:= ResetStreamId
         ->
-            From ! {h2_stream_reset, StreamId, peer},
+            From ! {h2_send_reset, Ref, StreamId, peer},
             %% Worker exits via sync/1; revert to normal mode in case
             %% more messages arrive (they should not).
             fake_conn_loop(Reporter, Sends, undefined);

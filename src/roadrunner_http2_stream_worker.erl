@@ -43,9 +43,10 @@
 %% control still holds part of a buffered body, once that body drains.
 %%
 %% If the peer cancels the stream (`RST_STREAM` or worker-level error
-%% on the conn side), the conn sends `{h2_stream_reset, StreamId, Why}` —
-%% the worker observes this on its next sync round and exits without
-%% emitting further frames.
+%% on the conn side), the conn tells the worker
+%% `{h2_stream_reset, StreamId, Why}` and answers a write it holds, or the
+%% next one, with `{h2_send_reset, Ref, StreamId, Why}` in place of the
+%% ack. The worker exits on it without emitting further frames.
 %%
 %% Crash isolation: workers are spawn_monitored (NOT linked) so a
 %% handler crash resets only the affected stream — the conn
