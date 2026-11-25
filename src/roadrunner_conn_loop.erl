@@ -78,11 +78,11 @@
 %% re-enter them after wake-from-hibernate.
 -export([init_loop/2, recv_request_bytes_hib/3, sniff_recv_hib/3]).
 
-%% Loop-state record carried through every phase. Allocated once on
-%% the transition out of `awaiting_shoot` and pattern-matched (not
-%% reconstructed) thereafter, so the per-request hot path stays
-%% allocation-light.
--record(loop_state, {
+%% What the connection decides once, when it is shot, and never changes:
+%% the socket, the listener options it reads per request, and what it
+%% resolved for its peer. Kept apart from `#loop_state{}` so each update
+%% of that record copies one field for all of them.
+-record(h1_cfg, {
     socket :: roadrunner_transport:socket(),
     proto_opts :: roadrunner_conn:proto_opts(),
     listener_name :: atom(),
@@ -95,6 +95,57 @@
     %% and the rest), built once per connection.
     conn_info :: roadrunner_req:conn_info(),
     scheme = http :: http | https,
+    %% Conn-stable values pulled from `proto_opts` once at `shoot`
+    %% time so the per-request hot path doesn't re-`maps:get` them.
+    %% Saves ~8 hash lookups per request.
+    requests_counter :: atomics:atomics_ref() | undefined,
+    dispatch :: roadrunner_conn:dispatch() | undefined,
+    middlewares = [] :: roadrunner_middleware:middlewares(),
+    max_content_length = 0 :: non_neg_integer(),
+    max_keep_alive_requests = infinity :: roadrunner_listener:request_cap(),
+    %% Read-phase deadlines: `request_timeout` for the first request on a
+    %% fresh conn, `keep_alive_timeout` for keep-alive loop-backs. Picked
+    %% by `phase_timeout/1` per `phase`.
+    request_timeout = 0 :: non_neg_integer(),
+    keep_alive_timeout = 0 :: non_neg_integer(),
+    %% `auto` reads the full body synchronously; `manual` builds a
+    %% body_reader the handler pulls from. Drives `read_body_phase/3`.
+    body_buffering = auto :: roadrunner_listener:body_buffering(),
+    %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
+    %% Prepended to every response, by `roadrunner_http1:response/4` for
+    %% the keep-alive shapes and `roadrunner_http:auto_headers/2` for
+    %% stream / loop.
+    alt_svc = undefined :: binary() | undefined,
+    %% HTTP/1 inbound size limits as the
+    %% `{max_request_line, max_header_line, max_header_block, max_header_count}`
+    %% tuple `roadrunner_http1:parse_request/2` takes. Cached from the
+    %% `http1_*` proto_opts keys at `shoot` (defaults match the parser's
+    %% own `?MAX_*` macros).
+    http1_limits = {8192, 8192, 10240, 100} ::
+        {pos_integer(), pos_integer(), pos_integer(), pos_integer()},
+    %% Anti-slowloris on the request-read phase, cached from
+    %% `proto_opts.min_bytes_per_second` at `shoot`. When > 0,
+    %% `recv_passive/2` closes the conn if the bytes received since
+    %% `#loop_state.recv_phase_start` average below it after a 1 s grace
+    %% (matches `roadrunner_conn:rate_ok/3`).
+    min_rate = 0 :: non_neg_integer(),
+    %% Per-peer rate-limit guard resolved from `proto_opts` + peer once at
+    %% `shoot` (`undefined` when off — the common case, a single branch in
+    %% `dispatch_phase/3`).
+    rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
+    %% The `real_ip` trust config when the peer is a trusted proxy, decided
+    %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
+    %% otherwise, the common case, so the request path resolves nothing.
+    real_ip = undefined :: roadrunner_real_ip:trust()
+}).
+
+%% Loop-state record carried through every phase. Allocated once on
+%% the transition out of `awaiting_shoot` and pattern-matched (not
+%% reconstructed) thereafter, so the per-request hot path stays
+%% allocation-light.
+-record(loop_state, {
+    %% The connection's fixed settings, see `#h1_cfg{}`.
+    cfg :: #h1_cfg{},
     %% `first` for the first request on a fresh conn; `keep_alive` for
     %% subsequent loop-back iterations. Drives the timeout selection
     %% (request_timeout vs keep_alive_timeout) and the silent-vs-408
@@ -115,22 +166,6 @@
     %% buffer triggers a refill. Threaded via the loop_state to
     %% avoid process-dictionary writes.
     req_id_buffer = <<>> :: binary(),
-    %% Conn-stable values pulled from `proto_opts` once at `shoot`
-    %% time so the per-request hot path doesn't re-`maps:get` them.
-    %% Saves ~8 hash lookups per request.
-    requests_counter :: atomics:atomics_ref() | undefined,
-    dispatch :: roadrunner_conn:dispatch() | undefined,
-    middlewares = [] :: roadrunner_middleware:middlewares(),
-    max_content_length = 0 :: non_neg_integer(),
-    max_keep_alive_requests = infinity :: roadrunner_listener:request_cap(),
-    %% Read-phase deadlines: `request_timeout` for the first request on a
-    %% fresh conn, `keep_alive_timeout` for keep-alive loop-backs. Picked
-    %% by `phase_timeout/1` per `phase`.
-    request_timeout = 0 :: non_neg_integer(),
-    keep_alive_timeout = 0 :: non_neg_integer(),
-    %% `auto` reads the full body synchronously; `manual` builds a
-    %% body_reader the handler pulls from. Drives `read_body_phase/3`.
-    body_buffering = auto :: roadrunner_listener:body_buffering(),
     %% `{Idle, Max}` while the socket still reads with its small
     %% `idle_recv_buffer`: the first body with more than `Idle` bytes still
     %% to come grows it to `Max` for good (`grow_buffer/3`), and a request
@@ -158,34 +193,13 @@
     %% copied on every update, at its size: an extra field measured as a
     %% higher GC share and fewer requests per second on plain TCP.
     recv_mode = once :: recv_mode(),
-    %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
-    %% Prepended to every response, by `roadrunner_http1:response/4` for
-    %% the keep-alive shapes and `roadrunner_http:auto_headers/2` for
-    %% stream / loop.
-    alt_svc = undefined :: binary() | undefined,
-    %% HTTP/1 inbound size limits as the
-    %% `{max_request_line, max_header_line, max_header_block, max_header_count}`
-    %% tuple `roadrunner_http1:parse_request/2` takes. Cached from the
-    %% `http1_*` proto_opts keys at `shoot` (defaults match the parser's
-    %% own `?MAX_*` macros).
-    http1_limits = {8192, 8192, 10240, 100} ::
-        {pos_integer(), pos_integer(), pos_integer(), pos_integer()},
-    %% Anti-slowloris on the request-read phase. `min_rate` is cached
-    %% from `proto_opts.min_bytes_per_second` at `shoot`. When > 0,
-    %% `recv_passive/2` tracks bytes received since `recv_phase_start`
-    %% and closes the conn if the running average drops below
-    %% `min_rate` after a 1 s grace (matches `roadrunner_conn:rate_ok/3`).
+    %% The request-read window `#h1_cfg.min_rate` is checked against.
     %% `recv_phase_bytes` is reset at every `read_request_phase` entry:
     %% to 0, with `recv_phase_start` then anchored at the first byte of
     %% that request (per-request window, idle keep-alive gap excluded),
     %% or to a pipelined leftover's size, with the window starting there.
-    min_rate = 0 :: non_neg_integer(),
     recv_phase_start = 0 :: integer(),
     recv_phase_bytes = 0 :: non_neg_integer(),
-    %% Per-peer rate-limit guard resolved from `proto_opts` + peer once at
-    %% `shoot` (`undefined` when off — the common case, a single branch in
-    %% `dispatch_phase/3`).
-    rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
     %% The listener's in-flight ceiling, which an HTTP/1 request joins only
     %% in `shed` overload mode (`undefined` otherwise, the common case, a
     %% single branch per request). `idle` between requests, `held` from the
@@ -194,10 +208,6 @@
     %% its own `max_concurrent_requests` wraps it in `route` for as long as
     %% it holds the route's slot, so the record keeps its size.
     request_slot = undefined :: request_slot(),
-    %% The `real_ip` trust config when the peer is a trusted proxy, decided
-    %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
-    %% otherwise, the common case, so the request path resolves nothing.
-    real_ip = undefined :: roadrunner_real_ip:trust(),
     %% Encoded buffered responses queued while the keep-alive loop spins
     %% on pipelined requests already sitting in `buffered`, written in
     %% ONE send by `flush_out/1` the moment the loop is about to touch
@@ -392,30 +402,32 @@ serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
                 http1_max_header_count = MaxHeaderCount
             } = ProtoOpts,
             S = #loop_state{
-                socket = Socket,
-                proto_opts = ProtoOpts,
-                listener_name = ListenerName,
-                conn_span = ConnSpan,
-                peer = Peer,
-                conn_info = roadrunner_conn:conn_info(Socket),
-                scheme = Scheme,
+                cfg = #h1_cfg{
+                    socket = Socket,
+                    proto_opts = ProtoOpts,
+                    listener_name = ListenerName,
+                    conn_span = ConnSpan,
+                    peer = Peer,
+                    conn_info = roadrunner_conn:conn_info(Socket),
+                    scheme = Scheme,
+                    requests_counter = RequestsCounter,
+                    dispatch = Dispatch,
+                    middlewares = Middlewares,
+                    max_content_length = MaxContentLength,
+                    max_keep_alive_requests = MaxKeepAliveRequests,
+                    min_rate = MinRate,
+                    request_timeout = RequestTimeout,
+                    keep_alive_timeout = KeepAliveTimeout,
+                    body_buffering = BodyBuffering,
+                    alt_svc = AltSvc,
+                    http1_limits = {MaxRequestLine, MaxHeaderLine, MaxHeaderBlock, MaxHeaderCount},
+                    rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
+                    real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer)
+                },
                 buffered = Buffered,
-                requests_counter = RequestsCounter,
-                dispatch = Dispatch,
-                middlewares = Middlewares,
-                max_content_length = MaxContentLength,
-                max_keep_alive_requests = MaxKeepAliveRequests,
-                min_rate = MinRate,
-                request_timeout = RequestTimeout,
-                keep_alive_timeout = KeepAliveTimeout,
-                body_buffering = BodyBuffering,
                 grow_buffer = GrowBuffer,
                 heap_floor = heap_floor(ProtoOpts),
                 recv_mode = recv_mode(read_mode(Active, Socket), HibernateAfter),
-                alt_svc = AltSvc,
-                http1_limits = {MaxRequestLine, MaxHeaderLine, MaxHeaderBlock, MaxHeaderCount},
-                rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
-                real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
                 request_slot = request_slot(ProtoOpts)
             },
             case shares_port_with_h2c(Scheme, ProtoOpts) of
@@ -469,11 +481,13 @@ sniff_preface(#loop_state{buffered = Buf} = S, Deadline) ->
             handle_request_bytes(proxy_leftover_anchored(S), Deadline);
         http2 ->
             #loop_state{
-                socket = Socket,
-                proto_opts = ProtoOpts,
-                listener_name = ListenerName,
-                peer = Peer,
-                conn_span = ConnSpan
+                cfg = #h1_cfg{
+                    socket = Socket,
+                    proto_opts = ProtoOpts,
+                    listener_name = ListenerName,
+                    peer = Peer,
+                    conn_span = ConnSpan
+                }
             } = S,
             roadrunner_conn_loop_http2:enter(
                 Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buf
@@ -501,7 +515,7 @@ proxy_leftover_anchored(S) ->
 -spec sniff_recv(#loop_state{}, integer()) -> no_return().
 sniff_recv(
     #loop_state{
-        socket = Socket,
+        cfg = #h1_cfg{socket = Socket},
         buffered = Buf,
         recv_phase_bytes = PhaseBytes,
         recv_mode = Mode
@@ -937,9 +951,9 @@ anchored(S, Buf, Bytes) ->
 %% `keep_alive_timeout` (typically shorter — connections that have
 %% nothing to do drop faster).
 -spec phase_timeout(#loop_state{}) -> non_neg_integer().
-phase_timeout(#loop_state{phase = first, request_timeout = T}) ->
+phase_timeout(#loop_state{cfg = #h1_cfg{request_timeout = T}, phase = first}) ->
     T;
-phase_timeout(#loop_state{phase = keep_alive, keep_alive_timeout = T}) ->
+phase_timeout(#loop_state{cfg = #h1_cfg{keep_alive_timeout = T}, phase = keep_alive}) ->
     T.
 
 -spec recv_request_bytes(#loop_state{}, integer()) -> no_return().
@@ -978,7 +992,7 @@ recv_request_bytes(S0, Deadline) ->
 %% receive's own `after` clause: no `send_after` / `cancel_timer` pair per
 %% request, which is what kept the passive path cheap.
 -spec recv_idle(#loop_state{}, integer()) -> no_return().
-recv_idle(#loop_state{socket = Socket, buffered = Buf} = S, Deadline) ->
+recv_idle(#loop_state{cfg = #h1_cfg{socket = Socket}, buffered = Buf} = S, Deadline) ->
     arm_active_once(S),
     {DataTag, ClosedTag, ErrorTag} = roadrunner_transport:messages(Socket),
     Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
@@ -1036,9 +1050,8 @@ recv_idle(#loop_state{socket = Socket, buffered = Buf} = S, Deadline) ->
 -spec recv_passive(#loop_state{}, integer()) -> no_return().
 recv_passive(
     #loop_state{
-        socket = Socket,
+        cfg = #h1_cfg{socket = Socket, min_rate = MinRate},
         buffered = Buf,
-        min_rate = MinRate,
         recv_phase_start = PhaseStart,
         recv_phase_bytes = PhaseBytes
     } = S,
@@ -1136,9 +1149,8 @@ drain_mailbox_check() ->
 -spec recv_active(#loop_state{}, integer(), hibernate_after()) -> no_return().
 recv_active(
     #loop_state{
-        socket = Socket,
+        cfg = #h1_cfg{socket = Socket, min_rate = MinRate},
         buffered = Buf,
-        min_rate = MinRate,
         recv_phase_start = PhaseStart,
         recv_phase_bytes = PhaseBytes
     } = S,
@@ -1242,7 +1254,7 @@ cancel_deadline_timer(TRef) ->
 %% Slowloris on first request → 408. Idle keep-alive timeout →
 %% silent close (peer wasn't waiting on bytes).
 -spec timeout_response(#loop_state{}) -> ok.
-timeout_response(#loop_state{phase = first, socket = Socket}) ->
+timeout_response(#loop_state{cfg = #h1_cfg{socket = Socket}, phase = first}) ->
     _ = roadrunner_conn:send_request_timeout(Socket),
     ok;
 timeout_response(#loop_state{phase = keep_alive}) ->
@@ -1255,13 +1267,15 @@ timeout_response(#loop_state{phase = keep_alive}) ->
 -spec handle_request_bytes(#loop_state{}, integer()) -> no_return().
 handle_request_bytes(
     #loop_state{
-        socket = Socket,
-        listener_name = ListenerName,
-        peer = Peer,
-        conn_info = ConnInfo,
-        scheme = Scheme,
-        requests_counter = ReqCounter,
-        http1_limits = Http1Limits
+        cfg = #h1_cfg{
+            socket = Socket,
+            listener_name = ListenerName,
+            peer = Peer,
+            conn_info = ConnInfo,
+            scheme = Scheme,
+            requests_counter = ReqCounter,
+            http1_limits = Http1Limits
+        }
     } = S,
     Deadline
 ) ->
@@ -1279,7 +1293,7 @@ handle_request_bytes(
                 request_id => RequestId,
                 listener_name => ListenerName
             },
-            Req = roadrunner_conn:with_client_ip(Req1, S#loop_state.real_ip, Peer),
+            Req = roadrunner_conn:with_client_ip(Req1, S#loop_state.cfg#h1_cfg.real_ip, Peer),
             ok = roadrunner_conn:set_request_logger_metadata(Req),
             read_body_phase(
                 S#loop_state{buffered = Rest, req_id_buffer = NewBuffer}, Req, Deadline
@@ -1337,7 +1351,9 @@ handle_request_bytes(
 %% answers (404, 405) takes neither slot.
 -spec read_body_phase(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
 read_body_phase(
-    #loop_state{rate_limit = RateLimit, listener_name = ListenerName} = S, Req, Deadline
+    #loop_state{cfg = #h1_cfg{rate_limit = RateLimit, listener_name = ListenerName}} = S,
+    Req,
+    Deadline
 ) ->
     case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
         allow ->
@@ -1348,7 +1364,7 @@ read_body_phase(
 
 %% Route the request, then take the slots it needs.
 -spec route(#loop_state{}, roadrunner_req:request(), integer()) -> no_return().
-route(#loop_state{dispatch = Dispatch} = S, Req, Deadline) ->
+route(#loop_state{cfg = #h1_cfg{dispatch = Dispatch}} = S, Req, Deadline) ->
     Resolved = roadrunner_conn:resolve_handler(Dispatch, Req),
     case Resolved of
         {ok, _Handler, _Bindings, _Pipeline, _State, {_Body, Ceiling}} ->
@@ -1416,7 +1432,9 @@ admit(#loop_state{request_slot = Slot} = S, Req, Deadline, Resolved) ->
             route_and_read(S#loop_state{request_slot = Held}, Req, Deadline, Resolved);
         {shed, RetryAfter} ->
             #loop_state{
-                proto_opts = #proto_opts{throttled_counter = Throttled}, listener_name = Name
+                cfg = #h1_cfg{
+                    proto_opts = #proto_opts{throttled_counter = Throttled}, listener_name = Name
+                }
             } = S,
             ok = roadrunner_conn:throttled_telemetry(Name, Throttled, max_concurrent_requests),
             refuse_retry_later(S, 503, RetryAfter, roadrunner_conn:body_framing(Req))
@@ -1475,7 +1493,7 @@ collect_route_heap(S) ->
     pos_integer(),
     roadrunner_http1:framing()
 ) -> no_return().
-refuse_retry_later(#loop_state{socket = Socket} = S, Status, RetryAfter, Framing) ->
+refuse_retry_later(#loop_state{cfg = #h1_cfg{socket = Socket}} = S, Status, RetryAfter, Framing) ->
     S1 = flush_out(S),
     _ = roadrunner_conn:send_retry_later(Socket, Status, RetryAfter),
     case Framing of
@@ -1486,7 +1504,7 @@ refuse_retry_later(#loop_state{socket = Socket} = S, Status, RetryAfter, Framing
 -spec route_and_read(
     #loop_state{}, roadrunner_req:request(), integer(), roadrunner_conn:resolved()
 ) -> no_return().
-route_and_read(#loop_state{body_buffering = BodyMode} = S, Req, Deadline, Resolved) ->
+route_and_read(#loop_state{cfg = #h1_cfg{body_buffering = BodyMode}} = S, Req, Deadline, Resolved) ->
     case {BodyMode, roadrunner_conn:body_framing(Req)} of
         {auto, none} ->
             dispatch_phase(S, Req#{body => <<>>}, Resolved);
@@ -1494,11 +1512,11 @@ route_and_read(#loop_state{body_buffering = BodyMode} = S, Req, Deadline, Resolv
             S2 = flush_out(S),
             ok = rejection(S2, FramingReason),
             _ = roadrunner_conn:send_status(
-                S2#loop_state.socket, roadrunner_conn:parse_error_status(FramingReason)
+                S2#loop_state.cfg#h1_cfg.socket, roadrunner_conn:parse_error_status(FramingReason)
             ),
             exit_lingering(S2, rejected);
         {_, Framing} ->
-            MaxCL = roadrunner_conn:body_cap(Resolved, S#loop_state.max_content_length),
+            MaxCL = roadrunner_conn:body_cap(Resolved, S#loop_state.cfg#h1_cfg.max_content_length),
             case expect_answer(S, Req, Framing, MaxCL) of
                 too_large ->
                     %% The client holds back a body over its cap for a 100:
@@ -1539,7 +1557,7 @@ grow_for_head(#loop_state{grow_buffer = {Idle, Max}, buffered = Buffered} = S) w
     byte_size(Buffered) >= Idle, Idle < ?HEAD_RECV_BUFFER
 ->
     Head = min(?HEAD_RECV_BUFFER, Max),
-    _ = roadrunner_transport:setopts(S#loop_state.socket, [{buffer, Head}]),
+    _ = roadrunner_transport:setopts(S#loop_state.cfg#h1_cfg.socket, [{buffer, Head}]),
     S#loop_state{grow_buffer = head_grown(Head, Max)};
 grow_for_head(S) ->
     S.
@@ -1558,7 +1576,7 @@ grow_buffer(#loop_state{grow_buffer = undefined} = S, _Framing, _MaxCL) ->
 grow_buffer(#loop_state{grow_buffer = {Idle, Max}, buffered = Buffered} = S, Framing, MaxCL) ->
     case large_body(Framing, byte_size(Buffered), Idle, MaxCL) of
         true ->
-            _ = roadrunner_transport:setopts(S#loop_state.socket, [{buffer, Max}]),
+            _ = roadrunner_transport:setopts(S#loop_state.cfg#h1_cfg.socket, [{buffer, Max}]),
             S#loop_state{grow_buffer = undefined};
         false ->
             S
@@ -1713,7 +1731,14 @@ expect_answer(_S, _Req, _Framing, _MaxCL) ->
     integer()
 ) -> no_return().
 read_body(
-    auto, continue, #loop_state{socket = Socket} = S, Req, Framing, MaxCL, Resolved, Deadline
+    auto,
+    continue,
+    #loop_state{cfg = #h1_cfg{socket = Socket}} = S,
+    Req,
+    Framing,
+    MaxCL,
+    Resolved,
+    Deadline
 ) ->
     S1 = flush_out(S),
     ok = roadrunner_conn:send_continue(Socket),
@@ -1721,7 +1746,7 @@ read_body(
 read_body(auto, none, S, Req, Framing, MaxCL, Resolved, Deadline) ->
     read_auto_body(S, Req, Framing, MaxCL, Resolved, Deadline);
 read_body(manual, Answer, S, Req, Framing, MaxCL, Resolved, Deadline) ->
-    #loop_state{socket = Socket, min_rate = MinRate} = S,
+    #loop_state{cfg = #h1_cfg{socket = Socket, min_rate = MinRate}} = S,
     BodyState = roadrunner_conn:make_body_reader(
         Framing,
         S#loop_state.buffered,
@@ -1751,7 +1776,12 @@ read_body(manual, Answer, S, Req, Framing, MaxCL, Resolved, Deadline) ->
     integer()
 ) -> no_return().
 read_auto_body(
-    #loop_state{socket = Socket, buffered = Buffered} = S, Req, Framing, MaxCL, Resolved, Deadline
+    #loop_state{cfg = #h1_cfg{socket = Socket}, buffered = Buffered} = S,
+    Req,
+    Framing,
+    MaxCL,
+    Resolved,
+    Deadline
 ) ->
     Recv = body_recv(S, Deadline),
     case roadrunner_conn:read_body(Framing, Buffered, Recv, MaxCL, trailer_limits(S)) of
@@ -1789,13 +1819,17 @@ read_auto_body(
 %% deadline, with the anti-slowloris rate over the time they wait.
 -spec body_recv(#loop_state{}, integer()) ->
     fun(() -> {ok, binary()} | {error, term()}).
-body_recv(#loop_state{socket = Socket, min_rate = MinRate, buffered = Buffered}, Deadline) ->
+body_recv(
+    #loop_state{cfg = #h1_cfg{socket = Socket, min_rate = MinRate}, buffered = Buffered}, Deadline
+) ->
     roadrunner_conn:make_recv(Socket, Deadline, MinRate, byte_size(Buffered)).
 
 %% Trailer headers (chunked bodies) obey the same caps as request
 %% headers; the request-line cap doesn't apply to a trailer block.
 -spec trailer_limits(#loop_state{}) -> {pos_integer(), pos_integer(), pos_integer()}.
-trailer_limits(#loop_state{http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}}) ->
+trailer_limits(#loop_state{
+    cfg = #h1_cfg{http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, MaxHdrCount}}
+}) ->
     {MaxHdrLine, MaxHdrBlock, MaxHdrCount}.
 
 %% --- dispatch phase ---
@@ -1808,7 +1842,7 @@ trailer_limits(#loop_state{http1_limits = {_ReqLine, MaxHdrLine, MaxHdrBlock, Ma
 %% own response (`send_phase/6`).
 -spec dispatch_phase(#loop_state{}, roadrunner_req:request(), roadrunner_conn:resolved()) ->
     no_return().
-dispatch_phase(#loop_state{socket = Socket} = S, Req, Resolved) ->
+dispatch_phase(#loop_state{cfg = #h1_cfg{socket = Socket}} = S, Req, Resolved) ->
     case Resolved of
         {ok, Handler, Bindings, Pipeline, _State, _Limits} ->
             run_pipeline(S, Handler, Req#{bindings => Bindings}, Pipeline);
@@ -1831,7 +1865,7 @@ dispatch_phase(#loop_state{socket = Socket} = S, Req, Resolved) ->
     roadrunner_req:request(),
     roadrunner_middleware:next()
 ) -> no_return().
-run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
+run_pipeline(#loop_state{cfg = #h1_cfg{socket = Socket}} = S, Handler, Req, Pipeline) ->
     Span = roadrunner_event:request_start(Req),
     try Pipeline(Req) of
         {{send, Headers, Fun}, Req2} when is_list(Headers), is_function(Fun, 1), is_map(Req2) ->
@@ -1901,7 +1935,7 @@ run_pipeline(#loop_state{socket = Socket} = S, Handler, Req, Pipeline) ->
 ) -> no_return().
 send_phase(S0, Handler, Req, Headers, Fun, Span) ->
     %% Queued pipelined responses go out ahead of anything the fun sends.
-    #loop_state{socket = Socket} = S = flush_out(S0),
+    #loop_state{cfg = #h1_cfg{socket = Socket}} = S = flush_out(S0),
     case roadrunner_send_writer:run(Handler, Fun, Headers, Req, send_emit(S, Handler)) of
         {done, {websocket, _Status, {session, Upgrade, Run}}, Req2} ->
             %% The fun answered with an upgrade: run the session here, as
@@ -1964,7 +1998,7 @@ send_finish(S, Req, _Kind, Headers) ->
 %% sent after it (`roadrunner_conn:skip_continue/1`); a stream sends it
 %% first.
 -spec send_emit(#loop_state{}, module()) -> roadrunner_send_writer:emit().
-send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
+send_emit(#loop_state{cfg = #h1_cfg{socket = Socket, alt_svc = AltSvc}} = S, Handler) ->
     fun
         ({inform, Status, Headers}, Req) ->
             send_interim(Socket, Status, Headers, AltSvc, Req);
@@ -2072,19 +2106,19 @@ ensure_close_signaled(_S, _Req, Response) ->
 -spec with_close_if_closing(#loop_state{}, roadrunner_req:request(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
 with_close_if_closing(
-    #loop_state{body_buffering = manual},
+    #loop_state{cfg = #h1_cfg{body_buffering = manual}},
     #{body_reader := #h1_body_reader{continue = {_, _}}} = Req,
     Headers
 ) ->
     with_close(Req, Headers);
 with_close_if_closing(
-    #loop_state{body_buffering = manual},
+    #loop_state{cfg = #h1_cfg{body_buffering = manual}},
     #{body_reader := #h1_body_reader{framing = {content_length, N}, max = Max}} = Req,
     Headers
 ) when N > Max ->
     with_close(Req, Headers);
 with_close_if_closing(
-    #loop_state{body_buffering = manual} = S,
+    #loop_state{cfg = #h1_cfg{body_buffering = manual}} = S,
     #{body_reader := #h1_body_reader{framing = none}} = Req,
     Headers
 ) ->
@@ -2092,7 +2126,7 @@ with_close_if_closing(
     %% lookup below.
     close_at_ceiling(S, Req, Headers);
 with_close_if_closing(
-    #loop_state{body_buffering = manual} = S, #{body_reader := Reader} = Req, Headers
+    #loop_state{cfg = #h1_cfg{body_buffering = manual}} = S, #{body_reader := Reader} = Req, Headers
 ) ->
     %% A read of the body failed: where the rest of it starts is unknown,
     %% so the connection closes after this response instead of draining it
@@ -2110,7 +2144,9 @@ with_close_if_closing(S, Req, Headers) ->
 -spec close_at_ceiling(#loop_state{}, roadrunner_req:request(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
 close_at_ceiling(
-    #loop_state{requests_served = Served, max_keep_alive_requests = Max}, Req, Headers
+    #loop_state{cfg = #h1_cfg{max_keep_alive_requests = Max}, requests_served = Served},
+    Req,
+    Headers
 ) when
     Served >= Max
 ->
@@ -2139,7 +2175,9 @@ with_close(Req, Headers) ->
 %% request); the second closes out a burst by flushing the batch with
 %% its last response appended.
 -spec queue_response(#loop_state{}, iodata(), non_neg_integer()) -> #loop_state{}.
-queue_response(#loop_state{buffered = <<>>, out = [], socket = Socket} = S, Resp, Size) ->
+queue_response(
+    #loop_state{cfg = #h1_cfg{socket = Socket}, buffered = <<>>, out = []} = S, Resp, Size
+) ->
     _ = roadrunner_event:response_send(
         roadrunner_transport:send(Socket, Resp, Size), buffered_response
     ),
@@ -2157,7 +2195,7 @@ queue_response(#loop_state{out = Out, out_size = OutSize} = S, Resp, Size) ->
 -spec flush_out(#loop_state{}) -> #loop_state{}.
 flush_out(#loop_state{out = []} = S) ->
     S;
-flush_out(#loop_state{socket = Socket, out = Out, out_size = OutSize} = S) ->
+flush_out(#loop_state{cfg = #h1_cfg{socket = Socket}, out = Out, out_size = OutSize} = S) ->
     _ = roadrunner_event:response_send(
         roadrunner_transport:send(Socket, Out, OutSize), buffered_response
     ),
@@ -2184,7 +2222,7 @@ dispatch_response(S0, _Handler, Req, {websocket, Mod, State, Opts}) when
 ->
     dispatch_websocket(S0, Req, Mod, State, Opts);
 dispatch_response(
-    #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
+    #loop_state{cfg = #h1_cfg{socket = Socket, alt_svc = AltSvc}} = S0,
     _Handler,
     Req,
     {stream, Status, Headers0, Fun}
@@ -2202,7 +2240,7 @@ dispatch_response(
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
     S;
 dispatch_response(
-    #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
+    #loop_state{cfg = #h1_cfg{socket = Socket, alt_svc = AltSvc}} = S0,
     Handler,
     Req,
     {loop, Status, Headers0, LoopState}
@@ -2217,7 +2255,7 @@ dispatch_response(
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
     S;
 dispatch_response(
-    #loop_state{socket = Socket, alt_svc = AltSvc} = S0,
+    #loop_state{cfg = #h1_cfg{socket = Socket, alt_svc = AltSvc}} = S0,
     _Handler,
     Req,
     {sendfile, Status, Headers0, {Filename, Offset, Length}}
@@ -2261,7 +2299,7 @@ dispatch_response(
 %% function head and emit the response with an empty body. Free
 %% pattern-match dispatch (no `maps:get(method, _)` per response).
 dispatch_response(
-    #loop_state{alt_svc = AltSvc} = S,
+    #loop_state{cfg = #h1_cfg{alt_svc = AltSvc}} = S,
     _Handler,
     #{method := ~"HEAD"},
     {Status, Headers0, Body}
@@ -2271,7 +2309,7 @@ dispatch_response(
     {Headers, _Size} = framed(Status, Headers0, Body),
     queue_response(S, roadrunner_http1:response(Status, Headers, ~"", AltSvc), 0);
 dispatch_response(
-    #loop_state{alt_svc = AltSvc} = S,
+    #loop_state{cfg = #h1_cfg{alt_svc = AltSvc}} = S,
     _Handler,
     _Req,
     {Status, Headers0, Body}
@@ -2356,7 +2394,7 @@ dispatch_websocket(S0, Req, Mod, State, Opts) ->
     %% reject) on the wire. The session arms the socket itself, so it
     %% starts from a passive one, with what was already read in
     %% `Buffered`.
-    #loop_state{socket = Socket, buffered = Buffered, proto_opts = ProtoOpts} =
+    #loop_state{cfg = #h1_cfg{socket = Socket, proto_opts = ProtoOpts}, buffered = Buffered} =
         S = flush_out(disarm(S0)),
     %% `start/7` returns right after the 101 with the session to run in
     %% this process (`Run`). A rejected upgrade (400/426/500 already sent,
@@ -2458,7 +2496,9 @@ buffered_finish(S0, Req, Headers) ->
 %% pipelining after that request.
 -spec exit_closing(#loop_state{}, roadrunner_req:request(), binary()) -> no_return().
 exit_closing(
-    #loop_state{requests_served = Served, max_keep_alive_requests = Max} = S, _Req, _ManualLeftover
+    #loop_state{cfg = #h1_cfg{max_keep_alive_requests = Max}, requests_served = Served} = S,
+    _Req,
+    _ManualLeftover
 ) when
     Served >= Max
 ->
@@ -2494,9 +2534,7 @@ exit_closing(S, Req, ManualLeftover) ->
 ) -> roadrunner_ws_session:finish().
 ws_finish(
     #loop_state{
-        socket = Socket,
-        proto_opts = ProtoOpts,
-        conn_span = ConnSpan,
+        cfg = #h1_cfg{socket = Socket, proto_opts = ProtoOpts, conn_span = ConnSpan},
         requests_served = Served
     },
     Req,
@@ -2569,7 +2607,7 @@ drain_latest(#h1_body_reader{deadline = Deadline, request_deadline = RequestDead
 refuse_too_large(S) ->
     S1 = flush_out(S),
     ok = rejection(S1, content_length_too_large),
-    _ = roadrunner_conn:send_payload_too_large(S1#loop_state.socket),
+    _ = roadrunner_conn:send_payload_too_large(S1#loop_state.cfg#h1_cfg.socket),
     exit_lingering(S1, rejected).
 
 %% Close after a response sent before the request was read to its end,
@@ -2578,8 +2616,10 @@ refuse_too_large(S) ->
 -spec exit_lingering(#loop_state{}, roadrunner_event_handler:close_reason()) -> no_return().
 exit_lingering(
     #loop_state{
-        socket = Socket,
-        proto_opts = #proto_opts{http1_linger_timeout = Linger, linger_budget = Budget}
+        cfg = #h1_cfg{
+            socket = Socket,
+            proto_opts = #proto_opts{http1_linger_timeout = Linger, linger_budget = Budget}
+        }
     } = S,
     Reason
 ) ->
@@ -2598,7 +2638,7 @@ exit_unread(S, _Req) ->
     exit_normal(S, normal).
 
 -spec rejection(#loop_state{}, atom()) -> ok.
-rejection(#loop_state{listener_name = ListenerName, peer = Peer}, Reason) ->
+rejection(#loop_state{cfg = #h1_cfg{listener_name = ListenerName, peer = Peer}}, Reason) ->
     roadrunner_event:request_rejected(ListenerName, Peer, Reason).
 
 %% Hand a writer-owned response (stream, loop, WebSocket) a passive
@@ -2618,7 +2658,7 @@ disarm(#loop_state{recv_mode = Mode} = S) ->
     end.
 
 -spec passive(#loop_state{}) -> #loop_state{}.
-passive(#loop_state{socket = Socket} = S) ->
+passive(#loop_state{cfg = #h1_cfg{socket = Socket}} = S) ->
     _ = roadrunner_transport:setopts(Socket, [{active, false}]),
     ok = roadrunner_conn:disarmed(),
     ok = drop_passive(roadrunner_transport:passive_message(Socket)),
@@ -2635,7 +2675,7 @@ drop_passive(PassiveTag) ->
 %% Arm `{active, N}`: at the connection's start and on each passive
 %% message. A failed arm means the socket is gone.
 -spec arm_active_n(#loop_state{}, pos_integer()) -> ok.
-arm_active_n(#loop_state{socket = Socket} = S, N) ->
+arm_active_n(#loop_state{cfg = #h1_cfg{socket = Socket}} = S, N) ->
     case roadrunner_transport:setopts(Socket, [{active, N}]) of
         ok -> roadrunner_conn:armed(N);
         {error, Reason} -> exit_normal(S, transport_reason(Reason))
@@ -2650,7 +2690,7 @@ rearm_after_stray(S, once) -> arm_active_once(S);
 rearm_after_stray(_S, _N) -> ok.
 
 -spec arm_active_once(#loop_state{}) -> ok.
-arm_active_once(#loop_state{socket = Socket} = S) ->
+arm_active_once(#loop_state{cfg = #h1_cfg{socket = Socket}} = S) ->
     %% On socket failure (peer RST during the gap, kernel-side close)
     %% we can't `setopts` — exit cleanly instead of crashing.
     case roadrunner_transport:setopts(Socket, [{active, once}]) of
@@ -2675,9 +2715,7 @@ transport_reason(Reason) -> {transport, Reason}.
 -spec exit_normal(#loop_state{}, roadrunner_event_handler:close_reason()) -> no_return().
 exit_normal(S, Reason) ->
     #loop_state{
-        socket = Socket,
-        proto_opts = ProtoOpts,
-        conn_span = ConnSpan,
+        cfg = #h1_cfg{socket = Socket, proto_opts = ProtoOpts, conn_span = ConnSpan},
         requests_served = Served
     } = flush_out(release_request_slot(S)),
     exit_clean(Socket, roadrunner_conn:close_opts(ProtoOpts), ConnSpan, Served, Reason).
