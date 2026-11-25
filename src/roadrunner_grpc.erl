@@ -1738,7 +1738,7 @@ reflection_index(#stream{req = Req}) ->
     Index.
 
 -doc "The client's address.".
--spec peer(stream()) -> {inet:ip_address(), inet:port_number()} | undefined.
+-spec peer(stream()) -> roadrunner_event_handler:peer().
 peer(#stream{req = Req}) ->
     roadrunner_req:peer(Req).
 

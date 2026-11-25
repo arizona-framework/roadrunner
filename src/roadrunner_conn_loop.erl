@@ -89,7 +89,7 @@
     %% fired once the peer is settled. Paired with `listener_conn_close`
     %% in `exit_clean/5`.
     conn_span :: roadrunner_event_handler:span(),
-    peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    peer :: roadrunner_event_handler:peer(),
     %% The connection queries each request carries (`roadrunner_req:sockname/1`
     %% and the rest), built once per connection.
     conn_info :: roadrunner_req:conn_info(),
@@ -354,7 +354,7 @@ label_handshake(Socket, #proto_opts{tls_upgrade = TlsUpgrade}, ListenerName) ->
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
     atom(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     binary()
 ) -> no_return().
 serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
@@ -638,8 +638,8 @@ request_slot(_ProtoOpts) ->
 -spec proxy_protocol_stage(
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
-    {inet:ip_address(), inet:port_number()} | undefined
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+    roadrunner_event_handler:peer()
+) -> {ok, roadrunner_event_handler:peer(), binary()} | {close, term()}.
 proxy_protocol_stage(_Socket, #proto_opts{proxy_protocol = false}, OsPeer) ->
     {ok, OsPeer, <<>>};
 proxy_protocol_stage(
@@ -755,10 +755,10 @@ read_proxy_v1_line(Socket, Timeout) ->
     roadrunner_transport:socket(),
     integer(),
     non_neg_integer(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     integer(),
     binary()
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+) -> {ok, roadrunner_event_handler:peer(), binary()} | {close, term()}.
 read_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
     case roadrunner_transport:setopts(Socket, [{active, once}]) of
         ok -> await_proxy_bytes(Socket, Deadline, MinRate, OsPeer, Start, Acc);
@@ -817,10 +817,10 @@ await_proxy_bytes(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
     roadrunner_transport:socket(),
     integer(),
     non_neg_integer(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     integer(),
     binary()
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+) -> {ok, roadrunner_event_handler:peer(), binary()} | {close, term()}.
 parsed_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Buf) ->
     case roadrunner_proxy_protocol:parse(Buf) of
         {ok, Peer, Rest} -> {ok, Peer, Rest};

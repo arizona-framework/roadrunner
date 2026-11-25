@@ -231,7 +231,7 @@
     %% (`roadrunner_stream_worker:conn_heap_floor/1`).
     heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor(),
     listener_name :: atom(),
-    peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    peer :: roadrunner_event_handler:peer(),
     %% The connection queries each request carries, built once: they ask
     %% the QUIC connection (`conn_info/1`).
     conn_info :: roadrunner_req:conn_info(),

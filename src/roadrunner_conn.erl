@@ -393,7 +393,7 @@ try_acquire_request_slot(Max, Counter) ->
 %% well as a `rate_limit` of `undefined`.
 -doc false.
 -spec resolve_rate_limit(
-    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
+    proto_opts(), roadrunner_event_handler:peer()
 ) -> rate_limit_state().
 resolve_rate_limit(
     #proto_opts{rate_limit = #{table := Table} = RateLimit, rate_limited_counter = Counter},
@@ -425,7 +425,7 @@ resolve_rate_limit(_ProtoOpts, _Peer) ->
 %% is dominated by code loading.
 -doc false.
 -spec resolve_real_ip(
-    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
+    proto_opts(), roadrunner_event_handler:peer()
 ) -> roadrunner_real_ip:trust().
 resolve_real_ip(#proto_opts{real_ip = undefined}, _Peer) ->
     undefined;
@@ -722,7 +722,7 @@ hand_off_request_slots(Keeper, Cell, Workers, _Parked, _Max, _Counter, _Overload
 
 -doc false.
 -spec refine_conn_label(
-    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
+    proto_opts(), roadrunner_event_handler:peer()
 ) -> ok.
 refine_conn_label(#proto_opts{listener_name = ListenerName}, Peer) ->
     proc_lib:set_label({roadrunner_conn, ListenerName, Peer}),
@@ -1132,7 +1132,7 @@ rate_deadline(Start, Total, MinRate) ->
     Start + max(1001, Total * 1000 div MinRate + 1).
 
 -doc false.
--spec peer(roadrunner_transport:socket()) -> {inet:ip_address(), inet:port_number()} | undefined.
+-spec peer(roadrunner_transport:socket()) -> roadrunner_event_handler:peer().
 peer(Socket) ->
     case roadrunner_transport:peername(Socket) of
         %% A Unix domain socket's peer has no address.
@@ -1255,7 +1255,7 @@ expect_answer(ProtoOpts, Headers, MaxCL) ->
 -spec with_client_ip(
     roadrunner_req:request(),
     roadrunner_real_ip:trust(),
-    {inet:ip_address(), inet:port_number()} | undefined
+    roadrunner_event_handler:peer()
 ) -> roadrunner_req:request().
 with_client_ip(Req, undefined, _Peer) ->
     Req;

@@ -181,7 +181,7 @@ word_checks(IP, Len, Index) ->
 %% is not trusted, or there is no peer. Called once per connection, so an
 %% untrusted connection pays nothing per request.
 -doc false.
--spec peer_trust(trust(), {inet:ip_address(), inet:port_number()} | undefined) -> trust().
+-spec peer_trust(trust(), roadrunner_event_handler:peer()) -> trust().
 peer_trust({hops, _Header, _N} = Config, {_IP, _Port}) ->
     Config;
 peer_trust({cidrs, _Header, {V4, V6, _Unix}} = Config, {IP, _Port}) ->

@@ -323,7 +323,7 @@
     socket :: roadrunner_transport:socket(),
     proto_opts :: roadrunner_conn:proto_opts(),
     listener_name :: atom(),
-    peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    peer :: roadrunner_event_handler:peer(),
     %% The connection queries each request carries, built once.
     conn_info :: roadrunner_req:conn_info(),
     %% The event handler's span from `listener_accept`, fired by the
@@ -583,7 +583,7 @@ normal path.
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
     atom(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     roadrunner_event_handler:span(),
     binary()
 ) -> no_return().

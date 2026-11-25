@@ -87,7 +87,7 @@ care which protocol delivered the bytes.
     %% Client TCP peer captured once per connection from
     %% `inet:peername/1`. `undefined` when the OS call fails (rare;
     %% usually socket teardown) or on a Unix domain socket.
-    peer => {inet:ip_address(), inet:port_number()} | undefined,
+    peer => roadrunner_event_handler:peer(),
     %% The client address behind trusted reverse proxies, resolved per
     %% request from the forwarding header on a listener with `real_ip`
     %% whose peer is a trusted proxy. Absent otherwise; read it through
@@ -729,7 +729,7 @@ opt is opt-in precisely because trusting a PROXY header from a peer that
 can reach the listener directly would let that peer spoof its own address.
 """.
 -spec peer(request()) ->
-    {inet:ip_address(), inet:port_number()} | undefined.
+    roadrunner_event_handler:peer().
 peer(#{peer := P}) -> P;
 peer(_) -> undefined.
 
