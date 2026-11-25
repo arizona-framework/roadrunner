@@ -1357,7 +1357,7 @@ make_body_reader(Framing, Buffered, Recv, Max, TrailerLimits, Deadline) ->
         recv = Recv,
         deadline = Deadline,
         request_deadline = Deadline,
-        id = make_ref(),
+        id = erlang:unique_integer(),
         max = Max,
         trailer_limits = TrailerLimits,
         chunk_left = 0
@@ -1378,7 +1378,7 @@ stream_body_reader(Conn, StreamId, Deadline, Max, Done) ->
         done = Done,
         recv = stream_recv(Conn, StreamId),
         deadline = Deadline,
-        id = make_ref(),
+        id = erlang:unique_integer(),
         max = Max,
         source = {Conn, StreamId}
     }.
@@ -1402,7 +1402,7 @@ with_arrived_body_reader(Req, Body, Len, Max) ->
         done = Len =:= 0,
         recv = fun(_Deadline) -> {ok, Body, true} end,
         deadline = infinity,
-        id = make_ref(),
+        id = erlang:unique_integer(),
         max = Max
     },
     (maps:remove(body, Req))#{body_reader => Reader}.
@@ -1812,7 +1812,7 @@ consume_body_reader(BS, Mode) ->
     end.
 
 %% What tells a body reader apart from the readers of other bodies.
--spec reader_id(body_reader()) -> reference().
+-spec reader_id(body_reader()) -> integer().
 reader_id(#h1_body_reader{id = Id}) -> Id;
 reader_id(#stream_body_reader{id = Id}) -> Id.
 

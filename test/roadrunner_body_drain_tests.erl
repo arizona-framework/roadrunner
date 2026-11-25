@@ -123,7 +123,7 @@ reader(Framing, Max, Piece, Pieces) ->
         done = false,
         deadline = infinity,
         request_deadline = infinity,
-        id = make_ref(),
+        id = erlang:unique_integer(),
         recv = recv(Piece, Pieces),
         max = Max,
         trailer_limits = {8192, 10240, 100},
