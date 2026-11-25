@@ -62,6 +62,12 @@ watching a dead owner's workers before taking its registration.
     keeper_crash_watches_an_orphaned_worker/1,
     keeper_restart_leaves_owned_slots_to_their_owner/1,
     late_intent_is_swept/1,
+    handed_over_owner_leaves_its_workers_to_the_keeper/1,
+    hand_over_after_the_route_went/1,
+    hand_over_reaches_a_route_with_no_key/1,
+    hand_over_before_any_registration/1,
+    late_intent_after_a_hand_over_is_swept/1,
+    sweep_spares_an_owner_registered_again/1,
     drain_against_a_fast_worker/1,
     worker_key_taken_asks_the_keeper/1,
     table_deleted_mid_worker_admission/1,
@@ -129,6 +135,12 @@ all() ->
         keeper_crash_watches_an_orphaned_worker,
         keeper_restart_leaves_owned_slots_to_their_owner,
         late_intent_is_swept,
+        handed_over_owner_leaves_its_workers_to_the_keeper,
+        hand_over_after_the_route_went,
+        hand_over_reaches_a_route_with_no_key,
+        hand_over_before_any_registration,
+        late_intent_after_a_hand_over_is_swept,
+        sweep_spares_an_owner_registered_again,
         drain_against_a_fast_worker,
         worker_key_taken_asks_the_keeper,
         table_deleted_mid_worker_admission,
@@ -784,6 +796,121 @@ late_intent_is_swept(_Config) ->
     ok = wait_no_intents(C, erlang:monotonic_time(millisecond) + 10000),
     ok = stop_keeper(Keeper).
 
+handed_over_owner_leaves_its_workers_to_the_keeper(_Config) ->
+    %% An owner that lives on but stops answering its workers hands its
+    %% registration over: the keeper frees its worker's slot as the worker
+    %% ends, and does not register the owner again for a worker that asks.
+    {Keeper, C} = route(4, shed),
+    Owner = registered_owner(Keeper, C),
+    Worker = stream(Owner),
+    {ok, K} = result(Worker),
+    ?assertEqual([{K, Owner, Worker}], ets:lookup(slots(C), K)),
+    ok = hand_over(Owner),
+    ok = wait_unregistered(C, Owner, 1000000),
+    ok = end_worker(Worker),
+    ok = wait_in_flight(Keeper, C, 0),
+    ?assertEqual([], ets:tab2list(intents(C))),
+    Late = worker(C, idle(), Owner),
+    {ok, K2} = result(Late),
+    ?assertEqual([{K2, Late, Late}], ets:lookup(slots(C), K2)),
+    ?assertNot(ets:member(regs(C), Owner)),
+    %% Told again, the keeper has nothing to take.
+    Keeper ! {hand_over, Owner},
+    _ = sys:get_state(Keeper),
+    ok = end_worker(Late),
+    ok = wait_in_flight(Keeper, C, 0),
+    ok = stop_keeper(Keeper).
+
+hand_over_after_the_route_went(_Config) ->
+    %% The listener went with the route's tables: the owner has no keeper
+    %% to tell, and goes on.
+    {Keeper, C} = route(4, shed),
+    Owner = registered_owner(Keeper, C),
+    {ok, _} = result(stream(Owner)),
+    ok = stop_keeper(Keeper),
+    true = roadrunner_route_keeper:delete_table(table(C)),
+    ok = hand_over(Owner).
+
+hand_over_reaches_a_route_with_no_key(_Config) ->
+    %% The owner holds no slot of the route when it hands over, but is
+    %% registered there: the keeper takes the registration all the same, so
+    %% a worker of it starting later asks the keeper, which frees its slot
+    %% as it ends, while the owner still lives.
+    {Keeper, C} = route(4, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = hand_over(Owner),
+    ok = wait_unregistered(C, Owner, 1000000),
+    Worker = worker(C, idle(), Owner),
+    {ok, K} = result(Worker),
+    ?assertEqual([{K, Worker, Worker}], ets:lookup(slots(C), K)),
+    ok = end_worker(Worker),
+    ok = wait_in_flight(Keeper, C, 0),
+    ?assert(is_process_alive(Owner)),
+    ok = stop_keeper(Keeper).
+
+hand_over_before_any_registration(_Config) ->
+    %% An owner the keeper never registered hands over: the keeper watches
+    %% it, so its first worker to ask does not register it.
+    {Keeper, C} = route(4, shed),
+    Owner = owner(C),
+    ok = hand_over(Owner),
+    _ = sys:get_state(Keeper),
+    Worker = worker(C, idle(), Owner),
+    {ok, K} = result(Worker),
+    ?assertEqual([{K, Worker, Worker}], ets:lookup(slots(C), K)),
+    ?assertNot(ets:member(regs(C), Owner)),
+    ok = end_worker(Worker),
+    ok = wait_in_flight(Keeper, C, 0),
+    ok = stop_keeper(Keeper).
+
+late_intent_after_a_hand_over_is_swept(_Config) ->
+    %% As `late_intent_is_swept`, the owner handing over rather than dying:
+    %% a worker that read it registered writes its intent after the keeper
+    %% looked for them, and dies before taking it back. The keeper looks
+    %% again a second later and removes it.
+    {Keeper, C} = route(4, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = roadrunner_route_pause:arm(worker_noted),
+    Worker = stream(Owner),
+    Worker = roadrunner_route_pause:await(worker_noted),
+    ok = hand_over(Owner),
+    ok = wait_unregistered(C, Owner, 1000000),
+    _ = sys:get_state(Keeper),
+    ok = roadrunner_route_pause:arm(worker_intent, Worker),
+    ok = roadrunner_route_pause:resume(Worker, worker_noted),
+    Worker = roadrunner_route_pause:await(worker_intent),
+    exit(Worker, kill),
+    ?assertMatch([{Owner, Worker, _}], ets:tab2list(intents(C))),
+    ok = wait_no_intents(C, erlang:monotonic_time(millisecond) + 10000),
+    ok = stop_keeper(Keeper).
+
+sweep_spares_an_owner_registered_again(_Config) ->
+    %% An owner died, and a worker naming it asked the keeper before the
+    %% keeper looked again for the owner's intents: the keeper registers the
+    %% dead owner until it sees it die once more, and a worker may take a
+    %% slot owned by it meanwhile. The look must leave that worker's intent,
+    %% which the owner's next death leads the keeper to.
+    {Keeper, C} = route(4, shed),
+    Owner = registered_owner(Keeper, C),
+    ok = kill_owner(Keeper, C, Owner),
+    ok = sys:suspend(Keeper),
+    Asker = worker(C, idle(), Owner),
+    ok = wait_mailbox(Keeper, Asker),
+    ok = wait_sweep(Keeper, erlang:monotonic_time(millisecond) + 10000),
+    %% A worker holding a slot owned by the owner registered again.
+    Holder = idle(),
+    true = ets:insert(intents(C), {Owner, Holder, 4}),
+    true = ets:insert(slots(C), {4, Owner, Holder}),
+    ok = sys:resume(Keeper),
+    {ok, _} = result(Asker),
+    _ = sys:get_state(Keeper),
+    ?assertNot(ets:member(regs(C), Owner)),
+    ?assertEqual([{Owner, Holder, 4}], ets:lookup(intents(C), Owner)),
+    ok = end_worker(Holder),
+    ok = end_worker(Asker),
+    ok = wait_in_flight(Keeper, C, 0),
+    ok = stop_keeper(Keeper).
+
 drain_against_a_fast_worker(_Config) ->
     %% A worker found its owner registered just as the route was dropped.
     %% Nothing runs, so the keeper stops; the worker then inserts its row,
@@ -1239,6 +1366,8 @@ protocol_steps_keep_their_order(_Config) ->
             {{worker_down, 1}, [{ets, delete_object, 'Slots'}, {ets, delete_object, 'Intents'}]},
             %% A dead owner's registration goes before its workers are watched.
             {{watched_down, 3}, [{ets, take, 'Regs'}, adopt]},
+            %% So does the registration of an owner that handed it over.
+            {{handed_over, 2}, [{ets, take, 'Regs'}, adopt]},
             %% A request that ends deletes its row before it reads the gate.
             {{release, 2}, [{ets, delete_object, 'Slots'}, notify]},
             %% The keeper closes the gate before its last look for room.
@@ -1298,6 +1427,18 @@ index(Step, [Step | _], N) -> N;
 index(Step, [_ | Rest], N) -> index(Step, Rest, N + 1).
 
 %% Until the route holds no intent, or `Deadline` (ms) passes.
+%% Until the (suspended) keeper has its look for late intents queued.
+wait_sweep(Keeper, Deadline) ->
+    {messages, Messages} = erlang:process_info(Keeper, messages),
+    case lists:member(sweep, Messages) of
+        true ->
+            ok;
+        false ->
+            erlang:monotonic_time(millisecond) < Deadline orelse ct:fail(no_sweep),
+            erlang:yield(),
+            wait_sweep(Keeper, Deadline)
+    end.
+
 wait_no_intents(Ceiling, Deadline) ->
     case ets:tab2list(intents(Ceiling)) of
         [] ->
@@ -1488,7 +1629,23 @@ owner_loop(Ceiling, Test) ->
             owner_loop(Ceiling, Test);
         {ping, Ref} ->
             Test ! {Ref, pong},
-            owner_loop(Ceiling, Test)
+            owner_loop(Ceiling, Test);
+        {hand_over, Ref} ->
+            ok = roadrunner_route_keeper:hand_over([Ceiling]),
+            Test ! {Ref, handed_over},
+            receive
+                stop -> ok
+            end
+    end.
+
+%% Have an owner hand its registration over, after which it answers none
+%% of its workers.
+hand_over(Owner) ->
+    Ref = make_ref(),
+    Owner ! {hand_over, Ref},
+    receive
+        {Ref, handed_over} -> ok
+    after 5000 -> ct:fail({no_hand_over, Owner})
     end.
 
 %% A round trip to an owner: it has handled everything sent to it before.

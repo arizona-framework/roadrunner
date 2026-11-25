@@ -43,7 +43,11 @@
 %%   the keeper takes its registration, then watches every worker it has
 %%   an intent of, freeing each row as its worker ends: either the keeper
 %%   finds a worker's intent, or the worker finds the registration gone
-%%   before its row exists. A worker killed between its intent and backing
+%%   before its row exists. An owner that lives on but stops answering its
+%%   workers (an HTTP/2 connection lingering after its GOAWAY) tells the
+%%   keeper of every route it may hold a slot of (`hand_over/1`), which
+%%   takes its registration the same way, and never registers it again
+%%   while it lives. A worker killed between its intent and backing
 %%   off leaves only the intent, which the keeper looks for again a second
 %%   later; one stalled for longer than that before it died leaves the
 %%   intent, a few words and never a slot, until a keeper takes over or the
@@ -110,7 +114,8 @@
     acquire/4,
     release/2,
     noted/1,
-    worker_down/1
+    worker_down/1,
+    hand_over/1
 ]).
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2]).
 -export_type([ceiling/0, table/0, token/0, wait/0]).
@@ -184,10 +189,12 @@
 %% A process the keeper watches: a registered connection, or a stream
 %% worker holding a slot it granted or one whose owner died, with the rows
 %% to free when it dies. Only a registered one has a registration to remove
-%% then.
+%% then. An owner that handed over stays watched, so it is not registered
+%% again while it lives.
 -record(watched, {
     monitor :: reference(),
     registered = false :: boolean(),
+    handed_over = false :: boolean(),
     rows = [] :: [row()]
 }).
 
@@ -374,6 +381,61 @@ worker_down(Worker) ->
             catch
                 error:badarg -> ok
             end
+    end.
+
+%% The calling owner stops answering its workers while it lives on: an
+%% HTTP/2 connection lingering after its GOAWAY. It first takes the keys
+%% and `'DOWN'`s already sent to it, in the order they came, freeing the
+%% slot of each worker that ended. Then it tells the keeper of each route
+%% in `Ceilings` (its listener's routes with a ceiling), and of each route a
+%% worker still holds a key of (one a reload dropped among them), to take
+%% its registration, as the owner's death would: the keeper frees each row
+%% of a worker still running as the worker ends, and the owner's workers
+%% take no slot of their own from now on. Two cases stay counted until the
+%% owner exits, which the linger bounds: a slot a worker takes of a route a
+%% reload dropped, where the owner is registered but held no key when it
+%% handed over, and one a worker takes after a keeper that crashed during
+%% the linger restarts, as the new keeper does not know the owner handed
+%% over and registers it again when a worker asks.
+-spec hand_over([ceiling()]) -> ok.
+hand_over(Ceilings) ->
+    ok = ?PAUSE(handing_over),
+    take_sent(Ceilings).
+
+-spec take_sent([ceiling()]) -> ok.
+take_sent(Ceilings) ->
+    receive
+        {roadrunner_route_slot, _Worker, _Ceiling, _K} = Note ->
+            ok = noted(Note),
+            take_sent(Ceilings);
+        {'DOWN', _Mon, process, Worker, _Reason} ->
+            ok = worker_down(Worker),
+            take_sent(Ceilings)
+    after 0 ->
+        Self = self(),
+        Tables = lists:usort(
+            lists:foldl(
+                fun
+                    ({{?MODULE, _Worker}, {#ceiling{regs = Regs}, _K}}, Acc) -> [Regs | Acc];
+                    (_Entry, Acc) -> Acc
+                end,
+                [Regs || #ceiling{regs = Regs} <- Ceilings],
+                get()
+            )
+        ),
+        lists:foreach(fun(Regs) -> tell_keeper(Regs, Self) end, Tables)
+    end.
+
+%% A table already gone went with its listener, or with a route that
+%% drained, and counts nothing any more.
+-spec tell_keeper(ets:tid(), pid()) -> ok.
+tell_keeper(Regs, Owner) ->
+    try ets:lookup_element(Regs, '$keeper', 2) of
+        Keeper ->
+            _ = erlang:send(Keeper, {hand_over, Owner}),
+            ok
+    catch
+        error:badarg -> ok
     end.
 
 %% An HTTP/1.1 connection hands its slot back as its request ends, telling
@@ -712,6 +774,8 @@ handle_info({acquire, Token, Pid, h1, Wait}, State) ->
     noreply(admit(Token, Pid, h1, Wait, serve(State)));
 handle_info({acquire, Token, Pid, {worker, Owner}, Wait}, State) ->
     noreply(admit(Token, Pid, worker, Wait, serve(register_owner(Owner, State))));
+handle_info({hand_over, Owner}, State) ->
+    noreply(handed_over(Owner, State));
 handle_info({done, K}, State) ->
     noreply(serve(spare(K, State)));
 handle_info({expire, Token}, #state{waiters = Waiters} = State) ->
@@ -882,6 +946,8 @@ register_owner(Owner, #state{watched = Watched, regs = Regs} = State) ->
     case Watched of
         #{Owner := #watched{registered = true}} ->
             State;
+        #{Owner := #watched{handed_over = true}} ->
+            State;
         #{} ->
             State1 = registered(Owner, undefined, State),
             true = ets:insert_new(Regs, {Owner, none}),
@@ -954,6 +1020,25 @@ watched_down(Pid, Mon, #state{regs = Regs, watched = Watched, monitors = Monitor
             free_rows(Rows, State1)
     end.
 
+%% A live owner handed over. It is watched from now on, registered or not,
+%% so a worker of it asking is not taken for a new owner. A registration it
+%% has is taken as its death takes it, then the keeper watches every worker
+%% it has an intent of.
+-spec handed_over(pid(), #state{}) -> #state{}.
+handed_over(Owner, #state{regs = Regs} = State0) ->
+    #state{watched = Watched} = State = watch(Owner, undefined, State0),
+    #{Owner := #watched{registered = Registered} = W} = Watched,
+    State1 = State#state{
+        watched = Watched#{Owner := W#watched{registered = false, handed_over = true}}
+    },
+    case Registered of
+        true ->
+            [{Owner, none}] = ets:take(Regs, Owner),
+            sweep_later(Owner, adopt(Owner, State1));
+        false ->
+            State1
+    end.
+
 -spec home(token() | none, pid(), [row()]) -> [row()].
 home(none, _Pid, Rows) ->
     Rows;
@@ -982,15 +1067,23 @@ sweep_later(Owner, #state{late = Late} = State) ->
     State#state{late = [Owner | Late]}.
 
 -spec sweep(pid(), #state{}) -> #state{}.
-sweep(Owner, #state{intents = Intents, watched = Watched} = State) ->
-    lists:foreach(
-        fun({_Owner, Worker, K} = Intent) ->
-            adopted(Worker, {K, Owner, Worker}, Watched) orelse
-                ets:delete_object(Intents, Intent)
-        end,
-        ets:lookup(Intents, Owner)
-    ),
-    State.
+sweep(Owner, #state{regs = Regs, intents = Intents, watched = Watched} = State) ->
+    %% An owner registered again (a dead one, until the keeper sees it die
+    %% once more) may have workers holding rows from then on, which only
+    %% their intents lead the keeper to: its next death looks for them.
+    case ets:member(Regs, Owner) of
+        true ->
+            State;
+        false ->
+            lists:foreach(
+                fun({_Owner, Worker, K} = Intent) ->
+                    adopted(Worker, {K, Owner, Worker}, Watched) orelse
+                        ets:delete_object(Intents, Intent)
+                end,
+                ets:lookup(Intents, Owner)
+            ),
+            State
+    end.
 
 -spec adopted(pid(), row(), #{pid() => #watched{}}) -> boolean().
 adopted(Worker, Row, Watched) ->

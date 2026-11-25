@@ -41,6 +41,8 @@ alone.
     h2_killed_worker_frees_its_slot/1,
     h2_waiting_streams_leave_cheap_routes_a_slot/1,
     h2_owned_slot_frees_in_order/1,
+    h2_owned_slot_ended_before_the_linger/1,
+    h2_owned_slot_frees_through_the_linger/1,
     h3_shed_answers_503/1,
     h3_queue_grants_in_arrival_order/1,
     h3_queue_timeout_answers_503/1,
@@ -83,6 +85,8 @@ all() ->
         h2_killed_worker_frees_its_slot,
         h2_waiting_streams_leave_cheap_routes_a_slot,
         h2_owned_slot_frees_in_order,
+        h2_owned_slot_ended_before_the_linger,
+        h2_owned_slot_frees_through_the_linger,
         h3_shed_answers_503,
         h3_queue_grants_in_arrival_order,
         h3_queue_timeout_answers_503,
@@ -143,6 +147,12 @@ end_per_testcase(Case, _Config) ->
     true = unregister(?COLLECTOR),
     ok = roadrunner_listener:stop(Case).
 
+protocol_opts(Case) when
+    Case =:= h2_owned_slot_ended_before_the_linger;
+    Case =:= h2_owned_slot_frees_through_the_linger
+->
+    %% Far longer than the case waits for the slot to free.
+    #{protocols => [{http2, #{linger_timeout => 60_000}}]};
 protocol_opts(Case) ->
     case atom_to_list(Case) of
         "h2_" ++ _ -> #{protocols => [http2]};
@@ -616,6 +626,55 @@ h2_owned_slot_frees_in_order(Config) ->
     ok = h2_get(Sock, 3, ~"/slow"),
     ok = owned_slot_ends_while_its_owner_waits(Name).
 
+h2_owned_slot_ended_before_the_linger(Config) ->
+    %% A worker that took a slot owned by its connection ends as the
+    %% connection closes with a GOAWAY, before the connection read the
+    %% worker's key and its `'DOWN'`: the connection takes both before it
+    %% lingers, and the slot is free while it lingers.
+    Name = ?config(listener, Config),
+    Sock = registered_h2_conn(Config),
+    ok = roadrunner_route_pause:arm(worker_noted),
+    ok = roadrunner_route_pause:arm(handing_over),
+    ok = gen_tcp:send(Sock, [h2_get_frame(3, ~"/slow"), h2_connection_error()]),
+    Worker = roadrunner_route_pause:await(worker_noted),
+    Conn = roadrunner_route_pause:await(handing_over),
+    ok = roadrunner_route_pause:resume(Worker, worker_noted),
+    Worker = expect_handler(),
+    ?assertMatch([{_, Conn, Worker}], ets:tab2list(slots(Name))),
+    Mon = monitor(process, Worker),
+    Worker ! release,
+    receive
+        {'DOWN', Mon, process, Worker, _} -> ok
+    end,
+    ok = roadrunner_route_pause:resume(Conn, handing_over),
+    ok = wait_in_flight(Name, 0),
+    ?assert(is_process_alive(Conn)).
+
+h2_owned_slot_frees_through_the_linger(Config) ->
+    %% A worker that took a slot owned by its connection still runs when
+    %% the connection closes with a GOAWAY: the connection hands the slot
+    %% to the route's keeper before it lingers, and the keeper frees it as
+    %% the worker ends, while the connection still lingers.
+    Name = ?config(listener, Config),
+    Sock = registered_h2_conn(Config),
+    ok = h2_get(Sock, 3, ~"/slow"),
+    Worker = expect_handler(),
+    [{_, Conn, Worker}] = ets:tab2list(slots(Name)),
+    ?assertNotEqual(Conn, Worker),
+    ok = roadrunner_route_pause:arm(handing_over),
+    ok = gen_tcp:send(Sock, h2_connection_error()),
+    Conn = roadrunner_route_pause:await(handing_over),
+    ok = roadrunner_route_pause:resume(Conn, handing_over),
+    ok = wait_unregistered(Name, Conn),
+    Worker ! release,
+    ok = wait_in_flight(Name, 0),
+    ?assert(is_process_alive(Conn)),
+    %% A worker of the lingering connection asking now is granted by the
+    %% keeper, which does not register the connection again.
+    {ok, K} = roadrunner_route_keeper:acquire(slow_ceiling(Name), reset, Conn, Conn),
+    ?assertEqual([{K, self(), self()}], ets:tab2list(slots(Name))),
+    ?assertNot(ets:member(regs(Name), Conn)).
+
 h2_connection_gone_leaves_the_queue(Config) ->
     %% The client goes while a stream waits: its worker stops waiting, and
     %% no handler runs for it once a slot frees.
@@ -980,16 +1039,32 @@ h2_connect(Config) ->
     Sock.
 
 h2_get(Sock, StreamId, Path) ->
+    gen_tcp:send(Sock, h2_get_frame(StreamId, Path)).
+
+h2_get_frame(StreamId, Path) ->
     {Block, _} = roadrunner_http2_hpack:encode(
         [{~":method", ~"GET"}, {~":scheme", ~"http"}, {~":authority", ~"x"}, {~":path", Path}],
         roadrunner_http2_hpack:new_encoder(4096)
     ),
-    gen_tcp:send(
-        Sock,
-        roadrunner_http2_frame:encode(
-            {headers, StreamId, 16#04 bor 16#01, undefined, iolist_to_binary(Block)}
-        )
+    roadrunner_http2_frame:encode(
+        {headers, StreamId, 16#04 bor 16#01, undefined, iolist_to_binary(Block)}
     ).
+
+%% A DATA frame on stream 0: a connection error (RFC 9113 §6.1), answered
+%% with a GOAWAY and a linger.
+h2_connection_error() ->
+    <<0:24, 0:8, 0:8, 0:1, 0:31>>.
+
+%% An h2c connection the `/slow` keeper registered: its first stream asked
+%% the keeper, and has ended.
+registered_h2_conn(Config) ->
+    Name = ?config(listener, Config),
+    Sock = h2_connect(Config),
+    ok = h2_get(Sock, 1, ~"/slow"),
+    expect_handler() ! release,
+    {200, _, ~"ok"} = h2_response(Sock, 1),
+    ok = wait_in_flight(Name, 0),
+    Sock.
 
 %% Stream `StreamId`'s response, `{Status, Headers, Body}`. Frames of other
 %% streams read on the way are kept for their own call; the HPACK decoder is
@@ -1130,6 +1205,20 @@ route(Name, Path) ->
 
 wait_queued(Name, N) ->
     wait_route(Name, ~"/slow", queued, N).
+
+%% Until `/slow`'s keeper no longer has `Pid` registered, for up to 5 s.
+wait_unregistered(Name, Pid) ->
+    wait_unregistered(Name, Pid, erlang:monotonic_time(millisecond) + 5000).
+
+wait_unregistered(Name, Pid, Deadline) ->
+    case ets:member(regs(Name), Pid) of
+        false ->
+            ok;
+        true ->
+            erlang:monotonic_time(millisecond) < Deadline orelse ct:fail({registered, Pid}),
+            erlang:yield(),
+            wait_unregistered(Name, Pid, Deadline)
+    end.
 
 wait_in_flight(Name, N) ->
     wait_route(Name, ~"/slow", in_flight, N).

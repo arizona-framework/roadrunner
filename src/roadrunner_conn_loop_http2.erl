@@ -3839,15 +3839,21 @@ exit_clean(
 %% Linger over the socket (`roadrunner_conn:linger/3`). The conn answers
 %% none of its workers while it lingers, so each worker still running is
 %% told its stream is reset first, as a client reset tells it: one waiting
-%% on the conn ends now rather than when the conn exits. The reads are
-%% passive: a socket left armed with `{active, N}` would fail them at once
-%% and close with input unread.
+%% on the conn ends now rather than when the conn exits. The route slots
+%% its workers took on their own, which only the conn frees on their
+%% `'DOWN'`, go to the routes' keepers first
+%% (`roadrunner_route_keeper:hand_over/1`): a slot is not held through the
+%% linger after its handler ended. The reads are passive: a socket left
+%% armed with `{active, N}` would fail them at once and close with input
+%% unread.
 -spec linger(#loop{}, non_neg_integer()) -> ok.
 linger(_State, 0) ->
     ok;
 linger(
     #loop{
-        socket = Socket, streams = Streams, proto_opts = #proto_opts{linger_budget = Budget}
+        socket = Socket,
+        streams = Streams,
+        proto_opts = #proto_opts{linger_budget = Budget, dispatch = Dispatch}
     },
     Linger
 ) ->
@@ -3861,8 +3867,20 @@ linger(
         end,
         Streams
     ),
+    ok = roadrunner_route_keeper:hand_over(route_ceilings(Dispatch)),
     _ = roadrunner_transport:setopts(Socket, [{active, false}]),
     roadrunner_conn:linger(Socket, Linger, Budget).
+
+%% The routes with a ceiling the conn's workers may have taken a slot of:
+%% those of the listener's table, none for a single handler. A table gone
+%% with its listener has none.
+-spec route_ceilings(roadrunner_conn:dispatch()) -> [roadrunner_route_keeper:ceiling()].
+route_ceilings({router, ListenerName}) ->
+    roadrunner_router:compiled_ceilings(
+        persistent_term:get({roadrunner_routes, ListenerName}, {none, {}})
+    );
+route_ceilings({handler, _Mod, _Pipeline, _State}) ->
+    [].
 
 %% The in-flight slots the conn still holds as it exits, counted in its
 %% cell: one per worker not yet seen ending (`workers`), plus any grant on

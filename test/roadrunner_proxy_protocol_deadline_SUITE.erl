@@ -21,9 +21,16 @@ with a `{proxy_protocol, Reason}` reason.
     tcp_v2_trickle_hits_the_deadline/1,
     tcp_v1_trickle_below_rate_is_closed/1,
     tcp_v2_trickle_below_rate_is_closed/1,
+    tcp_header_gone_silent_is_closed_at_the_rate/1,
     tcp_whole_header_passes_the_rate/1,
     tcp_header_split_inside_the_grace_passes/1,
-    tls_split_header_shares_one_deadline/1
+    tls_split_header_shares_one_deadline/1,
+    tcp_drain_closes_a_header_on_its_way/1,
+    tcp_drain_closes_a_conn_before_its_header/1,
+    tcp_header_wait_never_wakes/1,
+    tcp_peer_gone_before_its_header/1,
+    tcp_transport_error_before_its_header/1,
+    tcp_stray_message_before_its_header/1
 ]).
 
 -define(V2_SIG, 16#0D, 16#0A, 16#0D, 16#0A, 16#00, 16#0D, 16#0A, 16#51, 16#55, 16#49, 16#54, 16#0A).
@@ -38,9 +45,16 @@ all() ->
         tcp_v2_trickle_hits_the_deadline,
         tcp_v1_trickle_below_rate_is_closed,
         tcp_v2_trickle_below_rate_is_closed,
+        tcp_header_gone_silent_is_closed_at_the_rate,
         tcp_whole_header_passes_the_rate,
         tcp_header_split_inside_the_grace_passes,
-        tls_split_header_shares_one_deadline
+        tls_split_header_shares_one_deadline,
+        tcp_drain_closes_a_header_on_its_way,
+        tcp_drain_closes_a_conn_before_its_header,
+        tcp_header_wait_never_wakes,
+        tcp_peer_gone_before_its_header,
+        tcp_transport_error_before_its_header,
+        tcp_stray_message_before_its_header
     ].
 
 init_per_testcase(Case, Config) ->
@@ -58,7 +72,11 @@ init_per_testcase(Case, Config) ->
 
 end_per_testcase(_Case, Config) ->
     ok = telemetry:detach(?config(handler_id, Config)),
-    ok = roadrunner_listener:stop(?MODULE).
+    %% A drain case leaves no listener to stop.
+    case whereis(?MODULE) of
+        undefined -> ok;
+        _Listener -> roadrunner_listener:stop(?MODULE)
+    end.
 
 tcp_v1_trickle_hits_the_deadline(_Config) ->
     %% One byte every 50 ms would take about 2 s for the whole line. Each
@@ -88,6 +106,17 @@ tcp_v2_trickle_below_rate_is_closed(_Config) ->
     Port = start_tcp_listener(#{request_timeout => 20000, min_bytes_per_second => 1000}),
     {ok, Tcp} = connect(Port),
     ?assertMatch({closed, Left} when Left > 0, trickle(Tcp, v2_tcp4(), 1100)),
+    ?assertEqual({proxy_protocol, slow_client}, await_accept_error()).
+
+tcp_header_gone_silent_is_closed_at_the_rate(_Config) ->
+    %% A header begun, then nothing: silence counts toward the rate, as it
+    %% does for the request head, so the bytes so far fall below
+    %% `min_bytes_per_second` once the 1 s grace is over and the connection
+    %% is closed then, long before `request_timeout`.
+    Port = start_tcp_listener(#{request_timeout => 20000, min_bytes_per_second => 100}),
+    {ok, Tcp} = connect(Port),
+    ok = gen_tcp:send(Tcp, ~"PROXY TCP4 "),
+    ?assertEqual({error, closed}, gen_tcp:recv(Tcp, 0, 5000)),
     ?assertEqual({proxy_protocol, slow_client}, await_accept_error()).
 
 tcp_whole_header_passes_the_rate(_Config) ->
@@ -131,7 +160,118 @@ tls_split_header_shares_one_deadline(_Config) ->
     ?assertMatch({closed, _}, send_spaced(Tcp, [Sig, Prefix, Block], 400)),
     ?assertEqual({proxy_protocol, timeout}, await_accept_error()).
 
+tcp_drain_closes_a_header_on_its_way(_Config) ->
+    %% A peer that sent part of its header and went quiet does not hold up a
+    %% graceful drain: the connection waits for the rest in `receive`, where
+    %% it sees the drain at once, so the drain ends long before the header's
+    %% deadline.
+    Port = start_tcp_listener(#{request_timeout => 20000, min_bytes_per_second => 0}),
+    ok = drain_while_waiting(Port, ~"PROXY TCP4 ").
+
+tcp_drain_closes_a_conn_before_its_header(_Config) ->
+    %% The same for a peer that has sent nothing yet.
+    Port = start_tcp_listener(#{request_timeout => 20000}),
+    ok = drain_while_waiting(Port, ~"").
+
+tcp_header_wait_never_wakes(_Config) ->
+    %% A connection waiting for its header, before any byte or with part of
+    %% it in (no rate to keep), does no work while it waits: its reductions
+    %% do not move over a second of silence.
+    Port = start_tcp_listener(#{request_timeout => 20000, min_bytes_per_second => 0}),
+    {ok, Idle} = connect(Port),
+    ok = still_while_silent(Idle),
+    {ok, Partial} = connect(Port),
+    ok = gen_tcp:send(Partial, ~"PROXY TCP4 "),
+    ok = still_while_silent(Partial).
+
+tcp_peer_gone_before_its_header(_Config) ->
+    Port = start_tcp_listener(#{}),
+    {ok, Tcp} = connect(Port),
+    _Conn = waiting_for_header(Tcp),
+    ok = gen_tcp:close(Tcp),
+    ?assertEqual({proxy_protocol, closed}, await_accept_error()).
+
+tcp_transport_error_before_its_header(_Config) ->
+    Port = start_tcp_listener(#{}),
+    {ok, Tcp} = connect(Port),
+    Conn = waiting_for_header(Tcp),
+    Conn ! {tcp_error, Tcp, econnreset},
+    ?assertEqual({proxy_protocol, econnreset}, await_accept_error()),
+    ok = gen_tcp:close(Tcp).
+
+tcp_stray_message_before_its_header(_Config) ->
+    %% A message the wait does not know is dropped, and the header still
+    %% comes through.
+    Port = start_tcp_listener(#{}),
+    {ok, Tcp} = connect(Port),
+    Conn = waiting_for_header(Tcp),
+    Conn ! stray,
+    ok = gen_tcp:send(Tcp, [?V1, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"]),
+    ?assertEqual(~"192.168.0.7", body_of(recv_until_closed(Tcp, <<>>))),
+    ok = gen_tcp:close(Tcp).
+
 %% --- helpers ---
+
+%% Send part of a header, wait until the connection reads the rest, then
+%% drain: it returns `{ok, drained}` with the connection closed, and no
+%% accept error is reported for the drain.
+drain_while_waiting(Port, Part) ->
+    {ok, Tcp} = connect(Port),
+    ok = gen_tcp:send(Tcp, Part),
+    _Conn = waiting_for_header(Tcp),
+    ?assertEqual({ok, drained}, roadrunner_listener:drain(?MODULE, 5000)),
+    ?assertEqual({error, closed}, gen_tcp:recv(Tcp, 0, 1000)),
+    receive
+        {accept_error, Meta} -> ct:fail({accept_error, Meta})
+    after 0 -> ok
+    end.
+
+%% The connection serving `Tcp`, once it waits for the rest of its PROXY
+%% header with everything sent so far taken in.
+waiting_for_header(Tcp) ->
+    {ok, Local} = inet:sockname(Tcp),
+    waiting_for_header(Local, erlang:monotonic_time(millisecond) + 5000).
+
+waiting_for_header(Local, Deadline) ->
+    case
+        [
+            P
+         || P <- processes(),
+            [
+                {current_function, {roadrunner_conn_loop, await_proxy_bytes, 6}},
+                {message_queue_len, 0}
+            ] <-
+                [erlang:process_info(P, [current_function, message_queue_len])],
+            serves(P, Local)
+        ]
+    of
+        [Conn] ->
+            Conn;
+        [] ->
+            erlang:monotonic_time(millisecond) < Deadline orelse ct:fail(never_waiting),
+            erlang:yield(),
+            waiting_for_header(Local, Deadline)
+    end.
+
+%% Whether `Pid` owns the server side of the connection whose client end
+%% is at `Local`.
+serves(Pid, Local) ->
+    lists:any(
+        fun(Port) ->
+            erlang:port_info(Port, connected) =:= {connected, Pid} andalso
+                inet:peername(Port) =:= {ok, Local}
+        end,
+        erlang:ports()
+    ).
+
+%% The connection serving `Tcp` does no work over a second in which the
+%% client sends nothing.
+still_while_silent(Tcp) ->
+    Conn = waiting_for_header(Tcp),
+    {reductions, Before} = erlang:process_info(Conn, reductions),
+    ?assertEqual({error, timeout}, gen_tcp:recv(Tcp, 0, 1000)),
+    ?assertEqual({reductions, Before}, erlang:process_info(Conn, reductions)),
+    ok.
 
 start_tcp_listener(Extra) ->
     {ok, _} = roadrunner_listener:start_link(

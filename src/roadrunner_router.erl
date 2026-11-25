@@ -68,7 +68,7 @@ of trying every route in turn.
 """.
 
 -export([compile/2, compile/3, validate/1, match/3, resolve/3, init_handler_state/3]).
--export([compile/4, ceilings/1, ceiling_key/1]).
+-export([compile/4, ceilings/1, ceiling_key/1, compiled_ceilings/1]).
 
 -export_type([
     route/0,
@@ -848,6 +848,16 @@ ceilings(Routes) ->
     [
         {ceiling_key(Route), Max, ceiling_mode(Max, maps:get(overload_mode, Route, {shed, #{}}))}
      || #{max_concurrent_requests := Max} = Route <- Routes
+    ].
+
+-doc false.
+%% The counts of the ceilings a compiled table carries, one per route with
+%% a ceiling a listener keeps.
+-spec compiled_ceilings(compiled()) -> [roadrunner_route_keeper:ceiling()].
+compiled_ceilings({_Tree, Entries}) ->
+    [
+        Ceiling
+     || {_Handler, _Pipeline, _State, _Methods, {_Body, Ceiling}} <- tuple_to_list(Entries)
     ].
 
 -spec ceiling_mode(roadrunner_listener:positive_limit(), overload_mode()) ->
