@@ -2351,6 +2351,8 @@ base_listen_opts(Opts, Buffer) ->
     %% idle, so an idle TLS connection holds no read buffer anyway. See
     %% `erlang/otp#9423` and `ninenines/cowlib#143` for the upstream
     %% context.
+    SendOpts = send_opts(Opts, os:type()),
+    ok = roadrunner_transport:slice_sends(SendOpts),
     Base = [
         binary,
         {active, false},
@@ -2358,7 +2360,7 @@ base_listen_opts(Opts, Buffer) ->
         {packet, raw},
         {nodelay, true},
         {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)}
-        | kernel_recv_buffer(Opts, [{buffer, Buffer} | send_opts(Opts, os:type())])
+        | kernel_recv_buffer(Opts, [{buffer, Buffer} | SendOpts])
     ],
     %% Both `gen_tcp:listen/2` and `ssl:listen/2` accept the bind
     %% options, and the TLS path builds on this list, so a loopback bind
@@ -2389,7 +2391,8 @@ kernel_recv_buffer(Opts, SocketOpts) ->
 %% each time a write finds the socket's queue full, which measured 5% more
 %% CPU on a 110 KB page, so it is set only where the kernel option is
 %% missing; there a send that waits that long fails and closes the socket
-%% (`send_timeout_close`). `max_unsent_bytes` is the
+%% (`send_timeout_close`), and large sends go out in slices
+%% (`roadrunner_transport:slice_sends/1`). `max_unsent_bytes` is the
 %% kernel's `TCP_NOTSENT_LOWAT`: a write waits while more than this is queued
 %% in the kernel and not sent yet. Without it the kernel grows a socket's
 %% send buffer to megabytes and fills it for a client that does not read (a

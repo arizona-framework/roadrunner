@@ -22,7 +22,8 @@ a large write more slowly than `send_timeout` allows for all of it.
     invalid_values_refuse_to_start/1,
     socket_options_per_os/1,
     sliced_writes_arrive_whole_on_tcp/1,
-    sliced_writes_arrive_whole_on_tls/1
+    sliced_writes_arrive_whole_on_tls/1,
+    kernel_timeout_writes_are_not_sliced/1
 ]).
 
 %% Far larger than what the kernel queues for one connection with a
@@ -43,7 +44,8 @@ all() ->
         invalid_values_refuse_to_start,
         socket_options_per_os,
         sliced_writes_arrive_whole_on_tcp,
-        sliced_writes_arrive_whole_on_tls
+        sliced_writes_arrive_whole_on_tls,
+        kernel_timeout_writes_are_not_sliced
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -52,6 +54,7 @@ init_per_testcase(_Case, Config) ->
     [{file, File} | Config].
 
 end_per_testcase(_Case, _Config) ->
+    _ = persistent_term:erase({roadrunner_transport, slice_sends}),
     case whereis(send_timeout_test) of
         undefined -> ok;
         _ -> roadrunner_listener:stop(send_timeout_test)
@@ -152,27 +155,75 @@ socket_options_per_os(_Config) ->
     ).
 
 sliced_writes_arrive_whole_on_tcp(_Config) ->
-    %% Writes over 256 KB go out in slices; the client gets every byte in
-    %% order, whatever the shape of the iolist, and a write on a closed
-    %% socket fails on its first slice.
+    %% Where the emulator's `send_timeout` is in use, writes over 256 KB
+    %% go out in slices; the client gets every byte in order, whatever the
+    %% shape of the iolist, and a write on a closed socket fails on its
+    %% first slice.
+    ok = roadrunner_transport:slice_sends(roadrunner_listener:send_opts(#{}, {unix, darwin})),
+    {Sends, Closed} = tcp_writes(),
+    ?assertEqual([], [N || N <- Sends, N < 2]),
+    ?assertEqual({error, closed}, Closed).
+
+sliced_writes_arrive_whole_on_tls(_Config) ->
+    ok = roadrunner_transport:slice_sends(roadrunner_listener:send_opts(#{}, {win32, nt})),
+    tls_writes().
+
+kernel_timeout_writes_are_not_sliced(_Config) ->
+    %% The kernel's `TCP_USER_TIMEOUT` (and no timeout at all) leaves each
+    %% write whole: one send, whatever its size.
+    ok = roadrunner_transport:slice_sends(roadrunner_listener:send_opts(#{}, {unix, linux})),
+    ok = roadrunner_transport:slice_sends(
+        roadrunner_listener:send_opts(#{send_timeout => infinity}, {unix, darwin})
+    ),
+    {Sends, Closed} = tcp_writes(),
+    ?assertEqual([1, 1, 1], Sends),
+    ?assertEqual({error, closed}, Closed),
+    tls_writes().
+
+%% Each of `sliced_data/0` written with `roadrunner_transport:send/2` on a
+%% TCP socket: how many `gen_tcp:send/2` calls each took, and the result
+%% of a write once the socket is closed.
+tcp_writes() ->
     {ok, L} = gen_tcp:listen(0, [binary, {active, false}]),
     {ok, Port} = inet:port(L),
     {ok, C} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]),
     {ok, S} = gen_tcp:accept(L),
-    lists:foreach(
+    1 = erlang:trace_pattern({gen_tcp, send, 2}, true, []),
+    Sends = lists:map(
         fun(Data) ->
+            Tracer = spawn_link(fun() -> count_traced_sends(0) end),
+            1 = erlang:trace(self(), true, [call, {tracer, Tracer}]),
             ok = roadrunner_transport:send({gen_tcp, S}, Data),
+            1 = erlang:trace(self(), false, [call]),
             Want = iolist_to_binary(Data),
-            ?assertEqual({ok, Want}, gen_tcp:recv(C, byte_size(Want), 5000))
+            ?assertEqual({ok, Want}, gen_tcp:recv(C, byte_size(Want), 5000)),
+            Ref = erlang:trace_delivered(self()),
+            receive
+                {trace_delivered, _, Ref} -> ok
+            end,
+            Tracer ! {count, self()},
+            receive
+                {sends, Tracer, N} -> N
+            end
         end,
         sliced_data()
     ),
+    1 = erlang:trace_pattern({gen_tcp, send, 2}, false, []),
     ok = gen_tcp:close(C),
     ok = gen_tcp:close(S),
-    ?assertEqual({error, closed}, roadrunner_transport:send({gen_tcp, S}, hd(sliced_data()))),
-    ok = gen_tcp:close(L).
+    Closed = roadrunner_transport:send({gen_tcp, S}, hd(sliced_data())),
+    ok = gen_tcp:close(L),
+    {Sends, Closed}.
 
-sliced_writes_arrive_whole_on_tls(_Config) ->
+%% A tracer (a process does not get its own trace messages) counting the
+%% `gen_tcp:send/2` calls it is told of until asked for the count.
+count_traced_sends(N) ->
+    receive
+        {trace, _Pid, call, {gen_tcp, send, [_, _]}} -> count_traced_sends(N + 1);
+        {count, From} -> From ! {sends, self(), N}
+    end.
+
+tls_writes() ->
     {ok, _} = application:ensure_all_started(ssl),
     {ok, L} = ssl:listen(
         0, roadrunner_test_certs:server_opts() ++ [binary, {active, false}, {reuseaddr, true}]
