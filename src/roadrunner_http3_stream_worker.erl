@@ -16,9 +16,10 @@
 %%    (`roadrunner_conn:resolve_handler/2` + the pre-composed pipeline).
 %% 3. Writes the response straight onto the QUIC stream. A streamed write
 %%    goes through `roadrunner_quic:send_data/4`, a synchronous round-trip
-%%    to the connection (make_ref + reply) keyed by the `Conn` handle, so
-%%    this non-owner worker gets flow-control back-pressure without a
-%%    separate h2-style conn-mediated send module. A buffered response is
+%%    to the connection (a request tagged with a monitor of it, and the
+%%    reply) keyed by the `Conn` handle, so this non-owner worker gets
+%%    flow-control back-pressure without a separate h2-style
+%%    conn-mediated send module. A buffered response is
 %%    the worker's last word on its stream, so it goes one way
 %%    (`roadrunner_quic:send_final/3`), as on h2.
 %%

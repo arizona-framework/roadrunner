@@ -378,7 +378,7 @@
     %% window) is parked here instead of replied, so the stream worker (and
     %% the loop handler's Push) blocks until the buffer drains — the HTTP/3
     %% analogue of h2's defer-ack backpressure. At most one entry per stream:
-    %% the worker blocks in `roadrunner_quic:await/3`, so it cannot have a
+    %% the worker blocks in `roadrunner_quic:await/2`, so it cannot have a
     %% second `send_data` outstanding. Released by `release_drained/1` (drain
     %% or abort) and `release_all/2` (connection teardown).
     parked = #{} :: #{non_neg_integer() => {pid(), reference()}},
@@ -1253,7 +1253,7 @@ handle_send(From, Ref, Sid, IoData, Fin, Now, State) ->
     case park_send(Sid, From, Ref, State2) of
         {parked, State3} ->
             %% Backpressure: the bytes did not fully flush, so withhold the
-            %% reply. The worker blocks in `await/3` until `release_drained/1`
+            %% reply. The worker blocks in `await/2` until `release_drained/1`
             %% (from a later send pass once the window opens, or on abort)
             %% emits it. Bytes already went out in SendEffects.
             {State3, SendEffects};

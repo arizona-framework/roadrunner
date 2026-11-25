@@ -4,7 +4,7 @@
 
 -define(M, roadrunner_quic).
 
-%% The control API is a make_ref round-trip over the connection's
+%% The control API is a monitor-tagged round-trip over the connection's
 %% {quic_call}/{quic_send} wire, so a fake connection that speaks that wire
 %% covers it without a full handshake (the real connection's replies are tested
 %% in roadrunner_quic_conn_state_tests).
@@ -62,6 +62,40 @@ conn_down_exits_caller_test() ->
             ?assertMatch({quic_conn_down, _}, Reason)
     after 1000 ->
         error(caller_did_not_exit)
+    end.
+
+%% A connection that takes a stream write and dies before answering exits
+%% the writer with {quic_conn_down, Reason}, and the writer is left with no
+%% reply or 'DOWN' behind in its mailbox. This guards the exit on the
+%% connection's death; the receive optimisation itself is pinned by
+%% slot_and_down_share_every_receive's allow-list and +recv_opt_info.
+conn_down_mid_write_exits_writer_test() ->
+    Test = self(),
+    Conn = spawn(fun() ->
+        receive
+            {quic_send, _From, _Mon, _StreamId, _IoData, _Fin} -> exit(gone)
+        end
+    end),
+    {Writer, WriterMon} = spawn_monitor(fun() ->
+        try
+            ?M:send_data(Conn, 4, ~"frames", false)
+        catch
+            exit:Reason ->
+                {messages, Left} = process_info(self(), messages),
+                Test ! {writer_exit, Reason, Left},
+                exit(Reason)
+        end
+    end),
+    receive
+        {writer_exit, Reason, Left} ->
+            ?assertEqual({quic_conn_down, gone}, Reason),
+            ?assertEqual([], Left)
+    after 1000 ->
+        error(writer_did_not_exit)
+    end,
+    receive
+        {'DOWN', WriterMon, process, Writer, Down} ->
+            ?assertEqual({quic_conn_down, gone}, Down)
     end.
 
 %% =============================================================================
