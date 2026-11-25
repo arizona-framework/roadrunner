@@ -21,6 +21,7 @@ with a `{proxy_protocol, Reason}` reason.
     tcp_v2_trickle_hits_the_deadline/1,
     tcp_v1_trickle_below_rate_is_closed/1,
     tcp_v2_trickle_below_rate_is_closed/1,
+    tcp_header_gone_silent_is_closed_at_the_rate/1,
     tcp_whole_header_passes_the_rate/1,
     tcp_header_split_inside_the_grace_passes/1,
     tls_split_header_shares_one_deadline/1
@@ -38,6 +39,7 @@ all() ->
         tcp_v2_trickle_hits_the_deadline,
         tcp_v1_trickle_below_rate_is_closed,
         tcp_v2_trickle_below_rate_is_closed,
+        tcp_header_gone_silent_is_closed_at_the_rate,
         tcp_whole_header_passes_the_rate,
         tcp_header_split_inside_the_grace_passes,
         tls_split_header_shares_one_deadline
@@ -88,6 +90,17 @@ tcp_v2_trickle_below_rate_is_closed(_Config) ->
     Port = start_tcp_listener(#{request_timeout => 20000, min_bytes_per_second => 1000}),
     {ok, Tcp} = connect(Port),
     ?assertMatch({closed, Left} when Left > 0, trickle(Tcp, v2_tcp4(), 1100)),
+    ?assertEqual({proxy_protocol, slow_client}, await_accept_error()).
+
+tcp_header_gone_silent_is_closed_at_the_rate(_Config) ->
+    %% A header begun, then nothing: silence counts toward the rate, as it
+    %% does for the request head, so the bytes so far fall below
+    %% `min_bytes_per_second` once the 1 s grace is over and the connection
+    %% is closed then, long before `request_timeout`.
+    Port = start_tcp_listener(#{request_timeout => 20000, min_bytes_per_second => 100}),
+    {ok, Tcp} = connect(Port),
+    ok = gen_tcp:send(Tcp, ~"PROXY TCP4 "),
+    ?assertEqual({error, closed}, gen_tcp:recv(Tcp, 0, 5000)),
     ?assertEqual({proxy_protocol, slow_client}, await_accept_error()).
 
 tcp_whole_header_passes_the_rate(_Config) ->

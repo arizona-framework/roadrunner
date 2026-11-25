@@ -737,11 +737,12 @@ read_proxy_v1_line(Socket, Timeout) ->
 %% accumulating until `roadrunner_proxy_protocol:parse/1` decides. The parser
 %% bounds the header size (v1 107 bytes, v2 by its declared length), so `Acc`
 %% cannot grow without bound. Every read waits only for what is left of the
-%% header's `Deadline`, and the bytes so far must keep up with `MinRate`
-%% (`roadrunner_conn:rate_ok/3`, with its grace) from `Start`, the arrival of
-%% the first byte, as the request head's bytes do. Over-reading is fine here:
-%% leftover bytes are the start of the first request and are threaded into
-%% its parse.
+%% header's `Deadline`, and once the header has begun, only until the bytes
+%% so far fall below `MinRate` (`roadrunner_conn:rate_deadline/3`, with its
+%% grace) from `Start`, the arrival of the first byte, as the request head's
+%% bytes do: a peer that goes silent partway is closed then, not at the
+%% deadline. Over-reading is fine here: leftover bytes are the start of the
+%% first request and are threaded into its parse.
 -spec read_proxy_header(
     roadrunner_transport:socket(),
     integer(),
@@ -751,19 +752,25 @@ read_proxy_v1_line(Socket, Timeout) ->
     binary()
 ) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
 read_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
-    case roadrunner_transport:recv(Socket, 0, time_left(Deadline)) of
+    Wake =
+        case Acc of
+            <<>> -> Deadline;
+            _ -> min(Deadline, roadrunner_conn:rate_deadline(Start, byte_size(Acc), MinRate))
+        end,
+    case roadrunner_transport:recv(Socket, 0, time_left(Wake)) of
         {ok, Bytes} ->
-            Now = erlang:monotonic_time(millisecond),
+            %% No rate check here: more bytes only raise the average, and
+            %% the next wait ends where the new total falls below it.
             Start1 =
                 case Acc of
-                    <<>> -> Now;
+                    <<>> -> erlang:monotonic_time(millisecond);
                     _ -> Start
                 end,
-            Buf = <<Acc/binary, Bytes/binary>>,
-            case roadrunner_conn:rate_ok(Now - Start1, byte_size(Buf), MinRate) of
-                true -> parsed_proxy_header(Socket, Deadline, MinRate, OsPeer, Start1, Buf);
-                false -> {close, slow_client}
-            end;
+            parsed_proxy_header(
+                Socket, Deadline, MinRate, OsPeer, Start1, <<Acc/binary, Bytes/binary>>
+            );
+        {error, timeout} when Wake =/= Deadline ->
+            {close, slow_client};
         {error, Reason} ->
             {close, Reason}
     end.
