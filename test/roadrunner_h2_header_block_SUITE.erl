@@ -17,7 +17,8 @@ guard).
 -export([init_per_testcase/2, end_per_testcase/2]).
 -export([
     block_over_cap_gets_431_and_the_conn_serves_on/1,
-    block_over_the_list_size_gets_goaway/1
+    block_over_the_list_size_gets_goaway/1,
+    refusals_on_a_shut_window_send_no_data/1
 ]).
 
 -define(MAX_FRAME_SIZE, 16384).
@@ -30,7 +31,8 @@ suite() ->
 all() ->
     [
         block_over_cap_gets_431_and_the_conn_serves_on,
-        block_over_the_list_size_gets_goaway
+        block_over_the_list_size_gets_goaway,
+        refusals_on_a_shut_window_send_no_data
     ].
 
 init_per_suite(Config) ->
@@ -95,6 +97,49 @@ block_over_the_list_size_gets_goaway(Config) ->
     ?assertMatch({goaway, _, enhance_your_calm, _}, lists:last(Frames)),
     ?assertEqual({error, closed}, gen_tcp:recv(maps:get(sock, C3), 0, 5000)).
 
+refusals_on_a_shut_window_send_no_data(Config) ->
+    %% A client that opens its streams with no send window (its
+    %% INITIAL_WINDOW_SIZE is 0) gets no DATA it did not allow (RFC 9113
+    %% §6.9.1): a request the server refuses itself before any handler runs
+    %% is answered with its status alone, then reset. Stream 1's block is
+    %% over `max_header_block` (431); stream 3 declares a body over its cap
+    %% and asks for `100-continue` (413).
+    C0 = open(Config, [{4, 0}]),
+    C1 = send_block(C0, 1, 16#01, request(~"GET", [{~"x-big", big_value(20_000)}])),
+    {Refusal1, C2} = refusal(C1, 1),
+    ?assertEqual([{headers, 1, 16#05, ~"431"}, {rst_stream, 1, no_error}], Refusal1),
+    C3 = send_block(
+        C2,
+        3,
+        0,
+        request(~"POST", [
+            {~"content-length", ~"1000000000000"}, {~"expect", ~"100-continue"}
+        ])
+    ),
+    {Refusal3, _} = refusal(C3, 3),
+    ?assertEqual([{headers, 3, 16#05, ~"413"}, {rst_stream, 3, no_error}], Refusal3).
+
+%% The frames on `StreamId` up to its reset (SETTINGS left out), each
+%% HEADERS as its flags and status, and the connection after them.
+refusal(C0, StreamId) ->
+    {Frames, C1} = until(C0, fun
+        ({rst_stream, Id, _}) -> Id =:= StreamId;
+        (_) -> false
+    end),
+    {
+        [
+            case F of
+                {headers, Id, Flags, Headers} ->
+                    {_, Status} = lists:keyfind(~":status", 1, Headers),
+                    {headers, Id, Flags, Status};
+                _ ->
+                    F
+            end
+         || F <- Frames, element(1, F) =/= settings, element(2, F) =:= StreamId
+        ],
+        C1
+    }.
+
 %% =============================================================================
 %% HTTP/2 client
 %% =============================================================================
@@ -113,11 +158,14 @@ big_value(Size) ->
     binary:part(binary:copy(~"abcdefghijklmnopqrstuvwxyz0123456789", Size div 36 + 1), 0, Size).
 
 open(Config) ->
+    open(Config, []).
+
+open(Config, Settings) ->
     {ok, Sock} = gen_tcp:connect(
         {127, 0, 0, 1}, ?config(port, Config), [binary, {active, false}], 5000
     ),
     ok = gen_tcp:send(Sock, [
-        ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", roadrunner_http2_frame:encode({settings, 0, []})
+        ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", roadrunner_http2_frame:encode({settings, 0, Settings})
     ]),
     #{
         sock => Sock,

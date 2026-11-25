@@ -21,6 +21,8 @@ clients send as they connect, upload and read never do.
     stream_window_update_flood_closes/1,
     window_update_nothing_waits_on_flood_closes/1,
     priority_flood_closes/1,
+    unsolicited_ping_ack_flood_closes/1,
+    unsolicited_liveness_ping_ack_flood_closes/1,
     unknown_frame_flood_closes/1,
     empty_data_flood_closes/1,
     padded_empty_data_flood_closes/1,
@@ -74,6 +76,8 @@ all() ->
         stream_window_update_flood_closes,
         window_update_nothing_waits_on_flood_closes,
         priority_flood_closes,
+        unsolicited_ping_ack_flood_closes,
+        unsolicited_liveness_ping_ack_flood_closes,
         unknown_frame_flood_closes,
         empty_data_flood_closes,
         padded_empty_data_flood_closes,
@@ -198,6 +202,17 @@ priority_flood_closes(Config) ->
     %% PRIORITY on idle streams (RFC 9113 §6.3 allows it), each ignored
     %% (CVE-2019-9513, the priority shuffling attack).
     flood(open(Config), 1, priority(3)).
+
+unsolicited_ping_ack_flood_closes(Config) ->
+    %% ACKs of PINGs the server never sent: `ping_policy` judges only the
+    %% PINGs it answers, so these are counted here.
+    flood(open(Config), 1, roadrunner_http2_frame:encode({ping, 1, ~"12345678"})).
+
+unsolicited_liveness_ping_ack_flood_closes(Config) ->
+    %% Nor are ACKs that carry the data of the server's own liveness or
+    %% drain PING free while it has none of them out.
+    flood(open(Config), 1, roadrunner_http2_frame:encode({ping, 1, ~"rr-alive"})),
+    flood(open(Config), 1, roadrunner_http2_frame:encode({ping, 1, ~"rr-drain"})).
 
 unknown_frame_flood_closes(Config) ->
     flood(open(Config), 1, ?UNKNOWN).
@@ -465,7 +480,8 @@ data_in_flight_on_a_reset_stream_is_not_counted(Config) ->
     _ = allowed(C2, []).
 
 pings_are_left_to_the_ping_policy(Config) ->
-    %% PINGs are counted by `ping_policy` alone (here off).
+    %% PINGs the server answers are counted by `ping_policy` alone (here
+    %% off).
     C = lists:foldl(fun(_, C0) -> allowed(C0, []) end, open(Config), lists:seq(1, 4 * ?MAX)),
     {200, ~"ok", _} = response(send_get(C, 1, ~"/"), 1).
 

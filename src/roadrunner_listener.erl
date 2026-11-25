@@ -300,7 +300,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   HTTP/2 how long after its last request ended (or after it opened) a
   connection with no request open is closed with a GOAWAY, whatever
   else the client sends meanwhile (gRPC's `max_connection_idle`), and
-  how long one with a handler still at work may stay quiet before it is
+  how long one with a handler still at work (or a request waiting for
+  its slot in `queue` overload mode) may stay quiet before it is
   checked with a PING (at least 1 s, so a client has time to send its
   first request and to answer the PING), and on HTTP/3 the QUIC idle
   timeout the server offers (at least 1 s; the connection uses the smaller of it and the
@@ -1031,7 +1032,7 @@ HTTP/2 listener tunables (under `{http2, ThisMap}` in `protocols`).
   may send (RFC 9113 §10.5), or `false` for no limit. These are SETTINGS
   (each one answered), WINDOW_UPDATE, PRIORITY, frames of an unknown
   type, DATA frames that carry nothing and do not end their stream,
-  RST_STREAM or DATA frames on a stream already closed, a request reset
+  PING ACKs the server did not ask for, RST_STREAM or DATA frames on a stream already closed, a request reset
   while no handler runs for it, a request the server refuses, and header
   blocks on a stream the server reset. DATA the client sent on a stream
   before it saw the server reset it is not counted, up to the receive

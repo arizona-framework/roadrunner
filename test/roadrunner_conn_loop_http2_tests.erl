@@ -2197,6 +2197,11 @@ closes_after_a_goaway_linger() ->
                     Ping(ConnPid)
                 end
             },
+            %% The client's GOAWAY(NO_ERROR), which ours answers: frames the
+            %% client sent before it read ours may still come.
+            {#{}, fun(ConnPid) ->
+                serve_recv(ConnPid, roadrunner_http2_frame:encode({goaway, 0, no_error, <<>>}))
+            end},
             %% The final GOAWAY of a drain.
             {#{}, fun(ConnPid) ->
                 ConnPid ! {roadrunner_drain, erlang:monotonic_time(millisecond) + 5_000},
@@ -2210,8 +2215,8 @@ closes_after_a_goaway_linger() ->
     ).
 
 closes_by_the_peer_do_not_linger() ->
-    %% A peer that sent its own GOAWAY, closed, or broke the connection is
-    %% not lingered over.
+    %% A peer that sent a GOAWAY for an error, closed, or broke the
+    %% connection is not lingered over.
     lists:foreach(
         fun(Close) ->
             {Pid, Ref, ConnPid} = post_handshake_conn(#{http2_linger_timeout => 60_000}),
@@ -2228,7 +2233,9 @@ closes_by_the_peer_do_not_linger() ->
         end,
         [
             fun(ConnPid) ->
-                serve_recv(ConnPid, roadrunner_http2_frame:encode({goaway, 0, no_error, <<>>}))
+                serve_recv(
+                    ConnPid, roadrunner_http2_frame:encode({goaway, 0, protocol_error, <<>>})
+                )
             end,
             fun(ConnPid) -> ConnPid ! {roadrunner_fake_closed, {fake, self()}} end,
             fun(ConnPid) -> ConnPid ! {roadrunner_fake_error, {fake, self()}, etimedout} end

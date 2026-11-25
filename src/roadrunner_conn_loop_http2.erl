@@ -992,8 +992,13 @@ recv_idle_expired(State) ->
         false -> idle_goaway(State)
     end.
 
-%% Whether the conn is still serving: a worker runs and no stream holds
-%% sends that wait for the client's flow-control window. A worker reading a
+%% Whether the conn is still serving: a worker runs, or a request waits
+%% for a slot of the listener's in-flight ceiling (`awaiting_slot`; a
+%% stream waiting its turn in `queued` waits behind one of the two), and no
+%% stream holds sends that wait for the client's flow-control window. A
+%% request waiting for its slot is the server's to answer, not the
+%% client's: closing the conn under it with a GOAWAY that names it would
+%% leave the client no answer and no safe retry. A worker reading a
 %% body waits on the client too, within its read's deadline, which the
 %% handler may have moved to never (`roadrunner_req:set_body_timeout/2`):
 %% the liveness PING is then all that ends a client gone quiet. A
@@ -1001,7 +1006,9 @@ recv_idle_expired(State) ->
 %% closes with every stream on it, a quiet one still at work included: a
 %% client that holds a window shut that long has stopped reading.
 -spec serving(#loop{}) -> boolean().
-serving(#loop{workers = Workers}) when map_size(Workers) =:= 0 ->
+serving(#loop{workers = Workers, awaiting_slot = Awaiting}) when
+    map_size(Workers) =:= 0, map_size(Awaiting) =:= 0
+->
     false;
 serving(#loop{streams = Streams}) ->
     no_blocked_sends(maps:iterator(Streams)).
@@ -1087,7 +1094,8 @@ too_many_pings(#loop{last_stream_id = LastId} = State, Ack) ->
 %% `control_frame_policy` (RFC 9113 §10.5, `http2_control_frame_*`
 %% proto_opts, read only here): SETTINGS, WINDOW_UPDATE, PRIORITY, a frame
 %% of an unknown type, a DATA frame that carries nothing and does not end
-%% its stream, RST_STREAM or DATA on a stream already closed (DATA within
+%% its stream, a PING ACK the conn did not ask for, RST_STREAM or DATA on
+%% a stream already closed (DATA within
 %% the window a stream the conn reset had left excepted), RST_STREAM on a
 %% stream no handler runs for, HEADERS the conn refuses, and field blocks
 %% on a stream it reset; a
@@ -1239,6 +1247,22 @@ final_goaway(State, Reason) ->
     _ = send_goaway(State, no_error),
     maybe_exit_when_drained(State#loop{goaway = {final, Reason}}).
 
+%% The client sent GOAWAY(NO_ERROR). Every stream it opened before it
+%% reached us, as frames on the connection come in order: close as a
+%% graceful close ends, with the GOAWAY naming the last of them, so the
+%% client knows a stream it opens after its own GOAWAY is not served, and
+%% exit once they are done. A graceful close already under way takes this
+%% step now rather than wait for its PING's ACK, the GOAWAY having told the
+%% same; one already past it is left as it is.
+-spec peer_goaway(#loop{}) -> #loop{}.
+peer_goaway(#loop{goaway = open} = State) ->
+    final_goaway(State, peer_closed);
+peer_goaway(#loop{goaway = {announced, TRef, Reason}} = State) ->
+    _ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+    final_goaway(State, Reason);
+peer_goaway(State) ->
+    State.
+
 %% A timer this conn started went off. One no longer wanted (its step
 %% already happened another way) is ignored. The conn reaching its
 %% `connection_age` starts the graceful close (which a drain may have
@@ -1382,13 +1406,16 @@ handle_frame({settings, 0, Params}, State0) ->
         {error, {flow_control_error, _}} ->
             goaway_exit(State, flow_control_error)
     end;
-handle_frame({ping, 1, ?LIVENESS_PING}, State) ->
+handle_frame({ping, 1, ?LIVENESS_PING}, #loop{liveness_ping = true} = State) ->
     frame_loop(State#loop{liveness_ping = false});
 handle_frame({ping, 1, ?GOAWAY_PING}, #loop{goaway = {announced, TRef, Reason}} = State) ->
     _ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
     frame_loop(final_goaway(State, Reason));
 handle_frame({ping, 1, _Data}, State) ->
-    frame_loop(State);
+    %% The ACK of a PING the server never sent or no longer waits on (its
+    %% liveness or drain PING included): it serves nothing, and
+    %% `ping_policy` judges only the PINGs it answers.
+    frame_loop(control_frame(State));
 handle_frame({ping, 0, Opaque}, State) ->
     Ack = roadrunner_http2_frame:encode({ping, 1, Opaque}),
     case ping_strike(State) of
@@ -1484,8 +1511,15 @@ handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
                     frame_loop(control_frame(State))
             end
     end;
+handle_frame({goaway, _, no_error, _}, State) ->
+    %% The client is shutting down gracefully (RFC 9113 §6.8). Its GOAWAY
+    %% only bars streams the server would open, and the requests it already
+    %% sent still wait for their answers: serve them to their end, then
+    %% close (`peer_goaway/1`).
+    frame_loop(peer_goaway(control_frame(State)));
 handle_frame({goaway, _, _, _}, State) ->
-    %% Client is shutting down.
+    %% The client closes the connection for an error (RFC 9113 §5.4.1):
+    %% nothing more on it is wanted.
     exit_clean(State, peer_closed);
 handle_frame({headers, StreamId, Flags, Priority, Fragment}, State) ->
     on_headers(StreamId, Flags, Priority, Fragment, State);
@@ -1907,14 +1941,8 @@ finalize_headers(
                     %% (decode succeeded, so the connection is intact), and
                     %% drop the stream; no worker is dispatched until
                     %% END_STREAM.
-                    Resp = ~"Request Header Fields Too Large",
-                    State2 = encode_and_send_response_atomic(
-                        State1,
-                        StreamId,
-                        431,
-                        [{~"content-type", ~"text/plain"}],
-                        Resp,
-                        byte_size(Resp)
+                    State2 = refuse_request(
+                        State1, StreamId, 431, ~"Request Header Fields Too Large"
                     ),
                     _ = send_rst_stream(State2, StreamId, no_error),
                     frame_loop(remove_reset_stream(State2, StreamId));
@@ -1983,12 +2011,27 @@ send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
 %% dispatch is at END_STREAM).
 -spec reject_too_large(#loop{}, stream_id()) -> no_return().
 reject_too_large(State, StreamId) ->
-    Resp = ~"Payload Too Large",
-    State1 = encode_and_send_response_atomic(
-        State, StreamId, 413, [{~"content-type", ~"text/plain"}], Resp, byte_size(Resp)
-    ),
+    State1 = refuse_request(State, StreamId, 413, ~"Payload Too Large"),
     _ = send_rst_stream(State1, StreamId, no_error),
     frame_loop(remove_reset_stream(State1, StreamId)).
+
+%% The answer the conn gives a request it refuses itself, before any
+%% handler runs (431, 413): its status and a short text when the client's
+%% flow-control windows take the text (RFC 9113 §6.9.1), else the status
+%% alone. The stream is reset right after, so a text held back for a
+%% window to open would never be sent.
+-spec refuse_request(#loop{}, stream_id(), 413 | 431, binary()) -> #loop{}.
+refuse_request(#loop{streams = Streams} = State, StreamId, Status, Text) ->
+    #{StreamId := Stream} = Streams,
+    Len = byte_size(Text),
+    case window_budget(State, Stream) of
+        Budget when Budget >= Len ->
+            encode_and_send_response_atomic(
+                State, StreamId, Status, [{~"content-type", ~"text/plain"}], Text, Len
+            );
+        _Short ->
+            encode_and_send_headers(State, StreamId, Status, [], true)
+    end.
 
 %% --- DATA ---
 

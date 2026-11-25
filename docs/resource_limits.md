@@ -185,7 +185,9 @@ rejected on its 9-byte header, before the body is buffered, with
 `GOAWAY(FRAME_SIZE_ERROR)`. A connection closed with a GOAWAY then reads
 and drops what the client still sends for up to `linger_timeout` or until
 it closes, so the client reads the GOAWAY rather than losing it to a
-reset. Streams over
+reset. A client that sends its own `GOAWAY(NO_ERROR)` still gets the
+answers to the requests it already sent: the server replies with a
+GOAWAY naming the last of them and closes once they are done. Streams over
 the concurrency limit are refused with `REFUSED_STREAM`, which a client
 may retry (RFC 9113 §8.7).
 
@@ -223,7 +225,7 @@ reason `too_many_pings` in `listener_conn_close`.
 Some frames make the server work without serving anything (RFC 9113
 §10.5): SETTINGS (each one answered with an ACK), WINDOW_UPDATE,
 PRIORITY, frames of an unknown type, DATA frames that carry nothing and
-do not end their stream, RST_STREAM or DATA frames on a stream already
+do not end their stream, PING ACKs the server did not ask for, RST_STREAM or DATA frames on a stream already
 closed, a request reset while no handler runs for it, a request the
 server refuses, and header blocks on a stream the server reset. DATA the
 client sent on a stream before it saw the server reset it is not
@@ -404,7 +406,7 @@ table.
 | `overload_mode` | `refuse` | yes | what a request over `max_concurrent_requests` gets: refused, queued, or shed with `503` |
 | `max_lingering` | `auto`: `max(256, max_clients div 32)` | yes | connections lingering at once after a response that closes before the request was read to its end; over it the close follows at once (`lingers_skipped` in `roadrunner_listener:info/1`) |
 | `request_timeout` | 30 s | yes | header-read timeout on a fresh connection; in `manual` body mode, also how long the body may take to read (on HTTP/2 and HTTP/3 from dispatch, on HTTP/1.1 within the request's read deadline, which is `keep_alive_timeout` for a connection's later requests), which `roadrunner_req:set_body_timeout/2` changes per request; at most `16#FFFFFFFF` ms, as `keep_alive_timeout` and `tls_handshake_timeout` |
-| `keep_alive_timeout` | 60 s | yes | idle timeout between requests (on HTTP/2 and HTTP/3, of the whole connection, at least 1 s; on HTTP/2 counted from the end of the last request, whatever else the client sends; an HTTP/2 connection with a handler still at work gets a PING instead, while on HTTP/3 the client waiting on a response keeps the connection open, as RFC 9114 §5.1 expects of it) |
+| `keep_alive_timeout` | 60 s | yes | idle timeout between requests (on HTTP/2 and HTTP/3, of the whole connection, at least 1 s; on HTTP/2 counted from the end of the last request, whatever else the client sends; an HTTP/2 connection with a handler still at work, or a request waiting for its slot in `queue` overload mode, gets a PING instead, while on HTTP/3 the client waiting on a response keeps the connection open, as RFC 9114 §5.1 expects of it) |
 | `max_keep_alive_requests` | `infinity` | yes | requests an HTTP/1.1 connection serves before it closes |
 | `min_bytes_per_second` | 100 | yes (0 disables) | slow-loris guard on HTTP/1.1 request heads and bodies; silence counts; a body is measured over the time spent waiting for its bytes |
 | `rate_limit` | off | opt-in | per-peer request-rate cap (`429` + `Retry-After`) |

@@ -269,7 +269,8 @@ Why a connection ended, as carried by `listener_conn_close`.
   body or WebSocket session that owns the connection finished, or a
   `404`, `405` or `500` that closes it
 - `peer_closed`: the client closed it (on HTTP/2, also a client
-  `GOAWAY`)
+  `GOAWAY`: with an error code at once, with `NO_ERROR` once the
+  requests it already sent are answered)
 - `request_timeout`: no complete request within `request_timeout`
   (on HTTP/2, the client preface and `SETTINGS` did not arrive in time)
 - `keep_alive_timeout`: idle between requests past `keep_alive_timeout`
