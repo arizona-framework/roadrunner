@@ -334,6 +334,26 @@ gate or CI run.
 
 **Scope:** small.
 
+### Opt-in mailbox-proof HTTP/2 writes — small
+
+**What:** every HTTP/2 write from a stream worker waits for the
+connection's acknowledgement with a receive that scans the worker's
+whole mailbox, about 4.5 ns per queued message per write. A loop handler
+or gRPC method that falls behind on its own messages pays that on every
+write: about 44 µs per write with 10,000 queued, and the slower it gets
+the further behind it falls. Tagging the wait with a monitor of the
+connection, made for that write, lets the runtime skip straight to the
+reply, so a write costs about 1 µs at any queue depth. A handler or route
+option would turn that on for workers that expect a backlog.
+
+**Why deferred:** every automatic choice costs something on the common
+write with an empty mailbox: checking the queue length on each write
+adds 30 to 45 ns, checking it every 16th write 9 to 30 ns, and always
+using the monitor tag about 250 ns. Only an explicit option is free for
+handlers that never fall behind, and it is new API.
+
+**Scope:** small.
+
 ### Cheaper accepts under load — medium
 
 **What:** acceptors run at high priority by default (`accept_priority`),
