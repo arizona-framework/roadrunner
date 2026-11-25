@@ -1094,7 +1094,8 @@ too_many_pings(#loop{last_stream_id = LastId} = State, Ack) ->
 %% `control_frame_policy` (RFC 9113 §10.5, `http2_control_frame_*`
 %% proto_opts, read only here): SETTINGS, WINDOW_UPDATE, PRIORITY, a frame
 %% of an unknown type, a DATA frame that carries nothing and does not end
-%% its stream, RST_STREAM or DATA on a stream already closed (DATA within
+%% its stream, a PING ACK the conn did not ask for, RST_STREAM or DATA on
+%% a stream already closed (DATA within
 %% the window a stream the conn reset had left excepted), RST_STREAM on a
 %% stream no handler runs for, HEADERS the conn refuses, and field blocks
 %% on a stream it reset; a
@@ -1405,13 +1406,16 @@ handle_frame({settings, 0, Params}, State0) ->
         {error, {flow_control_error, _}} ->
             goaway_exit(State, flow_control_error)
     end;
-handle_frame({ping, 1, ?LIVENESS_PING}, State) ->
+handle_frame({ping, 1, ?LIVENESS_PING}, #loop{liveness_ping = true} = State) ->
     frame_loop(State#loop{liveness_ping = false});
 handle_frame({ping, 1, ?GOAWAY_PING}, #loop{goaway = {announced, TRef, Reason}} = State) ->
     _ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
     frame_loop(final_goaway(State, Reason));
 handle_frame({ping, 1, _Data}, State) ->
-    frame_loop(State);
+    %% The ACK of a PING the server never sent or no longer waits on (its
+    %% liveness or drain PING included): it serves nothing, and
+    %% `ping_policy` judges only the PINGs it answers.
+    frame_loop(control_frame(State));
 handle_frame({ping, 0, Opaque}, State) ->
     Ack = roadrunner_http2_frame:encode({ping, 1, Opaque}),
     case ping_strike(State) of

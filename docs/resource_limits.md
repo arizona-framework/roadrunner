@@ -225,7 +225,7 @@ reason `too_many_pings` in `listener_conn_close`.
 Some frames make the server work without serving anything (RFC 9113
 §10.5): SETTINGS (each one answered with an ACK), WINDOW_UPDATE,
 PRIORITY, frames of an unknown type, DATA frames that carry nothing and
-do not end their stream, RST_STREAM or DATA frames on a stream already
+do not end their stream, PING ACKs the server did not ask for, RST_STREAM or DATA frames on a stream already
 closed, a request reset while no handler runs for it, a request the
 server refuses, and header blocks on a stream the server reset. DATA the
 client sent on a stream before it saw the server reset it is not
