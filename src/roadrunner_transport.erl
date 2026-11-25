@@ -267,16 +267,19 @@ send(Socket, Data, _Size) ->
     end.
 
 -doc """
-Turn on sliced sends (`send/2`) when `SendOpts`, the send options a
-listener puts on its sockets, carry the emulator's own `send_timeout`.
-Only that timeout needs slices: the kernel's `TCP_USER_TIMEOUT` starts
-its wait over whenever the client takes more, however large the write.
-Once on, it stays on for every connection of the node. A
-`persistent_term` update is a global GC, so it is written once.
+Turn on sliced sends (`send/2`) when `ListenOpts`, the options a
+listener opens its listen socket with (the user's `tls` ones among them),
+carry the emulator's own `send_timeout`. The listener sets it off Linux
+and on a Linux kernel whose `TCP_USER_TIMEOUT` does not close a client
+that stops reading (`roadrunner_listener:send_opts/3`). Only that timeout
+needs slices: the kernel's `TCP_USER_TIMEOUT` starts its wait over
+whenever the client takes more, however large the write. Once on, it
+stays on for every connection of the node. A `persistent_term` update is
+a global GC, so it is written once.
 """.
--spec slice_sends([gen_tcp:option()]) -> ok.
-slice_sends(SendOpts) ->
-    case {lists:keymember(send_timeout, 1, SendOpts), persistent_term:get(?SLICE_KEY, false)} of
+-spec slice_sends([term()]) -> ok.
+slice_sends(ListenOpts) ->
+    case {lists:keymember(send_timeout, 1, ListenOpts), persistent_term:get(?SLICE_KEY, false)} of
         {true, false} -> persistent_term:put(?SLICE_KEY, true);
         {_Emulator, _Slice} -> ok
     end.
