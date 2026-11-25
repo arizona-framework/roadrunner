@@ -407,6 +407,95 @@ listener_rejects_invalid_max_lingering_test() ->
         [0, -1, 16#80000000, infinity]
     ).
 
+%% Each top-level option refuses a value outside its type: an atom or a
+%% binary compares above every integer, so a cap given as one would
+%% otherwise cap nothing.
+listener_rejects_invalid_max_content_length_test() ->
+    rejects(max_content_length, [foo, -1, infinity, ~"10MB", 1.5]).
+
+listener_rejects_invalid_min_bytes_per_second_test() ->
+    rejects(min_bytes_per_second, [foo, -1, 1.5]).
+
+listener_rejects_invalid_hibernate_after_test() ->
+    rejects(hibernate_after, [foo, 0, -1, 16#100000000]).
+
+listener_rejects_invalid_max_clients_test() ->
+    rejects(max_clients, [foo, 0, infinity]).
+
+listener_rejects_invalid_max_concurrent_requests_test() ->
+    rejects(max_concurrent_requests, [foo, 0, -1]).
+
+listener_rejects_invalid_num_acceptors_test() ->
+    rejects(num_acceptors, [foo, 0]).
+
+listener_rejects_invalid_socket_backlog_test() ->
+    rejects(socket_backlog, [foo, 0, -1]).
+
+listener_rejects_invalid_graceful_drain_test() ->
+    rejects(graceful_drain, [foo, 1]).
+
+listener_rejects_invalid_body_buffering_test() ->
+    rejects(body_buffering, [foo, true]).
+
+listener_rejects_invalid_port_test() ->
+    rejects(port, [foo, -1, 65536]).
+
+listener_rejects_invalid_ip_test() ->
+    rejects(ip, [foo, "127.0.0.1", {1, 2, 3}, {local, 1}, {remote, "x"}]).
+
+%% `infinity`, as for `ws.hibernate_after`, is never: the same as unset.
+listener_hibernate_after_infinity_is_off_test() ->
+    Name = listener_test_hibernate_infinity,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0, hibernate_after => infinity, routes => roadrunner_hello_handler
+    }),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(ListenerPid))),
+    ?assertMatch(#{hibernate_after := 0}, ProtoOpts),
+    ok = roadrunner_listener:stop(Name).
+
+listener_rejects_invalid_tls_test() ->
+    rejects(tls, [foo]).
+
+%% Not a list, for a routed listener and a single-handler one.
+listener_rejects_invalid_middlewares_test() ->
+    rejects(middlewares, [foo, #{}]),
+    process_flag(trap_exit, true),
+    R = roadrunner_listener:start_link(listener_test_invalid_top_level, #{
+        port => 0, middlewares => foo, routes => [{~"/", roadrunner_hello_handler}]
+    }),
+    ?assertMatch({error, {{invalid_listener_opt, middlewares, foo}, _Stack}}, R).
+
+%% The values each takes at its limits still start a listener.
+listener_accepts_valid_top_level_opts_test() ->
+    {ok, _} = roadrunner_listener:start_link(listener_test_valid_top_level, #{
+        port => 0,
+        ip => {127, 0, 0, 1},
+        max_content_length => 0,
+        min_bytes_per_second => 0,
+        hibernate_after => 1,
+        max_clients => 1,
+        max_concurrent_requests => infinity,
+        num_acceptors => 1,
+        socket_backlog => 1,
+        graceful_drain => false,
+        body_buffering => manual,
+        routes => roadrunner_hello_handler
+    }),
+    ok = roadrunner_listener:stop(listener_test_valid_top_level).
+
+rejects(Key, Values) ->
+    process_flag(trap_exit, true),
+    lists:foreach(
+        fun(Bad) ->
+            R = roadrunner_listener:start_link(
+                listener_test_invalid_top_level,
+                maps:merge(#{port => 0, routes => roadrunner_hello_handler}, #{Key => Bad})
+            ),
+            ?assertMatch({error, {{invalid_listener_opt, Key, Bad}, _Stack}}, R)
+        end,
+        Values
+    ).
+
 listener_rejects_invalid_ws_compress_test() ->
     %% zlib's raw deflate takes windows 9..15, raw inflate 8..15, and
     %% memLevel 1..9; anything else, or an unknown key, refuses to start.
@@ -923,6 +1012,7 @@ listener_timeouts_reject_values_a_receive_cannot_wait_test() ->
         request_timeout => 16#FFFFFFFF,
         keep_alive_timeout => 16#FFFFFFFF,
         tls_handshake_timeout => 16#FFFFFFFF,
+        hibernate_after => 16#FFFFFFFF,
         routes => roadrunner_hello_handler
     }),
     ok = roadrunner_listener:stop(listener_test_timeout_max).
@@ -1109,6 +1199,33 @@ listener_rejects_ws_message_cap_below_frame_cap_test() ->
         R
     ).
 
+listener_accepts_infinity_ws_idle_opts_test() ->
+    %% `infinity`, the default of both, may be set too, as an upgrade can.
+    Name = listener_test_ws_idle_infinity,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        ws => #{idle_timeout => infinity, hibernate_after => infinity},
+        routes => roadrunner_hello_handler
+    }),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(ListenerPid))),
+    ?assertMatch(#{ws_idle_timeout := infinity, ws_hibernate_after := infinity}, ProtoOpts),
+    ok = roadrunner_listener:stop(Name).
+
+listener_accepts_longest_receive_wait_ws_idle_opts_test() ->
+    %% Both take what the top-level `hibernate_after` does: up to the
+    %% longest a `receive` waits.
+    Name = listener_test_ws_idle_max,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        ws => #{idle_timeout => 16#FFFFFFFF, hibernate_after => 16#FFFFFFFF},
+        routes => roadrunner_hello_handler
+    }),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(ListenerPid))),
+    ?assertMatch(
+        #{ws_idle_timeout := 16#FFFFFFFF, ws_hibernate_after := 16#FFFFFFFF}, ProtoOpts
+    ),
+    ok = roadrunner_listener:stop(Name).
+
 listener_rejects_invalid_ws_opt_test() ->
     %% Unknown keys, out-of-range / non-integer values, and non-map
     %% shapes in `ws` all reject (mirrors the strict `{http2, #{...}}`
@@ -1144,13 +1261,13 @@ listener_rejects_invalid_ws_opt_test() ->
             #{hibernate_after => 0},
             #{hibernate_after => -1},
             #{hibernate_after => bad},
-            #{hibernate_after => 16#80000000},
+            #{hibernate_after => 16#100000000},
             %% `compress` is a boolean; `idle_timeout` an interval like
             %% `hibernate_after`.
             #{compress => yes},
             #{idle_timeout => 0},
             #{idle_timeout => bad},
-            #{idle_timeout => 16#80000000},
+            #{idle_timeout => 16#100000000},
             %% `active` is `once` or a read count `inet:setopts/2` takes;
             %% `true` (unbounded unread data) rejects.
             #{active => true},

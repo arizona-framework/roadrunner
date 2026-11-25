@@ -255,7 +255,10 @@ events that follow.
 """.
 -type span() :: term().
 
--doc "A connection's peer address, `undefined` when it could not be read.".
+-doc """
+A connection's peer address, `undefined` when it could not be read or the
+connection is on a Unix domain socket.
+""".
 -type peer() :: {inet:ip_address(), inet:port_number()} | undefined.
 
 -doc "The shape of the response a request was answered with.".

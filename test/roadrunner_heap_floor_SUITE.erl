@@ -3,8 +3,8 @@
 The HTTP/1.1 connection's heap floor (`handler_spawn.heap_floor`): after a
 request it keeps the heap that request needed as its `min_heap_size`, up
 to the cap and never under a least floor once it has served a request,
-and drops back to the base before it hibernates or runs a WebSocket
-session. The handler is `roadrunner_heap_floor_handler`.
+and drops back to the base before it hibernates, runs a WebSocket
+session or starts a stream or loop response. The handler is `roadrunner_heap_floor_handler`.
 """.
 
 -behaviour(ct_suite).
@@ -26,7 +26,10 @@ session. The handler is `roadrunner_heap_floor_handler`.
     floor_kept_when_the_default_max_heap_size_changes_later/1,
     floor_relearns_every_16_requests/1,
     floor_resets_before_hibernating/1,
-    floor_resets_for_a_websocket_session/1
+    floor_resets_for_a_websocket_session/1,
+    floor_resets_for_a_stream_response/1,
+    floor_resets_for_a_send_stream/1,
+    floor_resets_for_a_loop_response/1
 ]).
 
 -define(H, roadrunner_heap_floor_handler).
@@ -48,7 +51,10 @@ all() ->
         floor_kept_when_the_default_max_heap_size_changes_later,
         floor_relearns_every_16_requests,
         floor_resets_before_hibernating,
-        floor_resets_for_a_websocket_session
+        floor_resets_for_a_websocket_session,
+        floor_resets_for_a_stream_response,
+        floor_resets_for_a_send_stream,
+        floor_resets_for_a_loop_response
     ].
 
 init_per_testcase(Case, Config) ->
@@ -59,7 +65,10 @@ init_per_testcase(Case, Config) ->
             routes => [
                 {~"/alloc", ?H, {alloc, self()}},
                 {~"/report", ?H, report},
-                {~"/ws", ?H, {ws, self()}}
+                {~"/ws", ?H, {ws, self()}},
+                {~"/stream", ?H, stream_min_heap},
+                {~"/send_stream", ?H, send_stream_min_heap},
+                {~"/loop", ?H, {loop, self()}}
             ]
         })
     ),
@@ -210,6 +219,31 @@ floor_resets_for_a_websocket_session(Config) ->
     after 5000 -> ct:fail(no_session)
     end.
 
+%% A stream can run for long, so it drops the floor the requests before
+%% it raised rather than hold that heap for its whole life.
+floor_resets_for_a_stream_response(Config) ->
+    stream_resets_the_floor(Config, ~"/stream").
+
+%% The same for a stream a `{send, ...}` fun starts.
+floor_resets_for_a_send_stream(Config) ->
+    stream_resets_the_floor(Config, ~"/send_stream").
+
+stream_resets_the_floor(Config, Path) ->
+    Sock = connect(Config),
+    ok = alloc(Sock),
+    ?assert(report(Sock) > base()),
+    ?assertEqual(base(), chunked_body(Sock, Path)).
+
+%% So does a loop response, which lives as long as its handler keeps it.
+floor_resets_for_a_loop_response(Config) ->
+    Sock = connect(Config),
+    ok = alloc(Sock),
+    ?assert(report(Sock) > base()),
+    ok = gen_tcp:send(Sock, ~"GET /loop HTTP/1.1\r\nHost: x\r\n\r\n"),
+    Conn = conn_pid(),
+    ok = read_head(Sock, <<>>),
+    ?assertEqual({min_heap_size, base()}, process_info(Conn, min_heap_size)).
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -250,6 +284,39 @@ conn_pid() ->
     receive
         {conn, Pid} -> Pid
     after 5000 -> ct:fail(no_conn_pid)
+    end.
+
+%% The body of a chunked response to a GET, one integer.
+chunked_body(Sock, Path) ->
+    ok = gen_tcp:send(Sock, [~"GET ", Path, ~" HTTP/1.1\r\nHost: x\r\n\r\n"]),
+    read_chunked(Sock, <<>>).
+
+read_chunked(Sock, Acc) ->
+    case binary:split(Acc, ~"\r\n\r\n") of
+        [_Head, Rest] ->
+            case binary:split(Rest, ~"\r\n0\r\n\r\n") of
+                [Chunk, _] ->
+                    [_Size, Body] = binary:split(Chunk, ~"\r\n"),
+                    binary_to_integer(Body);
+                [_] ->
+                    read_more_chunked(Sock, Acc)
+            end;
+        [_] ->
+            read_more_chunked(Sock, Acc)
+    end.
+
+read_more_chunked(Sock, Acc) ->
+    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+    read_chunked(Sock, <<Acc/binary, Data/binary>>).
+
+%% Read a response's head and nothing more.
+read_head(Sock, Acc) ->
+    case binary:split(Acc, ~"\r\n\r\n") of
+        [_Head, _Rest] ->
+            ok;
+        [_] ->
+            {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+            read_head(Sock, <<Acc/binary, Data/binary>>)
     end.
 
 %% One keep-alive GET on the socket; returns the body.

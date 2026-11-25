@@ -30,7 +30,9 @@ by messages to the session's `handle_info/2`.
     upgrade_sets_the_floor/1,
     upgrade_turns_the_floor_off/1,
     floor_resets_when_the_handler_hibernates/1,
-    floor_resets_when_the_session_idles/1
+    floor_resets_when_the_session_idles/1,
+    floor_off_under_a_listener_max_heap_size/1,
+    floor_off_under_an_upgrade_max_heap_size/1
 ]).
 
 -define(H, roadrunner_heap_floor_handler).
@@ -55,7 +57,9 @@ all() ->
         upgrade_sets_the_floor,
         upgrade_turns_the_floor_off,
         floor_resets_when_the_handler_hibernates,
-        floor_resets_when_the_session_idles
+        floor_resets_when_the_session_idles,
+        floor_off_under_a_listener_max_heap_size,
+        floor_off_under_an_upgrade_max_heap_size
     ].
 
 init_per_testcase(Case, Config) ->
@@ -90,6 +94,8 @@ listener_opts(session_starts_from_its_own_data_without_the_connection_floor) ->
     #{handler_spawn => #{heap_floor => false}, ws => #{heap_floor => #{max => 46422}}};
 listener_opts(floor_resets_when_the_session_idles) ->
     #{ws => #{hibernate_after => 200}};
+listener_opts(floor_off_under_a_listener_max_heap_size) ->
+    #{handler_spawn => #{opts => [{max_heap_size, #{size => 2000000, kill => false}}]}};
 listener_opts(_Case) ->
     #{}.
 
@@ -102,6 +108,8 @@ route_state(upgrade_sets_the_floor) ->
     {ws, self(), #{heap_floor => #{max => 1000, min => 0}}};
 route_state(upgrade_turns_the_floor_off) ->
     {ws, self(), #{heap_floor => false}};
+route_state(floor_off_under_an_upgrade_max_heap_size) ->
+    {ws, self(), #{max_heap_size => 2000000}};
 route_state(_Case) ->
     {ws, self()}.
 
@@ -211,6 +219,19 @@ floor_resets_when_the_session_idles(Config) ->
     end,
     _ = erlang:trace(Session, false, [running]),
     ?assertEqual({min_heap_size, base()}, process_info(Session, min_heap_size)).
+
+%% With a `max_heap_size` the floor is off, as it is for the connection:
+%% a raised `min_heap_size` could take the session over the limit.
+floor_off_under_a_listener_max_heap_size(Config) ->
+    Session = upgrade(Config),
+    ok = alloc(Session),
+    ?assertEqual(base(), report(Session)).
+
+%% The same when the limit comes from the upgrade's own options.
+floor_off_under_an_upgrade_max_heap_size(Config) ->
+    Session = upgrade(Config),
+    ok = alloc(Session),
+    ?assertEqual(base(), report(Session)).
 
 %% A keep-alive request that grew the connection's heap leaves it grown
 %% (nothing collects between requests); the session that then runs in the

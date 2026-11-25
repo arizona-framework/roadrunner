@@ -231,7 +231,7 @@
     %% (`roadrunner_stream_worker:conn_heap_floor/1`).
     heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor(),
     listener_name :: atom(),
-    peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    peer :: roadrunner_event_handler:peer(),
     %% The connection queries each request carries, built once: they ask
     %% the QUIC connection (`conn_info/1`).
     conn_info :: roadrunner_req:conn_info(),
@@ -306,8 +306,8 @@
     %% (default) disables it; `inflight_counter` is the shared gauge. Read
     %% from proto_opts at `init/2` so the per-stream acquire/release passes
     %% them to `roadrunner_conn` directly. See `dispatch_decoded/5`.
-    max_concurrent_requests = infinity :: infinity | pos_integer(),
-    inflight_counter :: counters:counters_ref() | undefined,
+    max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
+    inflight_counter :: roadrunner_conn:inflight_counter(),
     %% The loop's own count of the slots it holds
     %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
     slot_cell = undefined :: roadrunner_conn:slot_cell(),
@@ -330,7 +330,7 @@
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
     %% otherwise, the common case, so the request path resolves nothing.
-    real_ip = undefined :: undefined | roadrunner_real_ip:config()
+    real_ip = undefined :: roadrunner_real_ip:trust()
 }).
 
 -doc """

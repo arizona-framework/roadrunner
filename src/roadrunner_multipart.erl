@@ -135,7 +135,7 @@ next to `length`. `roadrunner_req:read_form/1` parses with the defaults.
     delim :: binary(),
     delim_cp :: binary:cp(),
     buf :: binary(),
-    stage :: start | preamble | seek | delimited | headers | body | done,
+    stage :: start | preamble | seek | delimited | padded | closing | headers | body | done,
     eof :: boolean(),
     parts = 0 :: non_neg_integer()
 }).
@@ -300,8 +300,8 @@ when the multipart structure is otherwise broken.
 -spec parse(binary(), binary(), parse_opts()) -> {ok, [part()]} | {error, term()}.
 parse(Body, Boundary, Opts) when is_binary(Body), is_binary(Boundary), is_map(Opts) ->
     Sep = <<"--", Boundary/binary>>,
-    case binary:split(Body, Sep) of
-        [_Preamble, Rest] ->
+    case first_boundary(Body, Sep) of
+        {ok, Rest} ->
             %% Fetch the compiled patterns ONCE on the success branch
             %% and thread them through `parse_parts/7` → `parse_one_part/6`
             %% → header-line parsing. Avoids three
@@ -329,14 +329,36 @@ parse(Body, Boundary, Opts) when is_binary(Body), is_binary(Boundary), is_map(Op
                 Parts when is_list(Parts) -> {ok, Parts};
                 {error, _} = Error -> Error
             end;
-        _ ->
+        error ->
             {error, no_initial_boundary}
     end.
 
-%% After the first boundary marker, what follows is either:
-%% - "--\r\n" or "--" → terminating boundary, end of multipart.
-%% - "\r\n" + part bytes → another part to parse, while `PartsLeft` allows.
-%% The parts come back as a bare list, so no `{ok, _}` is built per part.
+%% The bytes after the first boundary: one that opens the body, or else
+%% the first that starts a line (RFC 2046 §5.1.1), as `read_part/1,2`
+%% finds it.
+-spec first_boundary(binary(), binary()) -> {ok, binary()} | error.
+first_boundary(Body, Sep) ->
+    SepLen = byte_size(Sep),
+    case Body of
+        <<Sep:SepLen/binary, Rest/binary>> ->
+            {ok, Rest};
+        _ ->
+            case binary:split(Body, <<"\r\n", Sep/binary>>) of
+                [_Preamble, Rest] -> {ok, Rest};
+                [_] -> error
+            end
+    end.
+
+%% After a boundary marker, what follows is either (RFC 2046 §5.1.1):
+%% - "--", then transport padding (spaces and tabs), then a line break or
+%%   the end of the body → the close, the end of multipart; what follows
+%%   the line break (the epilogue) is ignored.
+%% - transport padding, then "\r\n" + part bytes → another part to
+%%   parse, while `PartsLeft` allows.
+%% The line break with no padding, the common case, matches in the clause
+%% head, so the part bytes are no new sub-binary; only padding goes through
+%% `skip_padding/1`. The parts come back as a bare list, so no `{ok, _}` is
+%% built per part.
 -spec parse_parts(
     binary(),
     non_neg_integer(),
@@ -347,15 +369,62 @@ parse(Body, Boundary, Opts) when is_binary(Body), is_binary(Boundary), is_map(Op
     binary:cp()
 ) ->
     [part()] | {error, term()}.
-parse_parts(<<"--\r\n", _Epilogue/binary>>, _PartsLeft, _MaxHeaders, _, _, _, _) ->
-    [];
-parse_parts(<<"--">>, _PartsLeft, _MaxHeaders, _, _, _, _) ->
-    [];
+parse_parts(<<"--", Rest/binary>>, _PartsLeft, _MaxHeaders, _, _, _, _) ->
+    case skip_padding(Rest) of
+        <<>> -> [];
+        <<"\r\n", _Epilogue/binary>> -> [];
+        _ -> {error, malformed}
+    end;
 parse_parts(<<"\r\n", _/binary>>, 0, _MaxHeaders, _, _, _, _) ->
     {error, too_many_parts};
 parse_parts(
     <<"\r\n", PartAndRest/binary>>, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp
 ) ->
+    parse_part(PartAndRest, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp);
+parse_parts(<<C, Rest/binary>>, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) when
+    C =:= $\s; C =:= $\t
+->
+    parse_next(skip_padding(Rest), PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp);
+parse_parts(_, _, _, _, _, _, _) ->
+    {error, malformed}.
+
+%% Transport padding: the spaces and tabs a boundary may carry.
+-spec skip_padding(binary()) -> binary().
+skip_padding(<<C, Rest/binary>>) when C =:= $\s; C =:= $\t -> skip_padding(Rest);
+skip_padding(Bytes) -> Bytes.
+
+%% A part after a boundary and its padding.
+-spec parse_next(
+    binary(),
+    non_neg_integer(),
+    pos_integer(),
+    binary:cp(),
+    binary:cp(),
+    binary:cp(),
+    binary:cp()
+) ->
+    [part()] | {error, term()}.
+parse_next(<<"\r\n", _/binary>>, 0, _MaxHeaders, _, _, _, _) ->
+    {error, too_many_parts};
+parse_next(
+    <<"\r\n", PartAndRest/binary>>, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp
+) ->
+    parse_part(PartAndRest, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp);
+parse_next(_, _, _, _, _, _, _) ->
+    {error, malformed}.
+
+%% One part, after its boundary's line break, then the parts after it.
+-spec parse_part(
+    binary(),
+    pos_integer(),
+    pos_integer(),
+    binary:cp(),
+    binary:cp(),
+    binary:cp(),
+    binary:cp()
+) ->
+    [part()] | {error, term()}.
+parse_part(PartAndRest, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) ->
     case parse_one_part(PartAndRest, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) of
         {ok, Part, Rest} ->
             case
@@ -368,9 +437,7 @@ parse_parts(
             end;
         {error, _} = Error ->
             Error
-    end;
-parse_parts(_, _, _, _, _, _, _) ->
-    {error, malformed}.
+    end.
 
 -spec parse_one_part(
     binary(), pos_integer(), binary:cp(), binary:cp(), binary:cp(), binary:cp()
@@ -631,18 +698,41 @@ next_part(#reader{stage = Stage, buf = Buf, delim = Delim} = Reader, Req, Length
             refill_part(Reader#reader{buf = Tail}, Req, Length, 0, unterminated(Stage))
     end;
 next_part(#reader{stage = delimited, buf = Buf} = Reader, Req, Length, _Scanned) ->
+    %% RFC 2046 §5.1.1: a boundary is the close when "--" follows it
+    %% straight away; otherwise transport padding and a line break do.
     case Buf of
-        <<"--", _/binary>> ->
-            {done, Req#{multipart => Reader#reader{stage = done, buf = <<>>}}};
+        <<"\r\n", Rest/binary>> ->
+            next_part(Reader#reader{stage = headers, buf = Rest}, Req, Length, 0);
+        <<"--", Rest/binary>> ->
+            next_part(Reader#reader{stage = closing, buf = Rest}, Req, Length, 0);
+        _ when Buf =:= <<>>; Buf =:= <<"-">> ->
+            refill_part(Reader, Req, Length, 0, no_part_terminator);
+        _ ->
+            next_part(Reader#reader{stage = padded}, Req, Length, 0)
+    end;
+next_part(#reader{stage = padded, buf = Buf} = Reader, Req, Length, _Scanned) ->
+    case Buf of
         <<"\r\n", Rest/binary>> ->
             next_part(Reader#reader{stage = headers, buf = Rest}, Req, Length, 0);
         <<C, Rest/binary>> when C =:= $\s; C =:= $\t ->
-            %% Transport padding after the boundary (RFC 2046 §5.1.1).
             next_part(Reader#reader{buf = Rest}, Req, Length, 0);
-        <<C>> when C =:= $-; C =:= $\r ->
+        _ when Buf =:= <<>>; Buf =:= <<"\r">> ->
             refill_part(Reader, Req, Length, 0, no_part_terminator);
-        <<>> ->
-            refill_part(Reader, Req, Length, 0, no_part_terminator);
+        _ ->
+            {error, malformed}
+    end;
+next_part(#reader{stage = closing, buf = Buf, eof = Eof} = Reader, Req, Length, _Scanned) ->
+    %% The close's padding, then a line break (the epilogue after it is
+    %% not read) or the end of the body.
+    case Buf of
+        <<C, Rest/binary>> when C =:= $\s; C =:= $\t ->
+            next_part(Reader#reader{buf = Rest}, Req, Length, 0);
+        <<"\r\n", _Epilogue/binary>> ->
+            {done, Req#{multipart => Reader#reader{stage = done, buf = <<>>}}};
+        <<>> when Eof ->
+            {done, Req#{multipart => Reader#reader{stage = done, buf = <<>>}}};
+        _ when Buf =:= <<>>; Buf =:= <<"\r">> ->
+            refill_part(Reader, Req, Length, 0, malformed);
         _ ->
             {error, malformed}
     end;

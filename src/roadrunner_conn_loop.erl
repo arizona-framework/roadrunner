@@ -89,7 +89,7 @@
     %% fired once the peer is settled. Paired with `listener_conn_close`
     %% in `exit_clean/5`.
     conn_span :: roadrunner_event_handler:span(),
-    peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    peer :: roadrunner_event_handler:peer(),
     %% The connection queries each request carries (`roadrunner_req:sockname/1`
     %% and the rest), built once per connection.
     conn_info :: roadrunner_req:conn_info(),
@@ -121,7 +121,7 @@
     dispatch :: roadrunner_conn:dispatch() | undefined,
     middlewares = [] :: roadrunner_middleware:middlewares(),
     max_content_length = 0 :: non_neg_integer(),
-    max_keep_alive_requests = infinity :: infinity | pos_integer(),
+    max_keep_alive_requests = infinity :: roadrunner_listener:request_cap(),
     %% Read-phase deadlines: `request_timeout` for the first request on a
     %% fresh conn, `keep_alive_timeout` for keep-alive loop-backs. Picked
     %% by `phase_timeout/1` per `phase`.
@@ -196,7 +196,7 @@
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
     %% otherwise, the common case, so the request path resolves nothing.
-    real_ip = undefined :: undefined | roadrunner_real_ip:config(),
+    real_ip = undefined :: roadrunner_real_ip:trust(),
     %% Encoded buffered responses queued while the keep-alive loop spins
     %% on pipelined requests already sitting in `buffered`, written in
     %% ONE send by `flush_out/1` the moment the loop is about to touch
@@ -225,7 +225,7 @@
 
 %% Idle ms before the conn hibernates (the listener's `hibernate_after`),
 %% `infinity` for never.
--type hibernate_after() :: pos_integer() | infinity.
+-type hibernate_after() :: roadrunner_listener:wait_ms().
 
 -spec start(roadrunner_transport:socket(), roadrunner_conn:proto_opts()) ->
     {ok, pid()}.
@@ -354,7 +354,7 @@ label_handshake(Socket, #proto_opts{tls_upgrade = TlsUpgrade}, ListenerName) ->
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
     atom(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     binary()
 ) -> no_return().
 serve(Socket, ProtoOpts, ListenerName, Peer, Buffered) ->
@@ -638,8 +638,8 @@ request_slot(_ProtoOpts) ->
 -spec proxy_protocol_stage(
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
-    {inet:ip_address(), inet:port_number()} | undefined
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+    roadrunner_event_handler:peer()
+) -> {ok, roadrunner_event_handler:peer(), binary()} | {close, term()}.
 proxy_protocol_stage(_Socket, #proto_opts{proxy_protocol = false}, OsPeer) ->
     {ok, OsPeer, <<>>};
 proxy_protocol_stage(
@@ -755,10 +755,10 @@ read_proxy_v1_line(Socket, Timeout) ->
     roadrunner_transport:socket(),
     integer(),
     non_neg_integer(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     integer(),
     binary()
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+) -> {ok, roadrunner_event_handler:peer(), binary()} | {close, term()}.
 read_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
     case roadrunner_transport:setopts(Socket, [{active, once}]) of
         ok -> await_proxy_bytes(Socket, Deadline, MinRate, OsPeer, Start, Acc);
@@ -775,10 +775,10 @@ read_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
     roadrunner_transport:socket(),
     integer(),
     non_neg_integer(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     integer(),
     binary()
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+) -> {ok, roadrunner_event_handler:peer(), binary()} | {close, term()}.
 await_proxy_bytes(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
     Wake =
         case Acc of
@@ -817,10 +817,10 @@ await_proxy_bytes(Socket, Deadline, MinRate, OsPeer, Start, Acc) ->
     roadrunner_transport:socket(),
     integer(),
     non_neg_integer(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     integer(),
     binary()
-) -> {ok, {inet:ip_address(), inet:port_number()} | undefined, binary()} | {close, term()}.
+) -> {ok, roadrunner_event_handler:peer(), binary()} | {close, term()}.
 parsed_proxy_header(Socket, Deadline, MinRate, OsPeer, Start, Buf) ->
     case roadrunner_proxy_protocol:parse(Buf) of
         {ok, Peer, Rest} -> {ok, Peer, Rest};
@@ -1652,7 +1652,9 @@ raise_heap_floor(#loop_state{heap_floor = {Floor, Least, Base, Cap}} = S) ->
     end.
 
 %% Back to `Base` before the process hibernates (it would otherwise wake at
-%% the floor) or runs a WebSocket session, which sizes its own heap.
+%% the floor), runs a WebSocket session, which sizes its own heap, or
+%% starts a `stream` or `loop` response, which can hold the connection for
+%% long.
 -spec reset_heap_floor(#loop_state{}) -> #loop_state{}.
 reset_heap_floor(#loop_state{heap_floor = {Floor, Least, Base, Cap}} = S) when Floor > Base ->
     _ = erlang:process_flag(min_heap_size, Base),
@@ -1976,7 +1978,10 @@ send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
             ),
             {Result, Status, Headers};
         ({stream, Status, Headers}, Req) ->
-            #loop_state{} = disarm(S),
+            %% The heap floor drops before the stream starts, as for a
+            %% returned one. The connection closes after a stream, so the
+            %% state it leaves is never read again.
+            #loop_state{} = disarm(reset_heap_floor(S)),
             ok = roadrunner_conn:continue_before_stream(Req),
             {Result, Send} = roadrunner_stream_response:start(
                 Socket, Status, roadrunner_http:auto_headers(Headers, AltSvc)
@@ -2185,8 +2190,10 @@ dispatch_response(
 ->
     %% The stream writer owns the wire from here — flush queued
     %% responses ahead of its first bytes, and the 100 a client may still
-    %% hold its body back for ahead of the head.
-    S = flush_out(disarm(S0)),
+    %% hold its body back for ahead of the head. The heap floor drops
+    %% first: a stream can run for long, and would otherwise hold the
+    %% heap the requests before it needed for all that time.
+    S = flush_out(disarm(reset_heap_floor(S0))),
     ok = roadrunner_conn:continue_before_stream(Req),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
@@ -2199,7 +2206,9 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    S = flush_out(disarm(S0)),
+    %% A loop response lives as long as its handler keeps it, so the heap
+    %% floor drops first, as for a stream.
+    S = flush_out(disarm(reset_heap_floor(S0))),
     ok = roadrunner_conn:continue_before_stream(Req),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),

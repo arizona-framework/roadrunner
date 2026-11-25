@@ -15,6 +15,8 @@
 
 -export([init/1, call/3, evict_full/2]).
 
+-export_type([state/0]).
+
 %% The key of the route buckets: path, sorted methods, and the rate, bucket
 %% capacity and cost of one request, in token-bucket units.
 -type state() ::
@@ -41,8 +43,11 @@ init(#{rate_limit := RateLimit, path := Path, methods := Methods}) ->
 %% buffered response, it carries its own `content-length: 0`, so an HTTP/1.1
 %% connection can go on after it. The
 %% client is `roadrunner_req:client_ip/1` (the peer unless `real_ip` resolved
-%% one), keyed as the listener's are (`roadrunner_rate_limit:client_key/1`); a
-%% request without one is not limited, as with the listener's limit.
+%% one), keyed as the listener's are (`roadrunner_rate_limit:client_key/1`). A
+%% request without one is not limited, except on a Unix domain socket
+%% listener, whose clients have no address: there the requests `real_ip`
+%% resolves no client for share one bucket per route, as with the
+%% listener's limit.
 -doc false.
 -spec call(roadrunner_req:request(), roadrunner_middleware:next(), state()) ->
     roadrunner_handler:result().
@@ -55,13 +60,25 @@ call(#{listener_name := Name} = Req, Next, State) ->
             {{429, Headers, ~""}, Req}
     end.
 
--spec check(inet:ip_address() | undefined, atom(), state()) -> allow | {deny, pos_integer()}.
-check(undefined, _Name, _State) ->
-    allow;
+-spec check(roadrunner_req:client_ip(), atom(), state()) -> allow | {deny, pos_integer()}.
 check(IP, Name, {_Path, _Methods, {Rate, Cap, Cost}} = RouteKey) ->
-    {Table, Counter} = persistent_term:get({roadrunner_route_rate_limit, Name}),
-    Key = {RouteKey, roadrunner_rate_limit:client_key(IP)},
-    roadrunner_conn:rate_limit_spend(Table, Key, Rate, Cap, Cost, Counter, Name).
+    {Table, Counter, Unix} = persistent_term:get({roadrunner_route_rate_limit, Name}),
+    case client_key(IP, Unix) of
+        undefined ->
+            allow;
+        ClientKey ->
+            roadrunner_conn:rate_limit_spend(
+                Table, {RouteKey, ClientKey}, Rate, Cap, Cost, Counter, Name
+            )
+    end.
+
+%% The bucket a request spends from: its client's, the one `local` bucket of
+%% a Unix domain socket's clients with no address, or none.
+-spec client_key(roadrunner_req:client_ip(), boolean()) ->
+    roadrunner_conn:rate_limit_client() | undefined.
+client_key(undefined, true) -> local;
+client_key(undefined, false) -> undefined;
+client_key(IP, _Unix) -> roadrunner_rate_limit:client_key(IP).
 
 %% Drop every route bucket full again by `NowMs`, in one `select_delete`
 %% pass, returning the number dropped, as the listener's own store is swept

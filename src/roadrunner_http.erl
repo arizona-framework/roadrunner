@@ -85,7 +85,7 @@ accessors that operate on it.
 %% The per-connection fields an HTTP/2 or HTTP/3 connection passes to
 %% build a request.
 -record(request_context, {
-    peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    peer :: roadrunner_event_handler:peer(),
     conn_info :: roadrunner_req:conn_info(),
     scheme :: http | https,
     request_id :: binary(),
@@ -869,7 +869,7 @@ find_content_length([_ | Rest], Value) ->
 %% was decoded.
 -doc false.
 -spec request_context(
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     roadrunner_req:conn_info(),
     http | https,
     atom(),

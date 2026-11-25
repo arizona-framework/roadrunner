@@ -126,8 +126,11 @@
     dispatch/0,
     rate_limit/0,
     rate_limit_state/0,
+    rate_limit_client/0,
+    rate_limit_bucket/0,
     overload/0,
     slot_cell/0,
+    inflight_counter/0,
     linger_budget/0,
     resolved/0,
     body_reader/0,
@@ -155,6 +158,19 @@
 
 -define(CONN_COMMA_CP_KEY, {?MODULE, conn_comma_cp}).
 
+%% A conn's own count of the in-flight slots it holds (`with_slot_cell/1`),
+%% or `undefined` when the listener has no ceiling.
+-type slot_cell() :: atomics:atomics_ref() | undefined.
+
+%% The listener's live count of in-flight requests under
+%% `max_concurrent_requests`, or `undefined` when the listener has no ceiling.
+-type inflight_counter() :: counters:counters_ref() | undefined.
+
+%% The listener's cap on connections lingering at once (`linger/3`): a
+%% table with a row per connection lingering now, the cumulative count of
+%% closes that skipped their linger over the cap, and the cap.
+-type linger_budget() :: {ets:table(), atomics:atomics_ref(), pos_integer()}.
+
 -doc """
 How a request over the listener-wide `max_concurrent_requests` ceiling
 is handled. `refuse` is the default and today's behavior: reject it
@@ -165,15 +181,6 @@ listener's queue process, the atomic that says whether anyone is parked
 deadline in milliseconds. The shed form answers it `503` with the
 `Retry-After` seconds it carries.
 """.
-%% A conn's own count of the in-flight slots it holds (`with_slot_cell/1`),
-%% or `undefined` when the listener has no ceiling.
--type slot_cell() :: atomics:atomics_ref() | undefined.
-
-%% The listener's cap on connections lingering at once (`linger/3`): a
-%% table with a row per connection lingering now, the cumulative count of
-%% closes that skipped their linger over the cap, and the cap.
--type linger_budget() :: {ets:table(), atomics:atomics_ref(), pos_integer()}.
-
 -type overload() ::
     refuse | {queue, pid(), atomics:atomics_ref(), pos_integer()} | {shed, pos_integer()}.
 
@@ -215,10 +222,12 @@ deadline in milliseconds. The shed form answers it `503` with the
 }.
 
 %% The per-connection rate-limit guard state cached on each conn loop's record:
-%% the `{Rate, Cap, Cost, Table, Counter, IP}` resolved from `proto_opts` + the
-%% peer once at setup (see `resolve_rate_limit/2`) — with `Cap`/`Cost` already
-%% derived so the per-request check does no arithmetic — or `undefined` when the
-%% guard is off or the peer IP is unknown. Checked by `rate_limit_check/6`.
+%% the `{Rate, Cap, Cost, Table, Counter, Client}` resolved from `proto_opts` +
+%% the peer once at setup (see `resolve_rate_limit/2`), with `Cap`/`Cost`
+%% already derived so the per-request check does no arithmetic. `Client` is
+%% the peer's address, or `local` for a Unix domain socket's peer. It is
+%% `undefined` when the guard is off or a TCP peer's address is unknown.
+%% Checked by `rate_limit/3`.
 -type rate_limit_state() ::
     {
         pos_integer(),
@@ -226,9 +235,20 @@ deadline in milliseconds. The shed form answers it `503` with the
         pos_integer(),
         ets:table(),
         atomics:atomics_ref(),
-        inet:ip_address()
+        rate_limit_client()
     }
     | undefined.
+
+%% Who a rate limit bucket counts: the request's client address, or `local`
+%% for a Unix domain socket's clients with no resolved address, who share
+%% one bucket.
+-type rate_limit_client() :: inet:ip_address() | local.
+
+%% The key of a rate limit bucket row: the client alone in the listener's
+%% store, or a route's key (`roadrunner_route_rate_limit:state()`) and the
+%% client in the route store.
+-type rate_limit_bucket() ::
+    rate_limit_client() | {roadrunner_route_rate_limit:state(), rate_limit_client()}.
 
 -doc """
 Spawn an unlinked connection process for the accepted `Socket` and the
@@ -354,7 +374,9 @@ conn has handed it over at its clean exit, never both).
 The `Max` and `Counter` are cached on the connection loop record at setup so
 the per-stream path passes them directly instead of re-reading `proto_opts`.
 """.
--spec try_acquire_request_slot(infinity | pos_integer(), counters:counters_ref() | undefined) ->
+-spec try_acquire_request_slot(
+    roadrunner_listener:request_cap(), inflight_counter()
+) ->
     boolean().
 try_acquire_request_slot(infinity, _Counter) ->
     true;
@@ -368,15 +390,15 @@ try_acquire_request_slot(Max, Counter) ->
             false
     end.
 
-%% Resolve the per-connection rate-limit tuple `{Rate, Burst, Table, Counter,
-%% IP}` from `proto_opts` + the (constant-per-conn) peer once at setup, or
-%% `undefined` when the guard is off, so the per-request check is a single
-%% branch on a cached value. The peer IP is baked in here, so the catch-all
-%% also covers a missing peer (a 2-tuple `{IP, _}` is required) as well as
-%% a `rate_limit` of `undefined`.
+%% Resolve the per-connection `rate_limit_state()` from `proto_opts` + the
+%% (constant-per-conn) peer once at setup, or `undefined` when the guard is
+%% off, so the per-request check is a single branch on a cached value. The
+%% peer's bucket key is baked in here: a TCP peer's address, or `local` for
+%% a Unix domain socket's peer, so the catch-all covers a missing TCP peer as
+%% well as a `rate_limit` of `undefined`.
 -doc false.
 -spec resolve_rate_limit(
-    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
+    proto_opts(), roadrunner_event_handler:peer()
 ) -> rate_limit_state().
 resolve_rate_limit(
     #proto_opts{rate_limit = #{table := Table} = RateLimit, rate_limited_counter = Counter},
@@ -387,6 +409,18 @@ resolve_rate_limit(
     %% per-request `rate_limit_check/6` does no arithmetic.
     {Rate, Cap, Cost} = roadrunner_rate_limit:bucket(RateLimit),
     {Rate, Cap, Cost, Table, Counter, roadrunner_rate_limit:client_key(IP)};
+resolve_rate_limit(
+    #proto_opts{
+        rate_limit = #{table := Table} = RateLimit,
+        rate_limited_counter = Counter,
+        unix_socket = true
+    },
+    undefined
+) ->
+    %% A Unix domain socket's clients have no address: the ones `real_ip`
+    %% resolves none for share one bucket, so the limit still holds.
+    {Rate, Cap, Cost} = roadrunner_rate_limit:bucket(RateLimit),
+    {Rate, Cap, Cost, Table, Counter, local};
 resolve_rate_limit(_ProtoOpts, _Peer) ->
     undefined.
 
@@ -396,10 +430,12 @@ resolve_rate_limit(_ProtoOpts, _Peer) ->
 %% is dominated by code loading.
 -doc false.
 -spec resolve_real_ip(
-    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
-) -> undefined | roadrunner_real_ip:config().
+    proto_opts(), roadrunner_event_handler:peer()
+) -> roadrunner_real_ip:trust().
 resolve_real_ip(#proto_opts{real_ip = undefined}, _Peer) ->
     undefined;
+resolve_real_ip(#proto_opts{real_ip = RealIp, unix_socket = true}, undefined) ->
+    roadrunner_real_ip:unix_trust(RealIp);
 resolve_real_ip(#proto_opts{real_ip = RealIp}, Peer) ->
     roadrunner_real_ip:peer_trust(RealIp, Peer).
 
@@ -419,7 +455,7 @@ rate_limit({Rate, Cap, Cost, Table, Counter, PeerKey}, Req, ListenerName) ->
 
 %% The bucket key of one request: its resolved client IP's key
 %% (`roadrunner_rate_limit:client_key/1`), else the peer's.
--spec rate_limit_key(roadrunner_req:request(), inet:ip_address()) -> inet:ip_address().
+-spec rate_limit_key(roadrunner_req:request(), rate_limit_client()) -> rate_limit_client().
 rate_limit_key(#{client_ip := IP}, _PeerKey) -> roadrunner_rate_limit:client_key(IP);
 rate_limit_key(_Req, PeerKey) -> PeerKey.
 
@@ -431,7 +467,7 @@ rate_limit_key(_Req, PeerKey) -> PeerKey.
 -doc false.
 -spec rate_limit_spend(
     ets:table(),
-    inet:ip_address() | {term(), inet:ip_address()},
+    rate_limit_bucket(),
     pos_integer(),
     pos_integer(),
     pos_integer(),
@@ -461,7 +497,7 @@ deterministically testable).
 """.
 -spec rate_limit_check(
     ets:table(),
-    inet:ip_address() | {term(), inet:ip_address()},
+    rate_limit_bucket(),
     pos_integer(),
     pos_integer(),
     pos_integer(),
@@ -543,8 +579,8 @@ the request has to release it rather than ignore it.
 is the natural choice.
 """.
 -spec acquire_request_slot(
-    infinity | pos_integer(),
-    counters:counters_ref() | undefined,
+    roadrunner_listener:request_cap(),
+    inflight_counter(),
     slot_cell(),
     overload(),
     term()
@@ -590,7 +626,7 @@ so a listener in queue mode that is not at its ceiling pays one extra
 `atomics:get/2` per request and no message.
 """.
 -spec release_request_slot(
-    infinity | pos_integer(), counters:counters_ref() | undefined, slot_cell(), overload()
+    roadrunner_listener:request_cap(), inflight_counter(), slot_cell(), overload()
 ) -> ok.
 release_request_slot(infinity, _Counter, _Cell, _Overload) ->
     ok;
@@ -614,7 +650,10 @@ Release `N` in-flight slots at once, taken out of a conn's cell by
 no-ops.
 """.
 -spec release_request_slots(
-    infinity | pos_integer(), counters:counters_ref() | undefined, non_neg_integer(), overload()
+    roadrunner_listener:request_cap(),
+    inflight_counter(),
+    non_neg_integer(),
+    overload()
 ) -> ok.
 release_request_slots(_Max, _Counter, 0, _Overload) ->
     ok;
@@ -645,7 +684,7 @@ with no ceiling). The listener's reaper calls it for a conn that died
 without its exit path.
 """.
 -spec reclaim_request_slots(
-    slot_cell(), infinity | pos_integer(), counters:counters_ref() | undefined, overload()
+    slot_cell(), roadrunner_listener:request_cap(), inflight_counter(), overload()
 ) -> ok.
 reclaim_request_slots(undefined, _Max, _Counter, _Overload) ->
     ok;
@@ -688,7 +727,7 @@ hand_off_request_slots(Keeper, Cell, Workers, _Parked, _Max, _Counter, _Overload
 
 -doc false.
 -spec refine_conn_label(
-    proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
+    proto_opts(), roadrunner_event_handler:peer()
 ) -> ok.
 refine_conn_label(#proto_opts{listener_name = ListenerName}, Peer) ->
     proc_lib:set_label({roadrunner_conn, ListenerName, Peer}),
@@ -1098,9 +1137,11 @@ rate_deadline(Start, Total, MinRate) ->
     Start + max(1001, Total * 1000 div MinRate + 1).
 
 -doc false.
--spec peer(roadrunner_transport:socket()) -> {inet:ip_address(), inet:port_number()} | undefined.
+-spec peer(roadrunner_transport:socket()) -> roadrunner_event_handler:peer().
 peer(Socket) ->
     case roadrunner_transport:peername(Socket) of
+        %% A Unix domain socket's peer has no address.
+        {ok, {local, _}} -> undefined;
         {ok, Peer} -> Peer;
         {error, _} -> undefined
     end.
@@ -1218,11 +1259,18 @@ expect_answer(ProtoOpts, Headers, MaxCL) ->
 -doc false.
 -spec with_client_ip(
     roadrunner_req:request(),
-    undefined | roadrunner_real_ip:config(),
-    {inet:ip_address(), inet:port_number()} | undefined
+    roadrunner_real_ip:trust(),
+    roadrunner_event_handler:peer()
 ) -> roadrunner_req:request().
 with_client_ip(Req, undefined, _Peer) ->
     Req;
+with_client_ip(#{headers := Headers} = Req, RealIp, undefined) ->
+    %% A Unix domain socket's client, trusted as the nearest hop: a client
+    %% address only when the header names one.
+    case roadrunner_real_ip:resolve(RealIp, undefined, Headers) of
+        undefined -> Req;
+        IP -> Req#{client_ip => IP}
+    end;
 with_client_ip(#{headers := Headers} = Req, RealIp, {PeerIP, _Port}) ->
     Req#{client_ip => roadrunner_real_ip:resolve(RealIp, PeerIP, Headers)}.
 

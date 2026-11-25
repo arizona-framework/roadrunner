@@ -14,7 +14,11 @@ chunks, as a `stream` response and from a `{send, ...}` fun;
 `{send_stream_alloc, Report}` tells `Report` its pid, starts a stream
 from a `{send, ...}` fun and builds a live term before it ends it;
 `{min_heap, Report}` tells `Report` its pid and answers with its
-`min_heap_size`; `report` answers with the running process's
+`min_heap_size`; `stream_min_heap` and `send_stream_min_heap` stream
+the running process's `min_heap_size` as their body, as a `stream`
+response and from a `{send, ...}` fun; `{loop, Report}` tells `Report`
+its pid and answers with a `loop` response that ends when the client
+goes; `report` answers with the running process's
 `min_heap_size`; `{heap, Report}` tells `Report` its pid and answers with
 its heap's size; `{ws, Report}` (or `{ws, Report, Opts}`, with upgrade
 options) upgrades, tells `Report` the session's pid and `min_heap_size`,
@@ -27,7 +31,7 @@ small one, `report` tells
 -behaviour(roadrunner_ws_handler).
 
 -export([handle/1]).
--export([init/1, handle_frame/2, handle_info/2]).
+-export([init/1, handle_frame/2, handle_info/2, handle_info/3]).
 
 handle(Req) ->
     handle(roadrunner_req:state(Req), Req).
@@ -94,6 +98,20 @@ handle({heap, Report}, Req) ->
     Report ! {conn, self()},
     {heap_size, Words} = process_info(self(), heap_size),
     {roadrunner_resp:text(200, integer_to_binary(Words)), Req};
+handle(stream_min_heap, Req) ->
+    {{stream, 200, [], fun(Send) -> Send(integer_to_binary(min_heap_size()), fin) end}, Req};
+handle(send_stream_min_heap, Req) ->
+    {
+        {send, [], fun(R) ->
+            {ok, Send} = roadrunner_send:stream(200, [], R),
+            ok = Send(integer_to_binary(min_heap_size()), fin),
+            R
+        end},
+        Req
+    };
+handle({loop, Report}, Req) ->
+    Report ! {conn, self()},
+    {{loop, 200, [], Report}, Req};
 handle(report, Req) ->
     {roadrunner_resp:text(200, integer_to_binary(min_heap_size())), Req};
 handle({ws, Report}, Req) ->
@@ -125,6 +143,10 @@ handle_info(report, Report) ->
 handle_info(hibernate, Report) ->
     Report ! ws_hibernating,
     {ok, Report, [hibernate]}.
+
+%% The `loop` response: it only waits for the client to go.
+handle_info({roadrunner_disconnect, _Reason}, _Push, Report) ->
+    {stop, Report}.
 
 %% Four chunks with about 40,000 words of garbage before each.
 stream_garbage(Send) ->

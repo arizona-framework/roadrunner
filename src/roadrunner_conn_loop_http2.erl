@@ -323,7 +323,7 @@
     socket :: roadrunner_transport:socket(),
     proto_opts :: roadrunner_conn:proto_opts(),
     listener_name :: atom(),
-    peer :: {inet:ip_address(), inet:port_number()} | undefined,
+    peer :: roadrunner_event_handler:peer(),
     %% The connection queries each request carries, built once.
     conn_info :: roadrunner_req:conn_info(),
     %% The event handler's span from `listener_accept`, fired by the
@@ -470,7 +470,7 @@
     %% with nothing sent before it is reset (the `send_stall_timeout`), and
     %% the one timer that checks it, armed while a stream holds DATA back
     %% (`arm_stall_timer/1`). Read from proto_opts at `enter/6`.
-    send_stall_timeout = infinity :: pos_integer() | infinity,
+    send_stall_timeout = infinity :: roadrunner_listener:wait_ms(),
     stall_timer = undefined :: reference() | undefined,
     %% Since when a stream has held DATA back for the connection window
     %% with no DATA sent on the connection at all, or `undefined` once
@@ -485,8 +485,8 @@
     %% (default) disables it; `inflight_counter` is the shared gauge.
     %% Read from proto_opts at `enter/6` so the per-stream acquire/release
     %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
-    max_concurrent_requests = infinity :: infinity | pos_integer(),
-    inflight_counter :: counters:counters_ref() | undefined,
+    max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
+    inflight_counter :: roadrunner_conn:inflight_counter(),
     %% The conn's own count of the slots it holds
     %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
     slot_cell = undefined :: roadrunner_conn:slot_cell(),
@@ -515,7 +515,7 @@
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
     %% otherwise, the common case, so the request path resolves nothing.
-    real_ip = undefined :: undefined | roadrunner_real_ip:config(),
+    real_ip = undefined :: roadrunner_real_ip:trust(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => #stream{}},
     %% Worker pid → stream id, for DOWN correlation: the workers that hold
@@ -583,7 +583,7 @@ normal path.
     roadrunner_transport:socket(),
     roadrunner_conn:proto_opts(),
     atom(),
-    {inet:ip_address(), inet:port_number()} | undefined,
+    roadrunner_event_handler:peer(),
     roadrunner_event_handler:span(),
     binary()
 ) -> no_return().

@@ -48,19 +48,19 @@ compile_rejects_test_() ->
 compile_accepts_test() ->
     ?assertMatch({hops, x_forwarded_for, 2}, ?M:compile(#{trusted_hops => 2})),
     ?assertMatch(
-        {cidrs, forwarded, {[_], [_]}},
+        {cidrs, forwarded, {[_], [_], false}},
         ?M:compile(#{trusted_proxies => [~"10.0.0.0/8", ~"2001:db8::/32"], header => forwarded})
     ),
     %% IPv4-mapped IPv6 covers the IPv4 range it maps (peers and hops are
     %% unmapped), as a host or as a prefix past the 96 mapping bits.
     ?assertMatch(
-        {cidrs, x_forwarded_for, {[_, _], []}},
+        {cidrs, x_forwarded_for, {[_, _], [], false}},
         ?M:compile(#{trusted_proxies => [~"::ffff:10.0.0.1", ~"::ffff:192.168.0.0/112"]})
     ),
     %% A shorter mapped prefix reaches past the mapped range, so it stays an
     %% IPv6 range.
     ?assertMatch(
-        {cidrs, x_forwarded_for, {[], [_]}},
+        {cidrs, x_forwarded_for, {[], [_], false}},
         ?M:compile(#{trusted_proxies => [~"::ffff:0.0.0.0/95"]})
     ).
 
@@ -189,3 +189,27 @@ forwarded_test_() ->
         ?_assertEqual(?PROXY, Resolve(~"secret;proto=https")),
         ?_assertEqual(?PROXY, Resolve(~"for=\"203.0.113.7"))
     ].
+
+%% `~"unix:"` trusts a Unix domain socket's clients, which have no address,
+%% as the nearest hop; `trusted_hops` always does.
+unix_trust_test() ->
+    Unix = ?M:compile(#{trusted_proxies => [~"unix:", ~"10.0.0.0/8"]}),
+    ?assertMatch({cidrs, x_forwarded_for, {[_], [], true}}, Unix),
+    ?assertEqual(Unix, ?M:unix_trust(Unix)),
+    Hops = ?M:compile(#{trusted_hops => 1}),
+    ?assertEqual(Hops, ?M:unix_trust(Hops)),
+    ?assertEqual(undefined, ?M:unix_trust(?M:compile(#{trusted_proxies => [~"10.0.0.0/8"]}))),
+    ?assertEqual(undefined, ?M:unix_trust(undefined)).
+
+%% With no peer address, the client is the first untrusted hop, and there
+%% is none without a header or past a hop that is not an address.
+resolve_without_a_peer_test() ->
+    Hops = ?M:compile(#{trusted_hops => 1}),
+    ?assertEqual({1, 2, 3, 4}, ?M:resolve(Hops, undefined, [{~"x-forwarded-for", ~"1.2.3.4"}])),
+    ?assertEqual(undefined, ?M:resolve(Hops, undefined, [])),
+    ?assertEqual(undefined, ?M:resolve(Hops, undefined, [{~"x-forwarded-for", ~"junk"}])),
+    Unix = ?M:compile(#{trusted_proxies => [~"unix:", ~"10.0.0.0/8"]}),
+    ?assertEqual(
+        {1, 2, 3, 4},
+        ?M:resolve(Unix, undefined, [{~"x-forwarded-for", ~"1.2.3.4, 10.0.0.1"}])
+    ).

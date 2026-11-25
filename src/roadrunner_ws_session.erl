@@ -141,7 +141,7 @@
 %% `recv_loop/1` clause matching it never fires. Its own record, like
 %% `#callbacks{}`, keeps the per-frame `#data{}` copies small.
 -record(idle, {
-    timeout :: roadrunner_listener:idle_ms(),
+    timeout :: roadrunner_listener:wait_ms(),
     timer :: reference() | undefined,
     recv = 0 :: non_neg_integer()
 }).
@@ -200,7 +200,7 @@
     %% opt, set once in `init/1`). `infinity` (the default) makes the
     %% recv_loop's `after` clause dead by the receive's own semantics —
     %% the timer never arms, so the default costs nothing per message.
-    hibernate_after :: roadrunner_listener:idle_ms(),
+    hibernate_after :: roadrunner_listener:wait_ms(),
     idle :: #idle{},
     msg_size = 0 :: non_neg_integer(),
     %% Trailing UTF-8 bytes carried over from a previous fragment that
@@ -1383,13 +1383,17 @@ wait(Data, false) -> recv_loop(Data).
     {pos_integer(), pos_integer(), pos_integer(), non_neg_integer()} | undefined.
 heap_floor(#proto_opts{ws_heap_floor_min = Min, ws_heap_floor_max = Cap}) ->
     %% After `apply_gc_settings/1`: the session's own `min_heap_size`, as
-    %% the emulator rounded it, or the emulator's default.
+    %% the emulator rounded it, or the emulator's default, and its own
+    %% `max_heap_size`, the upgrade's included. With a `max_heap_size` the
+    %% floor is off, as for the connection: a raised `min_heap_size` makes
+    %% every collection hold larger heaps, so it could take the session
+    %% over the limit when its own data would not.
     {min_heap_size, Base} = erlang:process_info(self(), min_heap_size),
-    case Cap > Base of
-        true ->
+    case erlang:process_info(self(), max_heap_size) of
+        {max_heap_size, #{size := 0}} when Cap > Base ->
             ok = start_from_live_data(Base),
             {Base, Base, Cap, Min};
-        false ->
+        {max_heap_size, _} ->
             undefined
     end.
 

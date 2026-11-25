@@ -46,7 +46,7 @@ call_test() ->
     {ok, _} = roadrunner_test_event_handler:start(),
     Table = ets:new(route_rl_test, [public]),
     Counter = atomics:new(1, [{signed, false}]),
-    persistent_term:put({roadrunner_route_rate_limit, route_rl_call}, {Table, Counter}),
+    persistent_term:put({roadrunner_route_rate_limit, route_rl_call}, {Table, Counter, false}),
     State = ?M:init(stage(~"/login", 1, 60)),
     Next = fun(Req) -> {{200, [], ~"ok"}, Req} end,
     Req = #{listener_name => route_rl_call, peer => {?IP, 5000}},
