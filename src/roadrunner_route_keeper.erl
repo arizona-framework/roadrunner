@@ -247,15 +247,32 @@ new(Max, MaxQueued, Draining) ->
 
 %% Start a keeper on a route's tables, linked to the caller (the listener):
 %% the first, or one taking over from a keeper that died or drained.
+%%
+%% The keeper runs at high priority. Its queue is first in, first out, and
+%% no longer than `max_queued`, only while it keeps up with its messages: at
+%% normal priority, on a server busy with the very requests it counts, it
+%% waits its turn behind them, the requests asking for a slot pile up unread
+%% in its mailbox (a queue `max_queued` does not count), and it finds no
+%% request waiting and opens the gate while they do. Connections already
+%% served then take their home slots as they free, and the requests in the
+%% mailbox can wait for seconds. Its work is a few messages for each
+%% request that reaches it, and once its queue is full a request is refused
+%% without reaching it. Its bursts of work run ahead of the connections on
+%% its scheduler as well: many connections it knows closing at once cost it
+%% about 1.5 us each.
 -spec start_link(table(), atomics:atomics_ref(), boolean()) -> {ok, pid()}.
 start_link(Table, Counts, Draining) ->
     gen_server:start_link(
-        ?MODULE, {Table, Counts, Draining}, [{hibernate_after, ?HIBERNATE_AFTER_MS}]
+        ?MODULE,
+        {Table, Counts, Draining},
+        [{hibernate_after, ?HIBERNATE_AFTER_MS}, {spawn_opt, [{priority, high}]}]
     ).
 
-%% A new ceiling and queue depth, from a reload. They apply at once, to the
-%% requests already counted too; a raised ceiling hands its slots to the
-%% requests waiting. Asynchronous, so the listener never waits on a keeper.
+%% A new ceiling and queue depth, from a reload. They apply at once: the
+%% ceiling to the requests already counted too, the depth to the requests
+%% that ask from then on (those already waiting stay); a raised ceiling hands
+%% its slots to the requests waiting. Asynchronous, so the listener never
+%% waits on a keeper.
 -spec configure(pid(), atomics:atomics_ref(), {pos_integer(), pos_integer()}) -> ok.
 configure(Pid, Counts, {Max, MaxQueued}) ->
     ok = atomics:put(Counts, ?MAX, Max),

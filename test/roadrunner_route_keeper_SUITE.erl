@@ -86,6 +86,7 @@ watching a dead owner's workers before taking its registration.
     full_route_scan_finds_free_keys/1,
     scan_under_half_keeps_releases_quiet/1,
     gone_table_refuses_and_releases/1,
+    keeper_runs_at_high_priority/1,
     unknown_messages_are_ignored/1,
     idle_keeper_hibernates/1,
     idle_connections_gone_leave_no_keys/1,
@@ -159,6 +160,7 @@ all() ->
         full_route_scan_finds_free_keys,
         scan_under_half_keeps_releases_quiet,
         gone_table_refuses_and_releases,
+        keeper_runs_at_high_priority,
         unknown_messages_are_ignored,
         idle_keeper_hibernates,
         idle_connections_gone_leave_no_keys,
@@ -1276,6 +1278,18 @@ gone_table_refuses_and_releases(_Config) ->
     ),
     ok = atomics:put(counts(Bare), 1, 5),
     ?assertEqual({refused, 2}, roadrunner_route_keeper:acquire(Bare)).
+
+keeper_runs_at_high_priority(_Config) ->
+    %% The queue stays first in, first out under load only while the keeper
+    %% keeps up with its messages, so it runs ahead of the connections whose
+    %% requests it counts: the first keeper, and one taking over the tables.
+    {Keeper, C} = route(1, {queue, 5000, 10}),
+    ?assertEqual({priority, high}, erlang:process_info(Keeper, priority)),
+    exit(Keeper, kill),
+    {'EXIT', Keeper, killed} = receive_exit(Keeper),
+    {ok, NewKeeper} = start_keeper(C, false),
+    ?assertEqual({priority, high}, erlang:process_info(NewKeeper, priority)),
+    ok = stop_keeper(NewKeeper).
 
 unknown_messages_are_ignored(_Config) ->
     {Keeper, C} = route(1, shed),

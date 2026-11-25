@@ -571,11 +571,10 @@ The default is `high`. The Erlang VM always runs a waiting high-priority
 process before a waiting normal-priority one, so the acceptors get CPU
 time ahead of the connections being served. Accepting a connection is
 only a little work, so this takes very little from them. The connection
-processes the acceptors start run at normal priority, like the rest of
-the system. High priority only covers taking the connection from the
-queue. The TLS handshake and the requests themselves run in the
-connection process at normal priority, and they share the server with
-everyone else.
+processes the acceptors start run at normal priority. High priority only
+covers taking the connection from the queue. The TLS handshake and the
+requests themselves run in the connection process at normal priority,
+and they share the server with everyone else.
 
 At `normal`, the acceptors take turns with every busy connection
 process. Under load that means a new client can sit in the kernel queue
@@ -819,6 +818,15 @@ the ceiling on, which costs a few microseconds of server CPU per request.
 That is nothing next to a request that decodes a large body, but it would
 show on a hot, cheap route: leave those without a ceiling and bound them
 with the listener's `max_concurrent_requests` if needed.
+
+The process runs at high priority, so on a busy server it keeps up with
+the requests it counts, and its queue stays first in, first out and no
+longer than `max_queued` (a reload that lowers `max_queued` leaves the
+requests already waiting in place). At normal priority it would wait its
+turn behind the very connections it counts. Requests asking it for a slot
+would then pile up unread, past `max_queued`, while connections it had
+already served took the slots as they freed, and some requests would wait
+for seconds.
 
 That process keeps a small record of each connection that took a slot
 through it, for as long as the connection lives, and gives the memory back
