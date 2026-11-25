@@ -723,7 +723,7 @@ handshake(
         max_header_list_size = MaxHeaderListSize
     } = State
 ) ->
-    _ = send(State, server_settings_frame(MaxStreams, MaxHeaderListSize)),
+    _ = send_frame(State, server_settings_frame(MaxStreams, MaxHeaderListSize)),
     %% RFC 9113 §6.9.2: SETTINGS_INITIAL_WINDOW_SIZE only affects
     %% stream-level recv windows. The conn-level recv window stays
     %% at the 65535 default until an explicit `WINDOW_UPDATE(0, _)`,
@@ -732,7 +732,7 @@ handshake(
         case ConnPeak > ?INITIAL_WINDOW of
             true ->
                 Inc = ConnPeak - ?INITIAL_WINDOW,
-                _ = send(State, roadrunner_http2_frame:encode({window_update, 0, Inc})),
+                _ = send_frame(State, roadrunner_http2_frame:encode({window_update, 0, Inc})),
                 State#loop{conn_recv_window = ConnPeak};
             false ->
                 State
@@ -981,7 +981,7 @@ recv_idle_expired(#loop{idle_deadline = Deadline} = State) when is_integer(Deadl
 recv_idle_expired(#loop{liveness_ping = false} = State) ->
     case serving(State) of
         true ->
-            _ = send(State, roadrunner_http2_frame:encode({ping, 0, ?LIVENESS_PING})),
+            _ = send_frame(State, roadrunner_http2_frame:encode({ping, 0, ?LIVENESS_PING})),
             recv_more(State#loop{liveness_ping = true});
         false ->
             idle_goaway(State)
@@ -1086,7 +1086,7 @@ ping_strike(
 %% keepalive enforcement), which tells a gRPC client to ping less.
 -spec too_many_pings(#loop{}, iodata()) -> no_return().
 too_many_pings(#loop{last_stream_id = LastId} = State, Ack) ->
-    _ = send(State, [
+    _ = send_frame(State, [
         Ack,
         roadrunner_http2_frame:encode({goaway, LastId, enhance_your_calm, ?TOO_MANY_PINGS})
     ]),
@@ -1232,7 +1232,7 @@ start_drain(#loop{streams = Streams} = State, Deadline) ->
 %% an idle timeout later. A close already under way is left as it is.
 -spec announce_goaway(#loop{}, close_reason()) -> #loop{}.
 announce_goaway(#loop{goaway = open, idle_timeout = Timeout} = State, Reason) ->
-    _ = send(State, [
+    _ = send_frame(State, [
         ?GOAWAY(?MAX_STREAM_ID, no_error),
         roadrunner_http2_frame:encode({ping, 0, ?GOAWAY_PING})
     ]),
@@ -1398,7 +1398,7 @@ handle_frame({settings, 0, Params}, State0) ->
                     State2 = apply_peer_max_header_list_size(
                         Params, apply_header_table_size(Params, State1)
                     ),
-                    _ = send(State2, roadrunner_http2_frame:encode({settings, 1, []})),
+                    _ = send_frame(State2, roadrunner_http2_frame:encode({settings, 1, []})),
                     frame_loop(flush_all_pending_data(State2));
                 {error, flow_control_error} ->
                     goaway_exit(State, flow_control_error)
@@ -1422,7 +1422,7 @@ handle_frame({ping, 0, Opaque}, State) ->
     Ack = roadrunner_http2_frame:encode({ping, 1, Opaque}),
     case ping_strike(State) of
         {ok, State1} ->
-            _ = send(State1, Ack),
+            _ = send_frame(State1, Ack),
             frame_loop(State1);
         too_many_pings ->
             too_many_pings(State, Ack)
@@ -2000,7 +2000,9 @@ body_follows(StreamId, State) ->
 -spec send_continue(#loop{}, stream_id()) -> #loop{}.
 send_continue(#loop{hpack_enc = Enc} = State, StreamId) ->
     {Block, Enc1} = roadrunner_http2_hpack:encode([{~":status", ~"100"}], Enc),
-    _ = send(State, roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block})),
+    _ = send_frame(
+        State, roadrunner_http2_frame:encode({headers, StreamId, 16#04, undefined, Block})
+    ),
     State#loop{
         hpack_enc = Enc1,
         ping_clock = undefined,
@@ -2226,7 +2228,7 @@ deliver(
                 {[], State2} ->
                     State2;
                 {Frame, State2} ->
-                    _ = send(State2, Frame),
+                    _ = send_frame(State2, Frame),
                     State2
             end
     end.
@@ -2331,7 +2333,7 @@ refill_conn_window(State) ->
         {[], State1} ->
             State1;
         {Frame, State1} ->
-            _ = send(State1, Frame),
+            _ = send_frame(State1, Frame),
             State1
     end.
 
@@ -2361,7 +2363,7 @@ stream_body_cap(
 replenish_conn_window(State, 0) ->
     State;
 replenish_conn_window(State, N) ->
-    _ = send(State, roadrunner_http2_frame:encode({window_update, 0, N})),
+    _ = send_frame(State, roadrunner_http2_frame:encode({window_update, 0, N})),
     State.
 
 %% Refill the conn-level + stream-level recv windows whenever they
@@ -2379,7 +2381,7 @@ maybe_refill_recv_windows(State, StreamId) ->
         {[], []} ->
             State2;
         {_, _} ->
-            _ = send(State2, [ConnFrame, StreamFrame]),
+            _ = send_frame(State2, [ConnFrame, StreamFrame]),
             State2
     end.
 
@@ -2914,7 +2916,7 @@ encode_and_send_headers(
             true -> 16#04
         end,
     Frame = roadrunner_http2_frame:encode({headers, StreamId, Flags, undefined, HpackBlock}),
-    _ = send(State, Frame),
+    _ = send_frame(State, Frame),
     case EndStream of
         true ->
             #loop{streams = #{StreamId := Stream} = Streams, live_streams = Live0} = State,
@@ -2983,7 +2985,7 @@ encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     Frame = roadrunner_http2_frame:encode(
         {headers, StreamId, 16#04 bor 16#01, undefined, HpackBlock}
     ),
-    _ = send(State, Frame),
+    _ = send_frame(State, Frame),
     State1 = State#loop{hpack_enc = Enc1},
     close_stream_send_side(State1, StreamId).
 
@@ -3051,7 +3053,7 @@ try_send_data(State, Stream, StreamId, From, Ref, Data, Size, EndStream) ->
         0 when EndStream ->
             %% Final empty DATA frame closes the stream.
             Frame = roadrunner_http2_frame:encode({data, StreamId, 16#01, <<>>}),
-            _ = send(State, Frame),
+            _ = send_frame(State, Frame),
             ok = ack(From, Ref),
             close_stream_send_side(State, StreamId);
         Total ->
@@ -3752,6 +3754,12 @@ validate_settings([_ | Rest]) ->
 send(#loop{socket = Socket}, Data) ->
     roadrunner_transport:send(Socket, Data).
 
+%% `send/2` for control frames and a HEADERS frame, sent without measuring:
+%% far under the size a send is sliced at (`roadrunner_transport:send/3`).
+-spec send_frame(#loop{}, iodata()) -> ok | {error, term()}.
+send_frame(#loop{socket = Socket}, Frame) ->
+    roadrunner_transport:send(Socket, Frame, 0).
+
 %% `send/2` for DATA whose payload size is known, so the transport does not
 %% measure it again.
 -spec send(#loop{}, iodata(), non_neg_integer()) -> ok | {error, term()}.
@@ -3760,12 +3768,12 @@ send(#loop{socket = Socket}, Data, Size) ->
 
 -spec send_goaway(#loop{}, roadrunner_http2_frame:error_code()) -> ok | {error, term()}.
 send_goaway(#loop{last_stream_id = LastId} = State, ErrorCode) ->
-    send(State, ?GOAWAY(LastId, ErrorCode)).
+    send_frame(State, ?GOAWAY(LastId, ErrorCode)).
 
 -spec send_rst_stream(#loop{}, pos_integer(), roadrunner_http2_frame:error_code()) ->
     ok | {error, term()}.
 send_rst_stream(State, StreamId, ErrorCode) ->
-    send(State, roadrunner_http2_frame:encode({rst_stream, StreamId, ErrorCode})).
+    send_frame(State, roadrunner_http2_frame:encode({rst_stream, StreamId, ErrorCode})).
 
 %% Bump the cumulative throttled counter and emit the throttled telemetry
 %% when a stream is refused at the `max_concurrent_requests` ceiling.

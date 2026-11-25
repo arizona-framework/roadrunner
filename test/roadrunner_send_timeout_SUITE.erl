@@ -22,7 +22,11 @@ a large write more slowly than `send_timeout` allows for all of it.
     invalid_values_refuse_to_start/1,
     socket_options_per_os/1,
     sliced_writes_arrive_whole_on_tcp/1,
-    sliced_writes_arrive_whole_on_tls/1
+    sliced_writes_arrive_whole_on_tls/1,
+    kernel_timeout_writes_are_not_sliced/1,
+    emulator_timeout_closes_non_reader/1,
+    pre_fix_linux_closes_non_reader/1,
+    tls_send_timeout_slices_sends/1
 ]).
 
 %% Far larger than what the kernel queues for one connection with a
@@ -43,7 +47,11 @@ all() ->
         invalid_values_refuse_to_start,
         socket_options_per_os,
         sliced_writes_arrive_whole_on_tcp,
-        sliced_writes_arrive_whole_on_tls
+        sliced_writes_arrive_whole_on_tls,
+        kernel_timeout_writes_are_not_sliced,
+        emulator_timeout_closes_non_reader,
+        pre_fix_linux_closes_non_reader,
+        tls_send_timeout_slices_sends
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -52,6 +60,8 @@ init_per_testcase(_Case, Config) ->
     [{file, File} | Config].
 
 end_per_testcase(_Case, _Config) ->
+    _ = persistent_term:erase({roadrunner_transport, slice_sends}),
+    _ = persistent_term:erase({roadrunner_listener, listen_os}),
     case whereis(send_timeout_test) of
         undefined -> ok;
         _ -> roadrunner_listener:stop(send_timeout_test)
@@ -82,9 +92,10 @@ slow_steady_reader_is_not_closed(Config) ->
 
 sendfile_response_to_non_reader_closes(Config) ->
     %% The emulator's `send_timeout` does not cover `sendfile`; the
-    %% kernel's `TCP_USER_TIMEOUT` does, and only Linux has it here.
-    case os:type() of
-        {unix, linux} -> non_reader_closes(Config, ~"/sendfile");
+    %% kernel's `TCP_USER_TIMEOUT` does, on a Linux that closes a client
+    %% that stops reading with it.
+    case roadrunner_listener:send_opts(#{}, os:type(), os:version()) of
+        [{raw, 6, 18, _}, {raw, 6, 25, _}] -> non_reader_closes(Config, ~"/sendfile");
         _ -> {skip, no_tcp_user_timeout}
     end.
 
@@ -126,53 +137,173 @@ invalid_values_refuse_to_start(_Config) ->
     ).
 
 socket_options_per_os(_Config) ->
-    %% The kernel options are set only where the system has them.
+    %% The kernel enforces `send_timeout` on a Linux whose
+    %% `TCP_USER_TIMEOUT` closes a client that stops reading, the emulator
+    %% as well on an older or unknown Linux, and alone elsewhere.
     Opts = #{send_timeout => 1000, max_unsent_bytes => 4096},
-    ?assertEqual(
-        [{raw, 6, 18, <<1000:32/native>>}, {raw, 6, 25, <<4096:32/native>>}],
-        roadrunner_listener:send_opts(Opts, {unix, linux})
+    Kernel = [{raw, 6, 18, <<1000:32/native>>}, {raw, 6, 25, <<4096:32/native>>}],
+    Both = [
+        {raw, 6, 18, <<1000:32/native>>},
+        {send_timeout, 1000},
+        {send_timeout_close, true},
+        {raw, 6, 25, <<4096:32/native>>}
+    ],
+    lists:foreach(
+        fun({Version, Want}) ->
+            ?assertEqual(
+                {Version, Want},
+                {Version, roadrunner_listener:send_opts(Opts, {unix, linux}, Version)}
+            )
+        end,
+        [
+            {{7, 0, 11}, Kernel},
+            {{5, 11, 0}, Kernel},
+            {{5, 10, 11}, Kernel},
+            {{5, 10, 10}, Both},
+            {{5, 4, 93}, Kernel},
+            {{5, 4, 0}, Both},
+            {{4, 18, 0}, Both},
+            {"5.15.0-custom", Both}
+        ]
     ),
     ?assertEqual(
         [{send_timeout, 1000}, {send_timeout_close, true}, {raw, 6, 16#201, <<4096:32/native>>}],
-        roadrunner_listener:send_opts(Opts, {unix, darwin})
+        roadrunner_listener:send_opts(Opts, {unix, darwin}, {24, 1, 0})
     ),
     ?assertEqual(
         [{send_timeout, 1000}, {send_timeout_close, true}],
-        roadrunner_listener:send_opts(Opts, {win32, nt})
+        roadrunner_listener:send_opts(Opts, {win32, nt}, {10, 0, 19045})
     ),
     ?assertEqual(
         [{raw, 6, 18, <<60000:32/native>>}, {raw, 6, 25, <<65536:32/native>>}],
-        roadrunner_listener:send_opts(#{}, {unix, linux})
+        roadrunner_listener:send_opts(#{}, {unix, linux}, {6, 1, 0})
     ),
     ?assertEqual(
         [],
         roadrunner_listener:send_opts(
-            #{send_timeout => infinity, max_unsent_bytes => infinity}, {unix, linux}
+            #{send_timeout => infinity, max_unsent_bytes => infinity}, {unix, linux}, {5, 4, 0}
         )
     ).
 
 sliced_writes_arrive_whole_on_tcp(_Config) ->
-    %% Writes over 256 KB go out in slices; the client gets every byte in
-    %% order, whatever the shape of the iolist, and a write on a closed
-    %% socket fails on its first slice.
+    %% Where the emulator's `send_timeout` is in use, writes over 256 KB
+    %% go out in slices; the client gets every byte in order, whatever the
+    %% shape of the iolist, and a write on a closed socket fails on its
+    %% first slice.
+    ok = roadrunner_transport:slice_sends(
+        roadrunner_listener:send_opts(#{}, {unix, darwin}, {24, 1, 0})
+    ),
+    {Sends, Closed} = tcp_writes(),
+    ?assertEqual([], [N || N <- Sends, N < 2]),
+    ?assertEqual({error, closed}, Closed).
+
+sliced_writes_arrive_whole_on_tls(_Config) ->
+    ok = roadrunner_transport:slice_sends(
+        roadrunner_listener:send_opts(#{}, {unix, linux}, {5, 4, 0})
+    ),
+    tls_writes().
+
+kernel_timeout_writes_are_not_sliced(_Config) ->
+    %% The kernel's `TCP_USER_TIMEOUT` alone (and no timeout at all) leaves
+    %% each write whole: one send, whatever its size.
+    ok = roadrunner_transport:slice_sends(
+        roadrunner_listener:send_opts(#{}, {unix, linux}, {5, 11, 0})
+    ),
+    ok = roadrunner_transport:slice_sends(
+        roadrunner_listener:send_opts(#{send_timeout => infinity}, {unix, darwin}, {24, 1, 0})
+    ),
+    {Sends, Closed} = tcp_writes(),
+    ?assertEqual([1, 1, 1], Sends),
+    ?assertEqual({error, closed}, Closed),
+    tls_writes().
+
+emulator_timeout_closes_non_reader(Config) ->
+    %% Where only the emulator enforces it (a system without
+    %% `TCP_USER_TIMEOUT`), a client that reads nothing is still closed,
+    %% for a buffered and a streamed body, and large sends are sliced.
+    ok = persistent_term:put({roadrunner_listener, listen_os}, {{win32, nt}, {10, 0, 19045}}),
+    non_reader_closes(Config, ~"/buffered"),
+    ?assert(persistent_term:get({roadrunner_transport, slice_sends}, false)),
+    ok = roadrunner_listener:stop(send_timeout_test),
+    non_reader_closes(Config, ~"/stream").
+
+pre_fix_linux_closes_non_reader(Config) ->
+    %% A Linux whose `TCP_USER_TIMEOUT` does not close a client that stops
+    %% reading has the emulator's timeout as well, which closes it. The
+    %% kernel running this test closes that client by itself, so the close
+    %% cannot tell the two apart: the accepted socket must carry the
+    %% emulator's `send_timeout`.
+    ok = persistent_term:put({roadrunner_listener, listen_os}, {{unix, linux}, {5, 4, 0}}),
+    non_reader_closes(Config, ~"/buffered", fun(Conn) ->
+        [Socket] = [
+            Port
+         || Port <- erlang:ports(),
+            erlang:port_info(Port, connected) =:= {connected, Conn},
+            erlang:port_info(Port, name) =:= {name, "tcp_inet"}
+        ],
+        ?assertEqual(
+            {ok, [{send_timeout, 200}, {send_timeout_close, true}]},
+            inet:getopts(Socket, [send_timeout, send_timeout_close])
+        )
+    end),
+    ?assert(persistent_term:get({roadrunner_transport, slice_sends}, false)).
+
+tls_send_timeout_slices_sends(_Config) ->
+    %% A `send_timeout` among the listener's `tls` options is the
+    %% emulator's own, so it turns on sliced sends like the listener's.
+    {ok, _} = application:ensure_all_started(ssl),
+    ok = persistent_term:put({roadrunner_listener, listen_os}, {{unix, linux}, {6, 1, 0}}),
+    {ok, _} = roadrunner_listener:start_link(send_timeout_test, #{
+        port => 0,
+        tls => [{send_timeout, 30000} | roadrunner_test_certs:server_opts()],
+        routes => roadrunner_hello_handler
+    }),
+    ?assert(persistent_term:get({roadrunner_transport, slice_sends}, false)).
+
+%% Each of `sliced_data/0` written with `roadrunner_transport:send/2` on a
+%% TCP socket: how many `gen_tcp:send/2` calls each took, and the result
+%% of a write once the socket is closed.
+tcp_writes() ->
     {ok, L} = gen_tcp:listen(0, [binary, {active, false}]),
     {ok, Port} = inet:port(L),
     {ok, C} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]),
     {ok, S} = gen_tcp:accept(L),
-    lists:foreach(
+    1 = erlang:trace_pattern({gen_tcp, send, 2}, true, []),
+    Sends = lists:map(
         fun(Data) ->
+            Tracer = spawn_link(fun() -> count_traced_sends(0) end),
+            1 = erlang:trace(self(), true, [call, {tracer, Tracer}]),
             ok = roadrunner_transport:send({gen_tcp, S}, Data),
+            1 = erlang:trace(self(), false, [call]),
             Want = iolist_to_binary(Data),
-            ?assertEqual({ok, Want}, gen_tcp:recv(C, byte_size(Want), 5000))
+            ?assertEqual({ok, Want}, gen_tcp:recv(C, byte_size(Want), 5000)),
+            Ref = erlang:trace_delivered(self()),
+            receive
+                {trace_delivered, _, Ref} -> ok
+            end,
+            Tracer ! {count, self()},
+            receive
+                {sends, Tracer, N} -> N
+            end
         end,
         sliced_data()
     ),
+    1 = erlang:trace_pattern({gen_tcp, send, 2}, false, []),
     ok = gen_tcp:close(C),
     ok = gen_tcp:close(S),
-    ?assertEqual({error, closed}, roadrunner_transport:send({gen_tcp, S}, hd(sliced_data()))),
-    ok = gen_tcp:close(L).
+    Closed = roadrunner_transport:send({gen_tcp, S}, hd(sliced_data())),
+    ok = gen_tcp:close(L),
+    {Sends, Closed}.
 
-sliced_writes_arrive_whole_on_tls(_Config) ->
+%% A tracer (a process does not get its own trace messages) counting the
+%% `gen_tcp:send/2` calls it is told of until asked for the count.
+count_traced_sends(N) ->
+    receive
+        {trace, _Pid, call, {gen_tcp, send, [_, _]}} -> count_traced_sends(N + 1);
+        {count, From} -> From ! {sends, self(), N}
+    end.
+
+tls_writes() ->
     {ok, _} = application:ensure_all_started(ssl),
     {ok, L} = ssl:listen(
         0, roadrunner_test_certs:server_opts() ++ [binary, {active, false}, {reuseaddr, true}]
@@ -216,12 +347,17 @@ sliced_data() ->
 %% none of it; the process serving it ends once a send has waited the
 %% timeout.
 non_reader_closes(Config, Path) ->
+    non_reader_closes(Config, Path, fun(_Conn) -> ok end).
+
+%% `Check` runs on the process serving the request before it closes.
+non_reader_closes(Config, Path, Check) ->
     Port = start(Config, #{send_timeout => 200}),
     {ok, Sock} = request(Port, Path, [{recbuf, 4096}], ~""),
     Conn =
         receive
             {roadrunner_slow_reader_handler, Pid} -> Pid
         end,
+    _ = Check(Conn),
     Ref = monitor(process, Conn),
     receive
         {'DOWN', Ref, process, Conn, _Reason} -> ok

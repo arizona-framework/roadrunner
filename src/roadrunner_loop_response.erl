@@ -73,7 +73,7 @@ run(Socket, Status, UserHeaders, Handler, State) ->
     Headers = [{~"transfer-encoding", ~"chunked"}, {~"connection", ~"close"} | UserHeaders],
     Head = roadrunner_http1:response(Status, Headers, ~""),
     _ = roadrunner_event:response_send(
-        roadrunner_transport:send(Socket, Head), loop_response_head
+        roadrunner_transport:send(Socket, Head, 0), loop_response_head
     ),
     Push = make_push(Socket),
     %% Active-mode tags for this transport (`{tcp, tcp_closed, tcp_error}`

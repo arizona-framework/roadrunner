@@ -78,13 +78,27 @@ head_gets_the_get_length(Config) ->
 
 own_content_length_is_kept(Config) ->
     Sock = ?config(sock, Config),
-    ?assertMatch({200, #{~"content-length" := [~"5"]}, ~"hello"}, get(Sock, ~"/own-length")).
+    ?assertMatch({200, #{~"content-length" := [~"5"]}, ~"hello"}, get(Sock, ~"/own-length")),
+    ?assertMatch(
+        {200, #{~"content-length" := [~"5"]}, ~"hello"}, get(Sock, ~"/own-length-iolist")
+    ).
 
 own_content_length_not_in_digits_is_kept(Config) ->
     %% A value that is not plain digits goes out as the handler wrote it.
     Sock = ?config(sock, Config),
     ?assertMatch(
         {200, #{~"content-length" := [~"+5"]}, ~"hello"}, get(Sock, ~"/own-length-signed")
+    ),
+    lists:foreach(
+        fun({Path, Value}) ->
+            ok = gen_tcp:send(Sock, [~"GET ", Path, ~" HTTP/1.1\r\nHost: x\r\n\r\n"]),
+            {200, #{~"content-length" := [Value]}, Rest} = recv_head(Sock),
+            ?assertEqual(~"hello", recv_rest(Sock, Rest, 5))
+        end,
+        [
+            {~"/own-length-suffixed", ~"5x"},
+            {~"/own-length-huge", ~"99999999999999999999"}
+        ]
     ).
 
 not_modified_gets_no_content_length(Config) ->
@@ -99,7 +113,11 @@ chunked_response_is_left_alone(Config) ->
     ok = gen_tcp:send(Sock, ~"GET /chunked HTTP/1.1\r\nHost: x\r\n\r\n"),
     {200, Headers, Rest} = recv_head(Sock),
     ?assertNot(is_map_key(~"content-length", Headers)),
-    ?assertEqual(~"5\r\nhello\r\n0\r\n\r\n", recv_rest(Sock, Rest, 15)).
+    ?assertEqual(~"5\r\nhello\r\n0\r\n\r\n", recv_rest(Sock, Rest, 15)),
+    ok = gen_tcp:send(Sock, ~"GET /chunked-iolist HTTP/1.1\r\nHost: x\r\n\r\n"),
+    {200, IolistHeaders, IolistRest} = recv_head(Sock),
+    ?assertNot(is_map_key(~"content-length", IolistHeaders)),
+    ?assertEqual(~"5\r\nhello\r\n0\r\n\r\n", recv_rest(Sock, IolistRest, 15)).
 
 no_content_gets_no_content_length(Config) ->
     %% RFC 9110 §8.6: no `content-length` on a 204.

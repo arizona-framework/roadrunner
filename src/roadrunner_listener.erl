@@ -49,7 +49,7 @@ reason (a bad route or middleware entry has an error of its own).
 %% port shared with another socket is rare, so it takes many picks to see.
 -export([resolve_quic_port/3]).
 %% Exported for a direct test of the socket options on each OS.
--export([send_opts/2]).
+-export([send_opts/3]).
 
 -export_type([
     opts/0,
@@ -71,6 +71,10 @@ reason (a bad route or middleware entry has an error of its own).
 -define(MAX_TIMEOUT_MS, 16#FFFFFFFF).
 %% The 31-bit cap on sizes, counts and the other limits.
 -define(MAX_LIMIT, 16#7FFFFFFF).
+-ifdef(COMMON_TEST).
+%% A test's stand-in for the system a listener runs on (listen_os/0).
+-define(LISTEN_OS_KEY, {?MODULE, listen_os}).
+-endif.
 
 -doc """
 How a listener reads request bodies (`body_buffering` in `t:opts/0`):
@@ -99,6 +103,13 @@ A size, count or time limit up to `2^31-1`, the largest HTTP/2 window
 
 -doc "A `t:positive_limit/0`, or `infinity` for no limit.".
 -type positive_limit_or_infinity() :: positive_limit() | infinity.
+
+%% What `os:version/0` gives: a release triple, or a string on some systems.
+-type os_version() :: {non_neg_integer(), non_neg_integer(), non_neg_integer()} | string().
+
+%% Who enforces `send_timeout` (send_timeout_by/2): the kernel's
+%% `TCP_USER_TIMEOUT`, the emulator's own `send_timeout`, or both.
+-type send_timeout_by() :: kernel | emulator | both.
 
 -doc """
 How long a connection or WebSocket session waits before it acts: a
@@ -479,18 +490,19 @@ Optional middleware and timing knobs (durations in milliseconds):
   `infinity` for no limit. Default `60000` (60 s), the default
   `keep_alive_timeout`. It covers every TCP connection, plain or TLS,
   and every protocol on it: a response, a file, a streamed chunk, a
-  WebSocket frame. On Linux the kernel enforces it (`TCP_USER_TIMEOUT`):
+  WebSocket frame. On Linux 5.11 or later (or 5.10.11 / 5.4.93 and
+  later in those series) the kernel enforces it (`TCP_USER_TIMEOUT`):
   the wait starts over whenever the client takes more, so a client that
   reads a large response slowly but steadily is not closed, and a
   connection whose client is gone without a word closes once sent data
-  has waited this long for its acknowledgement. Closing a client that
-  stops reading needs Linux 5.11 or later (or 5.10.11 / 5.4.93 and
-  later in those series). Elsewhere the emulator
-  enforces it on each write, which goes to the socket in slices of at
-  most 256 KB, so a client is closed when it takes less than about
-  256 KB in that time; a file sent with `sendfile` (a static file on
-  plain TCP) is not covered there, and a client that stops reading one
-  keeps its connection open.
+  has waited this long for its acknowledgement. On older Linux the
+  kernel does not close a client that stops reading, so the emulator
+  enforces it as well, as it does on other systems: on each write,
+  which goes to the socket in slices of at most 256 KB, so a client is
+  closed when it takes less than about 256 KB in that time. A file sent
+  with `sendfile` (a static file on plain TCP) is not covered by the
+  emulator, so on those systems a client that stops reading one keeps
+  its connection open.
 - `max_unsent_bytes`: the most bytes the kernel queues for a
   connection that it has not sent yet, or `infinity` to leave it to the
   kernel. Default `65536`. A write waits while more than this is queued
@@ -2274,7 +2286,9 @@ open_listen_socket(Port, #{tls := _, proxy_protocol := true} = Opts, _Protocols)
     %% before the ClientHello, so the listen socket is plain TCP and the conn
     %% reads the header off the raw stream, then upgrades the socket with the
     %% `tls_upgrade` options carried in proto_opts (`maybe_tls_upgrade/3`).
-    roadrunner_transport:listen(Port, base_listen_opts(Opts, validate_recv_buffer(Opts)));
+    roadrunner_transport:listen(
+        Port, slice_sends(base_listen_opts(Opts, validate_recv_buffer(Opts)))
+    );
 open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     %% TLS path — caller supplies cert/key. ALPN is derived from the
     %% normalized `protocols` list (`http2` → `~"h2"`, `http1` →
@@ -2285,7 +2299,7 @@ open_listen_socket(Port, #{tls := UserTlsOpts} = Opts, Protocols) ->
     %% top so accepted sockets behave like the plain-TCP variant.
     TlsOpts = roadrunner_transport:build_tls_opts(Protocols, UserTlsOpts),
     roadrunner_transport:listen_tls(
-        Port, TlsOpts ++ base_listen_opts(Opts, validate_recv_buffer(Opts))
+        Port, slice_sends(TlsOpts ++ base_listen_opts(Opts, validate_recv_buffer(Opts)))
     );
 open_listen_socket(Port, Opts, _Protocols) ->
     %% Plain TCP. The legacy `inet_drv` backend (gen_tcp default) has
@@ -2299,7 +2313,15 @@ open_listen_socket(Port, Opts, _Protocols) ->
     %%
     %% A plain-TCP socket starts at `idle_recv_buffer` and its connection
     %% grows it to `recv_buffer` for a large request body (`maybe_grow/1`).
-    roadrunner_transport:listen(Port, base_listen_opts(Opts, idle_recv_buffer(Opts))).
+    roadrunner_transport:listen(Port, slice_sends(base_listen_opts(Opts, idle_recv_buffer(Opts)))).
+
+%% A listen socket's final options, the user's `tls` ones among them, once
+%% they have turned on sliced sends where they carry the emulator's own
+%% `send_timeout` (`roadrunner_transport:slice_sends/1`).
+-spec slice_sends([Opt]) -> [Opt].
+slice_sends(ListenOpts) ->
+    ok = roadrunner_transport:slice_sends(ListenOpts),
+    ListenOpts.
 
 -spec base_listen_opts(opts(), pos_integer()) -> [gen_tcp:listen_option()].
 base_listen_opts(Opts, Buffer) ->
@@ -2351,6 +2373,7 @@ base_listen_opts(Opts, Buffer) ->
     %% idle, so an idle TLS connection holds no read buffer anyway. See
     %% `erlang/otp#9423` and `ninenines/cowlib#143` for the upstream
     %% context.
+    {OsType, OsVersion} = listen_os(),
     Base = [
         binary,
         {active, false},
@@ -2358,7 +2381,7 @@ base_listen_opts(Opts, Buffer) ->
         {packet, raw},
         {nodelay, true},
         {backlog, maps:get(socket_backlog, Opts, ?DEFAULT_SOCKET_BACKLOG)}
-        | kernel_recv_buffer(Opts, [{buffer, Buffer} | send_opts(Opts, os:type())])
+        | kernel_recv_buffer(Opts, [{buffer, Buffer} | send_opts(Opts, OsType, OsVersion)])
     ],
     %% Both `gen_tcp:listen/2` and `ssl:listen/2` accept the bind
     %% options, and the TLS path builds on this list, so a loopback bind
@@ -2380,16 +2403,34 @@ kernel_recv_buffer(Opts, SocketOpts) ->
             SocketOpts
     end.
 
+%% The system the listener runs on, as `os:type/0` and `os:version/0` give
+%% it. Common Test builds let a test set another under `?LISTEN_OS_KEY` to
+%% start a listener with the send options of that system; other builds
+%% have no such key (only `rebar3 ct` defines `COMMON_TEST`).
+-spec listen_os() -> {{atom(), atom()}, os_version()}.
+-ifdef(COMMON_TEST).
+listen_os() ->
+    case persistent_term:get(?LISTEN_OS_KEY, undefined) of
+        undefined -> {os:type(), os:version()};
+        Os -> Os
+    end.
+-else.
+listen_os() ->
+    {os:type(), os:version()}.
+-endif.
+
 %% The options that bound what a connection holds for a client that reads
-%% slowly or not at all. On Linux `send_timeout` is the kernel's
-%% `TCP_USER_TIMEOUT` alone: the kernel closes a connection whose queued
-%% data has waited that long behind a closed receive window, or whose sent
-%% data that long for its acknowledgement, which covers `sendfile` too and
-%% costs nothing per write. The emulator's own `send_timeout` arms a timer
-%% each time a write finds the socket's queue full, which measured 5% more
-%% CPU on a 110 KB page, so it is set only where the kernel option is
-%% missing; there a send that waits that long fails and closes the socket
-%% (`send_timeout_close`). `max_unsent_bytes` is the
+%% slowly or not at all. `send_timeout` is the kernel's `TCP_USER_TIMEOUT`
+%% on a Linux that closes a client that stops reading with it (see
+%% send_timeout_by/2): the kernel closes a connection whose queued data has
+%% waited that long behind a closed receive window, or whose sent data that
+%% long for its acknowledgement, which covers `sendfile` too and costs
+%% nothing per write. The emulator's own `send_timeout` arms a timer each
+%% time a write finds the socket's queue full, which measured 5% more CPU
+%% on a 110 KB page, so it is set only where the kernel option is missing
+%% or does not close such a client; there a send that waits that long fails
+%% and closes the socket (`send_timeout_close`), and large sends go out in
+%% slices (`roadrunner_transport:slice_sends/1`). `max_unsent_bytes` is the
 %% kernel's `TCP_NOTSENT_LOWAT`: a write waits while more than this is queued
 %% in the kernel and not sent yet. Without it the kernel grows a socket's
 %% send buffer to megabytes and fills it for a client that does not read (a
@@ -2398,21 +2439,44 @@ kernel_recv_buffer(Opts, SocketOpts) ->
 %% full speed is not slowed. Accepted sockets inherit both from the listen
 %% socket.
 -doc false.
--spec send_opts(opts(), {atom(), atom()}) -> [gen_tcp:option()].
-send_opts(Opts, OsType) ->
+-spec send_opts(opts(), {atom(), atom()}, os_version()) -> [gen_tcp:option()].
+send_opts(Opts, OsType, OsVersion) ->
     send_timeout_opts(
-        send_timeout(Opts), OsType, unsent_opts(max_unsent_bytes(Opts), OsType)
+        send_timeout(Opts),
+        send_timeout_by(OsType, OsVersion),
+        unsent_opts(max_unsent_bytes(Opts), OsType)
     ).
 
--spec send_timeout_opts(positive_limit_or_infinity(), {atom(), atom()}, [gen_tcp:option()]) ->
-    [gen_tcp:option()].
+%% Who enforces `send_timeout`. Linux 5.1 to 5.10.10 and 5.4.0 to 5.4.92
+%% have `TCP_USER_TIMEOUT` but do not close a client that acknowledges
+%% data while it reads none (a zero receive window); kernel commit
+%% 9d9b1ee0b2d1 fixed it in 5.11, 5.10.11 and 5.4.93. A Linux not known
+%% to have the fix, a distribution kernel reporting only its base version
+%% among them, sets both, so the emulator closes that client; the emulator
+%% alone everywhere else.
+-spec send_timeout_by({atom(), atom()}, os_version()) -> send_timeout_by().
+send_timeout_by({unix, linux}, Version) when is_tuple(Version), Version >= {5, 11, 0} -> kernel;
+send_timeout_by({unix, linux}, {5, 10, Release}) when Release >= 11 -> kernel;
+send_timeout_by({unix, linux}, {5, 4, Release}) when Release >= 93 -> kernel;
+send_timeout_by({unix, linux}, _Version) -> both;
+send_timeout_by(_OsType, _Version) -> emulator.
+
 %% `TCP_USER_TIMEOUT` is Linux's option 18, at the TCP level (6).
-send_timeout_opts(infinity, _OsType, Rest) ->
+-spec send_timeout_opts(positive_limit_or_infinity(), send_timeout_by(), [gen_tcp:option()]) ->
+    [gen_tcp:option()].
+send_timeout_opts(infinity, _By, Rest) ->
     Rest;
-send_timeout_opts(Timeout, {unix, linux}, Rest) ->
+send_timeout_opts(Timeout, kernel, Rest) ->
     [{raw, 6, 18, <<Timeout:32/native>>} | Rest];
-send_timeout_opts(Timeout, _OsType, Rest) ->
-    [{send_timeout, Timeout}, {send_timeout_close, true} | Rest].
+send_timeout_opts(Timeout, emulator, Rest) ->
+    [{send_timeout, Timeout}, {send_timeout_close, true} | Rest];
+send_timeout_opts(Timeout, both, Rest) ->
+    [
+        {raw, 6, 18, <<Timeout:32/native>>},
+        {send_timeout, Timeout},
+        {send_timeout_close, true}
+        | Rest
+    ].
 
 %% `TCP_NOTSENT_LOWAT` is Linux's option 25 and macOS's 0x201, at the TCP
 %% level (6). Other systems keep their default.
@@ -2872,6 +2936,7 @@ build_proto_opts(Opts, ListenerName) ->
         listener_name = ListenerName,
         graceful_drain = graceful_drain(Opts),
         handler_spawn_opts = HandlerSpawnOpts,
+        floor_spawn_opts = roadrunner_stream_worker:floor_spawn_opts(HandlerSpawnOpts),
         proxy_protocol = validate_proxy_protocol(maps:get(proxy_protocol, Opts, false), Protocols),
         protocols = Protocols,
         alt_svc = maybe_alt_svc(Protocols, Opts),

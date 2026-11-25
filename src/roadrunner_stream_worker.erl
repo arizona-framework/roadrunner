@@ -11,8 +11,8 @@
 %% below and passes its module in.
 
 -export([run/7]).
--export([conn_heap_floor/1, heap_floor/3, spawn_opts/2]).
--export_type([conn_heap_floor/0, heap_floor/0, peer_limit/0, reset_why/0]).
+-export([conn_heap_floor/1, heap_floor/3, floor_spawn_opts/1, spawn_opts/2]).
+-export_type([conn_heap_floor/0, floor_spawn_opts/0, heap_floor/0, peer_limit/0, reset_why/0]).
 
 %% Where a `{send, ...}` fun's worker keeps its reductions as its streamed
 %% body starts, and the most that body may take for the worker to still
@@ -34,6 +34,13 @@
 %% the stream's response back for `send_stall_timeout` (`send_stall`); or
 %% the `connection_age` grace ran out (`connection_age_grace`).
 -type reset_why() :: peer | deadline | send_stall | connection_age_grace.
+
+%% A listener's `handler_spawn` options made ready for a worker started at
+%% a heap floor (see floor_spawn_opts/1): whether the emulator's default
+%% `max_heap_size` decides if the floor applies, and the options without
+%% `min_heap_size`.
+-type floor_spawn_opts() ::
+    {default_max_heap_size | own_max_heap_size, [proc_lib:start_spawn_option()]}.
 
 %% The heap floor of a connection: the min_heap_size it starts its stream
 %% workers at, in an atomics cell its workers raise (see conn_heap_floor/1).
@@ -264,24 +271,56 @@ start_heap_floor({Cell, _Floor, Base, Cap, Relearn}) ->
 start_heap_floor(undefined) ->
     undefined.
 
-%% The worker's spawn options: the listener's `handler_spawn` ones, and a
-%% floor above the base as its `min_heap_size`. Spawned at that size, the
-%% worker has the heap from the start; setting it after the spawn
-%% (`process_flag/2`) would only take effect at the worker's first
-%% collection. Later options win, so the floor goes after the listener's.
-%% The emulator's default `max_heap_size` can change while the connection
-%% lives (`erlang:system_flag/2`) and applies at each spawn, so a worker
-%% spawned while one is set gets no floor (see max_heap_size_set/1).
+%% The listener's `handler_spawn` options made ready once, when it starts,
+%% for the workers started at a heap floor (spawn_opts/2): without
+%% `min_heap_size`, which the floor takes the place of, so the floor can go
+%% in front of them; and whether the emulator's default `max_heap_size`
+%% decides if the floor applies, which it does when the options set none
+%% (one that sets a limit has no floor at all, see conn_heap_floor/1).
 -doc false.
--spec spawn_opts([proc_lib:start_spawn_option()], heap_floor()) ->
+-spec floor_spawn_opts([proc_lib:start_spawn_option()]) -> floor_spawn_opts().
+floor_spawn_opts(SpawnOpts) ->
+    case last_spawn_opt(max_heap_size, SpawnOpts) of
+        false -> {default_max_heap_size, without_min_heap_size(SpawnOpts)};
+        {max_heap_size, _} -> {own_max_heap_size, without_min_heap_size(SpawnOpts)}
+    end.
+
+-spec without_min_heap_size([proc_lib:start_spawn_option()]) ->
+    [proc_lib:start_spawn_option()].
+without_min_heap_size([{min_heap_size, _} | Rest]) -> without_min_heap_size(Rest);
+without_min_heap_size([Opt | Rest]) -> [Opt | without_min_heap_size(Rest)];
+without_min_heap_size([]) -> [].
+
+%% The worker's spawn options: the listener's `handler_spawn` ones, and a
+%% floor above the base as its `min_heap_size`, in place of the
+%% listener's. Spawned at that size, the worker has the heap from the
+%% start; setting it after the spawn (`process_flag/2`) would only take
+%% effect at the worker's first collection. The emulator's default
+%% `max_heap_size` can change while the connection lives
+%% (`erlang:system_flag/2`) and applies at each spawn, so where the
+%% listener's options set none a worker spawned while one is set gets no
+%% floor (see max_heap_size_set/1).
+-doc false.
+-spec spawn_opts(roadrunner_conn:proto_opts(), heap_floor()) ->
     [proc_lib:start_spawn_option() | monitor].
-spawn_opts(SpawnOpts, {_Cell, Floor, Base, _Cap, _Relearn}) when Floor > Base ->
-    case max_heap_size_set(SpawnOpts) of
-        false -> [monitor | SpawnOpts ++ [{min_heap_size, Floor}]];
-        true -> [monitor | SpawnOpts]
-    end;
-spawn_opts(SpawnOpts, _HeapFloor) ->
+spawn_opts(
+    #proto_opts{floor_spawn_opts = FloorSpawnOpts} = ProtoOpts, {_Cell, Floor, Base, _Cap, _Relearn}
+) when
+    Floor > Base
+->
+    floor_spawn_opts(FloorSpawnOpts, ProtoOpts, Floor);
+spawn_opts(#proto_opts{handler_spawn_opts = SpawnOpts}, _HeapFloor) ->
     [monitor | SpawnOpts].
+
+-spec floor_spawn_opts(floor_spawn_opts(), roadrunner_conn:proto_opts(), pos_integer()) ->
+    [proc_lib:start_spawn_option() | monitor].
+floor_spawn_opts({own_max_heap_size, FloorOpts}, _ProtoOpts, Floor) ->
+    [monitor, {min_heap_size, Floor} | FloorOpts];
+floor_spawn_opts({default_max_heap_size, FloorOpts}, ProtoOpts, Floor) ->
+    case erlang:system_info(max_heap_size) of
+        #{size := 0} -> [monitor, {min_heap_size, Floor} | FloorOpts];
+        #{} -> [monitor | ProtoOpts#proto_opts.handler_spawn_opts]
+    end.
 
 %% Sampled once a complete response is sent, by the handler or by a
 %% `{send, ...}` fun. A streamed or file response (`stream`, `loop`,

@@ -39,8 +39,11 @@
 %% stapling is intentionally absent — `ssl` does not support
 %% server-side stapling at the time of writing.
 
-%% The most one send hands the socket (`send/2`).
+%% The most one send hands the socket when sends are sliced (`send/2`).
 -define(SEND_SLICE, 262144).
+%% Set once a listener puts the emulator's own `send_timeout` on its
+%% sockets (`slice_sends/1`).
+-define(SLICE_KEY, {?MODULE, slice_sends}).
 
 -export([
     listen/2,
@@ -52,6 +55,7 @@
     recv/3,
     send/2,
     send/3,
+    slice_sends/1,
     close/1,
     shutdown/2,
     peername/1,
@@ -73,10 +77,10 @@
 
 -export_type([socket/0]).
 
--type socket() ::
-    {gen_tcp, gen_tcp:socket()}
-    | {ssl, ssl:sslsocket()}
-    | {fake, pid()}.
+-type socket() :: net_socket() | {fake, pid()}.
+
+%% A socket on the network, not the test backend.
+-type net_socket() :: {gen_tcp, gen_tcp:socket()} | {ssl, ssl:sslsocket()}.
 
 -doc "Open a plain TCP listening socket. Options pass verbatim to gen_tcp:listen/2.".
 -spec listen(inet:port_number(), [gen_tcp:listen_option()]) ->
@@ -219,11 +223,11 @@ recv({fake, Pid}, Len, Timeout) ->
 -doc """
 Send bytes on the socket.
 
-Data larger than 256 KB goes out in 256 KB slices, one send each, so the
-listener's `send_timeout` measures a client that takes nothing, not one
-that reads a large write slowly (see `send_slices/3`). This measures
-`Data` first; a caller that already knows its size passes it to
-`send/3` instead.
+Where a listener uses the emulator's own `send_timeout` (`slice_sends/1`),
+data larger than 256 KB goes out in 256 KB slices, one send each, so the
+timeout measures a client that takes nothing, not one that reads a large
+write slowly (see `send_slices/2`). Only then is `Data` measured; a
+caller that already knows its size passes it to `send/3` instead.
 
 For `{fake, Pid}`: forwards `{roadrunner_fake_send, ConnPid, IoData}` to
 `Pid` and returns `ok`. `IoData` is left unflattened so tests can see
@@ -236,26 +240,55 @@ send({fake, Pid}, Data) ->
     Pid ! {roadrunner_fake_send, self(), Data},
     ok;
 send(Socket, Data) ->
-    send(Socket, Data, iolist_size(Data)).
+    case persistent_term:get(?SLICE_KEY, false) of
+        true -> send(Socket, Data, iolist_size(Data));
+        false -> send_whole(Socket, Data)
+    end.
 
 -doc """
 `send/2` for data whose size the caller already knows, so it is not
 measured again. `Size` only decides whether the data is sliced, so a
 size that leaves out a few bytes (a response head before a measured
-body) is fine.
+body) is fine, and a response head or control frame alone, far under a
+slice, goes with 0.
 """.
 -spec send(socket(), iodata(), non_neg_integer()) -> ok | {error, term()}.
 send({gen_tcp, S}, Data, Size) when Size =< ?SEND_SLICE ->
     gen_tcp:send(S, Data);
-send({gen_tcp, S}, Data, _Size) ->
-    send_slices(gen_tcp, S, Data);
 send({ssl, S}, Data, Size) when Size =< ?SEND_SLICE ->
     ssl:send(S, Data);
-send({ssl, S}, Data, _Size) ->
-    send_slices(ssl, S, Data);
 send({fake, Pid}, Data, _Size) ->
     Pid ! {roadrunner_fake_send, self(), Data},
-    ok.
+    ok;
+send(Socket, Data, _Size) ->
+    case persistent_term:get(?SLICE_KEY, false) of
+        true -> send_slices(Socket, Data);
+        false -> send_whole(Socket, Data)
+    end.
+
+-doc """
+Turn on sliced sends (`send/2`) when `ListenOpts`, the options a
+listener opens its listen socket with (the user's `tls` ones among them),
+carry the emulator's own `send_timeout`. The listener sets it off Linux
+and on a Linux kernel whose `TCP_USER_TIMEOUT` does not close a client
+that stops reading (`roadrunner_listener:send_opts/3`). Only that timeout
+needs slices: the kernel's `TCP_USER_TIMEOUT` starts its wait over
+whenever the client takes more, however large the write. Once on, it
+stays on for every connection of the node. A `persistent_term` update is
+a global GC, so it is written once.
+""".
+-spec slice_sends([term()]) -> ok.
+slice_sends(ListenOpts) ->
+    case {lists:keymember(send_timeout, 1, ListenOpts), persistent_term:get(?SLICE_KEY, false)} of
+        {true, false} -> persistent_term:put(?SLICE_KEY, true);
+        {_Emulator, _Slice} -> ok
+    end.
+
+-spec send_whole(net_socket(), iodata()) -> ok | {error, term()}.
+send_whole({gen_tcp, S}, Data) ->
+    gen_tcp:send(S, Data);
+send_whole({ssl, S}, Data) ->
+    ssl:send(S, Data).
 
 %% Send `Data` a slice at a time. The emulator queues a whole write and
 %% arms `send_timeout` when a later send finds that queue full, disarming
@@ -263,12 +296,11 @@ send({fake, Pid}, Data, _Size) ->
 %% meanwhile. A slow client still reading one large write would be closed
 %% as if it read nothing; with slices, each wait lasts until one slice is
 %% read. The slices are sub-binaries and list cells, so nothing is copied.
--spec send_slices(gen_tcp | ssl, gen_tcp:socket() | ssl:sslsocket(), iodata()) ->
-    ok | {error, term()}.
-send_slices(Mod, S, Data) ->
+-spec send_slices(net_socket(), iodata()) -> ok | {error, term()}.
+send_slices(Socket, Data) ->
     {Slice, Rest, Left} = take(Data, ?SEND_SLICE),
-    case {Mod:send(S, Slice), Left} of
-        {ok, 0} -> send_slices(Mod, S, Rest);
+    case {send_whole(Socket, Slice), Left} of
+        {ok, 0} -> send_slices(Socket, Rest);
         {Result, _Left} -> Result
     end.
 

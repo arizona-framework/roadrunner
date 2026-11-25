@@ -313,7 +313,7 @@ req(Script, Max) ->
             bytes_read = 0,
             done = false,
             deadline = infinity,
-            id = make_ref(),
+            id = erlang:unique_integer(),
             recv = fun(_Deadline) -> Recv() end,
             max = Max
         }

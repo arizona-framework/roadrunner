@@ -30,7 +30,10 @@
     %% what is left of the body once the response is out is drained by
     %% then at the latest.
     request_deadline :: integer(),
-    id :: reference(),
+    %% Tells this reader apart from the readers of other bodies
+    %% (`roadrunner_conn:reader_id/1`): `erlang:unique_integer/0`, unique
+    %% on the node and cheaper than a reference.
+    id :: integer(),
     max :: roadrunner_router:body_limit(),
     %% Trailer-header limits `{max_header_line, max_header_block,
     %% max_header_count}` threaded to `roadrunner_http1:parse_chunk_part/4`.
@@ -55,7 +58,8 @@
     done = false :: boolean(),
     recv :: fun((roadrunner_req:deadline()) -> {ok, iodata(), boolean()} | {error, term()}),
     deadline :: roadrunner_req:deadline(),
-    id :: reference(),
+    %% As the HTTP/1.1 reader's `id`.
+    id :: integer(),
     max :: roadrunner_router:body_limit(),
     %% Set while a 100 Continue is owed to a client holding its body back:
     %% the connection process and stream a streaming response asks for it

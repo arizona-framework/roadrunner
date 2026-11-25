@@ -3,6 +3,7 @@
 
 -include("roadrunner_proto_opts.hrl").
 -include("roadrunner_body_reader.hrl").
+-include("roadrunner_length.hrl").
 
 %% Tail-recursive per-connection process for HTTP/1.1.
 %%
@@ -2019,7 +2020,9 @@ send_interim(_Socket, _Status, _Headers, _AltSvc, #{version := {1, 0}}) ->
     ok;
 send_interim(Socket, Status, Headers, AltSvc, _Req) ->
     roadrunner_event:response_send(
-        roadrunner_transport:send(Socket, roadrunner_http1:response(Status, Headers, ~"", AltSvc)),
+        roadrunner_transport:send(
+            Socket, roadrunner_http1:response(Status, Headers, ~"", AltSvc), 0
+        ),
         interim_response
     ).
 
@@ -2226,7 +2229,7 @@ dispatch_response(
     S = flush_out(S0),
     Head = roadrunner_http1:response(Status, Headers0, ~"", AltSvc),
     _ = roadrunner_event:response_send(
-        roadrunner_transport:send(Socket, Head), sendfile_response_head
+        roadrunner_transport:send(Socket, Head, 0), sendfile_response_head
     ),
     ok =
         case roadrunner_req:method(Req) of
@@ -2288,36 +2291,58 @@ dispatch_response(
     {roadrunner_http:headers(), non_neg_integer()}.
 framed(Status, Headers, Body) when Status < 200; Status =:= 204; Status =:= 304 ->
     {Headers, body_size(Body)};
+framed(_Status, Headers, Body) when is_binary(Body) ->
+    Size = byte_size(Body),
+    case has_framing(Headers) of
+        true -> {Headers, Size};
+        false -> {[{~"content-length", integer_to_binary(Size)} | Headers], Size}
+    end;
 framed(_Status, Headers, Body) ->
-    case framing(Headers) of
+    case content_length(Headers) of
         none ->
             Size = iolist_size(Body),
             {[{~"content-length", integer_to_binary(Size)} | Headers], Size};
-        {content_length, Value} ->
-            {Headers, content_length_size(Value, Body)};
         transfer_encoding ->
-            {Headers, body_size(Body)}
+            {Headers, iolist_size(Body)};
+        Value ->
+            {Headers, content_length_size(Value, Body)}
     end.
 
-%% The size a handler's own `content-length` gives, which spares the send
-%% measuring the body; the body's own size when the value is not a number.
+%% The size a handler's own `content-length` gives an iolist body, which
+%% spares the send measuring it; the body's own size when the value is
+%% not a number. The digits are folded by hand: no exception handler and
+%% no result tuple for a value of a few bytes.
 -spec content_length_size(binary(), iodata()) -> non_neg_integer().
-content_length_size(Value, Body) ->
-    case roadrunner_bin:digits_to_integer(Value) of
-        {ok, Size} -> Size;
-        error -> body_size(Body)
-    end.
+content_length_size(<<C, Rest/binary>>, Body) when C >= $0, C =< $9 ->
+    content_length_digits(Rest, Body, C - $0);
+content_length_size(_Value, Body) ->
+    iolist_size(Body).
+
+-spec content_length_digits(binary(), iodata(), non_neg_integer()) -> non_neg_integer().
+content_length_digits(<<C, Rest/binary>>, Body, Acc) when C >= $0, C =< $9 ->
+    content_length_digits(Rest, Body, Acc * 10 + (C - $0));
+content_length_digits(<<>>, _Body, Acc) when Acc =< ?MAX_DECLARED_LENGTH ->
+    Acc;
+content_length_digits(_Value, Body, _Acc) ->
+    iolist_size(Body).
 
 -spec body_size(iodata()) -> non_neg_integer().
 body_size(Body) when is_binary(Body) -> byte_size(Body);
 body_size(Body) -> iolist_size(Body).
 
--spec framing(roadrunner_http:headers()) ->
-    none | {content_length, binary()} | transfer_encoding.
-framing([{~"content-length", Value} | _]) -> {content_length, Value};
-framing([{~"transfer-encoding", _} | _]) -> transfer_encoding;
-framing([_ | Rest]) -> framing(Rest);
-framing([]) -> none.
+-spec has_framing(roadrunner_http:headers()) -> boolean().
+has_framing([{~"content-length", _} | _]) -> true;
+has_framing([{~"transfer-encoding", _} | _]) -> true;
+has_framing([_ | Rest]) -> has_framing(Rest);
+has_framing([]) -> false.
+
+%% The handler's own `content-length` value, or how the body is framed
+%% without one.
+-spec content_length(roadrunner_http:headers()) -> binary() | none | transfer_encoding.
+content_length([{~"content-length", Value} | _]) -> Value;
+content_length([{~"transfer-encoding", _} | _]) -> transfer_encoding;
+content_length([_ | Rest]) -> content_length(Rest);
+content_length([]) -> none.
 
 -spec dispatch_websocket(
     #loop_state{},

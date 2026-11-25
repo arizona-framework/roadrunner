@@ -210,5 +210,10 @@
     heap_floor = undefined :: pos_integer() | undefined,
     %% Flattened spawn config for every handler-running process: the public
     %% `handler_spawn => #{opts}` listener opt over the defaults.
-    handler_spawn_opts = [{fullsweep_after, 0}] :: [proc_lib:start_spawn_option()]
+    handler_spawn_opts = [{fullsweep_after, 0}] :: [proc_lib:start_spawn_option()],
+    %% `handler_spawn_opts` made ready once for an HTTP/2 or HTTP/3 stream
+    %% worker started at a heap floor
+    %% (`roadrunner_stream_worker:floor_spawn_opts/1`).
+    floor_spawn_opts = {default_max_heap_size, [{fullsweep_after, 0}]} ::
+        roadrunner_stream_worker:floor_spawn_opts()
 }).

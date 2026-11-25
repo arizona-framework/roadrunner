@@ -419,7 +419,7 @@ send_upgrade_required(Socket) ->
         ~"",
         undefined
     ),
-    roadrunner_transport:send(Socket, Resp).
+    roadrunner_transport:send(Socket, Resp, 0).
 
 -spec upgrade(
     roadrunner_transport:socket(),
@@ -444,7 +444,7 @@ upgrade(Socket, Req, Mod, State, UpgradeResp, Negotiated, Buffered, ProtoOpts) -
             {ListenerName, Peer, RequestId} = ws_context(Req),
             Span = roadrunner_event:ws_upgrade(ListenerName, Peer, RequestId, Mod),
             _ = roadrunner_event:response_send(
-                roadrunner_transport:send(Socket, UpgradeResp), websocket_upgrade_response
+                roadrunner_transport:send(Socket, UpgradeResp, 0), websocket_upgrade_response
             ),
             Args = {Socket, Mod, State, {ListenerName, Span}, Negotiated, Buffered, ProtoOpts},
             {upgrade, fun(Finish) -> serve(Finish, Args) end};
@@ -2052,10 +2052,19 @@ flush_out(Data) ->
 %% later ping replacing it, and `release_pong/1` queues its pong after
 %% everything queued so far, when the session flushes or queues a close.
 %% A write thus carries at most `?MAX_PONGS + 1` pongs, each a whole frame
-%% between whole frames (the session never fragments what it sends).
+%% between whole frames (the session never fragments what it sends). The
+%% pong and its count go in one `#data{}` update.
 -spec queue_pong(#data{}, binary()) -> #data{}.
-queue_pong(#data{pongs = N} = Data, Payload) when N < ?MAX_PONGS ->
-    queue_frame(Data#data{pongs = N + 1}, pong, Payload);
+queue_pong(#data{pongs = N, span = Span, out = Out, out_size = OutSize} = Data, Payload) when
+    N < ?MAX_PONGS
+->
+    Size = byte_size(Payload),
+    ok = roadrunner_event:ws_frame_out(Span, pong, Size),
+    Data#data{
+        out = [Out | encode_outbound(Data, pong, Payload, Size)],
+        out_size = OutSize + Size,
+        pongs = N + 1
+    };
 queue_pong(Data, Payload) ->
     Data#data{pong = Payload}.
 
@@ -2078,25 +2087,33 @@ flush_and_exit(Reason, Data) ->
 %% The frames encoded, with the sum of their payload sizes. A `close`
 %% frame stops the list: it is not encoded here, the frames after it are
 %% dropped, and its payload comes back third so the caller ends the
-%% session with it (`close_after/3`).
+%% session with it (`close_after/3`). Each frame is encoded before the ones
+%% after it: with permessage-deflate the frames share one deflate stream,
+%% which must see them in the order they go on the wire. The encoded
+%% frames gather in a left-nested iolist, `[Acc | Frame]`, which keeps that
+%% order with no result tuple per frame.
 -spec encode_frames(
     #data{}, roadrunner_event_handler:span(), [{roadrunner_ws:opcode(), iodata()}]
 ) -> {iodata(), non_neg_integer()} | {iodata(), non_neg_integer(), {close, iodata()}}.
-encode_frames(_Data, _Span, []) ->
-    {[], 0};
-encode_frames(_Data, _Span, [{close, Payload} | _Dropped]) ->
-    {[], 0, {close, Payload}};
-encode_frames(Data, Span, [{Op, Payload} | Rest]) ->
+encode_frames(Data, Span, Frames) ->
+    encode_frames(Data, Span, Frames, [], 0).
+
+-spec encode_frames(
+    #data{},
+    roadrunner_event_handler:span(),
+    [{roadrunner_ws:opcode(), iodata()}],
+    iodata(),
+    non_neg_integer()
+) -> {iodata(), non_neg_integer()} | {iodata(), non_neg_integer(), {close, iodata()}}.
+encode_frames(_Data, _Span, [], Acc, AccSize) ->
+    {Acc, AccSize};
+encode_frames(_Data, _Span, [{close, Payload} | _Dropped], Acc, AccSize) ->
+    {Acc, AccSize, {close, Payload}};
+encode_frames(Data, Span, [{Op, Payload} | Rest], Acc, AccSize) ->
     Size = iolist_size(Payload),
     ok = roadrunner_event:ws_frame_out(Span, Op, Size),
-    %% Encode this frame before the ones after it: with permessage-deflate
-    %% the frames share one deflate stream, which must see them in the
-    %% order they go on the wire.
     Frame = encode_outbound(Data, Op, Payload, Size),
-    case encode_frames(Data, Span, Rest) of
-        {Encoded, RestSize} -> {[Frame | Encoded], Size + RestSize};
-        {Encoded, RestSize, Close} -> {[Frame | Encoded], Size + RestSize, Close}
-    end.
+    encode_frames(Data, Span, Rest, [Acc | Frame], AccSize + Size).
 
 %% `Size` is the payload's, measured once by the caller for its event; only the
 %% compressed path needs another, of its deflated bytes.
