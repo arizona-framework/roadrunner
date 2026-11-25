@@ -4,11 +4,15 @@
 %% Worker -> conn synchronous frame round-trip, shared by the h2 stream /
 %% loop response emitters (a buffered response goes one way, see
 %% `roadrunner_http2_stream_worker:send_buffered/5`).
-%% `sync/2` sends a frame request to the conn (via `SendFun`) and blocks
-%% for the conn's `{h2_send_ack, Ref}`; a conn-side stream reset
-%% (`{h2_stream_reset, _, Why}`) exits the worker with `stream_reset`,
-%% the reset put back in the mailbox for the code the exit unwinds to
-%% learn why (`roadrunner_grpc` reports a call the server cut).
+%% `sync/2` sends a frame request to the conn (via `SendFun`, handed the
+%% write's `Ref`) and blocks for the conn's answer to that write, given
+%% once on every path while the conn lives: `{h2_send_ack, Ref}` once it
+%% is on the wire, or `{h2_send_reset, Ref, StreamId, Why}` when the
+%% stream is reset first (or was already gone). The reset the conn tells
+%% the worker itself (`{h2_stream_reset, _, Why}`) ends the wait too. A
+%% reset exits the worker with `stream_reset`, the reset put back in the
+%% mailbox as `{h2_stream_reset, StreamId, Why}` for the code the exit
+%% unwinds to learn why (`roadrunner_grpc` reports a call the server cut).
 %%
 %% `monitor_conn/1` is called once per worker by the stream / loop
 %% emitters, before their first sync (a buffered response never waits on
@@ -35,6 +39,9 @@ sync(ConnPid, SendFun) ->
     receive
         {h2_send_ack, Ref} ->
             ok;
+        {h2_send_reset, Ref, StreamId, Why} ->
+            _ = (self() ! {h2_stream_reset, StreamId, Why}),
+            exit(stream_reset);
         {h2_stream_reset, _StreamId, _Why} = Reset ->
             _ = (self() ! Reset),
             exit(stream_reset);

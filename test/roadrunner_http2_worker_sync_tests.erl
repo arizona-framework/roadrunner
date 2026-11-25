@@ -68,3 +68,50 @@ conn_death_exits_worker_test() ->
             ?assertEqual(conn_down, Reason)
     after 1000 -> error(worker_did_not_wake)
     end.
+
+%% The conn's answer to the write itself, a reset, exits the worker with
+%% `stream_reset` and leaves the reset in its mailbox, with why, with or
+%% without messages queued ahead of it.
+tagged_reset_exits_worker_test() ->
+    lists:foreach(
+        fun(Backlog) ->
+            {Worker, WorkerRef, Tag} = blocked_worker(self(), Backlog),
+            Worker ! {h2_send_reset, Tag, 1, send_stall},
+            ?assertEqual(
+                {stream_reset, [{h2_stream_reset, 1, send_stall}]}, exit_of(Worker, WorkerRef)
+            )
+        end,
+        [0, 100]
+    ).
+
+%% A worker blocked in `sync/2` on `Conn` (the test process), with
+%% `Backlog` messages queued ahead of the answer, and the write's tag.
+blocked_worker(Conn, Backlog) ->
+    Parent = self(),
+    {Worker, WorkerRef} = spawn_monitor(fun() ->
+        _ = [self() ! {backlog, N} || N <- lists:seq(1, Backlog)],
+        try
+            roadrunner_http2_worker_sync:sync(Conn, fun(Tag) ->
+                Parent ! {sent, self(), Tag},
+                ok
+            end)
+        catch
+            exit:Reason -> exit({Reason, resets()})
+        end
+    end),
+    receive
+        {sent, Worker, Tag} -> {Worker, WorkerRef, Tag}
+    after 1000 -> error(send_fun_not_called)
+    end.
+
+resets() ->
+    receive
+        {h2_stream_reset, _, _} = Reset -> [Reset | resets()]
+    after 0 -> []
+    end.
+
+exit_of(Worker, WorkerRef) ->
+    receive
+        {'DOWN', WorkerRef, process, Worker, Reason} -> Reason
+    after 1000 -> error(worker_did_not_exit)
+    end.
