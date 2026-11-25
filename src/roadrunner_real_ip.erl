@@ -24,7 +24,7 @@
 
 -export([compile/1, peer_trust/2, unix_trust/1, resolve/3]).
 
--export_type([config/0]).
+-export_type([config/0, trust/0]).
 
 -define(SEMI_CP_KEY, {?MODULE, semi_cp}).
 -define(EQ_CP_KEY, {?MODULE, eq_cp}).
@@ -45,12 +45,16 @@
     {cidrs, header(), {[cidr4()], [cidr6()], boolean()}}
     | {hops, header(), pos_integer()}.
 
+%% A connection's trust (`peer_trust/2`, `unix_trust/1`), or a listener's
+%% compiled option (`compile/1`): the config, or `undefined` for none.
+-type trust() :: undefined | config().
+
 %% Compile the `real_ip` listener option: `undefined` (off) or a map with
 %% exactly one of `trusted_proxies` (CIDR binaries) and `trusted_hops`, and an
 %% optional `header` (`x_forwarded_for`, the default, or `forwarded`). Raises
 %% `{invalid_listener_opt, real_ip, Opts}` on anything else.
 -doc false.
--spec compile(term()) -> undefined | config().
+-spec compile(term()) -> trust().
 compile(undefined) ->
     undefined;
 compile(Opts) when is_map(Opts) ->
@@ -177,8 +181,7 @@ word_checks(IP, Len, Index) ->
 %% is not trusted, or there is no peer. Called once per connection, so an
 %% untrusted connection pays nothing per request.
 -doc false.
--spec peer_trust(undefined | config(), {inet:ip_address(), inet:port_number()} | undefined) ->
-    undefined | config().
+-spec peer_trust(trust(), {inet:ip_address(), inet:port_number()} | undefined) -> trust().
 peer_trust({hops, _Header, _N} = Config, {_IP, _Port}) ->
     Config;
 peer_trust({cidrs, _Header, {V4, V6, _Unix}} = Config, {IP, _Port}) ->
@@ -193,7 +196,7 @@ peer_trust(_Config, _Peer) ->
 %% address: it is the nearest hop, trusted in `trusted_hops` mode and, in
 %% `trusted_proxies` mode, only with a `~"unix:"` entry.
 -doc false.
--spec unix_trust(undefined | config()) -> undefined | config().
+-spec unix_trust(trust()) -> trust().
 unix_trust({hops, _Header, _N} = Config) -> Config;
 unix_trust({cidrs, _Header, {_V4, _V6, true}} = Config) -> Config;
 unix_trust(_Config) -> undefined.
@@ -208,8 +211,8 @@ unix_trust(_Config) -> undefined.
 %% header, or a first hop that is not an address, there is no client
 %% address either.
 -doc false.
--spec resolve(config(), inet:ip_address() | undefined, roadrunner_http:headers()) ->
-    inet:ip_address() | undefined.
+-spec resolve(config(), roadrunner_req:client_ip(), roadrunner_http:headers()) ->
+    roadrunner_req:client_ip().
 resolve({_Mode, Header, _Trust} = Config, undefined, Headers) ->
     walk_lines(lines(header_name(Header), Headers, []), Config, undefined, 1);
 resolve({_Mode, Header, _Trust} = Config, PeerIP, Headers) ->
@@ -225,8 +228,8 @@ lines(Name, [{Name, Value} | Rest], Acc) -> lines(Name, Rest, [Value | Acc]);
 lines(Name, [_ | Rest], Acc) -> lines(Name, Rest, Acc);
 lines(_Name, [], Acc) -> Acc.
 
--spec walk_lines([binary()], config(), inet:ip_address() | undefined, pos_integer()) ->
-    inet:ip_address() | undefined.
+-spec walk_lines([binary()], config(), roadrunner_req:client_ip(), pos_integer()) ->
+    roadrunner_req:client_ip().
 walk_lines([], _Config, Fallback, _Hop) ->
     Fallback;
 walk_lines([Line | Lines], Config, Fallback, Hop) ->
@@ -235,8 +238,8 @@ walk_lines([Line | Lines], Config, Fallback, Hop) ->
 %% Read the entry ending at byte `End` of `Line` (the bytes after the last
 %% comma before `End`), then the one before it, until an untrusted hop.
 -spec walk_line(
-    binary(), non_neg_integer(), [binary()], config(), inet:ip_address() | undefined, pos_integer()
-) -> inet:ip_address() | undefined.
+    binary(), non_neg_integer(), [binary()], config(), roadrunner_req:client_ip(), pos_integer()
+) -> roadrunner_req:client_ip().
 walk_line(Line, End, Lines, {_Mode, Header, _Trust} = Config, Fallback, Hop) ->
     Start = entry_start(Line, End - 1),
     Len = End - Start,

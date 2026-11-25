@@ -515,7 +515,7 @@
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
     %% otherwise, the common case, so the request path resolves nothing.
-    real_ip = undefined :: undefined | roadrunner_real_ip:config(),
+    real_ip = undefined :: roadrunner_real_ip:trust(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => #stream{}},
     %% Worker pid → stream id, for DOWN correlation: the workers that hold

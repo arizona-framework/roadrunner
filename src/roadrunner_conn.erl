@@ -424,7 +424,7 @@ resolve_rate_limit(_ProtoOpts, _Peer) ->
 -doc false.
 -spec resolve_real_ip(
     proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
-) -> undefined | roadrunner_real_ip:config().
+) -> roadrunner_real_ip:trust().
 resolve_real_ip(#proto_opts{real_ip = undefined}, _Peer) ->
     undefined;
 resolve_real_ip(#proto_opts{real_ip = RealIp, unix_socket = true}, undefined) ->
@@ -1249,7 +1249,7 @@ expect_answer(ProtoOpts, Headers, MaxCL) ->
 -doc false.
 -spec with_client_ip(
     roadrunner_req:request(),
-    undefined | roadrunner_real_ip:config(),
+    roadrunner_real_ip:trust(),
     {inet:ip_address(), inet:port_number()} | undefined
 ) -> roadrunner_req:request().
 with_client_ip(Req, undefined, _Peer) ->

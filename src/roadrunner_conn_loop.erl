@@ -196,7 +196,7 @@
     %% The `real_ip` trust config when the peer is a trusted proxy, decided
     %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
     %% otherwise, the common case, so the request path resolves nothing.
-    real_ip = undefined :: undefined | roadrunner_real_ip:config(),
+    real_ip = undefined :: roadrunner_real_ip:trust(),
     %% Encoded buffered responses queued while the keep-alive loop spins
     %% on pipelined requests already sitting in `buffered`, written in
     %% ONE send by `flush_out/1` the moment the loop is about to touch

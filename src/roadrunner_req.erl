@@ -23,7 +23,15 @@ re-exported alongside it (`headers/0`, `version/0`, `status/0`,
 -include("roadrunner_body_reader.hrl").
 
 -export_type([
-    request/0, body_reader/0, read_result/0, deadline/0, cached_decisions/0, private/0, conn_info/0
+    request/0,
+    body_reader/0,
+    read_result/0,
+    deadline/0,
+    cached_decisions/0,
+    private/0,
+    conn_info/0,
+    sock_address/0,
+    client_ip/0
 ]).
 
 -doc """
@@ -188,6 +196,19 @@ When a body read times out: an `erlang:monotonic_time(millisecond)`
 time, or `infinity` for never.
 """.
 -type deadline() :: integer() | infinity.
+
+-doc """
+A socket address, as `sockname/1` returns it: `{IpAddress, Port}`, or
+`{local, Path}` on a Unix domain socket, `Path` a binary.
+""".
+-type sock_address() :: {inet:ip_address(), inet:port_number()} | {local, binary()}.
+
+-doc """
+A request's client address, as `client_ip/1` returns it, or `undefined`
+when there is none: no peer, or a Unix domain socket's client that
+`real_ip` resolved no address for.
+""".
+-type client_ip() :: inet:ip_address() | undefined.
 
 -export([
     method/1,
@@ -721,8 +742,7 @@ not per request. On a listener bound to a Unix domain socket it is
 `{ok, {local, Path}}`, `Path` a binary. Returns `{error, unavailable}`
 for a request map built outside the connection pipeline.
 """.
--spec sockname(request()) ->
-    {ok, {inet:ip_address(), inet:port_number()} | {local, binary()}} | {error, term()}.
+-spec sockname(request()) -> {ok, sock_address()} | {error, term()}.
 sockname(#{conn_info := ConnInfo}) -> ConnInfo(sockname);
 sockname(_) -> {error, unavailable}.
 
@@ -770,7 +790,7 @@ logs, geolocation. Unlike `forwarded_for/1`, it reads only the hops the
 listener's trusted proxies added. With `trusted_hops`, that holds only
 while the listener is reachable through the proxies alone.
 """.
--spec client_ip(request()) -> inet:ip_address() | undefined.
+-spec client_ip(request()) -> client_ip().
 client_ip(#{client_ip := IP}) -> IP;
 client_ip(#{peer := {IP, _Port}}) -> IP;
 client_ip(_) -> undefined.

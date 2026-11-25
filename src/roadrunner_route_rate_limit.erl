@@ -60,7 +60,7 @@ call(#{listener_name := Name} = Req, Next, State) ->
             {{429, Headers, ~""}, Req}
     end.
 
--spec check(inet:ip_address() | undefined, atom(), state()) -> allow | {deny, pos_integer()}.
+-spec check(roadrunner_req:client_ip(), atom(), state()) -> allow | {deny, pos_integer()}.
 check(IP, Name, {_Path, _Methods, {Rate, Cap, Cost}} = RouteKey) ->
     {Table, Counter, Unix} = persistent_term:get({roadrunner_route_rate_limit, Name}),
     case client_key(IP, Unix) of
@@ -74,7 +74,7 @@ check(IP, Name, {_Path, _Methods, {Rate, Cap, Cost}} = RouteKey) ->
 
 %% The bucket a request spends from: its client's, the one `local` bucket of
 %% a Unix domain socket's clients with no address, or none.
--spec client_key(inet:ip_address() | undefined, boolean()) ->
+-spec client_key(roadrunner_req:client_ip(), boolean()) ->
     roadrunner_conn:rate_limit_client() | undefined.
 client_key(undefined, true) -> local;
 client_key(undefined, false) -> undefined;
