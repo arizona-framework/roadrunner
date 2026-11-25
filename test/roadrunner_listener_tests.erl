@@ -456,6 +456,15 @@ listener_hibernate_after_infinity_is_off_test() ->
 listener_rejects_invalid_tls_test() ->
     rejects(tls, [foo]).
 
+%% Not a list, for a routed listener and a single-handler one.
+listener_rejects_invalid_middlewares_test() ->
+    rejects(middlewares, [foo, #{}]),
+    process_flag(trap_exit, true),
+    R = roadrunner_listener:start_link(listener_test_invalid_top_level, #{
+        port => 0, middlewares => foo, routes => [{~"/", roadrunner_hello_handler}]
+    }),
+    ?assertMatch({error, {{invalid_listener_opt, middlewares, foo}, _Stack}}, R).
+
 %% The values each takes at its limits still start a listener.
 listener_accepts_valid_top_level_opts_test() ->
     {ok, _} = roadrunner_listener:start_link(listener_test_valid_top_level, #{

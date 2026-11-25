@@ -258,7 +258,8 @@ an entry in a `middlewares` list that is not a middleware, with
 `{invalid_middleware, Entry, Reason}` (see `roadrunner_middleware`).
 
 Optional middleware and timing knobs (durations in milliseconds):
-- `middlewares`: listener-wide pipeline applied to every request.
+- `middlewares`: listener-wide pipeline applied to every request, a
+  list (`t:roadrunner_middleware:middlewares/0`).
 - `max_content_length`: request-body cap across HTTP/1.1, HTTP/2, and
   HTTP/3; an over-cap body answers `413 Payload Too Large` (and resets
   the stream on h2/h3). A non-negative integer, default 10 MB. The
@@ -2531,6 +2532,15 @@ max_concurrent_requests(Opts) ->
         Bad -> error({invalid_listener_opt, max_concurrent_requests, Bad})
     end.
 
+%% The listener's `middlewares`: a list, whose entries the pipeline
+%% compile checks (`roadrunner_middleware`).
+-spec listener_middlewares(map()) -> roadrunner_middleware:middlewares().
+listener_middlewares(Opts) ->
+    case maps:get(middlewares, Opts, []) of
+        Middlewares when is_list(Middlewares) -> Middlewares;
+        Other -> error({invalid_listener_opt, middlewares, Other})
+    end.
+
 -spec body_buffering(map()) -> body_buffering().
 body_buffering(Opts) ->
     case maps:get(body_buffering, Opts, auto) of
@@ -2650,6 +2660,8 @@ build_proto_opts(Opts, ListenerName) ->
     %% each knob without a nested map dive.
     {Protocols, Entries} = normalize_protocols(Opts),
     ok = validate_quic_ip(Opts, Protocols),
+    %% Before `build_dispatch/2` and the router read it as a list.
+    Middlewares = listener_middlewares(Opts),
     %% Per-listener counters: live-connection counter (acceptors bump on
     %% accept; conns decrement on exit), a cumulative requests-served
     %% counter (conn bumps on each handler dispatch), and a cumulative
@@ -2725,7 +2737,7 @@ build_proto_opts(Opts, ListenerName) ->
     {WsHeapFloorMin, WsHeapFloorMax} = ws_heap_floor(WsHeapFloor, Opts),
     Base = #proto_opts{
         dispatch = build_dispatch(Opts, ListenerName),
-        middlewares = maps:get(middlewares, Opts, []),
+        middlewares = Middlewares,
         max_content_length = int_opt(max_content_length, Opts, ?DEFAULT_MAX_CONTENT_LENGTH, 0),
         ws_max_frame_size = WsFrame,
         ws_max_message_size = WsMsg,
