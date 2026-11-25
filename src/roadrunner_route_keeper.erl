@@ -344,6 +344,7 @@ acquire(#ceiling{slots = Slots} = Ceiling) ->
 acquire(#ceiling{} = Ceiling, Reset, Conn, Owner) ->
     case take_owned(Ceiling, Owner) of
         {taken, K} -> {ok, K};
+        {busy, Rows, Max} -> ask_worker(Ceiling, Rows, Max, Reset, Conn, Owner);
         busy -> ask_worker(Ceiling, Reset, Conn, Owner);
         gone -> refuse(Ceiling)
     end.
@@ -435,20 +436,24 @@ within(#ceiling{slots = Slots, regs = Regs, counts = Counts}) ->
 %% owner's registration is checked again, then the row. A route at half its
 %% ceiling or more goes to the keeper: a key picked at random is likely
 %% taken there, and the try wasted. That is looked at first, as it costs a
-%% request that goes to the keeper anyway the least.
--spec take_owned(ceiling(), pid()) -> {taken, token()} | busy | gone.
+%% request that goes to the keeper anyway the least, and the request asks
+%% with the size and ceiling it read.
+-spec take_owned(ceiling(), pid()) ->
+    {taken, token()} | {busy, non_neg_integer() | undefined, pos_integer()} | busy | gone.
 take_owned(#ceiling{slots = Slots, regs = Regs, counts = Counts} = Ceiling, Owner) ->
-    try
-        Max = atomics:get(Counts, ?MAX),
-        case
-            ets:info(Slots, size) < (Max + 1) div 2 andalso open(Regs) andalso
-                ets:member(Regs, Owner)
-        of
-            true -> take_owned(Ceiling, Owner, erlang:phash2(self(), Max) + 1);
-            false -> busy
-        end
-    catch
-        error:badarg -> gone
+    Max = atomics:get(Counts, ?MAX),
+    case ets:info(Slots, size) of
+        Rows when Rows < (Max + 1) div 2 ->
+            try
+                case open(Regs) andalso ets:member(Regs, Owner) of
+                    true -> take_owned(Ceiling, Owner, erlang:phash2(self(), Max) + 1);
+                    false -> busy
+                end
+            catch
+                error:badarg -> gone
+            end;
+        Rows ->
+            {busy, Rows, Max}
     end.
 
 -spec take_owned(ceiling(), pid(), token()) -> {taken, token()} | busy.
@@ -501,8 +506,17 @@ notify(#ceiling{regs = Regs}, K) ->
 %% A stream worker asks the keeper, which registers its owner.
 -spec ask_worker(ceiling(), term(), pid(), pid()) ->
     {ok, token()} | {refused, pos_integer()} | reset.
-ask_worker(Ceiling, Reset, Conn, Owner) ->
-    case ask(Ceiling, {worker, Owner}) of
+ask_worker(#ceiling{slots = Slots, counts = Counts} = Ceiling, Reset, Conn, Owner) ->
+    ask_worker(
+        Ceiling, ets:info(Slots, size), atomics:get(Counts, ?MAX), Reset, Conn, Owner
+    ).
+
+-spec ask_worker(
+    ceiling(), non_neg_integer() | undefined, pos_integer(), term(), pid(), pid()
+) ->
+    {ok, token()} | {refused, pos_integer()} | reset.
+ask_worker(Ceiling, Rows, Max, Reset, Conn, Owner) ->
+    case ask(Ceiling, {worker, Owner}, Rows, Max) of
         {asked, Token} ->
             ConnMon = erlang:monitor(process, Conn),
             Result =
@@ -529,8 +543,8 @@ ask_worker(Ceiling, Reset, Conn, Owner) ->
 %% An HTTP/1.1 connection asks the keeper, which makes the key it grants the
 %% connection's home.
 -spec ask_home(ceiling()) -> {ok, token()} | {refused, pos_integer()}.
-ask_home(#ceiling{slots = Slots} = Ceiling) ->
-    case ask(Ceiling, h1) of
+ask_home(#ceiling{slots = Slots, counts = Counts} = Ceiling) ->
+    case ask(Ceiling, h1, ets:info(Slots, size), atomics:get(Counts, ?MAX)) of
         {asked, Token} ->
             receive
                 {Token, {granted, K}} ->
@@ -547,16 +561,18 @@ ask_home(#ceiling{slots = Slots} = Ceiling) ->
             gone(Ceiling)
     end.
 
-%% Ask the keeper for a slot, unless the route is full and the request
-%% would not wait for one. The ask carries a monitor of the keeper that is
-%% also the alias its answer comes on.
--spec ask(ceiling(), h1 | {worker, pid()}) -> {asked, reference()} | full | gone.
-ask(#ceiling{slots = Slots, regs = Regs, counts = Counts, wait = Wait}, Kind) ->
-    case ets:info(Slots, size) of
+%% Ask the keeper for a slot, unless the route, with `Rows` running against
+%% its ceiling `Max`, is full and the request would not wait for one. The
+%% ask carries a monitor of the keeper that is also the alias its answer
+%% comes on.
+-spec ask(ceiling(), h1 | {worker, pid()}, non_neg_integer() | undefined, pos_integer()) ->
+    {asked, reference()} | full | gone.
+ask(#ceiling{regs = Regs, counts = Counts, wait = Wait}, Kind, Rows, Max) ->
+    case Rows of
         undefined ->
             gone;
         Rows ->
-            case full(Rows, Counts, Wait) of
+            case full(Rows, Max, Counts, Wait) of
                 true ->
                     full;
                 false ->
@@ -573,12 +589,11 @@ ask(#ceiling{slots = Slots, regs = Regs, counts = Counts, wait = Wait}, Kind) ->
 
 %% Whether a request would be turned away without asking: the route runs
 %% its ceiling and, for a queue, its queue is full too.
--spec full(non_neg_integer(), atomics:atomics_ref(), wait()) -> boolean().
-full(Rows, Counts, shed) ->
-    Rows >= atomics:get(Counts, ?MAX);
-full(Rows, Counts, _Timeout) ->
-    Rows >= atomics:get(Counts, ?MAX) andalso
-        atomics:get(Counts, ?QUEUED) >= atomics:get(Counts, ?MAX_QUEUED).
+-spec full(non_neg_integer(), pos_integer(), atomics:atomics_ref(), wait()) -> boolean().
+full(Rows, Max, _Counts, shed) ->
+    Rows >= Max;
+full(Rows, Max, Counts, _Timeout) ->
+    Rows >= Max andalso atomics:get(Counts, ?QUEUED) >= atomics:get(Counts, ?MAX_QUEUED).
 
 %% The keeper died before it answered. It may have added the caller's row
 %% first, and a caller asking holds no other row of the route, so every row
@@ -894,10 +909,18 @@ registered(Pid, Mon, State) ->
 
 %% Watch `Pid` with a row to free when it dies.
 -spec hold_row(pid(), row(), reference() | undefined, #state{}) -> #state{}.
-hold_row(Pid, Row, Mon, State) ->
-    #state{watched = Watched} = State1 = watch(Pid, Mon, State),
-    #{Pid := #watched{rows = Rows} = W} = Watched,
-    State1#state{watched = Watched#{Pid := W#watched{rows = [Row | Rows]}}}.
+hold_row(Pid, Row, Mon, #state{watched = Watched, monitors = Monitors} = State) ->
+    case Watched of
+        #{Pid := #watched{rows = Rows} = W} ->
+            State1 = State#state{watched = Watched#{Pid := W#watched{rows = [Row | Rows]}}},
+            drop_monitor(Mon, State1);
+        #{} ->
+            Mon1 = monitor_once(Pid, Mon),
+            State#state{
+                watched = Watched#{Pid => #watched{monitor = Mon1, rows = [Row]}},
+                monitors = Monitors#{Mon1 => {watched, Pid}}
+            }
+    end.
 
 -spec monitor_once(pid(), reference() | undefined) -> reference().
 monitor_once(Pid, undefined) ->
@@ -989,12 +1012,17 @@ free_rows([{K, Owner, Worker} = Row | Rows], #state{intents = Intents} = State) 
 
 %% A row goes, and its key is kept for the grants to come only when the row
 %% was there: a connection that died idle held none, and its home may be
-%% another request's by then.
+%% another request's by then. Only its holder, its owner and the keeper
+%% remove a row, and the keeper frees one only once the holder and any
+%% other owner are dead, so the row read is still there for the delete.
 -spec free_row(row(), #state{}) -> #state{}.
 free_row({K, _Owner, _Holder} = Row, #state{slots = Slots} = State) ->
-    case ets:select_delete(Slots, [{Row, [], [true]}]) of
-        1 -> spare(K, State);
-        0 -> State
+    case ets:lookup(Slots, K) of
+        [Row] ->
+            true = ets:delete_object(Slots, Row),
+            spare(K, State);
+        _Other ->
+            State
     end.
 
 %% A key heard freed, kept for the grants to come. There are no more of
