@@ -16,6 +16,7 @@ over UDP, needs an address.
     loopback_serves/1,
     unix_socket_serves_http1/1,
     unix_socket_needs_port_0/1,
+    unix_socket_port_is_0/1,
     http3_needs_an_ip_address/1
 ]).
 
@@ -28,6 +29,7 @@ all() ->
         loopback_serves,
         unix_socket_serves_http1,
         unix_socket_needs_port_0,
+        unix_socket_port_is_0,
         http3_needs_an_ip_address
     ].
 
@@ -47,8 +49,7 @@ serves_on_loopback(Name, Ip) ->
     end.
 
 unix_socket_serves_http1(_Config) ->
-    %% A short path: a Unix socket path is limited to about 100 bytes.
-    Path = "/tmp/roadrunner-" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".sock",
+    Path = unix_path(),
     {ok, _} = roadrunner_listener:start_link(bind_unix, opts(#{port => 0, ip => {local, Path}})),
     try
         ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, get({local, Path}, 0))
@@ -65,6 +66,24 @@ unix_socket_needs_port_0(_Config) ->
         roadrunner_listener:start_link(
             bind_unix_port, opts(#{port => 8080, ip => {local, "/tmp/roadrunner-port.sock"}})
         )
+    ).
+
+%% A Unix domain socket has no port, on plain TCP and on TLS alike.
+unix_socket_port_is_0(_Config) ->
+    lists:foreach(
+        fun(Extra) ->
+            Path = unix_path(),
+            {ok, _} = roadrunner_listener:start_link(
+                bind_unix_port0, opts(Extra#{port => 0, ip => {local, Path}})
+            ),
+            try
+                ?assertEqual(0, roadrunner_listener:port(bind_unix_port0))
+            after
+                ok = roadrunner_listener:stop(bind_unix_port0),
+                _ = file:delete(Path)
+            end
+        end,
+        [#{}, #{tls => roadrunner_test_certs:server_opts()}]
     ).
 
 http3_needs_an_ip_address(_Config) ->
@@ -88,6 +107,10 @@ http3_needs_an_ip_address(_Config) ->
 %% =============================================================================
 %% Helpers
 %% =============================================================================
+
+%% A short path: a Unix socket path is limited to about 100 bytes.
+unix_path() ->
+    "/tmp/roadrunner-" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".sock".
 
 opts(Extra) ->
     Extra#{routes => roadrunner_hello_handler}.

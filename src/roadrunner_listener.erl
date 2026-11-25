@@ -1459,7 +1459,10 @@ name is running.
 register_for_drain(Name, Pid) when is_atom(Name), is_pid(Pid) ->
     gen_server:call(Name, {register_for_drain, Pid}).
 
--doc "Return the actual TCP port the listener is bound to.".
+-doc """
+Return the actual TCP port the listener is bound to. A listener on a Unix
+domain socket (`ip => {local, Path}`) has no port and returns `0`.
+""".
 -spec port(Name :: atom()) -> inet:port_number().
 port(Name) ->
     gen_server:call(Name, port).
@@ -1631,7 +1634,7 @@ init(#{port := Port} = Opts) ->
                     {ok, #state{
                         listen_socket = LSocket,
                         quic_listener = QuicListener,
-                        port = bound_port(LSocket, QuicListener),
+                        port = bound_port(Opts, LSocket, QuicListener),
                         proto_opts = ProtoOpts,
                         reconciliation = Reconciliation,
                         route_buckets = RouteBuckets,
@@ -1811,11 +1814,15 @@ close_quic_probe(Probe) -> gen_udp:close(Probe).
 
 %% The bound port comes from whichever transport owns it. TCP wins when
 %% present (co-listen reuses the same number for UDP); an HTTP/3-only
-%% listener reads it back from the QUIC listener.
--spec bound_port(roadrunner_transport:socket() | none, pid() | undefined) -> inet:port_number().
-bound_port(none, QuicPool) ->
+%% listener reads it back from the QUIC listener. A Unix domain socket has
+%% no port: `0`, the `port` it was given.
+-spec bound_port(opts(), roadrunner_transport:socket() | none, pid() | undefined) ->
+    inet:port_number().
+bound_port(#{ip := {local, _}}, _LSocket, _QuicListener) ->
+    0;
+bound_port(_Opts, none, QuicPool) ->
     quic_pool_port(QuicPool);
-bound_port(LSocket, _QuicListener) ->
+bound_port(_Opts, LSocket, _QuicListener) ->
     {ok, BoundPort} = roadrunner_transport:port(LSocket),
     BoundPort.
 
