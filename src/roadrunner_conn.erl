@@ -127,6 +127,7 @@
     rate_limit/0,
     rate_limit_state/0,
     rate_limit_client/0,
+    rate_limit_bucket/0,
     overload/0,
     slot_cell/0,
     linger_budget/0,
@@ -142,11 +143,6 @@
 %% (`release_slot/1`, `unregister_for_drain/1`): what a WebSocket session
 %% keeps for its whole lifetime instead of the full listener options: the
 %% live-connection counter and the drain registry (`undefined` for none).
-%% Who a rate limit bucket counts: the request's client address, or `local`
-%% for a Unix domain socket's clients with no resolved address, who share
-%% one bucket.
--type rate_limit_client() :: inet:ip_address() | local.
-
 -type close_opts() :: {counters:counters_ref(), ets:table() | undefined}.
 
 %% A request's routing outcome (`resolve_handler/2`): the handler, its
@@ -161,6 +157,15 @@
 
 -define(CONN_COMMA_CP_KEY, {?MODULE, conn_comma_cp}).
 
+%% A conn's own count of the in-flight slots it holds (`with_slot_cell/1`),
+%% or `undefined` when the listener has no ceiling.
+-type slot_cell() :: atomics:atomics_ref() | undefined.
+
+%% The listener's cap on connections lingering at once (`linger/3`): a
+%% table with a row per connection lingering now, the cumulative count of
+%% closes that skipped their linger over the cap, and the cap.
+-type linger_budget() :: {ets:table(), atomics:atomics_ref(), pos_integer()}.
+
 -doc """
 How a request over the listener-wide `max_concurrent_requests` ceiling
 is handled. `refuse` is the default and today's behavior: reject it
@@ -171,15 +176,6 @@ listener's queue process, the atomic that says whether anyone is parked
 deadline in milliseconds. The shed form answers it `503` with the
 `Retry-After` seconds it carries.
 """.
-%% A conn's own count of the in-flight slots it holds (`with_slot_cell/1`),
-%% or `undefined` when the listener has no ceiling.
--type slot_cell() :: atomics:atomics_ref() | undefined.
-
-%% The listener's cap on connections lingering at once (`linger/3`): a
-%% table with a row per connection lingering now, the cumulative count of
-%% closes that skipped their linger over the cap, and the cap.
--type linger_budget() :: {ets:table(), atomics:atomics_ref(), pos_integer()}.
-
 -type overload() ::
     refuse | {queue, pid(), atomics:atomics_ref(), pos_integer()} | {shed, pos_integer()}.
 
@@ -221,10 +217,12 @@ deadline in milliseconds. The shed form answers it `503` with the
 }.
 
 %% The per-connection rate-limit guard state cached on each conn loop's record:
-%% the `{Rate, Cap, Cost, Table, Counter, IP}` resolved from `proto_opts` + the
-%% peer once at setup (see `resolve_rate_limit/2`) — with `Cap`/`Cost` already
-%% derived so the per-request check does no arithmetic — or `undefined` when the
-%% guard is off or the peer IP is unknown. Checked by `rate_limit_check/6`.
+%% the `{Rate, Cap, Cost, Table, Counter, Client}` resolved from `proto_opts` +
+%% the peer once at setup (see `resolve_rate_limit/2`), with `Cap`/`Cost`
+%% already derived so the per-request check does no arithmetic. `Client` is
+%% the peer's address, or `local` for a Unix domain socket's peer. It is
+%% `undefined` when the guard is off or a TCP peer's address is unknown.
+%% Checked by `rate_limit/3`.
 -type rate_limit_state() ::
     {
         pos_integer(),
@@ -235,6 +233,17 @@ deadline in milliseconds. The shed form answers it `503` with the
         rate_limit_client()
     }
     | undefined.
+
+%% Who a rate limit bucket counts: the request's client address, or `local`
+%% for a Unix domain socket's clients with no resolved address, who share
+%% one bucket.
+-type rate_limit_client() :: inet:ip_address() | local.
+
+%% The key of a rate limit bucket row: the client alone in the listener's
+%% store, or a route's key (`roadrunner_route_rate_limit:state()`) and the
+%% client in the route store.
+-type rate_limit_bucket() ::
+    rate_limit_client() | {roadrunner_route_rate_limit:state(), rate_limit_client()}.
 
 -doc """
 Spawn an unlinked connection process for the accepted `Socket` and the
@@ -374,12 +383,12 @@ try_acquire_request_slot(Max, Counter) ->
             false
     end.
 
-%% Resolve the per-connection rate-limit tuple `{Rate, Burst, Table, Counter,
-%% IP}` from `proto_opts` + the (constant-per-conn) peer once at setup, or
-%% `undefined` when the guard is off, so the per-request check is a single
-%% branch on a cached value. The peer IP is baked in here, so the catch-all
-%% also covers a missing peer (a 2-tuple `{IP, _}` is required) as well as
-%% a `rate_limit` of `undefined`.
+%% Resolve the per-connection `rate_limit_state()` from `proto_opts` + the
+%% (constant-per-conn) peer once at setup, or `undefined` when the guard is
+%% off, so the per-request check is a single branch on a cached value. The
+%% peer's bucket key is baked in here: a TCP peer's address, or `local` for
+%% a Unix domain socket's peer, so the catch-all covers a missing TCP peer as
+%% well as a `rate_limit` of `undefined`.
 -doc false.
 -spec resolve_rate_limit(
     proto_opts(), {inet:ip_address(), inet:port_number()} | undefined
@@ -451,7 +460,7 @@ rate_limit_key(_Req, PeerKey) -> PeerKey.
 -doc false.
 -spec rate_limit_spend(
     ets:table(),
-    rate_limit_client() | {term(), rate_limit_client()},
+    rate_limit_bucket(),
     pos_integer(),
     pos_integer(),
     pos_integer(),
@@ -481,7 +490,7 @@ deterministically testable).
 """.
 -spec rate_limit_check(
     ets:table(),
-    rate_limit_client() | {term(), rate_limit_client()},
+    rate_limit_bucket(),
     pos_integer(),
     pos_integer(),
     pos_integer(),

@@ -15,6 +15,8 @@
 
 -export([init/1, call/3, evict_full/2]).
 
+-export_type([state/0]).
+
 %% The key of the route buckets: path, sorted methods, and the rate, bucket
 %% capacity and cost of one request, in token-bucket units.
 -type state() ::
