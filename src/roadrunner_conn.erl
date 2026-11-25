@@ -126,6 +126,7 @@
     dispatch/0,
     rate_limit/0,
     rate_limit_state/0,
+    rate_limit_client/0,
     overload/0,
     slot_cell/0,
     linger_budget/0,
@@ -141,6 +142,11 @@
 %% (`release_slot/1`, `unregister_for_drain/1`): what a WebSocket session
 %% keeps for its whole lifetime instead of the full listener options: the
 %% live-connection counter and the drain registry (`undefined` for none).
+%% Who a rate limit bucket counts: the request's client address, or `local`
+%% for a Unix domain socket's clients with no resolved address, who share
+%% one bucket.
+-type rate_limit_client() :: inet:ip_address() | local.
+
 -type close_opts() :: {counters:counters_ref(), ets:table() | undefined}.
 
 %% A request's routing outcome (`resolve_handler/2`): the handler, its
@@ -226,8 +232,7 @@ deadline in milliseconds. The shed form answers it `503` with the
         pos_integer(),
         ets:table(),
         atomics:atomics_ref(),
-        %% `local`: the one bucket of a Unix domain socket's clients.
-        inet:ip_address() | local
+        rate_limit_client()
     }
     | undefined.
 
@@ -434,8 +439,7 @@ rate_limit({Rate, Cap, Cost, Table, Counter, PeerKey}, Req, ListenerName) ->
 
 %% The bucket key of one request: its resolved client IP's key
 %% (`roadrunner_rate_limit:client_key/1`), else the peer's.
--spec rate_limit_key(roadrunner_req:request(), inet:ip_address() | local) ->
-    inet:ip_address() | local.
+-spec rate_limit_key(roadrunner_req:request(), rate_limit_client()) -> rate_limit_client().
 rate_limit_key(#{client_ip := IP}, _PeerKey) -> roadrunner_rate_limit:client_key(IP);
 rate_limit_key(_Req, PeerKey) -> PeerKey.
 
@@ -447,7 +451,7 @@ rate_limit_key(_Req, PeerKey) -> PeerKey.
 -doc false.
 -spec rate_limit_spend(
     ets:table(),
-    inet:ip_address() | local | {term(), inet:ip_address() | local},
+    rate_limit_client() | {term(), rate_limit_client()},
     pos_integer(),
     pos_integer(),
     pos_integer(),
@@ -477,7 +481,7 @@ deterministically testable).
 """.
 -spec rate_limit_check(
     ets:table(),
-    inet:ip_address() | local | {term(), inet:ip_address() | local},
+    rate_limit_client() | {term(), rate_limit_client()},
     pos_integer(),
     pos_integer(),
     pos_integer(),

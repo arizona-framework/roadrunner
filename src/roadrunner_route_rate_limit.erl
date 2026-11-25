@@ -72,7 +72,8 @@ check(IP, Name, {_Path, _Methods, {Rate, Cap, Cost}} = RouteKey) ->
 
 %% The bucket a request spends from: its client's, the one `local` bucket of
 %% a Unix domain socket's clients with no address, or none.
--spec client_key(inet:ip_address() | undefined, boolean()) -> inet:ip_address() | local | undefined.
+-spec client_key(inet:ip_address() | undefined, boolean()) ->
+    roadrunner_conn:rate_limit_client() | undefined.
 client_key(undefined, true) -> local;
 client_key(undefined, false) -> undefined;
 client_key(IP, _Unix) -> roadrunner_rate_limit:client_key(IP).
