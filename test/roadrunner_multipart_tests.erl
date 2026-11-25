@@ -457,6 +457,77 @@ transport_padding_after_a_boundary_test() ->
     {ok, ~"v", R2} = roadrunner_multipart:read_part_body(R1),
     ?assertMatch({done, _}, roadrunner_multipart:read_part(R2)).
 
+%% `parse/2` takes the same padding, after a boundary and after the
+%% closing one, and reads what `read_part/1` reads.
+parse_transport_padding_after_a_boundary_test() ->
+    Body = <<"preamble\r\n--B\r\n\r\nx\r\n--B \t\r\n\r\ny\r\n--B--\r\nepi">>,
+    Parts = [#{headers => [], body => ~"x"}, #{headers => [], body => ~"y"}],
+    ?assertEqual({ok, Parts}, roadrunner_multipart:parse(Body, ~"B")),
+    ?assertEqual({ok, Parts}, read_all(Body)),
+    Padded = <<"--B\t\r\n\r\nv\r\n--B-- \r\n">>,
+    ?assertMatch({ok, [#{body := ~"v"}]}, roadrunner_multipart:parse(Padded, ~"B")),
+    ?assertMatch({ok, [#{body := ~"v"}]}, read_all(Padded)).
+
+%% RFC 2046 §5.1.1: the close is "--" straight after the boundary, then
+%% padding, then a line break or the end; padding before the "--", or
+%% anything but those after it, is malformed in both readers.
+close_delimiter_grammar_test() ->
+    lists:foreach(
+        fun(Body) ->
+            ?assertEqual({error, malformed}, roadrunner_multipart:parse(Body, ~"B")),
+            ?assertEqual({error, malformed}, read_all(Body))
+        end,
+        [
+            <<"--B\r\n\r\nv\r\n--B  --">>,
+            <<"--B\r\n\r\nv\r\n--B \t--\r\n">>,
+            <<"--B\r\n\r\nv\r\n--B--epilogue">>,
+            <<"--B\r\n\r\nv\r\n--B-- x\r\n">>,
+            <<"--B\r\n\r\nv\r\n--B--\r">>
+        ]
+    ),
+    lists:foreach(
+        fun(Body) ->
+            ?assertMatch({ok, [#{body := ~"v"}]}, roadrunner_multipart:parse(Body, ~"B")),
+            ?assertMatch({ok, [#{body := ~"v"}]}, read_all(Body))
+        end,
+        [
+            <<"--B\r\n\r\nv\r\n--B--">>,
+            <<"--B\r\n\r\nv\r\n--B-- \t">>,
+            <<"--B\r\n\r\nv\r\n--B--\r\nepilogue">>
+        ]
+    ).
+
+%% The first boundary opens the body or starts a line, for both readers:
+%% one inside a preamble line is not one.
+first_boundary_starts_a_line_test() ->
+    Body = <<"x--B\r\n--B\r\n\r\nv\r\n--B--">>,
+    ?assertMatch({ok, [#{body := ~"v"}]}, roadrunner_multipart:parse(Body, ~"B")),
+    ?assertMatch({ok, [#{body := ~"v"}]}, read_all(Body)),
+    ?assertEqual(
+        {error, no_initial_boundary}, roadrunner_multipart:parse(<<"x--B\r\n">>, ~"B")
+    ),
+    ?assertEqual({error, no_initial_boundary}, read_all(<<"x--B\r\n">>)).
+
+%% A body that ends in a boundary's padding, or its line break cut short.
+body_ending_in_padding_test() ->
+    ?assertEqual({error, no_part_terminator}, read_all(<<"--B \t">>)),
+    ?assertEqual({error, no_part_terminator}, read_all(<<"--B \r">>)).
+
+%% Every part through `read_part/1`, in `parse/2`'s shape.
+read_all(Body) ->
+    read_all_parts(roadrunner_multipart:read_part(stream_req(Body))).
+
+read_all_parts({done, _Req}) ->
+    {ok, []};
+read_all_parts({error, _} = Error) ->
+    Error;
+read_all_parts({ok, Headers, Req}) ->
+    maybe
+        {ok, PartBody, Req1} ?= roadrunner_multipart:read_part_body(Req),
+        {ok, More} ?= read_all_parts(roadrunner_multipart:read_part(Req1)),
+        {ok, [#{headers => Headers, body => PartBody} | More]}
+    end.
+
 content_type_is_case_insensitive_test() ->
     Req = stream_req(~"Multipart/Form-Data; boundary=B", <<"--B--">>),
     ?assertMatch({done, _}, roadrunner_multipart:read_part(Req)).
