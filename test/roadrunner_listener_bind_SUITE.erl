@@ -17,6 +17,7 @@ over UDP, needs an address.
     unix_socket_serves_http1/1,
     unix_socket_needs_port_0/1,
     unix_socket_port_is_0/1,
+    unix_socket_peer_has_no_address/1,
     http3_needs_an_ip_address/1
 ]).
 
@@ -30,6 +31,7 @@ all() ->
         unix_socket_serves_http1,
         unix_socket_needs_port_0,
         unix_socket_port_is_0,
+        unix_socket_peer_has_no_address,
         http3_needs_an_ip_address
     ].
 
@@ -86,6 +88,41 @@ unix_socket_port_is_0(_Config) ->
         [#{}, #{tls => roadrunner_test_certs:server_opts()}]
     ).
 
+%% A Unix domain socket's client has no address: no peer and no client
+%% address, with `rate_limit` and `real_ip` too, and the socket's path as
+%% the local address.
+unix_socket_peer_has_no_address(_Config) ->
+    lists:foreach(
+        fun(Extra) ->
+            Path = unix_path(),
+            {ok, _} = roadrunner_listener:start_link(
+                bind_unix_addr,
+                Extra#{port => 0, ip => {local, Path}, routes => roadrunner_addr_handler}
+            ),
+            try
+                Reply = request(
+                    {local, Path},
+                    0,
+                    ~"GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 1.2.3.4\r\nConnection: close\r\n\r\n"
+                ),
+                [_Head, Body] = binary:split(Reply, ~"\r\n\r\n"),
+                ?assertEqual(
+                    {undefined, undefined, {ok, {local, list_to_binary(Path)}}},
+                    binary_to_term(Body)
+                )
+            after
+                ok = roadrunner_listener:stop(bind_unix_addr),
+                _ = file:delete(Path)
+            end
+        end,
+        [
+            #{},
+            #{rate_limit => #{rate => 5}},
+            #{real_ip => #{trusted_hops => 1}},
+            #{real_ip => #{trusted_proxies => [~"127.0.0.1/32"]}}
+        ]
+    ).
+
 http3_needs_an_ip_address(_Config) ->
     process_flag(trap_exit, true),
     lists:foreach(
@@ -114,6 +151,18 @@ unix_path() ->
 
 opts(Extra) ->
     Extra#{routes => roadrunner_hello_handler}.
+
+%% The whole reply to `Request` on a connection the server closes.
+request(Address, Port, Request) ->
+    {ok, Sock} = gen_tcp:connect(Address, Port, [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Sock, Request),
+    recv_all(Sock, <<>>).
+
+recv_all(Sock, Acc) ->
+    case gen_tcp:recv(Sock, 0, 1000) of
+        {ok, Data} -> recv_all(Sock, <<Acc/binary, Data/binary>>);
+        {error, closed} -> Acc
+    end.
 
 get(Address, Port) ->
     {ok, Sock} = gen_tcp:connect(Address, Port, [binary, {active, false}], 1000),

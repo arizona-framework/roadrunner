@@ -1101,6 +1101,8 @@ rate_deadline(Start, Total, MinRate) ->
 -spec peer(roadrunner_transport:socket()) -> {inet:ip_address(), inet:port_number()} | undefined.
 peer(Socket) ->
     case roadrunner_transport:peername(Socket) of
+        %% A Unix domain socket's peer has no address.
+        {ok, {local, _}} -> undefined;
         {ok, Peer} -> Peer;
         {error, _} -> undefined
     end.

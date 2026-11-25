@@ -495,8 +495,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   listener binds: plain TCP, TLS, and the HTTP/3 UDP socket. It takes
   what `gen_tcp`'s `ip` option takes: an address, `any`, `loopback`, or
   `{local, Path}` to serve HTTP/1.1 or HTTP/2 on a Unix domain socket.
-  A Unix domain socket has no port, so it needs `port => 0`; any other
-  port fails the start with
+  Its clients have no address, so `roadrunner_req:peer/1` and
+  `client_ip/1` are `undefined` there, and `real_ip` and `rate_limit`
+  do not apply. A Unix domain socket has no port, so it needs
+  `port => 0`; any other port fails the start with
   `{listener_opt_conflict, port, Port, unix_socket_needs_port_0}`. A
   listener with `http3` needs an address, or it fails to start with
   `{listener_opt_conflict, ip, Ip, http3_needs_an_ip_address}`.

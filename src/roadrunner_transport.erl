@@ -334,7 +334,7 @@ For `{fake, _}`: returns a stub `{127, 0, 0, 1}, 0` so handlers that
 read `roadrunner_req:peer/1` get a sensible value.
 """.
 -spec peername(socket()) ->
-    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+    {ok, {inet:ip_address(), inet:port_number()} | {local, binary()}} | {error, term()}.
 peername({gen_tcp, S}) ->
     inet:peername(S);
 peername({ssl, S}) ->
@@ -342,8 +342,12 @@ peername({ssl, S}) ->
 peername({fake, _Pid}) ->
     {ok, {{127, 0, 0, 1}, 0}}.
 
--doc "Return the local address of a connected socket.".
--spec sockname(socket()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+-doc """
+Return the local address of a connected socket: `{local, Path}` on a Unix
+domain socket.
+""".
+-spec sockname(socket()) ->
+    {ok, {inet:ip_address(), inet:port_number()} | {local, binary()}} | {error, term()}.
 sockname({gen_tcp, S}) ->
     inet:sockname(S);
 sockname({ssl, S}) ->

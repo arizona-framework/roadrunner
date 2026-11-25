@@ -78,7 +78,7 @@ care which protocol delivered the bytes.
     conn_info => conn_info(),
     %% Client TCP peer captured once per connection from
     %% `inet:peername/1`. `undefined` when the OS call fails (rare;
-    %% usually socket teardown).
+    %% usually socket teardown) or on a Unix domain socket.
     peer => {inet:ip_address(), inet:port_number()} | undefined,
     %% The client address behind trusted reverse proxies, resolved per
     %% request from the forwarding header on a listener with `real_ip`
@@ -696,8 +696,9 @@ delivered this request.
 
 `roadrunner_conn` populates this from `inet:peername/1` once per
 connection. Returns `undefined` when the request map has no peer
-field (e.g. constructed manually outside the connection pipeline) or
-when the OS call failed at accept time.
+field (e.g. constructed manually outside the connection pipeline), when
+the OS call failed at accept time, or on a listener bound to a Unix
+domain socket (`ip => {local, Path}`), whose peers have no address.
 
 On a listener with `proxy_protocol => true` this is the client address
 the upstream balancer reported in its PROXY-protocol header, not the
@@ -716,11 +717,12 @@ Return the server's local address the request came in on: the listening
 address and port the client connected to. Unlike `peer/1`, which the
 connection reads once, this reads the socket when called, so it can
 fail: it returns `{ok, _}` or `{error, Reason}`. Read from the socket when called,
-not per request. Returns `{error, unavailable}` for a request map built
-outside the connection pipeline.
+not per request. On a listener bound to a Unix domain socket it is
+`{ok, {local, Path}}`, `Path` a binary. Returns `{error, unavailable}`
+for a request map built outside the connection pipeline.
 """.
 -spec sockname(request()) ->
-    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+    {ok, {inet:ip_address(), inet:port_number()} | {local, binary()}} | {error, term()}.
 sockname(#{conn_info := ConnInfo}) -> ConnInfo(sockname);
 sockname(_) -> {error, unavailable}.
 
@@ -758,7 +760,8 @@ header: the chain is read right to left, skipping trusted proxies, and the
 first untrusted hop is the client (see `t:roadrunner_listener:opts/0`). In
 every other case it is the peer's address (`peer/1`), which on a
 `proxy_protocol` listener is already the client the balancer reported.
-Returns `undefined` when the request has no peer.
+Returns `undefined` when the request has no peer, as on a Unix domain
+socket: there `real_ip` and the listener's `rate_limit` do not apply.
 
 This is the address to use for per-client decisions: rate limiting, access
 logs, geolocation. Unlike `forwarded_for/1`, it reads only the hops the
