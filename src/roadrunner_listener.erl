@@ -1257,8 +1257,9 @@ WebSocket session tunables (under `ws` in the listener opts).
   sizeable pushes starts each at the size the last one needed. `max`
   defaults to `handler_spawn`'s `heap_floor`, `min` to `2586` (about
   20 KB, so small messages leave the floor; `0` lets every message
-  raise it). `false` turns it off. Inbound frames never raise it. With
-  the floor on, a session collects once as it starts when the heap it
+  raise it). `false` turns it off. Inbound frames never raise it. A
+  `max_heap_size`, from `handler_spawn` or the upgrade, turns it off as
+  well. With the floor on, a session collects once as it starts when the heap it
   inherited from the connection is over its base, so it learns from its
   own data.
 
