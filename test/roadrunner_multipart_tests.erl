@@ -680,6 +680,15 @@ parse_max_header_count_option_test() ->
     ),
     ?assertEqual({error, too_many_headers}, roadrunner_multipart:parse(flood(1, 3), ~"B", Opts)).
 
+%% A part after a padded boundary counts against `max_parts` as one after
+%% a bare boundary does.
+parse_max_parts_after_padding_test() ->
+    Body = <<"--B\r\n\r\nx\r\n--B \t\r\n\r\ny\r\n--B--">>,
+    ?assertMatch({ok, [_, _]}, roadrunner_multipart:parse(Body, ~"B", #{max_parts => 2})),
+    ?assertEqual(
+        {error, too_many_parts}, roadrunner_multipart:parse(Body, ~"B", #{max_parts => 1})
+    ).
+
 read_part_max_parts_test() ->
     Opts = #{max_parts => 1},
     {ok, [], R1} = roadrunner_multipart:read_part(stream_req(flood(2, 0)), Opts),

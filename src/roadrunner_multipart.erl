@@ -355,7 +355,10 @@ first_boundary(Body, Sep) ->
 %%   the line break (the epilogue) is ignored.
 %% - transport padding, then "\r\n" + part bytes → another part to
 %%   parse, while `PartsLeft` allows.
-%% The parts come back as a bare list, so no `{ok, _}` is built per part.
+%% The line break with no padding, the common case, matches in the clause
+%% head, so the part bytes are no new sub-binary; only padding goes through
+%% `skip_padding/1`. The parts come back as a bare list, so no `{ok, _}` is
+%% built per part.
 -spec parse_parts(
     binary(),
     non_neg_integer(),
@@ -372,8 +375,18 @@ parse_parts(<<"--", Rest/binary>>, _PartsLeft, _MaxHeaders, _, _, _, _) ->
         <<"\r\n", _Epilogue/binary>> -> [];
         _ -> {error, malformed}
     end;
-parse_parts(Bytes, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) ->
-    parse_next(skip_padding(Bytes), PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp).
+parse_parts(<<"\r\n", _/binary>>, 0, _MaxHeaders, _, _, _, _) ->
+    {error, too_many_parts};
+parse_parts(
+    <<"\r\n", PartAndRest/binary>>, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp
+) ->
+    parse_part(PartAndRest, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp);
+parse_parts(<<C, Rest/binary>>, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) when
+    C =:= $\s; C =:= $\t
+->
+    parse_next(skip_padding(Rest), PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp);
+parse_parts(_, _, _, _, _, _, _) ->
+    {error, malformed}.
 
 %% Transport padding: the spaces and tabs a boundary may carry.
 -spec skip_padding(binary()) -> binary().
@@ -396,6 +409,22 @@ parse_next(<<"\r\n", _/binary>>, 0, _MaxHeaders, _, _, _, _) ->
 parse_next(
     <<"\r\n", PartAndRest/binary>>, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp
 ) ->
+    parse_part(PartAndRest, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp);
+parse_next(_, _, _, _, _, _, _) ->
+    {error, malformed}.
+
+%% One part, after its boundary's line break, then the parts after it.
+-spec parse_part(
+    binary(),
+    pos_integer(),
+    pos_integer(),
+    binary:cp(),
+    binary:cp(),
+    binary:cp(),
+    binary:cp()
+) ->
+    [part()] | {error, term()}.
+parse_part(PartAndRest, PartsLeft, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) ->
     case parse_one_part(PartAndRest, MaxHeaders, BodyEndCp, DblCrlfCp, CrlfCp, ColonCp) of
         {ok, Part, Rest} ->
             case
@@ -408,9 +437,7 @@ parse_next(
             end;
         {error, _} = Error ->
             Error
-    end;
-parse_next(_, _, _, _, _, _, _) ->
-    {error, malformed}.
+    end.
 
 -spec parse_one_part(
     binary(), pos_integer(), binary:cp(), binary:cp(), binary:cp(), binary:cp()
@@ -674,6 +701,8 @@ next_part(#reader{stage = delimited, buf = Buf} = Reader, Req, Length, _Scanned)
     %% RFC 2046 §5.1.1: a boundary is the close when "--" follows it
     %% straight away; otherwise transport padding and a line break do.
     case Buf of
+        <<"\r\n", Rest/binary>> ->
+            next_part(Reader#reader{stage = headers, buf = Rest}, Req, Length, 0);
         <<"--", Rest/binary>> ->
             next_part(Reader#reader{stage = closing, buf = Rest}, Req, Length, 0);
         _ when Buf =:= <<>>; Buf =:= <<"-">> ->
