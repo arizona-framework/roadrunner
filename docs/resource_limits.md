@@ -793,8 +793,11 @@ Shed routes wait for nothing and are not counted.
 A slot is held until the request ends: a buffered response once it is
 sent, a loop or stream response once it ends, a WebSocket upgrade once
 the `101` is out. A request whose process dies in any way (killed, over
-its `max_heap_size`, its connection gone) frees its slot as soon as it
-goes. On HTTP/1.1 the handler runs in the connection's process, so what
+its `max_heap_size`, its connection gone or lingering after a GOAWAY)
+frees its slot as soon as it goes. Two rare cases on HTTP/2 hold the
+slot until the lingering connection closes instead: a request to a
+route a reload just dropped, and one that starts after the route's
+slot process restarted during the linger. On HTTP/1.1 the handler runs in the connection's process, so what
 it built stays on that process's heap until the next collection; for a
 route with a ceiling the connection collects it once the response is out,
 before it hands the slot back and waits for the next request, so an idle
