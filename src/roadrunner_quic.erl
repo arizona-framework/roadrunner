@@ -5,15 +5,15 @@
 %% `roadrunner_http3_stream_worker`) calls on a native QUIC connection.
 %%
 %% The native connection is a hand-rolled `proc_lib` loop, not a gen_statem, so
-%% this module replicates `gen_statem:call` semantics itself: a `make_ref`
-%% tagged round-trip with a temporary monitor. A control request goes as
-%% `{quic_call, self(), Ref, Request}` and a stream write as `{quic_send,
-%% self(), Ref, Sid, IoData, Fin}`; both are answered by the connection with
-%% `{quic_reply, Ref, Result}`. A stream's final write can go one way instead
-%% (`{quic_send_final, Sid, IoData}`, never answered). The connection only
-%% ever sends to its owner asynchronously (`{quic, Conn, Event}`), so these
-%% synchronous calls never deadlock: the call tree is one-directional
-%% (owner/worker -> connection).
+%% this module replicates `gen_statem:call` semantics itself: a round-trip
+%% tagged, as `gen` does, with a temporary monitor of the connection. A control
+%% request goes as `{quic_call, self(), Mon, Request}` and a stream write as
+%% `{quic_send, self(), Mon, Sid, IoData, Fin}`; both are answered by the
+%% connection with `{quic_reply, Mon, Result}`. A stream's final write can go
+%% one way instead (`{quic_send_final, Sid, IoData}`, never answered). The
+%% connection only ever sends to its owner asynchronously (`{quic, Conn,
+%% Event}`), so these synchronous calls never deadlock: the call tree is
+%% one-directional (owner/worker -> connection).
 %%
 %% A connection that dies before replying exits the caller with
 %% `{quic_conn_down, Reason}`, the same shape `gen_statem:call` gives for a
@@ -69,10 +69,9 @@ the stream worker flow-control back-pressure.
 """.
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean()) -> ok | {error, term()}.
 send_data(Conn, StreamId, IoData, Fin) ->
-    Ref = make_ref(),
     Mon = monitor(process, Conn),
-    _ = Conn ! {quic_send, self(), Ref, StreamId, IoData, Fin},
-    await(Conn, Ref, Mon).
+    _ = Conn ! {quic_send, self(), Mon, StreamId, IoData, Fin},
+    await(Conn, Mon).
 
 -doc """
 Write a stream's last data (an iolist of h3 frames) and finish it, one way:
@@ -144,17 +143,18 @@ close_when_done(Conn, ErrorCode, Reason) ->
 
 -spec call(pid(), term()) -> term().
 call(Conn, Request) ->
-    Ref = make_ref(),
     Mon = monitor(process, Conn),
-    _ = Conn ! {quic_call, self(), Ref, Request},
-    await(Conn, Ref, Mon).
+    _ = Conn ! {quic_call, self(), Mon, Request},
+    await(Conn, Mon).
 
 %% Wait for the connection's reply, or exit if it dies first (matching
-%% gen_statem:call against a dead callee).
--spec await(pid(), reference(), reference()) -> term().
-await(Conn, Ref, Mon) ->
+%% gen_statem:call against a dead callee). The monitor is also the request
+%% tag, so both clauses match a reference made just before the request and
+%% the receive skips the messages already queued, however many there are.
+-spec await(pid(), reference()) -> term().
+await(Conn, Mon) ->
     receive
-        {quic_reply, Ref, Result} ->
+        {quic_reply, Mon, Result} ->
             _ = demonitor(Mon, [flush]),
             Result;
         {'DOWN', Mon, process, Conn, Reason} ->

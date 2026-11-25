@@ -823,7 +823,7 @@ slot_and_down_share_every_receive(_Config) ->
     %% a worker's here, so each such receive is listed with why it is not.
     Allowed = [
         %% A call to the QUIC connection, waiting on its own monitor of it.
-        {roadrunner_quic, await, 3},
+        {roadrunner_quic, await, 2},
         %% Body reads, run by the stream worker on its own monitor of the
         %% connection; reached here only through the readers the
         %% connection builds for its workers.

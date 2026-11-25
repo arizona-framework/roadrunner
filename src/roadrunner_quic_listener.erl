@@ -565,11 +565,10 @@ install_owner(ConnPid, Handler) ->
 %% skips the now-moot ownership install.
 -spec set_owner_sync(pid(), pid()) -> ok.
 set_owner_sync(ConnPid, Owner) ->
-    Ref = make_ref(),
     MonRef = monitor(process, ConnPid),
-    _ = ConnPid ! {quic_call, self(), Ref, {set_owner, Owner}},
+    _ = ConnPid ! {quic_call, self(), MonRef, {set_owner, Owner}},
     receive
-        {quic_reply, Ref, ok} ->
+        {quic_reply, MonRef, ok} ->
             _ = demonitor(MonRef, [flush]),
             ok;
         {'DOWN', MonRef, process, ConnPid, _Reason} ->
