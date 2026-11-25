@@ -266,6 +266,18 @@ parse2_long_pairs_test() ->
     ),
     ?assertEqual({error, too_many_pairs}, roadrunner_qs:parse(~"long=value&b&c", Opts)).
 
+%% A guard: the string is scanned for `+` and `%` only once every window
+%% is counted, which changes the cost of a refusal but not its result, so
+%% this checks the results around the cap and that a `+` past the first
+%% windows still decodes.
+parse2_trigger_after_count_test() ->
+    Bin = <<(binary:copy(~"a&", 4096))/binary, "k=x+y">>,
+    ?assertEqual({error, too_many_pairs}, roadrunner_qs:parse(Bin, #{max_pairs => 1})),
+    ?assertEqual({error, too_many_pairs}, roadrunner_qs:parse(Bin, #{max_pairs => 4096})),
+    {ok, Pairs} = roadrunner_qs:parse(Bin, #{max_pairs => 4097}),
+    ?assertEqual(4097, length(Pairs)),
+    ?assertEqual({~"k", ~"x y"}, lists:last(Pairs)).
+
 %% Every string of up to 7 bytes from `a=&+%2` (`%2` is a bad percent
 %% sequence, kept raw): `parse/2` takes the pairs `parse/1` does, or
 %% returns `too_many_pairs` past `max_pairs`.
