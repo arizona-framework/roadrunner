@@ -224,19 +224,57 @@
     headers_at = undefined :: undefined | integer()
 }).
 
--record(h3, {
+%% What the connection decides once, when its loop starts, and never
+%% changes: the QUIC connection, the listener options it reads per
+%% request and its in-flight ceiling. Kept apart from `#h3{}` so each
+%% update of that record copies one field for all of them.
+-record(h3_cfg, {
     conn :: pid(),
     proto_opts :: roadrunner_conn:proto_opts(),
     %% The heap floor this connection starts its workers at
     %% (`roadrunner_stream_worker:conn_heap_floor/1`).
     heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor(),
     listener_name :: atom(),
-    peer :: roadrunner_event_handler:peer(),
     %% The connection queries each request carries, built once: they ask
     %% the QUIC connection (`conn_info/1`).
     conn_info :: roadrunner_req:conn_info(),
     %% The event handler's span from `listener_accept`.
     conn_span :: roadrunner_event_handler:span(),
+    %% SETTINGS_QPACK_BLOCKED_STREAMS as advertised (RFC 9204 §2.1.2).
+    qpack_blocked_streams = ?QPACK_BLOCKED_STREAMS :: non_neg_integer(),
+    max_content_length :: non_neg_integer(),
+    %% `auto` buffers a request's body and dispatches at the stream's FIN;
+    %% `manual` dispatches at the end of the headers and hands the worker
+    %% the body as it reads (`dispatch_reading/4`). Read from proto_opts.
+    body_buffering = auto :: roadrunner_listener:body_buffering(),
+    %% Cap on the encoded request field section (HEADERS block). Read from
+    %% proto_opts at conn start; defaults to `?MAX_HEADER_BLOCK`.
+    max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
+    %% Cap on the DECODED field-section size (RFC 9114 §7.2.4.1
+    %% SETTINGS_MAX_FIELD_SECTION_SIZE): advertised on the control stream
+    %% (so conformant clients self-limit, §4.2.2) and enforced after QPACK
+    %% decode in `dispatch_request/2`. Read from proto_opts; defaults to
+    %% `2 * max_header_block`.
+    max_field_section_size = ?DEFAULT_MAX_FIELD_SECTION_SIZE :: pos_integer(),
+    %% In-flight-request slot accounting (cross-listener cap). `infinity`
+    %% (default) disables it; `inflight_counter` is the shared gauge. Read
+    %% from proto_opts at `init/2` so the per-stream acquire/release passes
+    %% them to `roadrunner_conn` directly. See `dispatch_decoded/5`.
+    max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
+    inflight_counter :: roadrunner_conn:inflight_counter(),
+    %% The loop's own count of the slots it holds
+    %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
+    slot_cell = undefined :: roadrunner_conn:slot_cell(),
+    %% What happens to a request that arrives over the ceiling: refuse it
+    %% (the default) or park it until a slot frees. Read from proto_opts
+    %% alongside the two fields above.
+    overload = refuse :: roadrunner_conn:overload()
+}).
+
+-record(h3, {
+    %% The connection's fixed settings, see `#h3_cfg{}`.
+    cfg :: #h3_cfg{},
+    peer :: roadrunner_event_handler:peer(),
     %% Pre-generated `request_id`s (hex), sliced 16 characters at a
     %% time and refilled by `roadrunner_conn:generate_request_id/1`.
     req_id_buffer = <<>> :: binary(),
@@ -262,8 +300,6 @@
     %% The QPACK dynamic table the peer's encoder stream fills (RFC 9204
     %% §3.2), bounded by the capacity advertised in our SETTINGS.
     qpack :: roadrunner_qpack_table:t(),
-    %% SETTINGS_QPACK_BLOCKED_STREAMS as advertised (RFC 9204 §2.1.2).
-    qpack_blocked_streams = ?QPACK_BLOCKED_STREAMS :: non_neg_integer(),
     %% Blocked request streams (RFC 9204 §2.2.1): StreamId => the Required
     %% Insert Count it waits for. The stream's own entry carries a
     %% `blocked` marker too (`block_stream/5`).
@@ -283,38 +319,11 @@
     %% to every stream worker started while draining (`start_worker/3`).
     %% `undefined` until then.
     drain_deadline = undefined :: integer() | undefined,
-    max_content_length :: non_neg_integer(),
-    %% `auto` buffers a request's body and dispatches at the stream's FIN;
-    %% `manual` dispatches at the end of the headers and hands the worker
-    %% the body as it reads (`dispatch_reading/4`). Read from proto_opts.
-    body_buffering = auto :: roadrunner_listener:body_buffering(),
-    %% Cap on the encoded request field section (HEADERS block). Read from
-    %% proto_opts at conn start; defaults to `?MAX_HEADER_BLOCK`.
-    max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
-    %% Cap on the DECODED field-section size (RFC 9114 §7.2.4.1
-    %% SETTINGS_MAX_FIELD_SECTION_SIZE): advertised on the control stream
-    %% (so conformant clients self-limit, §4.2.2) and enforced after QPACK
-    %% decode in `dispatch_request/2`. Read from proto_opts; defaults to
-    %% `2 * max_header_block`.
-    max_field_section_size = ?DEFAULT_MAX_FIELD_SECTION_SIZE :: pos_integer(),
     %% The client's SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §4.2.2), read
     %% off its control stream; `infinity` (the §7.2.4.1 default) until its
     %% SETTINGS arrive or when they leave it out. Each stream worker gets
     %% the value current when it starts and keeps its response within it.
     peer_max_field_section_size = infinity :: roadrunner_stream_worker:peer_limit(),
-    %% In-flight-request slot accounting (cross-listener cap). `infinity`
-    %% (default) disables it; `inflight_counter` is the shared gauge. Read
-    %% from proto_opts at `init/2` so the per-stream acquire/release passes
-    %% them to `roadrunner_conn` directly. See `dispatch_decoded/5`.
-    max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
-    inflight_counter :: roadrunner_conn:inflight_counter(),
-    %% The loop's own count of the slots it holds
-    %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
-    slot_cell = undefined :: roadrunner_conn:slot_cell(),
-    %% What happens to a request that arrives over the ceiling: refuse it
-    %% (the default) or park it until a slot frees. Read from proto_opts
-    %% alongside the two fields above.
-    overload = refuse :: roadrunner_conn:overload(),
     %% Requests parked waiting for an in-flight slot, already assembled.
     %% The loop must NOT block waiting: it releases slots by processing
     %% its own workers' `DOWN` messages, so a blocked loop would wait on
@@ -390,29 +399,31 @@ init(Conn, ProtoOpts0) ->
     {ok, Peer} = roadrunner_quic:peername(Conn),
     ConnSpan = roadrunner_event:listener_accept(ListenerName, Peer),
     loop(#h3{
-        conn = Conn,
-        proto_opts = ProtoOpts,
-        heap_floor = roadrunner_stream_worker:conn_heap_floor(ProtoOpts),
-        listener_name = ListenerName,
+        cfg = #h3_cfg{
+            conn = Conn,
+            proto_opts = ProtoOpts,
+            heap_floor = roadrunner_stream_worker:conn_heap_floor(ProtoOpts),
+            listener_name = ListenerName,
+            conn_info = conn_info(Conn),
+            conn_span = ConnSpan,
+            max_content_length = MaxContentLength,
+            qpack_blocked_streams = QpackBlockedStreams,
+            body_buffering = BodyBuffering,
+            max_header_block = MaxHeaderBlock,
+            max_field_section_size = MaxFieldSectionSize,
+            max_concurrent_requests = MaxConcReq,
+            inflight_counter = InflightCounter,
+            slot_cell = SlotCell,
+            overload = Overload
+        },
         peer = Peer,
-        conn_info = conn_info(Conn),
-        conn_span = ConnSpan,
-        max_content_length = MaxContentLength,
         qpack = roadrunner_qpack_table:new(QpackMaxTableCapacity),
-        qpack_blocked_streams = QpackBlockedStreams,
-        body_buffering = BodyBuffering,
-        max_header_block = MaxHeaderBlock,
-        max_field_section_size = MaxFieldSectionSize,
-        max_concurrent_requests = MaxConcReq,
-        inflight_counter = InflightCounter,
-        slot_cell = SlotCell,
-        overload = Overload,
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
         real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer)
     }).
 
 -spec loop(#h3{}) -> ok.
-loop(#h3{conn = Conn} = State) ->
+loop(#h3{cfg = #h3_cfg{conn = Conn}} = State) ->
     receive
         {quic, Conn, {connected, _Info}} ->
             case send_control_stream(State) of
@@ -501,7 +512,7 @@ while_up(Query, Conn) ->
     end.
 
 -spec peer_changed(#h3{}, {inet:ip_address(), inet:port_number()}) -> #h3{}.
-peer_changed(#h3{proto_opts = ProtoOpts} = State, Peer) ->
+peer_changed(#h3{cfg = #h3_cfg{proto_opts = ProtoOpts}} = State, Peer) ->
     State#h3{
         peer = Peer,
         rate_limit = roadrunner_conn:resolve_rate_limit(ProtoOpts, Peer),
@@ -532,7 +543,7 @@ peer_changed(#h3{proto_opts = ProtoOpts} = State, Peer) ->
 %% the QPACK decoder stream (`open_decoder_stream/2`), everything this
 %% server opens, so it is served rather than refused.
 -spec send_control_stream(#h3{}) -> handle_result().
-send_control_stream(#h3{conn = Conn} = State) ->
+send_control_stream(#h3{cfg = #h3_cfg{conn = Conn}} = State) ->
     case roadrunner_quic:open_unidirectional_stream(Conn) of
         {ok, CtrlStreamId} ->
             send_settings(State, CtrlStreamId);
@@ -545,10 +556,12 @@ send_control_stream(#h3{conn = Conn} = State) ->
 -spec send_settings(#h3{}, non_neg_integer()) -> #h3{}.
 send_settings(
     #h3{
-        conn = Conn,
-        max_field_section_size = MaxFieldSection,
-        qpack = Qpack,
-        qpack_blocked_streams = BlockedStreams
+        cfg = #h3_cfg{
+            conn = Conn,
+            max_field_section_size = MaxFieldSection,
+            qpack_blocked_streams = BlockedStreams
+        },
+        qpack = Qpack
     } = State,
     CtrlStreamId
 ) ->
@@ -617,7 +630,7 @@ start_drain(#h3{drain_deadline = Deadline} = State, _Deadline) when is_integer(D
     State;
 start_drain(
     #h3{
-        conn = Conn,
+        cfg = #h3_cfg{conn = Conn},
         control_stream_id = CtrlId,
         last_request_id = LastId,
         worker_pids = WorkerPids
@@ -647,10 +660,8 @@ start_drain(
 -spec start_worker(#h3{}, non_neg_integer(), roadrunner_req:request()) -> {pid(), reference()}.
 start_worker(
     #h3{
-        conn = Conn,
-        proto_opts = ProtoOpts,
+        cfg = #h3_cfg{conn = Conn, proto_opts = ProtoOpts, heap_floor = HeapFloor},
         peer_max_field_section_size = PeerLimit,
-        heap_floor = HeapFloor,
         drain_deadline = Deadline
     },
     StreamId,
@@ -705,7 +716,7 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
     Stream0 =
         case Streams of
             #{StreamId := Stream} -> Stream;
-            _ -> new_request_stream(State#h3.max_content_length)
+            _ -> new_request_stream(State#h3.cfg#h3_cfg.max_content_length)
         end,
     case Stream0 of
         #h3_stream{frame_state = discarding} ->
@@ -740,7 +751,7 @@ handle_request_stream(State0, StreamId, Data, Fin) ->
 ) ->
     handle_result().
 request_frames(
-    #h3{proto_opts = ProtoOpts, max_header_block = MaxHdrBlock} = State,
+    #h3{cfg = #h3_cfg{proto_opts = ProtoOpts, max_header_block = MaxHdrBlock}} = State,
     StreamId,
     Stream0,
     Bytes,
@@ -803,7 +814,7 @@ blocked_after({conn_error, _, _} = ConnError, _StreamId, _Ric, _Fin) ->
 -spec block_stream(#h3{}, non_neg_integer(), #h3_stream{}, pos_integer(), boolean()) ->
     handle_result().
 block_stream(
-    #h3{blocked = Blocked, qpack_blocked_streams = Max, streams = Streams} = State,
+    #h3{cfg = #h3_cfg{qpack_blocked_streams = Max}, blocked = Blocked, streams = Streams} = State,
     StreamId,
     Stream,
     Ric,
@@ -840,9 +851,11 @@ blocked_in(
 %% may allow a larger body, cannot be known before its headers are
 %% decoded, so past that it is refused as a body over the listener's cap.
 -spec blocked_bytes(#h3{}, non_neg_integer()) -> #h3{}.
-blocked_bytes(#h3{body_buffering = manual} = State, _StreamId) ->
+blocked_bytes(#h3{cfg = #h3_cfg{body_buffering = manual}} = State, _StreamId) ->
     State;
-blocked_bytes(#h3{streams = Streams, max_header_block = MaxHdrBlock} = State, StreamId) ->
+blocked_bytes(
+    #h3{cfg = #h3_cfg{max_header_block = MaxHdrBlock}, streams = Streams} = State, StreamId
+) ->
     #{
         StreamId := #h3_stream{
             buf = Buf, body_len = Len, body_cap = Cap, blocked = {_, Fin, _}
@@ -959,7 +972,8 @@ await_body(State, _StreamId, _Stream0, _Stream1) ->
 -spec answer_expectation(#h3{}, non_neg_integer(), #h3_stream{}, roadrunner_http:headers()) ->
     handle_result().
 answer_expectation(
-    #h3{proto_opts = ProtoOpts, max_content_length = MaxLen, body_buffering = Mode} = State,
+    #h3{cfg = #h3_cfg{proto_opts = ProtoOpts, max_content_length = MaxLen, body_buffering = Mode}} =
+        State,
     StreamId,
     Stream0,
     Headers
@@ -984,7 +998,7 @@ send_continue(State, StreamId) ->
     Continue = roadrunner_quic_h3_frame:encode_headers(
         roadrunner_qpack:encode([{~":status", ~"100"}])
     ),
-    _ = roadrunner_quic:send_data(State#h3.conn, StreamId, Continue, false),
+    _ = roadrunner_quic:send_data(State#h3.cfg#h3_cfg.conn, StreamId, Continue, false),
     State.
 
 %% Answer a request refused before dispatch: 413 for a body over its cap,
@@ -997,7 +1011,9 @@ send_continue(State, StreamId) ->
 -spec refuse_request(
     #h3{}, non_neg_integer(), #h3_stream{}, boolean(), roadrunner_http:status(), binary()
 ) -> #h3{}.
-refuse_request(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream0, Fin, Status, Body) ->
+refuse_request(
+    #h3{cfg = #h3_cfg{conn = Conn}, streams = Streams} = State, StreamId, Stream0, Fin, Status, Body
+) ->
     ok = roadrunner_http3_stream_worker:send_buffered(
         Conn, StreamId, Status, [{~"content-type", ~"text/plain"}], Body
     ),
@@ -1049,7 +1065,9 @@ dispatch_reading(#h3{streams = Streams} = State, StreamId, Headers, ContinueOwed
 %% Count a chunk's raw bytes toward what a manual-mode stream hands back to
 %% QUIC flow control once its worker reads them (`deliver/3`).
 -spec unreleased(#h3_stream{}, non_neg_integer(), #h3{}) -> #h3_stream{}.
-unreleased(#h3_stream{unreleased = Unreleased} = Stream, Received, #h3{body_buffering = manual}) ->
+unreleased(#h3_stream{unreleased = Unreleased} = Stream, Received, #h3{
+    cfg = #h3_cfg{body_buffering = manual}
+}) ->
     Stream#h3_stream{unreleased = Unreleased + Received};
 unreleased(Stream, _Received, _State) ->
     Stream.
@@ -1083,7 +1101,7 @@ body_in(#h3{streams = Streams} = State, StreamId, Fin) ->
 %% raw byte received so far, now that all of it has left the connection.
 -spec deliver(#h3{}, non_neg_integer(), #h3_stream{}) -> #h3{}.
 deliver(
-    #h3{conn = Conn, streams = Streams} = State,
+    #h3{cfg = #h3_cfg{conn = Conn}, streams = Streams} = State,
     StreamId,
     #h3_stream{reader = Reader, body = Body, fin = Fin, unreleased = Unreleased} = Stream
 ) ->
@@ -1287,7 +1305,9 @@ insert_count_increment(#h3{qpack = Table} = State) ->
 %% means the peer allows fewer than the three unidirectional streams RFC
 %% 9114 §6.2 requires (we open two), as for the control stream.
 -spec open_decoder_stream(#h3{}, iodata()) -> handle_result().
-open_decoder_stream(#h3{conn = Conn, decoder_stream_id = undefined} = State, Instruction) ->
+open_decoder_stream(
+    #h3{cfg = #h3_cfg{conn = Conn}, decoder_stream_id = undefined} = State, Instruction
+) ->
     case roadrunner_quic:open_unidirectional_stream(Conn) of
         {ok, StreamId} ->
             Prefix = roadrunner_quic_h3_frame:encode_stream_type(qpack_decoder),
@@ -1304,7 +1324,7 @@ open_decoder_stream(State, Instruction) ->
 %% like the control stream's sends: a connection already closing has no use
 %% for it.
 -spec decoder_instruction(#h3{}, iodata()) -> ok.
-decoder_instruction(#h3{conn = Conn, decoder_stream_id = StreamId}, Instruction) when
+decoder_instruction(#h3{cfg = #h3_cfg{conn = Conn}, decoder_stream_id = StreamId}, Instruction) when
     is_integer(StreamId)
 ->
     _ = roadrunner_quic:send_data(Conn, StreamId, Instruction, false),
@@ -1392,7 +1412,7 @@ handle_stream_reset(#h3{uni = Uni} = State0, StreamId) ->
                     %% already complete (its FIN out) is left as it is
                     %% (`do_reset_stream` sends nothing on it).
                     ok = cancel_and_release(State, StreamId),
-                    ok = roadrunner_conn:cancel_slot_wait(State#h3.overload, StreamId),
+                    ok = roadrunner_conn:cancel_slot_wait(State#h3.cfg#h3_cfg.overload, StreamId),
                     State#h3{
                         streams = maps:remove(StreamId, Streams),
                         awaiting_slot = maps:remove(StreamId, State#h3.awaiting_slot)
@@ -1422,7 +1442,7 @@ handle_stop_sending(#h3{streams = Streams, worker_pids = WorkerPids} = State, St
             %% Not dispatched: a request parked for an in-flight slot leaves
             %% the queue, its answer unwanted (`awaiting_slot` holds a
             %% complete auto-mode one; a manual-mode one keeps its stream).
-            ok = roadrunner_conn:cancel_slot_wait(State#h3.overload, StreamId),
+            ok = roadrunner_conn:cancel_slot_wait(State#h3.cfg#h3_cfg.overload, StreamId),
             State1 = State#h3{awaiting_slot = maps:remove(StreamId, State#h3.awaiting_slot)},
             case Streams of
                 #{StreamId := Stream} -> stop_unanswered(State1, StreamId, Stream);
@@ -1472,7 +1492,7 @@ stop_unanswered(#h3{blocked = Blocked} = State, StreamId, #h3_stream{fin = Fin} 
 %% worker writes to (none dispatched, or it is gone) is released now, a
 %% dispatched one when its worker ends (`release_cancelled/2`).
 -spec release_unwritten(#h3{}, non_neg_integer()) -> ok.
-release_unwritten(#h3{conn = Conn, worker_pids = WorkerPids}, StreamId) ->
+release_unwritten(#h3{cfg = #h3_cfg{conn = Conn}, worker_pids = WorkerPids}, StreamId) ->
     case WorkerPids of
         #{StreamId := _} -> ok;
         #{} -> release_stream(Conn, StreamId)
@@ -1548,21 +1568,21 @@ reading_stopped(#h3{streams = Streams} = State, StreamId) ->
 %% nothing. Only for a stream whose answer is not complete: one already
 %% answered (`discarding` the rest of its body, or gone) has its FIN out.
 -spec cancel_response(#h3{}, non_neg_integer()) -> ok.
-cancel_response(#h3{conn = Conn}, StreamId) ->
+cancel_response(#h3{cfg = #h3_cfg{conn = Conn}}, StreamId) ->
     _ = roadrunner_quic:reset_stream(Conn, StreamId, ?H3_REQUEST_CANCELLED),
     ok.
 
 %% `cancel_response/2` for a stream no worker writes to: released to the
 %% QUIC connection at once.
 -spec cancel_and_release(#h3{}, non_neg_integer()) -> ok.
-cancel_and_release(#h3{conn = Conn} = State, StreamId) ->
+cancel_and_release(#h3{cfg = #h3_cfg{conn = Conn}} = State, StreamId) ->
     ok = cancel_response(State, StreamId),
     release_stream(Conn, StreamId).
 
 %% A cancelled stream's worker ended: it writes no more, so the QUIC
 %% connection may drop the stream once the peer's side ends too.
 -spec release_cancelled(#h3{}, non_neg_integer()) -> #h3{}.
-release_cancelled(#h3{conn = Conn, cancelled = Cancelled} = State, StreamId) when
+release_cancelled(#h3{cfg = #h3_cfg{conn = Conn}, cancelled = Cancelled} = State, StreamId) when
     is_map_key(StreamId, Cancelled)
 ->
     ok = release_stream(Conn, StreamId),
@@ -2105,7 +2125,7 @@ qpack_decompression_failed() ->
 -spec dispatch_headers(#h3{}, non_neg_integer(), #h3_stream{}, roadrunner_http:headers()) ->
     handle_result().
 dispatch_headers(State, StreamId, Stream, Headers) ->
-    case roadrunner_http:header_list_size(Headers) > State#h3.max_field_section_size of
+    case roadrunner_http:header_list_size(Headers) > State#h3.cfg#h3_cfg.max_field_section_size of
         true ->
             %% RFC 9114 §4.2.2: the decoded field section exceeds the
             %% MAX_FIELD_SECTION_SIZE we advertised. The section was
@@ -2134,7 +2154,7 @@ request_body(#h3_stream{body = Body}) -> Body.
 %% already ended (we dispatch at stream close), so no `stop_sending` is
 %% needed — just answer and drop the stream.
 -spec respond_field_section_too_large(#h3{}, non_neg_integer()) -> #h3{}.
-respond_field_section_too_large(#h3{conn = Conn} = State, StreamId) ->
+respond_field_section_too_large(#h3{cfg = #h3_cfg{conn = Conn}} = State, StreamId) ->
     ok = roadrunner_http3_stream_worker:send_buffered(
         Conn,
         StreamId,
@@ -2151,7 +2171,12 @@ respond_field_section_too_large(#h3{conn = Conn} = State, StreamId) ->
 dispatch_decoded(State, StreamId, Headers, Body, HeadersAt) ->
     {ReqId, NewBuf} = roadrunner_conn:generate_request_id(State#h3.req_id_buffer),
     RequestContext = roadrunner_http:request_context(
-        State#h3.peer, State#h3.conn_info, https, State#h3.listener_name, ReqId, HeadersAt
+        State#h3.peer,
+        State#h3.cfg#h3_cfg.conn_info,
+        https,
+        State#h3.cfg#h3_cfg.listener_name,
+        ReqId,
+        HeadersAt
     ),
     State1 = State#h3{req_id_buffer = NewBuf},
     case build_request(Headers, Body, RequestContext) of
@@ -2160,7 +2185,11 @@ dispatch_decoded(State, StreamId, Headers, Body, HeadersAt) ->
             %% HTTP/1.1, then the stream dropped: 501 for a CONNECT (no
             %% tunnels), 417 for an expectation other than `100-continue`.
             ok = roadrunner_http3_stream_worker:send_buffered(
-                State1#h3.conn, StreamId, roadrunner_conn:parse_error_status(Reason), [], ~""
+                State1#h3.cfg#h3_cfg.conn,
+                StreamId,
+                roadrunner_conn:parse_error_status(Reason),
+                [],
+                ~""
             ),
             drop_stream(State1, StreamId);
         {error, _} ->
@@ -2203,14 +2232,13 @@ build_request(Headers, Body, RequestContext) ->
 -spec with_body(roadrunner_req:request(), iodata() | reading, non_neg_integer(), #h3{}) ->
     roadrunner_req:request().
 with_body(Req, reading, StreamId, #h3{
-    proto_opts = #proto_opts{request_timeout = Timeout},
-    max_content_length = MaxLen,
+    cfg = #h3_cfg{proto_opts = #proto_opts{request_timeout = Timeout}, max_content_length = MaxLen},
     streams = Streams
 }) ->
     #{StreamId := #h3_stream{continue_owed = ContinueOwed}} = Streams,
     roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxLen, ContinueOwed);
 with_body(Req, Body, StreamId, #h3{
-    body_buffering = manual, max_content_length = MaxLen, streams = Streams
+    cfg = #h3_cfg{body_buffering = manual, max_content_length = MaxLen}, streams = Streams
 }) ->
     #{StreamId := #h3_stream{body_len = Len}} = Streams,
     roadrunner_conn:with_arrived_body_reader(Req, Body, Len, MaxLen);
@@ -2225,10 +2253,10 @@ with_body(Req, _Body, _StreamId, _State) ->
 dispatch_with_slot(#h3{streams = Streams} = State1, StreamId, Req) ->
     case
         roadrunner_conn:acquire_request_slot(
-            State1#h3.max_concurrent_requests,
-            State1#h3.inflight_counter,
-            State1#h3.slot_cell,
-            State1#h3.overload,
+            State1#h3.cfg#h3_cfg.max_concurrent_requests,
+            State1#h3.cfg#h3_cfg.inflight_counter,
+            State1#h3.cfg#h3_cfg.slot_cell,
+            State1#h3.cfg#h3_cfg.overload,
             StreamId
         )
     of
@@ -2305,10 +2333,10 @@ handle_slot(#h3{awaiting_slot = Awaiting} = State, StreamId, _Refused) ->
 -spec give_back_slot(#h3{}) -> #h3{}.
 give_back_slot(State) ->
     ok = roadrunner_conn:release_request_slot(
-        State#h3.max_concurrent_requests,
-        State#h3.inflight_counter,
-        State#h3.slot_cell,
-        State#h3.overload
+        State#h3.cfg#h3_cfg.max_concurrent_requests,
+        State#h3.cfg#h3_cfg.inflight_counter,
+        State#h3.cfg#h3_cfg.slot_cell,
+        State#h3.cfg#h3_cfg.overload
     ),
     State.
 
@@ -2326,10 +2354,10 @@ handle_worker_down(#h3{worker_refs = WorkerRefs, worker_pids = WorkerPids} = Sta
     %% ref so it is accounted for by this `DOWN` or by the conn's clean
     %% exit, never both.
     ok = roadrunner_conn:release_request_slot(
-        State#h3.max_concurrent_requests,
-        State#h3.inflight_counter,
-        State#h3.slot_cell,
-        State#h3.overload
+        State#h3.cfg#h3_cfg.max_concurrent_requests,
+        State#h3.cfg#h3_cfg.inflight_counter,
+        State#h3.cfg#h3_cfg.slot_cell,
+        State#h3.cfg#h3_cfg.overload
     ),
     State1 = release_cancelled(
         State#h3{worker_refs = WorkerRefs1, worker_pids = maps:remove(StreamId, WorkerPids)},
@@ -2347,7 +2375,9 @@ handle_worker_down(#h3{worker_refs = WorkerRefs, worker_pids = WorkerPids} = Sta
 %% Reset a request stream we stop serving, with a QPACK Stream
 %% Cancellation (RFC 9204 §4.4.2): it may hold sections never decoded.
 -spec reset_and_drop(#h3{}, non_neg_integer(), non_neg_integer()) -> #h3{}.
-reset_and_drop(#h3{conn = Conn, worker_pids = WorkerPids} = State0, StreamId, ErrorCode) ->
+reset_and_drop(
+    #h3{cfg = #h3_cfg{conn = Conn}, worker_pids = WorkerPids} = State0, StreamId, ErrorCode
+) ->
     _ = roadrunner_quic:reset_stream(Conn, StreamId, ErrorCode),
     %% Released to the QUIC connection once no worker writes to it: now if
     %% none runs (none ran, or it is gone), else when it ends
@@ -2369,7 +2399,9 @@ reset_and_drop(#h3{conn = Conn, worker_pids = WorkerPids} = State0, StreamId, Er
 %% when a stream is refused at the `max_concurrent_requests` ceiling.
 -spec throttle_stream(#h3{}) -> ok.
 throttle_stream(#h3{
-    proto_opts = #proto_opts{throttled_counter = Counter}, listener_name = ListenerName
+    cfg = #h3_cfg{
+        proto_opts = #proto_opts{throttled_counter = Counter}, listener_name = ListenerName
+    }
 }) ->
     roadrunner_conn:throttled_telemetry(ListenerName, Counter, max_concurrent_requests).
 
@@ -2382,7 +2414,7 @@ throttle_stream(#h3{
 -spec rate_limit_refused(#h3{}, non_neg_integer(), roadrunner_req:request()) ->
     ok | {refused, #h3{}}.
 rate_limit_refused(
-    #h3{rate_limit = RateLimit, listener_name = ListenerName} = State, StreamId, Req
+    #h3{cfg = #h3_cfg{listener_name = ListenerName}, rate_limit = RateLimit} = State, StreamId, Req
 ) ->
     case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
         allow ->
@@ -2395,7 +2427,7 @@ rate_limit_refused(
 %% in-flight ceiling) with `Retry-After` as a buffered response, then the
 %% stream dropped.
 -spec retry_later(#h3{}, non_neg_integer(), 429 | 503, pos_integer()) -> #h3{}.
-retry_later(#h3{conn = Conn} = State, StreamId, Status, RetryAfter) ->
+retry_later(#h3{cfg = #h3_cfg{conn = Conn}} = State, StreamId, Status, RetryAfter) ->
     ok = roadrunner_http3_stream_worker:send_buffered(
         Conn, StreamId, Status, [{~"retry-after", integer_to_binary(RetryAfter)}], ~""
     ),
@@ -2409,7 +2441,7 @@ retry_later(#h3{conn = Conn} = State, StreamId, Status, RetryAfter) ->
 -spec close_connection(
     #h3{}, non_neg_integer(), binary(), roadrunner_event_handler:close_reason()
 ) -> ok.
-close_connection(#h3{conn = Conn} = State, ErrorCode, Reason, CloseReason) ->
+close_connection(#h3{cfg = #h3_cfg{conn = Conn}} = State, ErrorCode, Reason, CloseReason) ->
     _ = roadrunner_quic:close(Conn, ErrorCode, Reason),
     terminate(State, CloseReason).
 
@@ -2465,7 +2497,7 @@ drop_stream(#h3{streams = Streams} = State, StreamId) ->
 %% no further: ask the peer to stop, and keep the stream to discard what it
 %% still sends, which would otherwise be taken for a new request.
 -spec discard_stream(#h3{}, non_neg_integer(), #h3_stream{}) -> #h3{}.
-discard_stream(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream) ->
+discard_stream(#h3{cfg = #h3_cfg{conn = Conn}, streams = Streams} = State, StreamId, Stream) ->
     _ = roadrunner_quic:stop_sending(Conn, StreamId, ?H3_NO_ERROR),
     ok = stream_cancellation(State, StreamId),
     Discarding = Stream#h3_stream{
@@ -2485,23 +2517,25 @@ discard_stream(#h3{conn = Conn, streams = Streams} = State, StreamId, Stream) ->
 %% (`slot_reconciliation`) empties its cell instead, and its workers still
 %% running stop counting then.
 -spec hand_off_slots(#h3{}) -> ok.
-hand_off_slots(#h3{slot_cell = undefined}) ->
+hand_off_slots(#h3{cfg = #h3_cfg{slot_cell = undefined}}) ->
     ok;
 hand_off_slots(#h3{
-    proto_opts = #proto_opts{slot_keeper = Keeper},
+    cfg = #h3_cfg{
+        proto_opts = #proto_opts{slot_keeper = Keeper},
+        max_concurrent_requests = Max,
+        inflight_counter = Counter,
+        slot_cell = Cell,
+        overload = Overload
+    },
     worker_pids = Pids,
-    parked = Parked,
-    max_concurrent_requests = Max,
-    inflight_counter = Counter,
-    slot_cell = Cell,
-    overload = Overload
+    parked = Parked
 }) ->
     roadrunner_conn:hand_off_request_slots(
         Keeper, Cell, maps:values(Pids), Parked, Max, Counter, Overload
     ).
 
 -spec terminate(#h3{}, roadrunner_event_handler:close_reason()) -> ok.
-terminate(#h3{proto_opts = ProtoOpts, conn_span = ConnSpan} = State, Reason) ->
+terminate(#h3{cfg = #h3_cfg{proto_opts = ProtoOpts, conn_span = ConnSpan}} = State, Reason) ->
     ok = hand_off_slots(State),
     ok = roadrunner_event:listener_conn_close(ConnSpan, 0, Reason),
     Close = roadrunner_conn:close_opts(ProtoOpts),

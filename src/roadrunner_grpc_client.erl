@@ -1057,11 +1057,9 @@ handle({?MODULE, From, Mon, {open, Ref, Fields, Timeout, Out}}, State) ->
         #state{streams = Streams, queue = Queue, owners = Owners} ->
             {Deadline, Timer} = deadline_at(Ref, Timeout),
             Stream = #stream{
-                ref = Ref,
-                owner = From,
-                fields = Fields,
-                deadline = Deadline,
-                timer = Timer,
+                cfg = #call_cfg{
+                    ref = Ref, owner = From, fields = Fields, deadline = Deadline, timer = Timer
+                },
                 local =
                     case Out of
                         [] -> open;
@@ -1141,9 +1139,9 @@ deadline_at(Ref, Timeout) ->
 %% A call that ends stops its deadline's timer. One that fired already
 %% left its message, which `deadline/3` drops: the call has its end.
 -spec stop_timer(#stream{}) -> ok.
-stop_timer(#stream{timer = undefined}) ->
+stop_timer(#stream{cfg = #call_cfg{timer = undefined}}) ->
     ok;
-stop_timer(#stream{timer = Timer}) ->
+stop_timer(#stream{cfg = #call_cfg{timer = Timer}}) ->
     _ = erlang:cancel_timer(Timer),
     ok.
 
@@ -1152,7 +1150,7 @@ owner_down(Pid, #state{streams = Streams, owners = Owners} = State) ->
     lists:foldl(
         fun cancel_stream/2,
         State#state{owners = maps:remove(Pid, Owners)},
-        [Ref || Ref := #stream{owner = Owner} <- Streams, Owner =:= Pid]
+        [Ref || Ref := #stream{cfg = #call_cfg{owner = Owner}} <- Streams, Owner =:= Pid]
     ).
 
 -spec cancel_stream(reference(), #state{}) -> #state{}.
@@ -1171,7 +1169,7 @@ cancel_stream(Ref, #state{streams = Streams} = State) ->
 -spec deadline(reference(), reference(), #state{}) -> #state{}.
 deadline(Ref, Timer, #state{streams = Streams} = State) ->
     case Streams of
-        #{Ref := #stream{timer = Timer, final = undefined}} ->
+        #{Ref := #stream{cfg = #call_cfg{timer = Timer}, final = undefined}} ->
             end_call(
                 Ref, {error, {grpc, deadline_exceeded, ~"deadline exceeded", []}}, cancel, State
             );
@@ -1215,7 +1213,7 @@ start_stream(
         initial_window = Window
     } = State
 ) ->
-    #{Ref := #stream{fields = {Head, Tail}, deadline = Deadline} = S} = Streams,
+    #{Ref := #stream{cfg = #call_cfg{fields = {Head, Tail}, deadline = Deadline}} = S} = Streams,
     %% Runs of the encoder make one block: the timeout, as of now, goes
     %% between the call's definition and the rest.
     {Block1, Enc1} = roadrunner_http2_hpack:encode(Head, Enc),
@@ -1778,7 +1776,9 @@ end_call(Ref, Final, Rst, #state{streams = Streams} = State) ->
     deliver(Ref, open_queued(State1#state{streams = Streams#{Ref := S1}})).
 
 -spec leave_wire(#stream{}, none | roadrunner_http2_frame:error_code(), #state{}) -> #state{}.
-leave_wire(#stream{id = undefined, ref = Ref}, _Rst, #state{queue = Queue} = State) ->
+leave_wire(
+    #stream{cfg = #call_cfg{ref = Ref}, id = undefined}, _Rst, #state{queue = Queue} = State
+) ->
     State#state{queue = queue:delete(Ref, Queue)};
 leave_wire(#stream{recv = closed}, _Rst, State) ->
     State;

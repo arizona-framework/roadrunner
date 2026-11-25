@@ -1606,7 +1606,7 @@ deadline_timer_stops(Config) ->
     Conn = connect(Config),
     Pid = conn_pid(Conn),
     {ok, S} = roadrunner_grpc_client:stream(Conn, path(~"Chat"), #{timeout => 60_000}),
-    [#stream{timer = Timer}] = streams(Pid),
+    [#stream{cfg = #call_cfg{timer = Timer}}] = streams(Pid),
     ?assert(is_integer(erlang:read_timer(Timer))),
     ok = roadrunner_grpc_client:close_send(S),
     {eof, _} = roadrunner_grpc_client:recv(S),
