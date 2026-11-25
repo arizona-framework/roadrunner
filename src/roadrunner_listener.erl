@@ -623,8 +623,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   little does not collect on almost every request. Every 16 requests
   the floor drops back to that and is learned again, so a connection
   whose requests got smaller gives the larger heap back; before the
-  connection hibernates or runs a WebSocket session it drops to
-  `min_heap_size` (or the emulator's default). A connection between
+  connection hibernates, runs a WebSocket session or starts a `stream`
+  or `loop` response (or a stream from a `{send, ...}` fun), which can
+  hold the connection for long, it drops to `min_heap_size` (or the
+  emulator's default). A connection between
   requests collects nothing while it waits, so it keeps the heap its last
   request left: the same as without the floor after larger requests, and
   the least floor's 20 KB after small ones. HTTP/2 and HTTP/3 run each

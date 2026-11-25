@@ -1652,7 +1652,9 @@ raise_heap_floor(#loop_state{heap_floor = {Floor, Least, Base, Cap}} = S) ->
     end.
 
 %% Back to `Base` before the process hibernates (it would otherwise wake at
-%% the floor) or runs a WebSocket session, which sizes its own heap.
+%% the floor), runs a WebSocket session, which sizes its own heap, or
+%% starts a `stream` or `loop` response, which can hold the connection for
+%% long.
 -spec reset_heap_floor(#loop_state{}) -> #loop_state{}.
 reset_heap_floor(#loop_state{heap_floor = {Floor, Least, Base, Cap}} = S) when Floor > Base ->
     _ = erlang:process_flag(min_heap_size, Base),
@@ -1976,7 +1978,10 @@ send_emit(#loop_state{socket = Socket, alt_svc = AltSvc} = S, Handler) ->
             ),
             {Result, Status, Headers};
         ({stream, Status, Headers}, Req) ->
-            #loop_state{} = disarm(S),
+            %% The heap floor drops before the stream starts, as for a
+            %% returned one. The connection closes after a stream, so the
+            %% state it leaves is never read again.
+            #loop_state{} = disarm(reset_heap_floor(S)),
             ok = roadrunner_conn:continue_before_stream(Req),
             {Result, Send} = roadrunner_stream_response:start(
                 Socket, Status, roadrunner_http:auto_headers(Headers, AltSvc)
@@ -2185,8 +2190,10 @@ dispatch_response(
 ->
     %% The stream writer owns the wire from here — flush queued
     %% responses ahead of its first bytes, and the 100 a client may still
-    %% hold its body back for ahead of the head.
-    S = flush_out(disarm(S0)),
+    %% hold its body back for ahead of the head. The heap floor drops
+    %% first: a stream can run for long, and would otherwise hold the
+    %% heap the requests before it needed for all that time.
+    S = flush_out(disarm(reset_heap_floor(S0))),
     ok = roadrunner_conn:continue_before_stream(Req),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_stream_response:run(Socket, Status, Headers, Fun),
@@ -2199,7 +2206,9 @@ dispatch_response(
 ) when
     is_integer(Status)
 ->
-    S = flush_out(disarm(S0)),
+    %% A loop response lives as long as its handler keeps it, so the heap
+    %% floor drops first, as for a stream.
+    S = flush_out(disarm(reset_heap_floor(S0))),
     ok = roadrunner_conn:continue_before_stream(Req),
     Headers = roadrunner_http:auto_headers(Headers0, AltSvc),
     _ = roadrunner_loop_response:run(Socket, Status, Headers, Handler, LoopState),
