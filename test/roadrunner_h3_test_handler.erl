@@ -25,7 +25,7 @@ handle(#{target := ~"/cancel-unfinished"} = Req) ->
             ok = Send(~"part", nofin),
             {ok, _} = roadrunner_send_writer:cancel_after(0, R),
             receive
-                {roadrunner_stream_reset, StreamId} ->
+                {roadrunner_stream_reset, StreamId, deadline} ->
                     _ =
                         (roadrunner_http3_stream_worker:loop() !
                             {roadrunner_cancel_stream, StreamId}),
@@ -44,7 +44,8 @@ handle(#{target := ~"/cancel-answered"} = Req) ->
             ok = roadrunner_send:reply(200, [], ~"ok", R),
             Armed = roadrunner_send_writer:cancel_after(0, R),
             receive
-                {roadrunner_stream_reset, _} -> h3_cancel_test ! {cancel_answered, Armed, told}
+                {roadrunner_stream_reset, _, deadline} ->
+                    h3_cancel_test ! {cancel_answered, Armed, told}
             end,
             R
         end},

@@ -234,6 +234,8 @@
 
 -type stream_id() :: pos_integer().
 
+-type reset_why() :: roadrunner_stream_worker:reset_why().
+
 -type stream_state() ::
     open | half_closed_remote | half_closed_local | closed.
 
@@ -398,7 +400,7 @@
     %% race that DOWN and eat a spurious REFUSED_STREAM).
     live_streams = 0 :: non_neg_integer(),
     %% The monitors of workers still running for streams reset while they
-    %% counted toward `max_concurrent_streams` (`drop_reset_stream/2`): the
+    %% counted toward `max_concurrent_streams` (`drop_reset_stream/3`): the
     %% stream is closed (RFC 9113 §5.1), but its handler is not done, so
     %% admission counts it with `live_streams` until its `DOWN`. Without this
     %% a client could open and reset streams in a loop, each reset freeing a
@@ -909,7 +911,7 @@ recv_more(
         {roadrunner_skip_continue, StreamId} ->
             recv_more(skip_continue(State, StreamId));
         {roadrunner_cancel_stream, StreamId} ->
-            recv_more(maybe_exit_when_drained(cancel_stream(State, StreamId)));
+            recv_more(maybe_exit_when_drained(cancel_stream(State, StreamId, deadline)));
         {'DOWN', MonRef, process, Pid, Reason} ->
             ok = roadrunner_route_keeper:worker_down(Pid),
             recv_more(
@@ -1036,7 +1038,7 @@ idle_goaway(State, Reason) ->
 %% the idle timeout from now when they leave it with no stream and no
 %% worker, the deadline it already has otherwise. Set as the last stream
 %% or worker goes, in the update that drops it: every path that drops a
-%% stream (`remove_stream/3`, `drop_reset_stream/2`, `abort_stream/3`) or
+%% stream (`remove_stream/3`, `drop_reset_stream/3`, `abort_stream/3`) or
 %% a worker whose stream is gone (`handle_worker_down/4`) asks it.
 -spec idle_deadline(#{stream_id() => #stream{}}, #{reference() => stream_id()}, #loop{}) ->
     integer() | undefined.
@@ -1453,7 +1455,7 @@ handle_frame({window_update, StreamId, Inc}, #loop{streams = Streams} = State0) 
                     %% and its slot is held until it ends.
                     State = control_frame(State0),
                     _ = send_rst_stream(State, StreamId, flow_control_error),
-                    frame_loop(reset_stream(State, StreamId));
+                    frame_loop(reset_stream(State, StreamId, peer));
                 New ->
                     Stream1 = Stream#stream{send_window = New},
                     State = State0#loop{
@@ -1483,7 +1485,7 @@ handle_frame(
     %% ends), so no frame of ours follows the RST_STREAM.
     _ = send_rst_stream(State, StreamId, protocol_error),
     case Streams of
-        #{StreamId := _} -> frame_loop(reset_stream(State, StreamId));
+        #{StreamId := _} -> frame_loop(reset_stream(State, StreamId, peer));
         #{} -> frame_loop(State)
     end;
 handle_frame({priority, _, _}, State) ->
@@ -1495,9 +1497,9 @@ handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
             %% waited for a slot or its turn in `queued`, or its handler
             %% ended with DATA still queued), so the rapid reset guard does not see it: the
             %% reset serves nothing.
-            frame_loop(drop_reset_stream(control_frame(State), StreamId));
+            frame_loop(drop_reset_stream(control_frame(State), StreamId, peer));
         #{StreamId := _} ->
-            frame_loop(drop_reset_stream(State, StreamId));
+            frame_loop(drop_reset_stream(State, StreamId, peer));
         #{} ->
             %% RFC 9113 §5.1: RST_STREAM on an idle stream is
             %% PROTOCOL_ERROR (we never opened it). On a closed
@@ -1777,7 +1779,7 @@ reset_refused(StreamId, Fragment, Code, #loop{hpack_dec = Dec} = State) ->
                     ignore -> ok;
                     _ -> send_rst_stream(State1, StreamId, Code)
                 end,
-            frame_loop(reset_stream(State1, StreamId));
+            frame_loop(reset_stream(State1, StreamId, peer));
         {error, Reason} ->
             goaway_exit(State, decode_error_code(Reason))
     end.
@@ -2097,7 +2099,7 @@ on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
                     %% More DATA than the stream-level window permits is a
                     %% stream-level FLOW_CONTROL_ERROR.
                     _ = send_rst_stream(State, StreamId, flow_control_error),
-                    frame_loop(replenish_conn_window(reset_stream(State, StreamId), FlowLen));
+                    frame_loop(replenish_conn_window(reset_stream(State, StreamId, peer), FlowLen));
                 true ->
                     NewLen = Len + byte_size(Payload),
                     EndStream = (Flags band 16#01) =/= 0,
@@ -2143,7 +2145,7 @@ on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
             %% delivered (which would also re-dispatch on a second
             %% END_STREAM).
             _ = send_rst_stream(State, StreamId, stream_closed),
-            frame_loop(replenish_conn_window(reset_stream(State, StreamId), FlowLen))
+            frame_loop(replenish_conn_window(reset_stream(State, StreamId, peer), FlowLen))
     end.
 
 %% A DATA frame taking the body to `NewLen` bytes, past its cap. Before
@@ -2192,7 +2194,7 @@ body_in(
     case roadrunner_http:body_length_fits(Declared, Len, Ended) of
         false ->
             _ = send_rst_stream(State, StreamId, protocol_error),
-            frame_loop(reset_stream(State, StreamId));
+            frame_loop(reset_stream(State, StreamId, peer));
         true ->
             State1 =
                 case Stream of
@@ -2726,7 +2728,7 @@ handle_send_response(State, StreamId, Status, Headers, Body, BodyLen) ->
 handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
     case stream_open(State, StreamId) of
         not_open ->
-            _ = (From ! {h2_stream_reset, StreamId}),
+            _ = (From ! not_open_reset(StreamId)),
             State;
         _Stream ->
             State1 = encode_and_send_headers(State, StreamId, Status, Headers, EndStream),
@@ -2737,7 +2739,7 @@ handle_send_headers(State, From, Ref, StreamId, Status, Headers, EndStream) ->
 handle_send_data(State, From, Ref, StreamId, Data, Size, EndStream) ->
     case stream_open(State, StreamId) of
         not_open ->
-            _ = (From ! {h2_stream_reset, StreamId}),
+            _ = (From ! not_open_reset(StreamId)),
             State;
         Stream ->
             try_send_data(State, Stream, StreamId, From, Ref, Data, Size, EndStream)
@@ -2746,7 +2748,7 @@ handle_send_data(State, From, Ref, StreamId, Data, Size, EndStream) ->
 handle_send_trailers(State, From, Ref, StreamId, Trailers) ->
     case stream_open(State, StreamId) of
         not_open ->
-            _ = (From ! {h2_stream_reset, StreamId}),
+            _ = (From ! not_open_reset(StreamId)),
             State;
         _Stream ->
             State1 = encode_and_send_trailers(State, StreamId, Trailers),
@@ -2771,7 +2773,7 @@ handle_worker_down(#loop{workers = Workers} = State, MonRef, Pid, Reason) ->
                 #{StreamId := #stream{worker_ref = MonRef}} ->
                     worker_ended(State, StreamId, Workers1, Reason);
                 #{} ->
-                    %% Its stream was reset while it ran (`drop_reset_stream/2`),
+                    %% Its stream was reset while it ran (`drop_reset_stream/3`),
                     %% gone or left as a placeholder for a header block
                     %% still arriving (`forget_stream/3`): nothing is left
                     %% to answer, and the stream it held toward
@@ -2876,6 +2878,14 @@ stream_open(#loop{streams = Streams}, StreamId) ->
         #{} -> not_open
     end.
 
+%% The answer to a write on a stream no longer open. Its reset, if it was
+%% one, was told to the worker as it happened (`drop_reset_stream/3`), with
+%% why, ahead of this answer: the stream is forgotten now, so this one says
+%% `peer`.
+-spec not_open_reset(stream_id()) -> {h2_stream_reset, stream_id(), peer}.
+not_open_reset(StreamId) ->
+    {h2_stream_reset, StreamId, peer}.
+
 %% The response field section as sent, built by the function the worker
 %% sizes it with against the client's SETTINGS_MAX_HEADER_LIST_SIZE, so the
 %% two agree (`roadrunner_http2_stream_worker:field_section/3`).
@@ -2978,7 +2988,7 @@ encode_and_send_trailers(#loop{hpack_enc = Enc} = State, StreamId, Trailers) ->
     close_stream_send_side(State1, StreamId).
 
 %% Mark the send side closed. Future worker writes on this stream
-%% get `{h2_stream_reset, _}` so they unwind cleanly. Every path that
+%% get `{h2_stream_reset, _, _}` so they unwind cleanly. Every path that
 %% puts the response's final END_STREAM on the wire funnels through
 %% here, so this is also where the stream stops counting toward the
 %% advertised concurrency limit: with the peer's END_STREAM already
@@ -3202,7 +3212,7 @@ arm_stall_timer(#loop{stall_timer = undefined, send_stall_timeout = Timeout} = S
 arm_stall_timer(State) ->
     State.
 
-%% The stall timer fired: reset with CANCEL (`cancel_stream/2`) every
+%% The stall timer fired: reset with CANCEL (`cancel_stream/3`) every
 %% stream that has held DATA back for the whole `send_stall_timeout`, so a
 %% client that grants no window cannot keep responses waiting in the
 %% server: one waiting on its own window with nothing sent on it, one
@@ -3228,7 +3238,9 @@ reset_stalled(
         {[], infinity},
         Streams
     ),
-    State1 = lists:foldl(fun(StreamId, Acc) -> cancel_stream(Acc, StreamId) end, State, Expired),
+    State1 = lists:foldl(
+        fun(StreamId, Acc) -> cancel_stream(Acc, StreamId, send_stall) end, State, Expired
+    ),
     case Next of
         infinity -> State1;
         Left -> State1#loop{stall_timer = erlang:start_timer(Left, self(), {?MODULE, send_stall})}
@@ -3333,47 +3345,50 @@ uncount_stream(#loop{streams = Streams, live_streams = Live} = State, StreamId) 
     end.
 
 %% A stream the server gives up on, at a deadline its worker armed
-%% (`roadrunner_send_writer:cancel_after/2`): reset it, which tells the
-%% worker. The frame depends on how far the exchange got (RFC 9113 §5.1,
-%% §8.1): CANCEL while our response is unfinished; NO_ERROR once it is
-%% complete and only the client's body is left, so the client keeps the
-%% response; nothing once both sides ended, as no frame may go on a closed
-%% stream, so it is not remembered as reset either. Stream ids are never
-%% reused, so a stream already gone makes this a no-op.
--spec cancel_stream(#loop{}, stream_id()) -> #loop{}.
-cancel_stream(#loop{streams = Streams} = State, StreamId) ->
+%% (`roadrunner_send_writer:cancel_after/2`, `Why` `deadline`) or as the
+%% client held its response back too long (`reset_stalled/1`, `send_stall`):
+%% reset it, which tells the worker why. The frame depends on how far the
+%% exchange got (RFC 9113 §5.1, §8.1): CANCEL while our response is
+%% unfinished; NO_ERROR once it is complete and only the client's body is
+%% left, so the client keeps the response; nothing once both sides ended,
+%% as no frame may go on a closed stream, so it is not remembered as reset
+%% either. Stream ids are never reused, so a stream already gone makes this
+%% a no-op.
+-spec cancel_stream(#loop{}, stream_id(), reset_why()) -> #loop{}.
+cancel_stream(#loop{streams = Streams} = State, StreamId, Why) ->
     case Streams of
         #{StreamId := #stream{refused = Refused}} when Refused =/= undefined ->
             %% Already reset by us, its header block still arriving.
             State;
         #{StreamId := #stream{state = closed, end_stream_seen = true}} ->
-            drop_reset_stream(State, StreamId);
+            drop_reset_stream(State, StreamId, Why);
         #{StreamId := #stream{state = closed}} ->
             _ = send_rst_stream(State, StreamId, no_error),
-            reset_stream(State, StreamId);
+            reset_stream(State, StreamId, Why);
         #{StreamId := _} ->
             _ = send_rst_stream(State, StreamId, cancel),
-            reset_stream(State, StreamId);
+            reset_stream(State, StreamId, Why);
         #{} ->
             State
     end.
 
 %% Reset a stream we have alive: the peer sent RST_STREAM, or we sent
 %% one for a stream-level flow-control error. Tell the worker (if any)
-%% to bail, then drop our stream entry. Pending sends get reset
+%% to bail, with why (`reset_why()`), then drop our stream entry. Pending sends get reset
 %% notifications so workers waiting on `h2_send_ack` unwind, as does a
 %% worker waiting on a manual-mode body read. A worker still computing
 %% learns of it at its next write or read; until it exits
 %% (`handle_worker_down/4`) it keeps its in-flight slot and counts as a
 %% stream toward `max_concurrent_streams` (`reset_workers`), so work a
 %% client abandons still counts against both limits while it runs.
-reset_stream(State, StreamId) ->
-    drop_reset_stream(remember_reset(State, StreamId), StreamId).
+-spec reset_stream(#loop{}, stream_id(), reset_why()) -> #loop{}.
+reset_stream(State, StreamId, Why) ->
+    drop_reset_stream(remember_reset(State, StreamId), StreamId, Why).
 
-%% `reset_stream/2` for the peer's own RST_STREAM: nothing it sent before
+%% `reset_stream/3` for the peer's own RST_STREAM: nothing it sent before
 %% is in flight, so the stream is not remembered.
--spec drop_reset_stream(#loop{}, stream_id()) -> #loop{}.
-drop_reset_stream(#loop{streams = Streams0} = State0, StreamId) ->
+-spec drop_reset_stream(#loop{}, stream_id(), reset_why()) -> #loop{}.
+drop_reset_stream(#loop{streams = Streams0} = State0, StreamId, Why) ->
     #{StreamId := #stream{counted = Counted}} = Streams0,
     #loop{streams = Streams} = State = uncount_stream(State0, StreamId),
     #{
@@ -3384,7 +3399,7 @@ drop_reset_stream(#loop{streams = Streams0} = State0, StreamId) ->
             reader = Reader
         }
     } = Streams,
-    notify_pending_reset(StreamId, Pending),
+    notify_pending_reset(StreamId, Why, Pending),
     ok = roadrunner_conn:send_body_error(Reader, StreamId, closed),
     Reset =
         case WorkerRef of
@@ -3392,7 +3407,7 @@ drop_reset_stream(#loop{streams = Streams0} = State0, StreamId) ->
             undefined ->
                 State#loop.reset_workers;
             MonRef ->
-                WorkerPid ! {h2_stream_reset, StreamId},
+                WorkerPid ! {h2_stream_reset, StreamId, Why},
                 hold_reset_slot(State#loop.reset_workers, MonRef, Counted)
         end,
     Streams1 = forget_stream(State, StreamId, Streams),
@@ -3418,7 +3433,8 @@ hold_reset_slot(Reset, _MonRef, false) -> Reset.
 abort_stream(State0, StreamId, ErrorCode) ->
     #loop{streams = Streams} = State = remember_reset(uncount_stream(State0, StreamId), StreamId),
     #{StreamId := #stream{pending_sends = Pending}} = Streams,
-    notify_pending_reset(StreamId, Pending),
+    %% Its pending sends are the dead worker's own.
+    notify_pending_reset(StreamId, peer, Pending),
     _ = send_rst_stream(State, StreamId, ErrorCode),
     Streams1 = forget_stream(State, StreamId, Streams),
     withdraw_parked(
@@ -3572,16 +3588,17 @@ give_back_slot(State) ->
     ),
     State.
 
-notify_pending_reset(StreamId, Pending) ->
+-spec notify_pending_reset(stream_id(), reset_why(), queue:queue(pending_send())) -> ok.
+notify_pending_reset(StreamId, Why, Pending) ->
     case queue:out(Pending) of
         {empty, _} ->
             ok;
         {{value, {data, _Ref, undefined, _Bin, _Es}}, Rest} ->
             %% A buffered response's body: its worker is already gone.
-            notify_pending_reset(StreamId, Rest);
+            notify_pending_reset(StreamId, Why, Rest);
         {{value, {data, _Ref, From, _Bin, _Es}}, Rest} ->
-            _ = (From ! {h2_stream_reset, StreamId}),
-            notify_pending_reset(StreamId, Rest)
+            _ = (From ! {h2_stream_reset, StreamId, Why}),
+            notify_pending_reset(StreamId, Why, Rest)
     end.
 
 %% =============================================================================
@@ -3828,6 +3845,7 @@ exit_clean(
     #loop{socket = Socket, proto_opts = ProtoOpts, conn_span = ConnSpan} = State, Reason, Linger
 ) ->
     ok = hand_off_slots(State),
+    ok = tell_reset(State, Reason, Linger),
     ok = linger(State, Linger),
     ok = roadrunner_event:listener_conn_close(ConnSpan, 0, Reason),
     Close = roadrunner_conn:close_opts(ProtoOpts),
@@ -3836,14 +3854,38 @@ exit_clean(
     ok = roadrunner_transport:close(Socket),
     exit(normal).
 
-%% Linger over the socket (`roadrunner_conn:linger/3`). The conn answers
-%% none of its workers while it lingers, so each worker still running is
-%% told its stream is reset first, as a client reset tells it: one waiting
-%% on the conn ends now rather than when the conn exits. The route slots
-%% its workers took on their own, which only the conn frees on their
-%% `'DOWN'`, go to the routes' keepers first
-%% (`roadrunner_route_keeper:hand_over/1`): a slot is not held through the
-%% linger after its handler ended. The reads are passive: a socket left
+%% Tell each worker still running that its stream is reset, before the
+%% conn goes. The conn answers none of its workers while it lingers, so
+%% one waiting on the conn ends now rather than when the conn exits, as a
+%% client reset ends it. The `connection_age` grace cut tells them with or
+%% without a linger: the conn's exit alone would not say why their streams
+%% went.
+-spec tell_reset(#loop{}, close_reason(), non_neg_integer()) -> ok.
+tell_reset(State, connection_age_grace, _Linger) ->
+    tell_workers(State, connection_age_grace);
+tell_reset(_State, _Reason, 0) ->
+    ok;
+tell_reset(State, _Reason, _Linger) ->
+    tell_workers(State, peer).
+
+-spec tell_workers(#loop{}, reset_why()) -> ok.
+tell_workers(#loop{streams = Streams}, Why) ->
+    maps:foreach(
+        fun
+            (StreamId, #stream{worker_pid = Pid, worker_ref = MonRef}) when is_reference(MonRef) ->
+                _ = (Pid ! {h2_stream_reset, StreamId, Why}),
+                ok;
+            (_StreamId, _Stream) ->
+                ok
+        end,
+        Streams
+    ).
+
+%% Linger over the socket (`roadrunner_conn:linger/3`), its workers told
+%% first (`tell_reset/3`). The route slots its workers took on their own,
+%% which only the conn frees on their `'DOWN'`, go to the routes' keepers
+%% first (`roadrunner_route_keeper:hand_over/1`): a slot is not held through
+%% the linger after its handler ended. The reads are passive: a socket left
 %% armed with `{active, N}` would fail them at once and close with input
 %% unread.
 -spec linger(#loop{}, non_neg_integer()) -> ok.
@@ -3851,22 +3893,10 @@ linger(_State, 0) ->
     ok;
 linger(
     #loop{
-        socket = Socket,
-        streams = Streams,
-        proto_opts = #proto_opts{linger_budget = Budget, dispatch = Dispatch}
+        socket = Socket, proto_opts = #proto_opts{linger_budget = Budget, dispatch = Dispatch}
     },
     Linger
 ) ->
-    ok = maps:foreach(
-        fun
-            (StreamId, #stream{worker_pid = Pid, worker_ref = MonRef}) when is_reference(MonRef) ->
-                _ = (Pid ! {h2_stream_reset, StreamId}),
-                ok;
-            (_StreamId, _Stream) ->
-                ok
-        end,
-        Streams
-    ),
     ok = roadrunner_route_keeper:hand_over(route_ceilings(Dispatch)),
     _ = roadrunner_transport:setopts(Socket, [{active, false}]),
     roadrunner_conn:linger(Socket, Linger, Budget).

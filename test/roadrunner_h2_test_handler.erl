@@ -123,7 +123,7 @@ handle(#{target := ~"/stream/many"} = Req) ->
 handle(#{target := ~"/stream/slow"} = Req) ->
     %% Pauses between emissions so a test can race a peer RST in.
     %% The Send call after the sleep should return via
-    %% `{h2_stream_reset, _}` (worker's `sync/2` exit branch).
+    %% `{h2_stream_reset, _, _}` (worker's `sync/2` exit branch).
     {
         {stream, 200, [], fun(Send) ->
             Send(~"a", nofin),

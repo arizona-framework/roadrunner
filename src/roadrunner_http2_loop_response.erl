@@ -22,7 +22,7 @@
 %% `{roadrunner_disconnect, Reason}` through `handle_info/3` (its chance
 %% to drop subscriptions) and ends without the END_STREAM DATA frame —
 %% the wire is gone. `Reason` is `reset` when the peer cancelled this
-%% stream (`RST_STREAM`, surfaced by the conn as `{h2_stream_reset, _}`)
+%% stream (`RST_STREAM`, surfaced by the conn as `{h2_stream_reset, _, _}`)
 %% or `conn_down` when the owning conn process died (the worker's monitor
 %% `'DOWN'`).
 %%
@@ -60,7 +60,7 @@ info_loop(ConnPid, StreamId, Handler, Push, State) ->
         {'DOWN', _MonRef, process, ConnPid, _Reason} ->
             %% Connection gone — give the handler its disconnect and stop.
             deliver_disconnect(Handler, Push, State, conn_down);
-        {h2_stream_reset, StreamId} ->
+        {h2_stream_reset, StreamId, _Why} ->
             %% The conn reset this stream (peer RST_STREAM, or a protocol
             %% violation on the conn side) and already dropped it. Hand
             %% the handler the disconnect and stop; no END_STREAM frame —

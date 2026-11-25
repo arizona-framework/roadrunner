@@ -541,7 +541,7 @@ reset_stops_the_wait(_Config) ->
     {ok, _} = result(Holder),
     Waiter = worker(C),
     ok = wait_queued(Keeper, C, 1),
-    Waiter ! {reset, Waiter},
+    Waiter ! {reset, Waiter, peer},
     ?assertEqual(reset, result(Waiter)),
     %% Still waiting as far as the keeper knows, until the worker ends.
     ok = end_worker(Waiter),
@@ -562,7 +562,7 @@ reset_after_a_grant_frees_the_slot(_Config) ->
     true = erlang:suspend_process(Waiter),
     ok = release(Holder),
     ok = wait_queued(Keeper, C, 0),
-    Waiter ! {reset, Waiter},
+    Waiter ! {reset, Waiter, peer},
     true = erlang:resume_process(Waiter),
     {ok, _} = result(Waiter),
     ok = end_worker(Waiter),
@@ -1265,7 +1265,7 @@ gone_table_refuses_and_releases(_Config) ->
     ok = stop_keeper(Keeper),
     true = roadrunner_route_keeper:delete_table(table(C)),
     ?assertEqual({refused, 3}, roadrunner_route_keeper:acquire(C)),
-    ?assertEqual({refused, 3}, roadrunner_route_keeper:acquire(C, reset, self(), self())),
+    ?assertEqual({refused, 3}, roadrunner_route_keeper:acquire(C, {reset, self()}, self(), self())),
     ?assertEqual(ok, roadrunner_route_keeper:release(C, K)),
     %% Tables without a keeper refuse too.
     Bare = roadrunner_route_keeper:ceiling(

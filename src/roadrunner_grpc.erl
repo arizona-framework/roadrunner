@@ -161,6 +161,7 @@ to read what the metadata leaves out: the client's certificate, the
 -export([set_send_compression/2, cancelled/2, recv_compressed/1]).
 -export([recv_async/1, info/2]).
 -export([reflection_index/1]).
+-export([reset_why/1]).
 
 -export_type([opts/0, status/0, stream/0, encoding/0, info/0, details/0, reject_opts/0]).
 
@@ -178,7 +179,9 @@ to read what the metadata leaves out: the client's certificate, the
 %% own way. The slack covers that gap.
 -define(DEADLINE_SLACK, 50).
 %% When `cancelled/2` told the method the call is over, which takes the
-%% message that said so from the mailbox (`stream_gone/1`, `gone/0`).
+%% message that said so from the mailbox (`stream_gone/1`, `gone/0`), and
+%% why its connection reset the stream, when the message said
+%% (`roadrunner_stream_worker:reset_why()`).
 -define(GONE_KEY, {?MODULE, gone}).
 %% And the call's event span, the client's `grpc-encoding`, and the request
 %% and response messages so far, counted and summed in bytes, until the call
@@ -959,12 +962,12 @@ status_ending(Status, Message) -> {Status, Message, error}.
 %% would then read: `cancelled/2` said so to the method, or the message
 %% that says so waits in the mailbox.
 -spec stream_gone(stream()) -> boolean().
-stream_gone(#stream{connection = Ref}) ->
+stream_gone(#stream{connection = Ref} = Stream) ->
     get(?GONE_KEY) =/= undefined orelse
         receive
-            {h2_stream_reset, _StreamId} -> true;
-            {roadrunner_stream_reset, _StreamId} -> true;
-            {'DOWN', Ref, process, _Pid, _Reason} -> true
+            {h2_stream_reset, _StreamId, Why} -> gone_now(Stream, Why);
+            {roadrunner_stream_reset, _StreamId, Why} -> gone_now(Stream, Why);
+            {'DOWN', Ref, process, _Pid, _Reason} -> gone_now(Stream, peer)
         after 0 -> false
         end.
 
@@ -1002,23 +1005,68 @@ call_raised(exit, Gone, _Stacktrace) when
 call_raised(Class, Reason, Stacktrace) ->
     call_ended({exception, Class, Reason, Stacktrace}).
 
-%% A call whose stream went away before its status: from `?DEADLINE_SLACK`
-%% ahead of its deadline on, the deadline's (whether roadrunner or the
-%% client reset it then); before, the client cancelled it or its connection
-%% went away. When it went away is when `cancelled/2` told the method, or
-%% else when the call finds out (a write or read that fails, a reset in the
-%% mailbox), which may be later than the reset came in.
+%% A call whose stream went away before its status. One its connection
+%% reset on its own, the client holding its response back too long or the
+%% `connection_age` grace running out, is reported so (`send_stall`,
+%% `connection_age_grace`), its status `CANCELLED` as the client reads its
+%% RST_STREAM(CANCEL). Any other: from `?DEADLINE_SLACK` ahead of its
+%% deadline on, the deadline's (whether roadrunner or the client reset it
+%% then); before, the client cancelled it or its connection went away.
+%% When it went away is when `cancelled/2` told the method, or else when
+%% the call finds out (a write or read that fails, a reset in the mailbox),
+%% which may be later than the reset came in. Why is the most specific of
+%% what the reset that told it said and the resets still in the mailbox (a
+%% write that failed leaves its reset there,
+%% `roadrunner_http2_worker_sync:sync/2`); a connection that crashed or was
+%% killed says nothing, and is the client's.
+%%
+%% A manual-mode read the reset failed (`info/2`) is told before the reset
+%% itself comes (`drop_reset_stream/3` in the HTTP/2 connection), so the
+%% reset may not be in the mailbox yet when this looks. That loses no
+%% reason that matters: a `deadline` reset is told by the time it comes,
+%% not by why; one for `send_stall` resets a call waiting on a write, not
+%% a read; and the `connection_age` grace fails no read before the reset,
+%% which comes ahead of the connection's exit.
 -spec gone() -> ending().
 gone() ->
-    At =
+    {At, Why} =
         case erase(?GONE_KEY) of
-            undefined -> erlang:monotonic_time(millisecond);
-            Told -> Told
+            undefined -> {erlang:monotonic_time(millisecond), reset_why(peer)};
+            {Told, Said} -> {Told, reset_why(Said)}
         end,
+    gone(At, Why).
+
+-spec gone(integer(), roadrunner_stream_worker:reset_why()) -> ending().
+gone(_At, send_stall) ->
+    {cancelled, <<>>, send_stall};
+gone(_At, connection_age_grace) ->
+    {cancelled, <<>>, connection_age_grace};
+gone(At, _Why) ->
     case get(?TIMER_KEY) of
         {_Timer, Reached} when At >= Reached -> {deadline_exceeded, <<>>, deadline};
         _ -> {cancelled, <<>>, cancelled}
     end.
+
+%% Why the call's stream was reset: the most specific of `Said` and the
+%% resets in the mailbox, all taken from it. Any reason beats `peer`, which
+%% the connection also answers a write with once it has forgotten the
+%% stream (behind the reset that said why), and the first such reason is
+%% kept.
+-doc false.
+-spec reset_why(roadrunner_stream_worker:reset_why()) -> roadrunner_stream_worker:reset_why().
+reset_why(Said) ->
+    receive
+        {Reset, _StreamId, Why} when
+            Reset =:= h2_stream_reset; Reset =:= roadrunner_stream_reset
+        ->
+            reset_why(specific(Said, Why))
+    after 0 -> Said
+    end.
+
+-spec specific(roadrunner_stream_worker:reset_why(), roadrunner_stream_worker:reset_why()) ->
+    roadrunner_stream_worker:reset_why().
+specific(peer, Why) -> Why;
+specific(Said, _Why) -> Said.
 
 %% Emit the event that ends the call, once: the first to end it takes its
 %% span, so a crash already reported is not reported again as the call
@@ -1081,10 +1129,12 @@ watch_connection(Req) ->
 
 -doc """
 Whether `Message`, one the method's process received, says the call is
-over: the client cancelled it (its stream reset) or its connection went
-away. A method that waits on messages of its own, such as a server stream
-pushing events, checks each one with it and returns when it is `true`, as
-there is no one left to answer:
+over: its stream was reset (by the client, or by roadrunner at the
+call's deadline, for `send_stall_timeout` or as the `connection_age`
+grace ran out) or its connection went away. A method that waits on
+messages of its own, such as a server stream pushing events, checks each
+one with it and returns when it is `true`, as there is no one left to
+answer:
 
 ```erlang
 events(Stream) ->
@@ -1102,21 +1152,23 @@ events(Stream) ->
 It says nothing of a listener draining, which `info/2` tells as well.
 """.
 -spec cancelled(term(), stream()) -> boolean().
-cancelled({h2_stream_reset, _StreamId}, Stream) ->
-    gone_now(Stream);
-cancelled({roadrunner_stream_reset, _StreamId}, Stream) ->
-    gone_now(Stream);
+cancelled({h2_stream_reset, _StreamId, Why}, Stream) ->
+    gone_now(Stream, Why);
+cancelled({roadrunner_stream_reset, _StreamId, Why}, Stream) ->
+    gone_now(Stream, Why);
 cancelled({'DOWN', Ref, process, _Pid, _Reason}, #stream{connection = Ref} = Stream) ->
-    gone_now(Stream);
+    gone_now(Stream, peer);
 cancelled(_Message, _Stream) ->
     false.
 
-%% The call is over: its events say so whatever the method returns next.
--spec gone_now(stream()) -> true.
-gone_now(#stream{events = false}) ->
+%% The call is over: its events say so whatever the method returns next,
+%% with why its stream was reset (`peer` when the message that said the
+%% call is over did not say, `gone/0`).
+-spec gone_now(stream(), roadrunner_stream_worker:reset_why()) -> true.
+gone_now(#stream{events = false}, _Why) ->
     true;
-gone_now(#stream{events = true}) ->
-    _ = put(?GONE_KEY, erlang:monotonic_time(millisecond)),
+gone_now(#stream{events = true}, Why) ->
+    _ = put(?GONE_KEY, {erlang:monotonic_time(millisecond), Why}),
     true.
 
 -spec finish(status(), binary(), stream()) -> {ending(), roadrunner_req:request()}.
@@ -1433,7 +1485,7 @@ info(Message, #stream{pending = {demand, Timer}, req = Req} = Stream) ->
         ignore ->
             other(Message, Stream);
         {error, closed} ->
-            true = gone_now(Stream),
+            true = gone_now(Stream, peer),
             cancelled;
         Result ->
             ok = cancel_read_timer(Timer),

@@ -780,7 +780,8 @@ protocols => [{http2, #{connection_age => #{max => 1_800_000, grace => 60_000}}}
 ```
 
 Only the calls the grace cuts short fail, reset with `CANCEL`; new calls
-go to the new connection.
+go to the new connection. Their `grpc_call_stop` says so with the reason
+`connection_age_grace` (see [Telemetry](#telemetry)).
 
 ## Telemetry
 
@@ -805,7 +806,15 @@ How a call ended is one of:
 - `error`: it ended with another status, yours or one roadrunner
   answered for you (a call you end `UNAVAILABLE` on a drain among them)
 - `cancelled`: the client cancelled it or went away before it could
-  read the status; the status is `cancelled`
+  read the status; the status is `cancelled`. A connection process that
+  crashed or was killed is reported so too, as it leaves no word of why
+  the call went
+- `send_stall`: roadrunner reset it, the client having held its response
+  back for the listener's `send_stall_timeout` (see
+  [Resource limits](resource_limits.md)); the status is `cancelled`, what
+  the client reads from the reset
+- `connection_age_grace`: roadrunner reset it, still running as the
+  `connection_age` grace ran out; the status is `cancelled`
 - `deadline`: the same, from 50 ms before its deadline on; the status is
   `deadline_exceeded`. The time that counts is when the call learned the
   client was gone: when `roadrunner_grpc:info/2` or

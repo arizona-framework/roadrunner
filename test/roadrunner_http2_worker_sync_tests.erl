@@ -37,7 +37,7 @@ stream_reset_exits_worker_test() ->
         {sent, Worker} -> ok
     after 1000 -> error(send_fun_not_called)
     end,
-    Worker ! {h2_stream_reset, 1},
+    Worker ! {h2_stream_reset, 1, peer},
     receive
         {'DOWN', WorkerRef, process, Worker, Reason} ->
             ?assertEqual(stream_reset, Reason)

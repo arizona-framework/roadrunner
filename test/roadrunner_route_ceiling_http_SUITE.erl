@@ -671,7 +671,7 @@ h2_owned_slot_frees_through_the_linger(Config) ->
     ?assert(is_process_alive(Conn)),
     %% A worker of the lingering connection asking now is granted by the
     %% keeper, which does not register the connection again.
-    {ok, K} = roadrunner_route_keeper:acquire(slow_ceiling(Name), reset, Conn, Conn),
+    {ok, K} = roadrunner_route_keeper:acquire(slow_ceiling(Name), {reset, 1}, Conn, Conn),
     ?assertEqual([{K, self(), self()}], ets:tab2list(slots(Name))),
     ?assertNot(ets:member(regs(Name), Conn)).
 

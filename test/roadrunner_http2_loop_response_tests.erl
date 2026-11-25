@@ -48,7 +48,7 @@ empty_push_skips_data_frame_test() ->
 %% --- sync exits on h2_stream_reset ---
 
 sync_exits_on_stream_reset_test() ->
-    %% When the conn replies `{h2_stream_reset, StreamId}` instead of
+    %% When the conn replies `{h2_stream_reset, StreamId, Why}` instead of
     %% `{h2_send_ack, Ref}`, `sync/1` raises `exit(stream_reset)`. The
     %% conn drives this when the peer has cancelled the stream.
     {FakeConn, Worker} = spawn_loop([{push, ~"hi"}, stop]),
@@ -68,7 +68,7 @@ sync_exits_on_stream_reset_test() ->
 %% --- client disconnect delivers {roadrunner_disconnect, _} ---
 
 %% A peer RST_STREAM arriving while the loop is idle (surfaced by the
-%% conn as `{h2_stream_reset, StreamId}`) delivers
+%% conn as `{h2_stream_reset, StreamId, Why}`) delivers
 %% `{roadrunner_disconnect, reset}` and ends the loop with no END_STREAM
 %% DATA frame. Spawned so the fake conn's `{sends, _}` reply can't bleed
 %% into a sibling test's mailbox.
@@ -76,7 +76,7 @@ loop_delivers_disconnect_on_stream_reset_test_() ->
     {spawn, fun() ->
         {FakeConn, Worker} = spawn_loop_with_state(self()),
         ok = wait_until_looping(Worker),
-        Worker ! {h2_stream_reset, 1},
+        Worker ! {h2_stream_reset, 1, peer},
         ok = wait_for_exit(Worker, 1000),
         ?assertEqual(reset, recv_disconnect()),
         ?assertEqual([{send_headers, 1, 200, [], false}], collect_sends(FakeConn)),
@@ -161,7 +161,7 @@ fake_conn_loop(Reporter, Sends) ->
 
 %% ResetStreamId = undefined means ack every h2_send_data normally;
 %% set to a stream id by `{reset_next, _}` to make the next matching
-%% h2_send_data reply with `{h2_stream_reset, StreamId}` instead.
+%% h2_send_data reply with `{h2_stream_reset, StreamId, peer}` instead.
 fake_conn_loop(Reporter, Sends, ResetStreamId) ->
     receive
         stop ->
@@ -181,7 +181,7 @@ fake_conn_loop(Reporter, Sends, ResetStreamId) ->
         {h2_send_data, From, _Ref, StreamId, _Bin, _Size, _EndStream} when
             StreamId =:= ResetStreamId
         ->
-            From ! {h2_stream_reset, StreamId},
+            From ! {h2_stream_reset, StreamId, peer},
             %% Worker exits via sync/1; revert to normal mode in case
             %% more messages arrive (they should not).
             fake_conn_loop(Reporter, Sends, undefined);

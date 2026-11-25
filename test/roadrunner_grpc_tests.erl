@@ -355,3 +355,22 @@ reject_with_details_and_trailers_test() ->
 handle_other_method_test() ->
     Req = #{version => {2, 0}, method => ~"GET"},
     ?assertEqual({{405, [{~"allow", ~"POST"}], <<>>}, Req}, ?M:handle(Req)).
+
+%% A reset that says why beats a `peer` one queued ahead of it, and every
+%% queued reset is taken from the mailbox.
+reset_why_prefers_a_specific_reason_test_() ->
+    {spawn, fun() ->
+        self() ! {h2_stream_reset, 1, peer},
+        self() ! {h2_stream_reset, 1, send_stall},
+        self() ! {roadrunner_stream_reset, 1, peer},
+        ?assertEqual(send_stall, ?M:reset_why(peer)),
+        ?assertEqual({messages, []}, process_info(self(), messages))
+    end}.
+
+%% A reason already said is kept over the queued ones.
+reset_why_keeps_what_was_said_test_() ->
+    {spawn, fun() ->
+        self() ! {h2_stream_reset, 1, send_stall},
+        ?assertEqual(connection_age_grace, ?M:reset_why(connection_age_grace)),
+        ?assertEqual(peer, ?M:reset_why(peer))
+    end}.

@@ -43,7 +43,7 @@
 %% control still holds part of a buffered body, once that body drains.
 %%
 %% If the peer cancels the stream (`RST_STREAM` or worker-level error
-%% on the conn side), the conn sends `{h2_stream_reset, StreamId}` —
+%% on the conn side), the conn sends `{h2_stream_reset, StreamId, Why}` —
 %% the worker observes this on its next sync round and exits without
 %% emitting further frames.
 %%
