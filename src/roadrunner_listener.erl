@@ -1240,7 +1240,7 @@ WebSocket session tunables (under `ws` in the listener opts).
   (presence, notifications, low-traffic subscriptions) where the
   per-connection heap held across long silences dominates. A busy
   session never pays — the next frame arrives before the timer.
-  Unset (the default) never hibernates on idle; handlers can still
+  `infinity` (the default) never hibernates on idle; handlers can still
   opt in per event via the `hibernate` return option.
 - `compress` — whether to accept a client's permessage-deflate offer
   (RFC 7692), and with which zlib settings (`t:roadrunner_ws:compress/0`):
@@ -1255,7 +1255,7 @@ WebSocket session tunables (under `ws` in the listener opts).
   many milliseconds, with close code 1001; the handler's `terminate/2`
   gets `timeout`. The session checks once per interval, so a silent
   client is closed between one and two intervals after its last bytes.
-  Unset (the default) never closes on idle.
+  `infinity` (the default) never closes on idle.
 - `active` — how a session reads its socket: `once` or an integer in
   `1..32767`. With `N`, the socket delivers up to `N` reads before the
   session asks for more, which saves a socket call per message (on TLS
@@ -1286,9 +1286,9 @@ An upgrade can set each of these for its own session
     max_frame_size => limit(),
     max_message_size => limit(),
     recv_buffer => positive_limit(),
-    hibernate_after => positive_limit(),
+    hibernate_after => idle_ms(),
     compress => roadrunner_ws:compress(),
-    idle_timeout => positive_limit(),
+    idle_timeout => idle_ms(),
     active => active(),
     heap_floor => heap_floor()
 }.
@@ -3440,9 +3440,9 @@ validate_ws_opts(Other) ->
     error({invalid_listener_opt, ws, Other}).
 
 %% Per-key range check for the `ws` sub-opts. The size caps allow 0
-%% (reject every frame / message); `recv_buffer` and `hibernate_after`
-%% are a buffer size and an idle interval, so zero is meaningless and
-%% rejected for both. `active` takes what HTTP/2's does: `true` is
+%% (reject every frame / message); `recv_buffer` is a buffer size, and
+%% `hibernate_after` and `idle_timeout` idle intervals (`infinity` for
+%% never), so zero is meaningless and rejected for each. `active` takes what HTTP/2's does: `true` is
 %% rejected (an always-active socket has no bound on unread data), and
 %% `32767` is the largest count `inet:setopts/2` and `ssl:setopts/2`
 %% accept. `heap_floor` is `false` or a map of a positive `max` and a
@@ -3466,7 +3466,7 @@ valid_ws_opt(compress, V) when is_map(V) ->
 valid_ws_opt(compress, V) ->
     is_boolean(V);
 valid_ws_opt(idle_timeout, V) ->
-    is_integer(V) andalso V >= 1 andalso V =< ?MAX_LIMIT;
+    valid_idle_ms(V);
 valid_ws_opt(recv_buffer, V) ->
     is_integer(V) andalso V >= 1 andalso V =< ?MAX_LIMIT;
 valid_ws_opt(heap_floor, false) ->
@@ -3476,9 +3476,14 @@ valid_ws_opt(heap_floor, V) when is_map(V) ->
 valid_ws_opt(heap_floor, _V) ->
     false;
 valid_ws_opt(hibernate_after, V) ->
-    is_integer(V) andalso V >= 1 andalso V =< ?MAX_LIMIT;
+    valid_idle_ms(V);
 valid_ws_opt(_SizeCap, V) ->
     is_integer(V) andalso V >= 0 andalso V =< ?MAX_LIMIT.
+
+%% A `t:idle_ms/0`: `infinity`, the default, is never.
+-spec valid_idle_ms(term()) -> boolean().
+valid_idle_ms(infinity) -> true;
+valid_idle_ms(V) -> is_integer(V) andalso V >= 1 andalso V =< ?MAX_LIMIT.
 
 -spec valid_heap_floor_opt(term(), term()) -> boolean().
 valid_heap_floor_opt(max, V) -> is_integer(V) andalso V > 0;

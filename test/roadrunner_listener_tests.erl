@@ -1189,6 +1189,18 @@ listener_rejects_ws_message_cap_below_frame_cap_test() ->
         R
     ).
 
+listener_accepts_infinity_ws_idle_opts_test() ->
+    %% `infinity`, the default of both, may be set too, as an upgrade can.
+    Name = listener_test_ws_idle_infinity,
+    {ok, ListenerPid} = roadrunner_listener:start_link(Name, #{
+        port => 0,
+        ws => #{idle_timeout => infinity, hibernate_after => infinity},
+        routes => roadrunner_hello_handler
+    }),
+    ProtoOpts = roadrunner_test_proto_opts:to_map(element(4, sys:get_state(ListenerPid))),
+    ?assertMatch(#{ws_idle_timeout := infinity, ws_hibernate_after := infinity}, ProtoOpts),
+    ok = roadrunner_listener:stop(Name).
+
 listener_rejects_invalid_ws_opt_test() ->
     %% Unknown keys, out-of-range / non-integer values, and non-map
     %% shapes in `ws` all reject (mirrors the strict `{http2, #{...}}`
