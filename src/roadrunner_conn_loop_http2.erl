@@ -1246,6 +1246,22 @@ final_goaway(State, Reason) ->
     _ = send_goaway(State, no_error),
     maybe_exit_when_drained(State#loop{goaway = {final, Reason}}).
 
+%% The client sent GOAWAY(NO_ERROR). Every stream it opened before it
+%% reached us, as frames on the connection come in order: close as a
+%% graceful close ends, with the GOAWAY naming the last of them, so the
+%% client knows a stream it opens after its own GOAWAY is not served, and
+%% exit once they are done. A graceful close already under way takes this
+%% step now rather than wait for its PING's ACK, the GOAWAY having told the
+%% same; one already past it is left as it is.
+-spec peer_goaway(#loop{}) -> #loop{}.
+peer_goaway(#loop{goaway = open} = State) ->
+    final_goaway(State, peer_closed);
+peer_goaway(#loop{goaway = {announced, TRef, Reason}} = State) ->
+    _ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+    final_goaway(State, Reason);
+peer_goaway(State) ->
+    State.
+
 %% A timer this conn started went off. One no longer wanted (its step
 %% already happened another way) is ignored. The conn reaching its
 %% `connection_age` starts the graceful close (which a drain may have
@@ -1491,8 +1507,15 @@ handle_frame({rst_stream, StreamId, _}, #loop{streams = Streams} = State) ->
                     frame_loop(control_frame(State))
             end
     end;
+handle_frame({goaway, _, no_error, _}, State) ->
+    %% The client is shutting down gracefully (RFC 9113 §6.8). Its GOAWAY
+    %% only bars streams the server would open, and the requests it already
+    %% sent still wait for their answers: serve them to their end, then
+    %% close (`peer_goaway/1`).
+    frame_loop(peer_goaway(control_frame(State)));
 handle_frame({goaway, _, _, _}, State) ->
-    %% Client is shutting down.
+    %% The client closes the connection for an error (RFC 9113 §5.4.1):
+    %% nothing more on it is wanted.
     exit_clean(State, peer_closed);
 handle_frame({headers, StreamId, Flags, Priority, Fragment}, State) ->
     on_headers(StreamId, Flags, Priority, Fragment, State);

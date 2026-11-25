@@ -185,7 +185,9 @@ rejected on its 9-byte header, before the body is buffered, with
 `GOAWAY(FRAME_SIZE_ERROR)`. A connection closed with a GOAWAY then reads
 and drops what the client still sends for up to `linger_timeout` or until
 it closes, so the client reads the GOAWAY rather than losing it to a
-reset. Streams over
+reset. A client that sends its own `GOAWAY(NO_ERROR)` still gets the
+answers to the requests it already sent: the server replies with a
+GOAWAY naming the last of them and closes once they are done. Streams over
 the concurrency limit are refused with `REFUSED_STREAM`, which a client
 may retry (RFC 9113 §8.7).
 

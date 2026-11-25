@@ -28,6 +28,9 @@ how a connection ends at its `connection_age`.
     a_crash_of_the_last_handler_leaves_the_conn_idle/1,
     a_conn_left_idle_by_a_reset_hibernates/1,
     a_request_waiting_for_a_slot_keeps_the_conn_open/1,
+    a_client_goaway_lets_open_requests_finish/1,
+    a_client_goaway_with_an_error_closes_at_once/1,
+    a_client_goaway_ends_a_graceful_close/1,
     age_closes_an_idle_conn/1,
     age_lets_open_requests_finish/1,
     age_grace_resets_open_requests/1,
@@ -68,6 +71,9 @@ all() ->
         a_crash_of_the_last_handler_leaves_the_conn_idle,
         a_conn_left_idle_by_a_reset_hibernates,
         a_request_waiting_for_a_slot_keeps_the_conn_open,
+        a_client_goaway_lets_open_requests_finish,
+        a_client_goaway_with_an_error_closes_at_once,
+        a_client_goaway_ends_a_graceful_close,
         age_closes_an_idle_conn,
         age_lets_open_requests_finish,
         age_grace_resets_open_requests,
@@ -140,6 +146,8 @@ http2_opts(data_sent_frees_the_next_ping) ->
     #{ping_policy => #{min_time => 60_000, max_strikes => 0}};
 http2_opts(interim_response_frees_the_next_ping) ->
     #{ping_policy => #{min_time => 60_000, max_strikes => 0}};
+http2_opts(a_client_goaway_ends_a_graceful_close) ->
+    #{connection_age => #{max => ?AGE, grace => 10_000}};
 http2_opts(age_closes_an_idle_conn) ->
     #{connection_age => #{max => ?AGE}};
 http2_opts(age_lets_open_requests_finish) ->
@@ -323,6 +331,61 @@ a_request_waiting_for_a_slot_keeps_the_conn_open(Config) ->
     Parked = handler_started(),
     Parked ! release,
     {200, ~"ok", _} = response(C1, 1).
+
+a_client_goaway_lets_open_requests_finish(Config) ->
+    %% A client's GOAWAY(NO_ERROR) bars only the streams the server would
+    %% open (RFC 9113 §6.8): the request it sent before is still answered.
+    %% The server replies with a GOAWAY naming that request, refuses a
+    %% stream opened after it (retry-safe), ignores a second GOAWAY, and
+    %% closes once the request is done.
+    Ref = attach_conn_close(),
+    #{sock := Sock} = C0 = send_headers(open(Config), 1, ~"/hold"),
+    Handler = handler_started(),
+    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({goaway, 0, no_error, <<>>})),
+    {Frames, C1} = until(C0, fun is_goaway/1),
+    ?assertEqual([{goaway, 1, no_error, <<>>}], [
+        F
+     || F <- Frames, element(1, F) =/= window_update
+    ]),
+    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({goaway, 0, no_error, <<>>})),
+    {Refused, C2} = until(send_headers(C1, 3), fun is_rst_stream/1),
+    ?assertEqual({rst_stream, 3, refused_stream}, lists:last(Refused)),
+    Handler ! release,
+    {200, ~"ok", C3} = response(C2, 1),
+    ?assertEqual(peer_closed, conn_closed(Ref)),
+    closed(C3).
+
+a_client_goaway_with_an_error_closes_at_once(Config) ->
+    %% A GOAWAY with an error code closes the connection at once (RFC 9113
+    %% §5.4.1), the request still open with it.
+    Ref = attach_conn_close(),
+    #{sock := Sock} = C = send_headers(open(Config), 1, ~"/hold"),
+    Handler = handler_started(),
+    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({goaway, 0, protocol_error, <<>>})),
+    ?assertEqual([], frames_until_closed(C)),
+    ?assertEqual(peer_closed, conn_closed(Ref)),
+    Handler ! release.
+
+a_client_goaway_ends_a_graceful_close(Config) ->
+    %% A client that answers the server's first GOAWAY with one of its own
+    %% rather than the PING's ACK has sent every stream it will: the final
+    %% GOAWAY, naming the last of them, follows at once, and the request
+    %% open is still served to its end.
+    Ref = attach_conn_close(),
+    C0 = send_headers(open(Config), 1, ~"/hold"),
+    Handler = handler_started(),
+    {Frames, #{sock := Sock} = C1} = until(C0, fun is_ping/1),
+    ?assertEqual([{goaway, 16#7FFFFFFF, no_error, <<>>}, {ping, 0, ~"rr-drain"}], [
+        F
+     || F <- Frames, element(1, F) =/= window_update
+    ]),
+    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({goaway, 0, no_error, <<>>})),
+    {Final, C2} = until(C1, fun is_goaway/1),
+    ?assertEqual([{goaway, 1, no_error, <<>>}], Final),
+    Handler ! release,
+    {200, ~"ok", C3} = response(C2, 1),
+    ?assertEqual(connection_age, conn_closed(Ref)),
+    closed(C3).
 
 age_closes_an_idle_conn(Config) ->
     %% At its age a conn closes as a drained one does (RFC 9113 §6.8): a
