@@ -692,10 +692,6 @@ Optional middleware and timing knobs (durations in milliseconds):
 The inline source comments next to each field carry the deeper
 ops-tuning rationale.
 """.
-%% The listener options as the caller passed them, before the start
-%% checks each one against `t:opts/0`.
--type unchecked_opts() :: #{atom() => term()}.
-
 -type opts() :: #{
     port := inet:port_number(),
     routes =>
@@ -888,6 +884,10 @@ ops-tuning rationale.
     protocols => [protocol_entry(), ...],
     tls => [ssl:tls_server_option()]
 }.
+
+%% The listener options as the caller passed them, before the start
+%% checks each one against `t:opts/0`.
+-type unchecked_opts() :: #{atom() => term()}.
 
 -doc """
 One protocol entry in the listener's `protocols` list. Either a
