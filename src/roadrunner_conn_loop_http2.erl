@@ -319,7 +319,11 @@
     headers_at :: undefined | integer()
 }).
 
--record(loop, {
+%% What the connection decides once, as it starts, and never changes:
+%% the socket and its messages, the listener options it reads, and what
+%% it resolved for its peer. Kept apart from the loop record so the many
+%% updates of that record copy one field for all of them.
+-record(h2_cfg, {
     socket :: roadrunner_transport:socket(),
     proto_opts :: roadrunner_conn:proto_opts(),
     listener_name :: atom(),
@@ -338,6 +342,90 @@
     %% Socket read mode: `once` re-arms after every read; `N` arms
     %% `{active, N}` and re-arms on the transport's passive message.
     active :: roadrunner_listener:active(),
+    %% Configured peaks + refill thresholds. Read from proto_opts at
+    %% `enter/6`. See the `?DEFAULT_*` macros above for the policy
+    %% baseline + the listener moduledoc for the override knobs.
+    recv_window_peak = ?DEFAULT_CONN_RECV_WINDOW :: pos_integer(),
+    stream_recv_window_peak = ?DEFAULT_STREAM_RECV_WINDOW :: pos_integer(),
+    recv_window_threshold = ?DEFAULT_CONN_RECV_WINDOW div 2 :: pos_integer(),
+    stream_recv_window_threshold = ?DEFAULT_STREAM_RECV_WINDOW div 2 :: pos_integer(),
+    %% Max concurrent client-initiated streams: advertised in our SETTINGS
+    %% and enforced in `on_headers/5` (as `stream_limit`) once the client
+    %% acknowledges them. Read from proto_opts at `enter/6`.
+    max_concurrent_streams = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
+    %% A request's HEADERS+CONTINUATION block cap: a larger block is
+    %% decoded, then answered 431 in `finalize_headers/2`. Read from
+    %% proto_opts at `enter/6`.
+    max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
+    %% The most bytes of one block the conn assembles (CONTINUATION-flood
+    %% guard), the larger of `max_header_block` and `max_header_list_size`;
+    %% past it, GOAWAY(ENHANCE_YOUR_CALM) in `on_continuation/4`.
+    header_block_ceiling = ?DEFAULT_MAX_HEADER_LIST_SIZE :: pos_integer(),
+    %% Request-body cap (`max_content_length` listener opt); an over-cap
+    %% body answers 413 + RST_STREAM(NO_ERROR). Read from proto_opts at
+    %% `enter/6`.
+    max_content_length :: non_neg_integer(),
+    %% `auto` buffers a request's body and starts its worker at END_STREAM;
+    %% `manual` starts the worker at the end of the headers and hands it the
+    %% body as it reads (`dispatch_reading/3`), within `request_timeout`
+    %% from then. Read from proto_opts at `enter/6`.
+    body_buffering = auto :: roadrunner_listener:body_buffering(),
+    request_timeout :: non_neg_integer(),
+    %% Decoded header-list cap (RFC 9113 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE):
+    %% advertised in our SETTINGS and enforced after HPACK decode in
+    %% `finalize_headers/2`. Read from proto_opts at `enter/6`.
+    max_header_list_size = ?DEFAULT_MAX_HEADER_LIST_SIZE :: pos_integer(),
+    %% `proto_opts.hibernate_after`, or 0 when unset (the common case).
+    %% When > 0 and no streams are in flight, the idle-wait path parks
+    %% for this window and hibernates. Read from proto_opts at `enter/6`.
+    hibernate_after = 0 :: non_neg_integer(),
+    %% Read-deadline caps, cached once at `enter/6` so the per-iteration
+    %% handshake/idle waits read a record field instead of re-reading
+    %% persistent_term every loop. The persistent_term override (a test
+    %% hook) is captured at `enter/6`, so it must be set before connect.
+    handshake_timeout = ?HANDSHAKE_TIMEOUT_DEFAULT :: non_neg_integer(),
+    idle_timeout :: non_neg_integer(),
+    %% The client PING policy (`http2_ping_*` proto_opts, `ping_policy/1`):
+    %% `off`, or the least time between two PINGs with a stream open and
+    %% with none, and the PINGs closer than that a client may send before
+    %% the next one closes the conn.
+    ping_policy = off :: ping_policy(),
+    %% How long a stream may hold DATA back for its flow-control window
+    %% with nothing sent before it is reset (the `send_stall_timeout`).
+    %% Read from proto_opts at `enter/6`.
+    send_stall_timeout = infinity :: roadrunner_listener:wait_ms(),
+    %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
+    %% Prepended to every response by `roadrunner_http:auto_headers/2`.
+    %% Read from proto_opts at `enter/6`.
+    alt_svc = undefined :: binary() | undefined,
+    %% In-flight-request slot accounting (cross-listener cap). `infinity`
+    %% (default) disables it; `inflight_counter` is the shared gauge.
+    %% Read from proto_opts at `enter/6` so the per-stream acquire/release
+    %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
+    max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
+    inflight_counter :: roadrunner_conn:inflight_counter(),
+    %% The conn's own count of the slots it holds
+    %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
+    slot_cell = undefined :: roadrunner_conn:slot_cell(),
+    %% What happens to a stream that arrives over the ceiling: refuse it
+    %% (the default) or park it until a slot frees. Read from proto_opts
+    %% at `enter/6` so the per-stream path never re-reads the map.
+    overload = refuse :: roadrunner_conn:overload(),
+    %% Per-peer rate-limit guard resolved from proto_opts + peer at `enter/6`
+    %% (`undefined` when off). Checked in `dispatch_stream/2`.
+    rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
+    %% The `real_ip` trust config when the peer is a trusted proxy, decided
+    %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
+    %% otherwise, the common case, so the request path resolves nothing.
+    real_ip = undefined :: roadrunner_real_ip:trust(),
+    %% The heap floor this connection starts its workers at
+    %% (`roadrunner_stream_worker:conn_heap_floor/1`).
+    heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor()
+}).
+
+-record(loop, {
+    %% The connection's settings, fixed at `enter/6`.
+    cfg :: #h2_cfg{},
     %% True while an `{active, N}` arm still has reads left, so the
     %% frame loop skips the setopts call. Always false under `once`.
     armed = false :: boolean(),
@@ -373,17 +461,6 @@
     %% its peak below `stream_recv_window_threshold`.
     conn_send_window = 65535 :: integer(),
     conn_recv_window = 65535 :: non_neg_integer(),
-    %% Configured peaks + refill thresholds. Read from proto_opts at
-    %% `enter/6`. See the `?DEFAULT_*` macros above for the policy
-    %% baseline + the listener moduledoc for the override knobs.
-    recv_window_peak = ?DEFAULT_CONN_RECV_WINDOW :: pos_integer(),
-    stream_recv_window_peak = ?DEFAULT_STREAM_RECV_WINDOW :: pos_integer(),
-    recv_window_threshold = ?DEFAULT_CONN_RECV_WINDOW div 2 :: pos_integer(),
-    stream_recv_window_threshold = ?DEFAULT_STREAM_RECV_WINDOW div 2 :: pos_integer(),
-    %% Max concurrent client-initiated streams: advertised in our SETTINGS
-    %% and enforced in `on_headers/5` (as `stream_limit`) once the client
-    %% acknowledges them. Read from proto_opts at `enter/6`.
-    max_concurrent_streams = ?MAX_CONCURRENT_STREAMS :: pos_integer(),
     %% The stream limit in force: `max_concurrent_streams` once the client
     %% has acknowledged our SETTINGS, and until then at least
     %% `?PRE_SETTINGS_STREAMS` (RFC 9113 §6.5.2: the limit is initially
@@ -412,38 +489,6 @@
     %% client is resetting far beyond the limit and gets
     %% GOAWAY(ENHANCE_YOUR_CALM) (`refuse_over_limit/5`).
     reset_refusals = 0 :: non_neg_integer(),
-    %% A request's HEADERS+CONTINUATION block cap: a larger block is
-    %% decoded, then answered 431 in `finalize_headers/2`. Read from
-    %% proto_opts at `enter/6`.
-    max_header_block = ?MAX_HEADER_BLOCK :: pos_integer(),
-    %% The most bytes of one block the conn assembles (CONTINUATION-flood
-    %% guard), the larger of `max_header_block` and `max_header_list_size`;
-    %% past it, GOAWAY(ENHANCE_YOUR_CALM) in `on_continuation/4`.
-    header_block_ceiling = ?DEFAULT_MAX_HEADER_LIST_SIZE :: pos_integer(),
-    %% Request-body cap (`max_content_length` listener opt); an over-cap
-    %% body answers 413 + RST_STREAM(NO_ERROR). Read from proto_opts at
-    %% `enter/6`.
-    max_content_length :: non_neg_integer(),
-    %% `auto` buffers a request's body and starts its worker at END_STREAM;
-    %% `manual` starts the worker at the end of the headers and hands it the
-    %% body as it reads (`dispatch_reading/3`), within `request_timeout`
-    %% from then. Read from proto_opts at `enter/6`.
-    body_buffering = auto :: roadrunner_listener:body_buffering(),
-    request_timeout :: non_neg_integer(),
-    %% Decoded header-list cap (RFC 9113 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE):
-    %% advertised in our SETTINGS and enforced after HPACK decode in
-    %% `finalize_headers/2`. Read from proto_opts at `enter/6`.
-    max_header_list_size = ?DEFAULT_MAX_HEADER_LIST_SIZE :: pos_integer(),
-    %% `proto_opts.hibernate_after`, or 0 when unset (the common case).
-    %% When > 0 and no streams are in flight, the idle-wait path parks
-    %% for this window and hibernates. Read from proto_opts at `enter/6`.
-    hibernate_after = 0 :: non_neg_integer(),
-    %% Read-deadline caps, cached once at `enter/6` so the per-iteration
-    %% handshake/idle waits read a record field instead of re-reading
-    %% persistent_term every loop. The persistent_term override (a test
-    %% hook) is captured at `enter/6`, so it must be set before connect.
-    handshake_timeout = ?HANDSHAKE_TIMEOUT_DEFAULT :: non_neg_integer(),
-    idle_timeout :: non_neg_integer(),
     %% When (`erlang:monotonic_time(millisecond)`) the conn closes for
     %% being idle: set once it has no stream and no worker left (from the
     %% start, and as its last stream goes, `idle_deadline/3`), cleared by
@@ -451,11 +496,6 @@
     %% client sends without a request (PING, SETTINGS, WINDOW_UPDATE...)
     %% keeps an unused conn open. `undefined` while it serves.
     idle_deadline = undefined :: integer() | undefined,
-    %% The client PING policy (`http2_ping_*` proto_opts, `ping_policy/1`):
-    %% `off`, or the least time between two PINGs with a stream open and
-    %% with none, and the PINGs closer than that a client may send before
-    %% the next one closes the conn.
-    ping_policy = off :: off | {pos_integer(), pos_integer(), non_neg_integer()},
     %% When the client last pinged, in milliseconds, and its strikes
     %% since; `undefined` while its next PING is free: none came yet, or
     %% HEADERS or DATA went out since (`ping_strike/1`).
@@ -466,34 +506,14 @@
     %% count since `Mark`, when (in milliseconds) the conn last read the
     %% clock for them.
     control_frames = 0 :: control_frames(),
-    %% How long a stream may hold DATA back for its flow-control window
-    %% with nothing sent before it is reset (the `send_stall_timeout`), and
-    %% the one timer that checks it, armed while a stream holds DATA back
-    %% (`arm_stall_timer/1`). Read from proto_opts at `enter/6`.
-    send_stall_timeout = infinity :: roadrunner_listener:wait_ms(),
+    %% The one timer that checks `send_stall_timeout`, armed while a
+    %% stream holds DATA back (`arm_stall_timer/1`).
     stall_timer = undefined :: reference() | undefined,
     %% Since when a stream has held DATA back for the connection window
     %% with no DATA sent on the connection at all, or `undefined` once
     %% some goes out: a client that reads one stream keeps the others
     %% waiting for the connection window from being reset.
     conn_stalled_at = undefined :: integer() | undefined,
-    %% Precomputed `Alt-Svc` value (h3 co-serving), or `undefined`.
-    %% Prepended to every response by `roadrunner_http:auto_headers/2`.
-    %% Read from proto_opts at `enter/6`.
-    alt_svc = undefined :: binary() | undefined,
-    %% In-flight-request slot accounting (cross-listener cap). `infinity`
-    %% (default) disables it; `inflight_counter` is the shared gauge.
-    %% Read from proto_opts at `enter/6` so the per-stream acquire/release
-    %% passes them to `roadrunner_conn` directly. See `dispatch_stream/2`.
-    max_concurrent_requests = infinity :: roadrunner_listener:request_cap(),
-    inflight_counter :: roadrunner_conn:inflight_counter(),
-    %% The conn's own count of the slots it holds
-    %% (`roadrunner_conn:with_slot_cell/1`), `undefined` with no ceiling.
-    slot_cell = undefined :: roadrunner_conn:slot_cell(),
-    %% What happens to a stream that arrives over the ceiling: refuse it
-    %% (the default) or park it until a slot frees. Read from proto_opts
-    %% at `enter/6` so the per-stream path never re-reads the map.
-    overload = refuse :: roadrunner_conn:overload(),
     %% Streams parked waiting for an in-flight slot, holding the request
     %% already assembled for them. The loop must NOT block waiting: it
     %% releases slots by processing its own workers' `DOWN` messages, so
@@ -509,13 +529,6 @@
     %% the slot keeper, which withdraws what it parked before emptying its
     %% cell, so a grant on its way is released rather than lost.
     parked = false :: boolean(),
-    %% Per-peer rate-limit guard resolved from proto_opts + peer at `enter/6`
-    %% (`undefined` when off). Checked in `dispatch_stream/2`.
-    rate_limit = undefined :: roadrunner_conn:rate_limit_state(),
-    %% The `real_ip` trust config when the peer is a trusted proxy, decided
-    %% once per connection (`roadrunner_real_ip:peer_trust/2`); `undefined`
-    %% otherwise, the common case, so the request path resolves nothing.
-    real_ip = undefined :: roadrunner_real_ip:trust(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => #stream{}},
     %% Worker pid → stream id, for DOWN correlation: the workers that hold
@@ -546,9 +559,6 @@
     %% request headers. Handed to each worker as it is spawned
     %% (`roadrunner_http2_stream_worker:start/6`), which applies it.
     peer_max_header_list_size = infinity :: roadrunner_stream_worker:peer_limit(),
-    %% The heap floor this connection starts its workers at
-    %% (`roadrunner_stream_worker:conn_heap_floor/1`).
-    heap_floor = undefined :: roadrunner_stream_worker:conn_heap_floor(),
     %% The `Deadline` of the first `{roadrunner_drain, Deadline}`
     %% message, `undefined` until one arrives. In drain mode we've
     %% passed the message on to every stream worker and hand the same
@@ -567,6 +577,9 @@
 
 -type close_reason() :: roadrunner_event_handler:close_reason().
 -type control_frames() :: non_neg_integer() | {non_neg_integer(), integer()}.
+%% The client PING policy: off, or the least time between two PINGs with a
+%% stream open and with none, and the PINGs closer than that a client may send.
+-type ping_policy() :: off | {pos_integer(), pos_integer(), non_neg_integer()}.
 
 -doc """
 Top-level entry from the HTTP/1.1 dispatch fork. Owns the socket
@@ -616,7 +629,7 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
     {ConnThreshold, StreamThreshold} = refill_thresholds(RefillThreshold, ConnPeak, StreamPeak),
     HandshakeTimeout = handshake_timeout(),
     IdleTimeout = idle_timeout(ProtoOpts),
-    State = #loop{
+    Cfg = #h2_cfg{
         socket = Socket,
         proto_opts = ProtoOpts,
         heap_floor = roadrunner_stream_worker:conn_heap_floor(ProtoOpts),
@@ -630,16 +643,11 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         msg_error = Error,
         msg_passive = roadrunner_transport:passive_message(Socket),
         active = Active,
-        grow_buffer = GrowBuffer,
-        hpack_dec = roadrunner_http2_hpack:new_decoder(?HPACK_TABLE_SIZE),
-        hpack_enc = roadrunner_http2_hpack:new_encoder(?HPACK_TABLE_SIZE),
-        buffer = Buffered,
         recv_window_peak = ConnPeak,
         stream_recv_window_peak = StreamPeak,
         recv_window_threshold = ConnThreshold,
         stream_recv_window_threshold = StreamThreshold,
         max_concurrent_streams = MaxStreams,
-        stream_limit = max(MaxStreams, ?PRE_SETTINGS_STREAMS),
         max_header_block = MaxHeaderBlock,
         header_block_ceiling = max(MaxHeaderBlock, MaxHeaderListSize),
         max_header_list_size = MaxHeaderListSize,
@@ -656,9 +664,17 @@ enter(Socket, ProtoOpts, ListenerName, Peer, ConnSpan, Buffered) ->
         real_ip = roadrunner_conn:resolve_real_ip(ProtoOpts, Peer),
         handshake_timeout = HandshakeTimeout,
         idle_timeout = IdleTimeout,
-        idle_deadline = erlang:monotonic_time(millisecond) + IdleTimeout,
         ping_policy = ping_policy(ProtoOpts),
         send_stall_timeout = SendStallTimeout
+    },
+    State = #loop{
+        cfg = Cfg,
+        grow_buffer = GrowBuffer,
+        hpack_dec = roadrunner_http2_hpack:new_decoder(?HPACK_TABLE_SIZE),
+        hpack_enc = roadrunner_http2_hpack:new_encoder(?HPACK_TABLE_SIZE),
+        buffer = Buffered,
+        stream_limit = max(MaxStreams, ?PRE_SETTINGS_STREAMS),
+        idle_deadline = erlang:monotonic_time(millisecond) + IdleTimeout
     },
     ok = start_connection_age(ProtoOpts),
     handshake(State).
@@ -685,8 +701,7 @@ jittered(Max) ->
 %% The listener's `ping_policy`, flattened onto `http2_ping_*` fields, all
 %% `undefined` when it is off. Without stream, a PING must wait `MinTime`
 %% when PINGs are permitted then, and at least 2 hours otherwise.
--spec ping_policy(roadrunner_conn:proto_opts()) ->
-    off | {pos_integer(), pos_integer(), non_neg_integer()}.
+-spec ping_policy(roadrunner_conn:proto_opts()) -> ping_policy().
 ping_policy(#proto_opts{http2_ping_min_time = undefined}) ->
     off;
 ping_policy(#proto_opts{
@@ -718,9 +733,11 @@ refill_thresholds(Threshold, _ConnPeak, _StreamPeak) ->
 -spec handshake(#loop{}) -> no_return().
 handshake(
     #loop{
-        recv_window_peak = ConnPeak,
-        max_concurrent_streams = MaxStreams,
-        max_header_list_size = MaxHeaderListSize
+        cfg = #h2_cfg{
+            recv_window_peak = ConnPeak,
+            max_concurrent_streams = MaxStreams,
+            max_header_list_size = MaxHeaderListSize
+        }
     } = State
 ) ->
     _ = send_frame(State, server_settings_frame(MaxStreams, MaxHeaderListSize)),
@@ -815,10 +832,7 @@ handshake_phase_settings(#loop{buffer = Buf} = State) ->
 -spec handshake_recv(#loop{}, fun((#loop{}) -> no_return())) -> no_return().
 handshake_recv(
     #loop{
-        socket = Sock,
-        msg_data = MData,
-        msg_closed = MClosed,
-        msg_error = MError,
+        cfg = #h2_cfg{socket = Sock, msg_data = MData, msg_closed = MClosed, msg_error = MError},
         buffer = Buf
     } = State,
     Cont
@@ -831,7 +845,7 @@ handshake_recv(
             exit_clean(State, peer_closed);
         {MError, _, Reason} ->
             exit_clean(State, {transport, Reason})
-    after State#loop.handshake_timeout ->
+    after State#loop.cfg#h2_cfg.handshake_timeout ->
         exit_clean(State, request_timeout)
     end.
 
@@ -865,10 +879,10 @@ frame_loop(#loop{buffer = Buf} = State) ->
 -spec arm_and_recv(#loop{}) -> no_return().
 arm_and_recv(#loop{armed = true} = State) ->
     recv_more(State);
-arm_and_recv(#loop{socket = Sock, active = once} = State) ->
+arm_and_recv(#loop{cfg = #h2_cfg{socket = Sock, active = once}} = State) ->
     _ = roadrunner_transport:setopts(Sock, [{active, once}]),
     recv_more(State);
-arm_and_recv(#loop{socket = Sock, active = N} = State) ->
+arm_and_recv(#loop{cfg = #h2_cfg{socket = Sock, active = N}} = State) ->
     _ = roadrunner_transport:setopts(Sock, [{active, N}]),
     recv_more(State#loop{armed = true}).
 
@@ -877,10 +891,9 @@ arm_and_recv(#loop{socket = Sock, active = N} = State) ->
 -spec recv_more(#loop{}) -> no_return().
 recv_more(
     #loop{
-        msg_data = MData,
-        msg_closed = MClosed,
-        msg_error = MError,
-        msg_passive = MPassive,
+        cfg = #h2_cfg{
+            msg_data = MData, msg_closed = MClosed, msg_error = MError, msg_passive = MPassive
+        },
         buffer = Buf
     } = State
 ) ->
@@ -945,9 +958,9 @@ recv_more(
 %% listener opted into a `hibernate_after` shorter than that, parks for
 %% that window so `recv_idle_expired/1` can hibernate.
 -spec recv_timeout(#loop{}) -> non_neg_integer().
-recv_timeout(#loop{idle_deadline = undefined, idle_timeout = T}) ->
+recv_timeout(#loop{cfg = #h2_cfg{idle_timeout = T}, idle_deadline = undefined}) ->
     T;
-recv_timeout(#loop{idle_deadline = Deadline, hibernate_after = Ms}) ->
+recv_timeout(#loop{cfg = #h2_cfg{hibernate_after = Ms}, idle_deadline = Deadline}) ->
     case max(0, Deadline - erlang:monotonic_time(millisecond)) of
         Left when Ms > 0, Ms < Left -> Ms;
         Left -> Left
@@ -1042,7 +1055,7 @@ idle_goaway(State, Reason) ->
 %% a worker whose stream is gone (`handle_worker_down/4`) asks it.
 -spec idle_deadline(#{stream_id() => #stream{}}, #{reference() => stream_id()}, #loop{}) ->
     integer() | undefined.
-idle_deadline(Streams, Workers, #loop{idle_deadline = undefined, idle_timeout = T}) when
+idle_deadline(Streams, Workers, #loop{cfg = #h2_cfg{idle_timeout = T}, idle_deadline = undefined}) when
     map_size(Streams) =:= 0, map_size(Workers) =:= 0
 ->
     erlang:monotonic_time(millisecond) + T;
@@ -1058,13 +1071,13 @@ idle_deadline(_Streams, _Refs, #loop{idle_deadline = Deadline}) ->
 %% free (`ping_clock`), so a client pinging as it reads a response (to
 %% measure its bandwidth) is never struck.
 -spec ping_strike(#loop{}) -> {ok, #loop{}} | too_many_pings.
-ping_strike(#loop{ping_policy = off} = State) ->
+ping_strike(#loop{cfg = #h2_cfg{ping_policy = off}} = State) ->
     {ok, State};
 ping_strike(#loop{ping_clock = undefined} = State) ->
     {ok, State#loop{ping_clock = {erlang:monotonic_time(millisecond), 0}}};
 ping_strike(
     #loop{
-        ping_policy = {MinTime, IdleMinTime, MaxStrikes},
+        cfg = #h2_cfg{ping_policy = {MinTime, IdleMinTime, MaxStrikes}},
         ping_clock = {Last, Strikes},
         live_streams = Live
     } = State
@@ -1118,17 +1131,19 @@ control_frame(State) ->
 %% it in an update of its own (`control_frame/1`).
 -spec control_count(#loop{}) -> control_frames().
 control_count(#loop{
-    control_frames = N, proto_opts = #proto_opts{http2_control_frame_max = Max}
+    cfg = #h2_cfg{proto_opts = #proto_opts{http2_control_frame_max = Max}}, control_frames = N
 }) when is_integer(N), N < Max ->
     N + 1;
 control_count(#loop{control_frames = N}) when is_integer(N) ->
     {1, erlang:monotonic_time(millisecond)};
 control_count(
     #loop{
-        control_frames = {N, Mark},
-        proto_opts = #proto_opts{
-            http2_control_frame_max = Max, http2_control_frame_window = Window
-        }
+        cfg = #h2_cfg{
+            proto_opts = #proto_opts{
+                http2_control_frame_max = Max, http2_control_frame_window = Window
+            }
+        },
+        control_frames = {N, Mark}
     } = State
 ) ->
     case N < Max of
@@ -1231,7 +1246,7 @@ start_drain(#loop{streams = Streams} = State, Deadline) ->
 %% the last of them. A client that never answers gets the final GOAWAY
 %% an idle timeout later. A close already under way is left as it is.
 -spec announce_goaway(#loop{}, close_reason()) -> #loop{}.
-announce_goaway(#loop{goaway = open, idle_timeout = Timeout} = State, Reason) ->
+announce_goaway(#loop{cfg = #h2_cfg{idle_timeout = Timeout}, goaway = open} = State, Reason) ->
     _ = send_frame(State, [
         ?GOAWAY(?MAX_STREAM_ID, no_error),
         roadrunner_http2_frame:encode({ping, 0, ?GOAWAY_PING})
@@ -1326,9 +1341,8 @@ final_goaway_frame(#loop{last_stream_id = LastId}) ->
 -spec start_worker(#loop{}, stream_id(), roadrunner_req:request()) -> {pid(), reference()}.
 start_worker(
     #loop{
-        proto_opts = ProtoOpts,
+        cfg = #h2_cfg{proto_opts = ProtoOpts, heap_floor = HeapFloor},
         peer_max_header_list_size = PeerLimit,
-        heap_floor = HeapFloor,
         drain_deadline = Deadline
     },
     StreamId,
@@ -1381,7 +1395,7 @@ handle_frame(Frame, #loop{awaiting_continuation = Awaiting} = State) when
         _ ->
             goaway_exit(State, protocol_error)
     end;
-handle_frame({settings, 1, _}, #loop{max_concurrent_streams = MaxStreams} = State) ->
+handle_frame({settings, 1, _}, #loop{cfg = #h2_cfg{max_concurrent_streams = MaxStreams}} = State) ->
     %% The client applied our SETTINGS (RFC 9113 §6.5.3): we send one
     %% SETTINGS frame, so this puts our stream limit in force. Streams
     %% already open stay; new ones over the limit are refused.
@@ -1573,7 +1587,9 @@ grow_buffer(Flags, Payload, #loop{grow_buffer = {Idle, _Max}} = State) when
     Flags band 16#01 =/= 0, byte_size(Payload) =< Idle
 ->
     State;
-grow_buffer(_Flags, _Payload, #loop{grow_buffer = {_Idle, Max}, socket = Socket} = State) ->
+grow_buffer(
+    _Flags, _Payload, #loop{cfg = #h2_cfg{socket = Socket}, grow_buffer = {_Idle, Max}} = State
+) ->
     _ = roadrunner_transport:setopts(Socket, [{buffer, Max}]),
     State#loop{grow_buffer = undefined}.
 
@@ -1656,10 +1672,10 @@ on_headers(
     _Priority,
     Fragment,
     #loop{
+        cfg = #h2_cfg{max_concurrent_streams = Max},
         live_streams = Live,
         reset_workers = Reset,
-        stream_limit = Limit,
-        max_concurrent_streams = Max
+        stream_limit = Limit
     } = State
 ) when
     Live + map_size(Reset) >= Limit; map_size(Reset) >= Max
@@ -1678,7 +1694,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
         EndStream,
         State#loop.peer_initial_window,
         ?INITIAL_WINDOW,
-        State#loop.max_content_length
+        State#loop.cfg#h2_cfg.max_content_length
     ),
     State1 = State#loop{
         streams = (State#loop.streams)#{StreamId => Stream},
@@ -1712,7 +1728,7 @@ on_headers(StreamId, Flags, _Priority, Fragment, State) ->
 -spec refuse_over_limit(stream_id(), non_neg_integer(), binary(), boolean(), #loop{}) ->
     no_return().
 refuse_over_limit(_StreamId, _Flags, _Fragment, true, #loop{reset_refusals = Refusals} = State) when
-    Refusals >= State#loop.max_concurrent_streams
+    Refusals >= State#loop.cfg#h2_cfg.max_concurrent_streams
 ->
     goaway_exit(State, enhance_your_calm);
 refuse_over_limit(StreamId, Flags, Fragment, true, #loop{reset_refusals = Refusals} = State) ->
@@ -1744,7 +1760,7 @@ refuse_new_stream(StreamId, Flags, Fragment, Code, State0) ->
         (Flags band 16#01) =/= 0,
         State#loop.peer_initial_window,
         ?INITIAL_WINDOW,
-        State#loop.max_content_length
+        State#loop.cfg#h2_cfg.max_content_length
     ),
     State1 = State#loop{
         streams = (State#loop.streams)#{
@@ -1809,7 +1825,10 @@ new_stream(Fragment, EndHeaders, EndStream, SendWindow, RecvWindow, BodyCap) ->
     }.
 
 on_continuation(
-    StreamId, Flags, Fragment, #loop{streams = Streams, header_block_ceiling = Ceiling} = State
+    StreamId,
+    Flags,
+    Fragment,
+    #loop{cfg = #h2_cfg{header_block_ceiling = Ceiling}, streams = Streams} = State
 ) ->
     case Streams of
         #{
@@ -1884,7 +1903,7 @@ finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) -
                 hpack_dec = Dec1,
                 streams = Streams#{StreamId := Stream1}
             },
-            case State1#loop.body_buffering of
+            case State1#loop.cfg#h2_cfg.body_buffering of
                 auto -> dispatch_stream(StreamId, State1);
                 manual -> body_in(StreamId, Stream1, State1)
             end;
@@ -1898,10 +1917,9 @@ finalize_trailers(StreamId, #loop{streams = Streams, hpack_dec = Dec} = State) -
 finalize_headers(
     StreamId,
     #loop{
+        cfg = #h2_cfg{max_header_block = MaxHeaderBlock, max_header_list_size = MaxHLS},
         streams = Streams,
-        hpack_dec = Dec,
-        max_header_block = MaxHeaderBlock,
-        max_header_list_size = MaxHLS
+        hpack_dec = Dec
     } = State
 ) ->
     #{
@@ -1968,7 +1986,11 @@ finalize_headers(
 %% worker's first read, so a handler that answers from the headers alone
 %% never has the client upload the body.
 -spec await_body(stream_id(), roadrunner_http:headers(), #loop{}) -> no_return().
-await_body(StreamId, Headers, #loop{proto_opts = ProtoOpts, max_content_length = MaxCL} = State) ->
+await_body(
+    StreamId,
+    Headers,
+    #loop{cfg = #h2_cfg{proto_opts = ProtoOpts, max_content_length = MaxCL}} = State
+) ->
     case roadrunner_conn:expect_answer(ProtoOpts, Headers, MaxCL) of
         too_large ->
             reject_too_large(State, StreamId);
@@ -1983,14 +2005,14 @@ await_body(StreamId, Headers, #loop{proto_opts = ProtoOpts, max_content_length =
 
 %% A body expected with `100-continue`, to be asked for.
 -spec body_wanted(stream_id(), #loop{}) -> no_return().
-body_wanted(StreamId, #loop{body_buffering = auto} = State) ->
+body_wanted(StreamId, #loop{cfg = #h2_cfg{body_buffering = auto}} = State) ->
     frame_loop(send_continue(State, StreamId));
 body_wanted(StreamId, State) ->
     dispatch_reading(StreamId, true, State).
 
 %% A body on its way, the client expecting nothing.
 -spec body_follows(stream_id(), #loop{}) -> no_return().
-body_follows(_StreamId, #loop{body_buffering = auto} = State) ->
+body_follows(_StreamId, #loop{cfg = #h2_cfg{body_buffering = auto}} = State) ->
     frame_loop(State);
 body_follows(StreamId, State) ->
     dispatch_reading(StreamId, false, State).
@@ -2120,7 +2142,7 @@ on_data(StreamId, Flags, Payload, FlowLen, #loop{streams = Streams} = State) ->
                                 streams = Streams#{StreamId := Stream1},
                                 conn_recv_window = ConnWindow - FlowLen
                             },
-                            case State1#loop.body_buffering of
+                            case State1#loop.cfg#h2_cfg.body_buffering of
                                 auto ->
                                     %% The DATA that ends the body leaves the
                                     %% stream no more to receive, so only the
@@ -2349,7 +2371,7 @@ stream_body_cap(
     _NewLen,
     _Cap,
     #stream{headers = Headers},
-    #loop{proto_opts = #proto_opts{dispatch = Dispatch}, max_content_length = MaxCL}
+    #loop{cfg = #h2_cfg{proto_opts = #proto_opts{dispatch = Dispatch}, max_content_length = MaxCL}}
 ) ->
     roadrunner_conn:route_body_cap(Dispatch, Headers, MaxCL).
 
@@ -2387,9 +2409,8 @@ maybe_refill_recv_windows(State, StreamId) ->
 
 build_conn_refill(
     #loop{
-        conn_recv_window = W,
-        recv_window_peak = Peak,
-        recv_window_threshold = Threshold
+        cfg = #h2_cfg{recv_window_peak = Peak, recv_window_threshold = Threshold},
+        conn_recv_window = W
     } = State
 ) when W < Threshold, W < Peak ->
     %% Below the threshold and short of the peak: a peak under the RFC's
@@ -2403,9 +2424,8 @@ build_conn_refill(State) ->
 
 build_stream_refill(
     #loop{
-        streams = Streams,
-        stream_recv_window_peak = Peak,
-        stream_recv_window_threshold = Threshold
+        cfg = #h2_cfg{stream_recv_window_peak = Peak, stream_recv_window_threshold = Threshold},
+        streams = Streams
     } = State,
     StreamId
 ) ->
@@ -2507,14 +2527,16 @@ dispatch_request(StreamId, Stream, Headers, Body, State) ->
 %% `DOWN`, reset ones included, as do requests parked for an in-flight slot,
 %% which start a handler once granted.
 -spec must_wait(#loop{}) -> boolean().
-must_wait(#loop{stream_limit = Max, max_concurrent_streams = Max, queued = Queued}) ->
+must_wait(#loop{cfg = #h2_cfg{max_concurrent_streams = Max}, stream_limit = Max, queued = Queued}) ->
     not queue:is_empty(Queued);
 must_wait(#loop{queued = Queued} = State) ->
     not queue:is_empty(Queued) orelse not has_room(State).
 
 %% Whether one more handler fits within `max_concurrent_streams`.
 -spec has_room(#loop{}) -> boolean().
-has_room(#loop{max_concurrent_streams = Max, workers = Workers, awaiting_slot = Awaiting}) ->
+has_room(#loop{
+    cfg = #h2_cfg{max_concurrent_streams = Max}, workers = Workers, awaiting_slot = Awaiting
+}) ->
     map_size(Workers) + map_size(Awaiting) < Max.
 
 %% Dispatch the queued streams, oldest first, while handlers fit. Called
@@ -2554,15 +2576,17 @@ start_request(
     Headers,
     Body,
     #loop{
-        streams = Streams,
-        peer = Peer,
-        conn_info = ConnInfo,
-        scheme = Scheme,
-        listener_name = ListenerName,
-        max_concurrent_requests = MaxConcReq,
-        inflight_counter = InflightCounter,
-        slot_cell = SlotCell,
-        overload = Overload
+        cfg = #h2_cfg{
+            peer = Peer,
+            conn_info = ConnInfo,
+            scheme = Scheme,
+            listener_name = ListenerName,
+            max_concurrent_requests = MaxConcReq,
+            inflight_counter = InflightCounter,
+            slot_cell = SlotCell,
+            overload = Overload
+        },
+        streams = Streams
     } = State
 ) ->
     {RequestId, NewBuf} = roadrunner_conn:generate_request_id(State#loop.req_id_buffer),
@@ -2575,7 +2599,7 @@ start_request(
                 StreamId,
                 Stream,
                 Body,
-                roadrunner_conn:with_client_ip(Req0, State#loop.real_ip, Peer),
+                roadrunner_conn:with_client_ip(Req0, State#loop.cfg#h2_cfg.real_ip, Peer),
                 State
             ),
             %% The new request-id buffer is stored by each branch's own final
@@ -2672,7 +2696,7 @@ request_body(
     #stream{continue_owed = ContinueOwed},
     reader,
     Req,
-    #loop{request_timeout = Timeout, max_content_length = MaxCL}
+    #loop{cfg = #h2_cfg{request_timeout = Timeout, max_content_length = MaxCL}}
 ) ->
     roadrunner_conn:with_body_reader(Req, StreamId, Timeout, MaxCL, ContinueOwed).
 
@@ -2765,10 +2789,10 @@ handle_worker_down(#loop{workers = Workers} = State, MonRef, Pid, Reason) ->
             %% worker so it is accounted for by its `DOWN` here or by the
             %% conn's clean exit, never both.
             ok = roadrunner_conn:release_request_slot(
-                State#loop.max_concurrent_requests,
-                State#loop.inflight_counter,
-                State#loop.slot_cell,
-                State#loop.overload
+                State#loop.cfg#h2_cfg.max_concurrent_requests,
+                State#loop.cfg#h2_cfg.inflight_counter,
+                State#loop.cfg#h2_cfg.slot_cell,
+                State#loop.cfg#h2_cfg.overload
             ),
             Workers1 = maps:remove(Pid, Workers),
             case State#loop.streams of
@@ -2893,7 +2917,7 @@ not_open_reset(StreamId) ->
 %% two agree (`roadrunner_http2_stream_worker:field_section/3`).
 -spec response_fields(#loop{}, roadrunner_http:status(), roadrunner_http:headers()) ->
     roadrunner_http:headers().
-response_fields(#loop{alt_svc = AltSvc}, Status, Headers) ->
+response_fields(#loop{cfg = #h2_cfg{alt_svc = AltSvc}}, Status, Headers) ->
     roadrunner_http2_stream_worker:field_section(Status, Headers, AltSvc).
 
 %% Encode + write a HEADERS frame (always fits without flow control;
@@ -3207,7 +3231,9 @@ stream_stall(_Stalled) -> {stream, erlang:monotonic_time(millisecond)}.
 %% unless one is already: it checks every stream when it fires
 %% (`reset_stalled/1`), and is armed again for the next to run out.
 -spec arm_stall_timer(#loop{}) -> #loop{}.
-arm_stall_timer(#loop{stall_timer = undefined, send_stall_timeout = Timeout} = State) when
+arm_stall_timer(
+    #loop{cfg = #h2_cfg{send_stall_timeout = Timeout}, stall_timer = undefined} = State
+) when
     is_integer(Timeout)
 ->
     State#loop{stall_timer = erlang:start_timer(Timeout, self(), {?MODULE, send_stall})};
@@ -3224,7 +3250,11 @@ arm_stall_timer(State) ->
 %% for the first of the other streams still waiting.
 -spec reset_stalled(#loop{}) -> #loop{}.
 reset_stalled(
-    #loop{streams = Streams, send_stall_timeout = Timeout, conn_stalled_at = ConnStalledAt} =
+    #loop{
+        cfg = #h2_cfg{send_stall_timeout = Timeout},
+        streams = Streams,
+        conn_stalled_at = ConnStalledAt
+    } =
         State
 ) ->
     Now = erlang:monotonic_time(millisecond),
@@ -3523,7 +3553,9 @@ forget_stream(_State, StreamId, Streams) ->
 %% and a grant can always find the stream it was granted for. A grant
 %% already in flight still arrives; `handle_slot/3` gives that slot back.
 -spec withdraw_parked(#loop{}, stream_id()) -> #loop{}.
-withdraw_parked(#loop{awaiting_slot = Awaiting, overload = Overload} = State, StreamId) ->
+withdraw_parked(
+    #loop{cfg = #h2_cfg{overload = Overload}, awaiting_slot = Awaiting} = State, StreamId
+) ->
     case Awaiting of
         #{StreamId := _} ->
             ok = roadrunner_conn:cancel_slot_wait(Overload, StreamId),
@@ -3558,7 +3590,11 @@ handle_slot(#loop{awaiting_slot = Awaiting} = State, StreamId, granted) ->
         _ ->
             give_back_slot(State)
     end;
-handle_slot(#loop{awaiting_slot = Awaiting, listener_name = ListenerName} = State, StreamId, _) ->
+handle_slot(
+    #loop{cfg = #h2_cfg{listener_name = ListenerName}, awaiting_slot = Awaiting} = State,
+    StreamId,
+    _
+) ->
     case Awaiting of
         #{StreamId := _} ->
             State1 = State#loop{awaiting_slot = maps:remove(StreamId, Awaiting)},
@@ -3583,10 +3619,10 @@ spawn_parked(#loop{streams = Streams} = State, StreamId, Req) ->
 -spec give_back_slot(#loop{}) -> #loop{}.
 give_back_slot(State) ->
     ok = roadrunner_conn:release_request_slot(
-        State#loop.max_concurrent_requests,
-        State#loop.inflight_counter,
-        State#loop.slot_cell,
-        State#loop.overload
+        State#loop.cfg#h2_cfg.max_concurrent_requests,
+        State#loop.cfg#h2_cfg.inflight_counter,
+        State#loop.cfg#h2_cfg.slot_cell,
+        State#loop.cfg#h2_cfg.overload
     ),
     State.
 
@@ -3751,19 +3787,19 @@ validate_settings([_ | Rest]) ->
     validate_settings(Rest).
 
 -spec send(#loop{}, iodata()) -> ok | {error, term()}.
-send(#loop{socket = Socket}, Data) ->
+send(#loop{cfg = #h2_cfg{socket = Socket}}, Data) ->
     roadrunner_transport:send(Socket, Data).
 
 %% `send/2` for control frames and a HEADERS frame, sent without measuring:
 %% far under the size a send is sliced at (`roadrunner_transport:send/3`).
 -spec send_frame(#loop{}, iodata()) -> ok | {error, term()}.
-send_frame(#loop{socket = Socket}, Frame) ->
+send_frame(#loop{cfg = #h2_cfg{socket = Socket}}, Frame) ->
     roadrunner_transport:send(Socket, Frame, 0).
 
 %% `send/2` for DATA whose payload size is known, so the transport does not
 %% measure it again.
 -spec send(#loop{}, iodata(), non_neg_integer()) -> ok | {error, term()}.
-send(#loop{socket = Socket}, Data, Size) ->
+send(#loop{cfg = #h2_cfg{socket = Socket}}, Data, Size) ->
     roadrunner_transport:send(Socket, Data, Size).
 
 -spec send_goaway(#loop{}, roadrunner_http2_frame:error_code()) -> ok | {error, term()}.
@@ -3778,7 +3814,9 @@ send_rst_stream(State, StreamId, ErrorCode) ->
 %% Bump the cumulative throttled counter and emit the throttled telemetry
 %% when a stream is refused at the `max_concurrent_requests` ceiling.
 -spec throttle_stream(#loop{}, atom()) -> ok.
-throttle_stream(#loop{proto_opts = #proto_opts{throttled_counter = Counter}}, ListenerName) ->
+throttle_stream(
+    #loop{cfg = #h2_cfg{proto_opts = #proto_opts{throttled_counter = Counter}}}, ListenerName
+) ->
     roadrunner_conn:throttled_telemetry(ListenerName, Counter, max_concurrent_requests).
 
 %% Per-peer rate-limit gate before spawning a stream worker. `ok` to proceed;
@@ -3790,7 +3828,9 @@ throttle_stream(#loop{proto_opts = #proto_opts{throttled_counter = Counter}}, Li
 -spec rate_limit_refused(#loop{}, stream_id(), roadrunner_req:request()) ->
     ok | {refused, #loop{}}.
 rate_limit_refused(
-    #loop{rate_limit = RateLimit, listener_name = ListenerName} = State, StreamId, Req
+    #loop{cfg = #h2_cfg{rate_limit = RateLimit, listener_name = ListenerName}} = State,
+    StreamId,
+    Req
 ) ->
     case roadrunner_conn:rate_limit(RateLimit, Req, ListenerName) of
         allow ->
@@ -3840,7 +3880,9 @@ parse_error_code(_) -> protocol_error.
 %% connection's slot, so it costs the server little, while a client told
 %% to calm down (gRPC's `too_many_pings`) must read why.
 -spec exit_lingering(#loop{}, roadrunner_event_handler:close_reason()) -> no_return().
-exit_lingering(#loop{proto_opts = #proto_opts{http2_linger_timeout = Linger}} = State, Reason) ->
+exit_lingering(
+    #loop{cfg = #h2_cfg{proto_opts = #proto_opts{http2_linger_timeout = Linger}}} = State, Reason
+) ->
     exit_clean(State, Reason, Linger).
 
 -spec exit_clean(#loop{}, roadrunner_event_handler:close_reason()) -> no_return().
@@ -3850,7 +3892,9 @@ exit_clean(State, Reason) ->
 -spec exit_clean(#loop{}, roadrunner_event_handler:close_reason(), non_neg_integer()) ->
     no_return().
 exit_clean(
-    #loop{socket = Socket, proto_opts = ProtoOpts, conn_span = ConnSpan} = State, Reason, Linger
+    #loop{cfg = #h2_cfg{socket = Socket, proto_opts = ProtoOpts, conn_span = ConnSpan}} = State,
+    Reason,
+    Linger
 ) ->
     ok = hand_off_slots(State),
     ok = tell_reset(State, Reason, Linger),
@@ -3901,7 +3945,9 @@ linger(_State, 0) ->
     ok;
 linger(
     #loop{
-        socket = Socket, proto_opts = #proto_opts{linger_budget = Budget, dispatch = Dispatch}
+        cfg = #h2_cfg{
+            socket = Socket, proto_opts = #proto_opts{linger_budget = Budget, dispatch = Dispatch}
+        }
     },
     Linger
 ) ->
@@ -3931,16 +3977,18 @@ route_ceilings({handler, _Mod, _Pipeline, _State}) ->
 %% request) or the listener's reaper (`slot_reconciliation`) empties its
 %% cell instead, and its workers still running stop counting then.
 -spec hand_off_slots(#loop{}) -> ok.
-hand_off_slots(#loop{slot_cell = undefined}) ->
+hand_off_slots(#loop{cfg = #h2_cfg{slot_cell = undefined}}) ->
     ok;
 hand_off_slots(#loop{
-    proto_opts = #proto_opts{slot_keeper = Keeper},
+    cfg = #h2_cfg{
+        proto_opts = #proto_opts{slot_keeper = Keeper},
+        max_concurrent_requests = Max,
+        inflight_counter = Counter,
+        slot_cell = Cell,
+        overload = Overload
+    },
     workers = Workers,
-    parked = Parked,
-    max_concurrent_requests = Max,
-    inflight_counter = Counter,
-    slot_cell = Cell,
-    overload = Overload
+    parked = Parked
 }) ->
     roadrunner_conn:hand_off_request_slots(
         Keeper, Cell, maps:keys(Workers), Parked, Max, Counter, Overload
