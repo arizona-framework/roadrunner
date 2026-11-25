@@ -300,7 +300,8 @@ Optional middleware and timing knobs (durations in milliseconds):
   HTTP/2 how long after its last request ended (or after it opened) a
   connection with no request open is closed with a GOAWAY, whatever
   else the client sends meanwhile (gRPC's `max_connection_idle`), and
-  how long one with a handler still at work may stay quiet before it is
+  how long one with a handler still at work (or a request waiting for
+  its slot in `queue` overload mode) may stay quiet before it is
   checked with a PING (at least 1 s, so a client has time to send its
   first request and to answer the PING), and on HTTP/3 the QUIC idle
   timeout the server offers (at least 1 s; the connection uses the smaller of it and the

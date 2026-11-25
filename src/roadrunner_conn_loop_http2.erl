@@ -992,8 +992,13 @@ recv_idle_expired(State) ->
         false -> idle_goaway(State)
     end.
 
-%% Whether the conn is still serving: a worker runs and no stream holds
-%% sends that wait for the client's flow-control window. A worker reading a
+%% Whether the conn is still serving: a worker runs, or a request waits
+%% for a slot of the listener's in-flight ceiling (`awaiting_slot`; a
+%% stream waiting its turn in `queued` waits behind one of the two), and no
+%% stream holds sends that wait for the client's flow-control window. A
+%% request waiting for its slot is the server's to answer, not the
+%% client's: closing the conn under it with a GOAWAY that names it would
+%% leave the client no answer and no safe retry. A worker reading a
 %% body waits on the client too, within its read's deadline, which the
 %% handler may have moved to never (`roadrunner_req:set_body_timeout/2`):
 %% the liveness PING is then all that ends a client gone quiet. A
@@ -1001,7 +1006,9 @@ recv_idle_expired(State) ->
 %% closes with every stream on it, a quiet one still at work included: a
 %% client that holds a window shut that long has stopped reading.
 -spec serving(#loop{}) -> boolean().
-serving(#loop{workers = Workers}) when map_size(Workers) =:= 0 ->
+serving(#loop{workers = Workers, awaiting_slot = Awaiting}) when
+    map_size(Workers) =:= 0, map_size(Awaiting) =:= 0
+->
     false;
 serving(#loop{streams = Streams}) ->
     no_blocked_sends(maps:iterator(Streams)).

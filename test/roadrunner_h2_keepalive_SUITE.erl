@@ -27,6 +27,7 @@ how a connection ends at its `connection_age`.
     a_reset_of_the_last_stream_leaves_the_conn_idle/1,
     a_crash_of_the_last_handler_leaves_the_conn_idle/1,
     a_conn_left_idle_by_a_reset_hibernates/1,
+    a_request_waiting_for_a_slot_keeps_the_conn_open/1,
     age_closes_an_idle_conn/1,
     age_lets_open_requests_finish/1,
     age_grace_resets_open_requests/1,
@@ -66,6 +67,7 @@ all() ->
         a_reset_of_the_last_stream_leaves_the_conn_idle,
         a_crash_of_the_last_handler_leaves_the_conn_idle,
         a_conn_left_idle_by_a_reset_hibernates,
+        a_request_waiting_for_a_slot_keeps_the_conn_open,
         age_closes_an_idle_conn,
         age_lets_open_requests_finish,
         age_grace_resets_open_requests,
@@ -110,6 +112,8 @@ end_per_testcase(_Case, _Config) ->
 
 listener_opts(a_conn_left_idle_by_a_reset_hibernates, Opts) ->
     Opts#{hibernate_after => 50};
+listener_opts(a_request_waiting_for_a_slot_keeps_the_conn_open, Opts) ->
+    Opts#{max_concurrent_requests => 1, overload_mode => {queue, #{}}};
 listener_opts(_Case, Opts) ->
     Opts.
 
@@ -120,7 +124,8 @@ idle_case(Case) ->
         a_request_restarts_the_idle_timeout,
         a_reset_of_the_last_stream_leaves_the_conn_idle,
         a_crash_of_the_last_handler_leaves_the_conn_idle,
-        a_conn_left_idle_by_a_reset_hibernates
+        a_conn_left_idle_by_a_reset_hibernates,
+        a_request_waiting_for_a_slot_keeps_the_conn_open
     ]).
 
 http2_opts(default_policy_closes_a_ping_flood) ->
@@ -301,6 +306,23 @@ a_conn_left_idle_by_a_reset_hibernates(Config) ->
     #{sock := Sock} = send_rst(send_post_headers(open(Config), 1), 1),
     ok = await_hibernating_conn(erlang:monotonic_time(millisecond) + 5000),
     ok = gen_tcp:close(Sock).
+
+a_request_waiting_for_a_slot_keeps_the_conn_open(Config) ->
+    %% A request parked for the listener's only in-flight slot has no
+    %% handler yet, but it is still the server's to answer: its quiet conn
+    %% is checked with a PING when the idle timeout passes, not closed with
+    %% a GOAWAY that names the request (which would leave the client no
+    %% answer and no safe retry). Once the slot frees, it is served.
+    _ = send_headers(open(Config), 1, ~"/hold"),
+    Holder = handler_started(),
+    C0 = send_headers(open(Config), 1, ~"/hold"),
+    {Frames, #{sock := Sock} = C1} = until(C0, fun(F) -> is_goaway(F) orelse is_ping(F) end),
+    {ping, 0, Opaque} = lists:last(Frames),
+    ok = gen_tcp:send(Sock, roadrunner_http2_frame:encode({ping, 1, Opaque})),
+    Holder ! release,
+    Parked = handler_started(),
+    Parked ! release,
+    {200, ~"ok", _} = response(C1, 1).
 
 age_closes_an_idle_conn(Config) ->
     %% At its age a conn closes as a drained one does (RFC 9113 §6.8): a
@@ -642,6 +664,9 @@ idle_frame(#{sock := Sock, buf := Buf} = C) ->
         _Frame ->
             next_frame(C)
     end.
+
+is_ping({ping, 0, _}) -> true;
+is_ping(_Frame) -> false.
 
 is_ping_ack({ping, 1, _}) -> true;
 is_ping_ack(_Frame) -> false.
