@@ -15,6 +15,7 @@ socket alike.
 -export([
     ipv4_and_ipv6_listeners_share_a_port/1,
     dual_stack_listener_serves_ipv4/1,
+    dual_stack_listener_keeps_off_an_ipv4_port/1,
     ipv6_v6only_needs_an_ipv6_ip/1,
     ipv6_v6only_must_be_a_boolean/1,
     http3_listener_binds_ipv6_only/1
@@ -31,16 +32,20 @@ all() ->
     [
         ipv4_and_ipv6_listeners_share_a_port,
         dual_stack_listener_serves_ipv4,
+        dual_stack_listener_keeps_off_an_ipv4_port,
         ipv6_v6only_needs_an_ipv6_ip,
         ipv6_v6only_must_be_a_boolean,
         http3_listener_binds_ipv6_only
     ].
 
 ipv4_and_ipv6_listeners_share_a_port(_Config) ->
-    {ok, _} = roadrunner_listener:start_link(ipv6_share_v4, opts(#{port => 0})),
+    {ok, _} = roadrunner_listener:start_link(
+        ipv6_share_v4, opts(#{port => 0, num_listen_sockets => 2})
+    ),
     Port = roadrunner_listener:port(ipv6_share_v4),
     {ok, _} = roadrunner_listener:start_link(
-        ipv6_share_v6, opts(#{port => Port, ip => ?ANY6, ipv6_v6only => true})
+        ipv6_share_v6,
+        opts(#{port => Port, ip => ?ANY6, ipv6_v6only => true, num_listen_sockets => 2})
     ),
     try
         ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, get(?LOOPBACK4, Port)),
@@ -61,6 +66,27 @@ dual_stack_listener_serves_ipv4(_Config) ->
         ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, get(?LOOPBACK6, Port))
     after
         ok = roadrunner_listener:stop(ipv6_dual)
+    end.
+
+dual_stack_listener_keeps_off_an_ipv4_port(_Config) ->
+    %% A dual-stack listener claims the port for IPv4 too, so it fails to
+    %% start on a port an IPv4 listener holds, even when both bind several
+    %% sockets with `SO_REUSEPORT`, which on their own could share it.
+    {ok, _} = roadrunner_listener:start_link(
+        ipv6_taken_v4, opts(#{port => 0, num_listen_sockets => 2})
+    ),
+    Port = roadrunner_listener:port(ipv6_taken_v4),
+    process_flag(trap_exit, true),
+    try
+        ?assertEqual(
+            {error, {listen_failed, eaddrinuse}},
+            roadrunner_listener:start_link(
+                ipv6_taken_dual,
+                opts(#{port => Port, ip => ?ANY6, ipv6_v6only => false, num_listen_sockets => 2})
+            )
+        )
+    after
+        ok = roadrunner_listener:stop(ipv6_taken_v4)
     end.
 
 ipv6_v6only_needs_an_ipv6_ip(_Config) ->
