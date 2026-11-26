@@ -4514,7 +4514,7 @@ await_http3_loops(Monitors) ->
 %% against its counter. The slots of every registered conn that died
 %% without its exit path (killed since the last tick, or an HTTP/3 loop
 %% gone with its QUIC connection) are given back. One that ran its exit
-%% path left the registry, its cell handed to the keeper, and each cell is
+%% path emptied its cell or handed it to the keeper, and each cell is
 %% emptied with an exchange, so nothing is given back twice. With
 %% `graceful_drain => false` no conn registers, and none is known here.
 -spec reclaim_dead_conns(roadrunner_conn:proto_opts()) -> ok.
