@@ -306,9 +306,9 @@ park(Pid, Token, Cell, Timeout, #state{order = Order, parked = Parked, conns = C
 %% or not, and each hand-off still in its mailbox, whose workers no one
 %% will watch now. Nothing parked holds a slot. A worker it gives back
 %% runs on uncounted: only the connections left from before the stop admit
-%% new requests, and they are no more than there were. So is what a
-%% connection that parked here and died without its exit path still holds
-%% (`dead_conns/1`), its `DOWN` perhaps still unread.
+%% new requests, and they are no more than there were. It also gives back
+%% what a connection that parked here and died without its exit path
+%% still holds (`dead_conns/1`), its `DOWN` perhaps still unread.
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{counter = Counter, adopted = Adopted, conns = Conns}) ->
     counters:sub(Counter, 1, map_size(Adopted) + unread_hand_offs() + dead_conns(Conns)).
@@ -324,8 +324,10 @@ unread_hand_offs() ->
     end.
 
 %% The slots in the cells of the connections that parked here and are
-%% dead. The cell is emptied, so whoever looks at it next (the
-%% listener's last reaper pass) takes nothing again.
+%% dead. The listener's last reaper pass, which runs before this process
+%% stops, already emptied the cells of the registered ones, so this takes
+%% only those of connections that never registered (`graceful_drain =>
+%% false`) or died after that pass. The exchange takes each slot once.
 -spec dead_conns(#{pid() => #conn{}}) -> non_neg_integer().
 dead_conns(Conns) ->
     lists:sum([
