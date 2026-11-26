@@ -349,7 +349,11 @@ Optional middleware and timing knobs (durations in milliseconds):
   it (with one socket, all of them do), so more acceptors than
   schedulers only adds contention: on one or two schedulers, matching
   them accepts more connections a second than 10 does, with lower tail
-  latency.
+  latency. On a TLS listener more acceptors do not take a burst of new
+  connections in faster either: each one's handshake costs server CPU
+  (far less with an ECDSA P-256 certificate, see `tls`), and OTP starts
+  every TLS connection of the node through one supervisor, so they only
+  wait there.
 - `num_listen_sockets`: how many listen sockets the TCP side binds to
   its port, `auto` (the default) or a positive integer. The sockets
   share the port, the kernel spreads new connections over them, and
