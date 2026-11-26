@@ -175,26 +175,26 @@ tcp_drain_closes_a_conn_before_its_header(_Config) ->
 
 tcp_header_wait_never_wakes(_Config) ->
     %% A connection waiting for its header, before any byte or with part of
-    %% it in (no rate to keep), does no work while it waits: its reductions
-    %% do not move over a second of silence.
+    %% it in (no rate to keep), never wakes while it waits: over a second of
+    %% silence nothing reaches it and its receive never times out.
     Port = start_tcp_listener(#{request_timeout => 20000, min_bytes_per_second => 0}),
     {ok, Idle} = connect(Port),
-    ok = still_while_silent(Idle),
+    ok = still_while_silent(Idle, ~""),
     {ok, Partial} = connect(Port),
     ok = gen_tcp:send(Partial, ~"PROXY TCP4 "),
-    ok = still_while_silent(Partial).
+    ok = still_while_silent(Partial, ~"PROXY TCP4 ").
 
 tcp_peer_gone_before_its_header(_Config) ->
     Port = start_tcp_listener(#{}),
     {ok, Tcp} = connect(Port),
-    _Conn = waiting_for_header(Tcp),
+    _Conn = waiting_for_header(Tcp, ~""),
     ok = gen_tcp:close(Tcp),
     ?assertEqual({proxy_protocol, closed}, await_accept_error()).
 
 tcp_transport_error_before_its_header(_Config) ->
     Port = start_tcp_listener(#{}),
     {ok, Tcp} = connect(Port),
-    Conn = waiting_for_header(Tcp),
+    Conn = waiting_for_header(Tcp, ~""),
     Conn ! {tcp_error, Tcp, econnreset},
     ?assertEqual({proxy_protocol, econnreset}, await_accept_error()),
     ok = gen_tcp:close(Tcp).
@@ -204,7 +204,7 @@ tcp_stray_message_before_its_header(_Config) ->
     %% comes through.
     Port = start_tcp_listener(#{}),
     {ok, Tcp} = connect(Port),
-    Conn = waiting_for_header(Tcp),
+    Conn = waiting_for_header(Tcp, ~""),
     Conn ! stray,
     ok = gen_tcp:send(Tcp, [?V1, ~"GET / HTTP/1.1\r\nHost: x\r\n\r\n"]),
     ?assertEqual(~"192.168.0.7", body_of(recv_until_closed(Tcp, <<>>))),
@@ -212,13 +212,13 @@ tcp_stray_message_before_its_header(_Config) ->
 
 %% --- helpers ---
 
-%% Send part of a header, wait until the connection reads the rest, then
-%% drain: it returns `{ok, drained}` with the connection closed, and no
-%% accept error is reported for the drain.
+%% Send part of a header, wait until the connection has taken it in and waits
+%% for the rest, then drain: it returns `{ok, drained}` with the connection
+%% closed, and no accept error is reported for the drain.
 drain_while_waiting(Port, Part) ->
     {ok, Tcp} = connect(Port),
     ok = gen_tcp:send(Tcp, Part),
-    _Conn = waiting_for_header(Tcp),
+    _Conn = waiting_for_header(Tcp, Part),
     ?assertEqual({ok, drained}, roadrunner_listener:drain(?MODULE, 5000)),
     ?assertEqual({error, closed}, gen_tcp:recv(Tcp, 0, 1000)),
     receive
@@ -227,51 +227,73 @@ drain_while_waiting(Port, Part) ->
     end.
 
 %% The connection serving `Tcp`, once it waits for the rest of its PROXY
-%% header with everything sent so far taken in.
-waiting_for_header(Tcp) ->
+%% header with `Sent`, everything sent so far, taken in: its socket has read
+%% those bytes, and the connection is back in its wait after that.
+waiting_for_header(Tcp, Sent) ->
     {ok, Local} = inet:sockname(Tcp),
-    waiting_for_header(Local, erlang:monotonic_time(millisecond) + 5000).
+    waiting_for_header(Local, Sent, erlang:monotonic_time(millisecond) + 5000).
 
-waiting_for_header(Local, Deadline) ->
-    case
-        [
-            P
-         || P <- processes(),
-            [
-                {current_function, {roadrunner_conn_loop, await_proxy_bytes, 6}},
-                {message_queue_len, 0}
-            ] <-
-                [erlang:process_info(P, [current_function, message_queue_len])],
-            serves(P, Local)
-        ]
-    of
+waiting_for_header(Local, Sent, Deadline) ->
+    case [P || P <- processes(), waiting(P), serves(P, Local, Sent), waiting(P)] of
         [Conn] ->
             Conn;
         [] ->
             erlang:monotonic_time(millisecond) < Deadline orelse ct:fail(never_waiting),
             erlang:yield(),
-            waiting_for_header(Local, Deadline)
+            waiting_for_header(Local, Sent, Deadline)
     end.
 
+%% Whether `Pid` waits for the bytes of a PROXY header, its mailbox empty.
+waiting(Pid) ->
+    erlang:process_info(Pid, [current_function, message_queue_len]) =:=
+        [{current_function, {roadrunner_conn_loop, await_proxy_bytes, 6}}, {message_queue_len, 0}].
+
 %% Whether `Pid` owns the server side of the connection whose client end
-%% is at `Local`.
-serves(Pid, Local) ->
+%% is at `Local`, which has read as many bytes as `Sent`.
+serves(Pid, Local, Sent) ->
     lists:any(
         fun(Port) ->
             erlang:port_info(Port, connected) =:= {connected, Pid} andalso
-                inet:peername(Port) =:= {ok, Local}
+                inet:peername(Port) =:= {ok, Local} andalso
+                inet:getstat(Port, [recv_oct]) =:= {ok, [{recv_oct, byte_size(Sent)}]}
         end,
         erlang:ports()
     ).
 
-%% The connection serving `Tcp` does no work over a second in which the
-%% client sends nothing.
-still_while_silent(Tcp) ->
-    Conn = waiting_for_header(Tcp),
-    {reductions, Before} = erlang:process_info(Conn, reductions),
+%% The connection serving `Tcp` never wakes over a second in which the
+%% client sends nothing: a trace of its `receive` catches no message and no
+%% timeout. Its reductions would not tell, as the VM charges a process for
+%% the housekeeping it does on it: a `persistent_term` value bigger than a
+%% word, replaced or erased anywhere in the node, has every process scanned
+%% for it, and the replacements here have the wait scanned too.
+still_while_silent(Tcp, Sent) ->
+    Conn = waiting_for_header(Tcp, Sent),
+    1 = erlang:trace(Conn, true, ['receive']),
+    ok = replace_persistent_term(20),
     ?assertEqual({error, timeout}, gen_tcp:recv(Tcp, 0, 1000)),
-    ?assertEqual({reductions, Before}, erlang:process_info(Conn, reductions)),
+    1 = erlang:trace(Conn, false, ['receive']),
+    ?assertEqual([], traced(Conn)),
     ok.
+
+%% Replace a `persistent_term` value `N` times, then erase it.
+replace_persistent_term(N) ->
+    Key = {?MODULE, scanned},
+    lists:foreach(fun(_) -> ok = persistent_term:put(Key, make_ref()) end, lists:seq(1, N)),
+    true = persistent_term:erase(Key),
+    ok.
+
+%% What a trace of `Conn`'s `receive` caught, once all of it has arrived.
+traced(Conn) ->
+    Ref = erlang:trace_delivered(Conn),
+    receive
+        {trace_delivered, Conn, Ref} -> traced_messages(Conn)
+    end.
+
+traced_messages(Conn) ->
+    receive
+        {trace, Conn, 'receive', Msg} -> [Msg | traced_messages(Conn)]
+    after 0 -> []
+    end.
 
 start_tcp_listener(Extra) ->
     {ok, _} = roadrunner_listener:start_link(
