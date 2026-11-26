@@ -22,7 +22,8 @@ the reset a close with unread input sends.
     linger_ends_when_the_client_closes/1,
     linger_ends_at_its_timeout/1,
     linger_over_the_cap_closes_at_once/1,
-    killed_lingering_conn_stops_counting/1
+    killed_lingering_conn_stops_counting/1,
+    linger_after_the_listener_stopped/1
 ]).
 
 -define(H, roadrunner_manual_body_handler).
@@ -48,7 +49,8 @@ all() ->
         linger_ends_when_the_client_closes,
         linger_ends_at_its_timeout,
         linger_over_the_cap_closes_at_once,
-        killed_lingering_conn_stops_counting
+        killed_lingering_conn_stops_counting,
+        linger_after_the_listener_stopped
     ].
 
 init_per_suite(Config) ->
@@ -64,13 +66,20 @@ init_per_testcase(Case, Config) ->
         #{
             port => 0,
             max_content_length => 1000,
-            routes => [{~"/r", ?H, reject}, {~"/stream", roadrunner_stream_handler}]
+            routes => [
+                {~"/r", ?H, reject},
+                {~"/stream", roadrunner_stream_handler},
+                {~"/keep", roadrunner_keepalive_handler}
+            ]
         },
         opts(Case)
     ),
     {ok, _} = roadrunner_listener:start_link(?MODULE, Opts),
     [{port, roadrunner_listener:port(?MODULE)} | Config].
 
+end_per_testcase(linger_after_the_listener_stopped, _Config) ->
+    %% The case stopped the listener itself.
+    ok;
 end_per_testcase(_Case, _Config) ->
     ok = roadrunner_listener:stop(?MODULE).
 
@@ -208,6 +217,33 @@ killed_lingering_conn_stops_counting(Config) ->
     Listener ! reconcile_slots,
     ?assertMatch(#{lingering := 0, lingers_skipped := 0}, roadrunner_listener:info(?MODULE)),
     ok = gen_tcp:close(Held).
+
+linger_after_the_listener_stopped(Config) ->
+    %% A keep-alive connection outlives its listener (`stop/1` does not
+    %% wait for it), and the table that counts lingering connections went
+    %% with the listener. A request refused after that still lingers and
+    %% closes cleanly: the client reads its 431 and the close is reported.
+    %% Refused for its header, it is refused before routing: the listener's
+    %% routes went with it too.
+    {ok, Sock} = gen_tcp:connect(
+        {127, 0, 0, 1},
+        ?config(port, Config),
+        [binary, {active, false}, {exit_on_close, false}],
+        5000
+    ),
+    ok = gen_tcp:send(Sock, ~"GET /keep HTTP/1.1\r\nHost: x\r\n\r\n"),
+    {ok, <<"HTTP/1.1 200 ", _/binary>>} = gen_tcp:recv(Sock, 0, 5000),
+    ok = roadrunner_listener:stop(?MODULE),
+    Ref = attach_conn_close(),
+    ok = gen_tcp:send(Sock, [
+        ~"GET /r HTTP/1.1\r\nHost: x\r\nX-Big: ", binary:copy(~"a", ?UPLOAD), ~"\r\n\r\n"
+    ]),
+    %% What follows the first read may still hold the tail of the 200.
+    ?assertNotEqual(
+        nomatch, binary:match(recv_until_closed(gen_tcp, Sock, <<>>), ~"HTTP/1.1 431 ")
+    ),
+    ok = gen_tcp:close(Sock),
+    ok = conn_closed(Ref).
 
 %% --- helpers ---
 

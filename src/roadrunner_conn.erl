@@ -2486,6 +2486,10 @@ parse_error_status(_) -> 400.
 %% hands the process a fresh binary, and a client that sends as fast as it
 %% can would otherwise pile up garbage until the process next collects,
 %% hundreds of kilobytes per lingering connection.
+%% The listener owns the budget's table, and a connection can outlive it
+%% (`roadrunner_listener:stop/1` does not wait for its connections): with
+%% the table gone there is no cap left to count against, and the
+%% connection lingers all the same.
 -doc false.
 -spec linger(roadrunner_transport:socket(), non_neg_integer(), linger_budget()) -> ok.
 linger(_Socket, 0, _Budget) ->
@@ -2495,17 +2499,34 @@ linger(Socket, Timeout, {Table, Skipped, Max}) ->
     %% lingers, which skips the `after` below, leaves a row for a dead
     %% process, and the listener's slot reaper drops it
     %% (`prune_lingering/1`).
-    true = ets:insert(Table, {self()}),
-    case ets:info(Table, size) of
-        Lingering when Lingering > Max ->
-            true = ets:delete(Table, self()),
+    case count_lingering(Table) of
+        Lingering when is_integer(Lingering), Lingering > Max ->
+            ok = uncount_lingering(Table),
             atomics:add(Skipped, 1, 1);
         _ ->
             try
                 linger_read(Socket, Timeout)
             after
-                true = ets:delete(Table, self())
+                ok = uncount_lingering(Table)
             end
+    end.
+
+%% Count the calling connection as lingering, and return how many linger
+%% now: `undefined` once the listener and its table are gone.
+-spec count_lingering(ets:table()) -> non_neg_integer() | undefined.
+count_lingering(Table) ->
+    try ets:insert(Table, {self()}) of
+        true -> ets:info(Table, size)
+    catch
+        error:badarg -> undefined
+    end.
+
+-spec uncount_lingering(ets:table()) -> ok.
+uncount_lingering(Table) ->
+    try ets:delete(Table, self()) of
+        true -> ok
+    catch
+        error:badarg -> ok
     end.
 
 %% A new budget of `Max` connections lingering at once, none lingering yet.

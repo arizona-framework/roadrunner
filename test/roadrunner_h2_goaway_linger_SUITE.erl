@@ -17,7 +17,8 @@ that reads the GOAWAY then gets the reset instead of a clean close.
     oversized_data_goaway_then_clean_close/1,
     oversized_headers_goaway_then_clean_close/1,
     no_linger_resets/1,
-    streaming_worker_ends_before_the_linger/1
+    streaming_worker_ends_before_the_linger/1,
+    goaway_after_the_listener_stopped_then_clean_close/1
 ]).
 
 -define(PREFACE, ~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
@@ -35,7 +36,8 @@ all() ->
         oversized_data_goaway_then_clean_close,
         oversized_headers_goaway_then_clean_close,
         no_linger_resets,
-        streaming_worker_ends_before_the_linger
+        streaming_worker_ends_before_the_linger,
+        goaway_after_the_listener_stopped_then_clean_close
     ].
 
 init_per_testcase(Case, Config) ->
@@ -46,6 +48,9 @@ init_per_testcase(Case, Config) ->
     }),
     [{port, roadrunner_listener:port(?MODULE)} | Config].
 
+end_per_testcase(goaway_after_the_listener_stopped_then_clean_close, _Config) ->
+    %% The case stopped the listener itself.
+    ok;
 end_per_testcase(_Case, _Config) ->
     ok = roadrunner_listener:stop(?MODULE).
 
@@ -105,6 +110,24 @@ streaming_worker_ends_before_the_linger(Config) ->
     after 5_000 -> error(worker_waited_for_the_linger)
     end,
     ok = gen_tcp:close(Sock).
+
+goaway_after_the_listener_stopped_then_clean_close(Config) ->
+    %% A connection outlives its listener (`stop/1` does not wait for it),
+    %% and the table that counts lingering connections went with the
+    %% listener. A GOAWAY after that still lingers, so the client reads it
+    %% and then a clean close, not a reset.
+    {ok, Sock} = gen_tcp:connect(
+        {127, 0, 0, 1}, ?config(port, Config), [binary, {active, false}, {show_econnreset, true}]
+    ),
+    ok = gen_tcp:send(Sock, [?PREFACE, roadrunner_http2_frame:encode({settings, 0, []})]),
+    %% The server's first frames: the connection is up before the listener
+    %% goes.
+    {ok, Read} = gen_tcp:recv(Sock, 0, 5000),
+    ok = roadrunner_listener:stop(?MODULE),
+    Frame = [<<16385:24, 0, 0, 1:32>>, binary:copy(<<0>>, ?TRAILING_BYTES)],
+    _ = spawn(fun() -> _ = gen_tcp:send(Sock, Frame) end),
+    ?assertEqual(frame_size_error, goaway_code(Sock, Read)),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 5000)).
 
 %% Streams its response until the conn stops taking it, announcing its pid
 %% to the case first.
