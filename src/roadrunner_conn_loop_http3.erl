@@ -2524,8 +2524,8 @@ discard_stream(#h3{cfg = #h3_cfg{conn = Conn}, streams = Streams} = State, Strea
 %% and opens another run handlers past `max_concurrent_requests`. A loop
 %% taken down with its QUIC connection never gets here: the slot keeper
 %% (for a loop that parked a request) or the listener's reaper
-%% (`slot_reconciliation`) empties its cell instead, and its workers still
-%% running stop counting then.
+%% (`slot_reconciliation`, with a last pass as the listener stops) empties
+%% its cell instead, and its workers still running stop counting then.
 -spec hand_off_slots(#h3{}) -> ok.
 hand_off_slots(#h3{cfg = #h3_cfg{slot_cell = undefined}}) ->
     ok;

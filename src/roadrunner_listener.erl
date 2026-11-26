@@ -4461,7 +4461,8 @@ terminate(_Reason, #state{
     erase_routes(ProtoOpts),
     Loops = watch_http3_loops(QuicListener, ProtoOpts),
     ok = stop_quic(QuicListener),
-    ok = reclaim_http3_loops(Loops, ProtoOpts),
+    ok = await_http3_loops(Loops),
+    ok = reclaim_dead_conns(ProtoOpts),
     ok = stop_slot_keeper(ProtoOpts),
     %% A link takes the keepers down when this process crashes, but not on a
     %% normal stop. Their tables go with this process.
@@ -4471,21 +4472,18 @@ terminate(_Reason, #state{
 
 %% The HTTP/3 request loops registered for drain, watched as the QUIC pool
 %% stops: each is linked to its QUIC connection and goes down with it,
-%% without its exit path, so the in-flight slots in its cell would stay
-%% counted, and HTTP/2 connections that outlive the listener still admit
-%% requests against that count. Only a listener with a request ceiling
-%% has slots to give back, and only loops registered for drain are known:
-%% none are with `graceful_drain => false`.
--spec watch_http3_loops(pid() | undefined, roadrunner_conn:proto_opts()) ->
-    [{reference(), roadrunner_conn:slot_cell()}].
+%% without its exit path, and its slots are reclaimed once it is gone
+%% (`reclaim_dead_conns/1`). Only a listener with a request ceiling has
+%% slots to give back.
+-spec watch_http3_loops(pid() | undefined, roadrunner_conn:proto_opts()) -> [reference()].
 watch_http3_loops(undefined, _ProtoOpts) ->
     [];
 watch_http3_loops(_QuicPool, #proto_opts{slot_keeper = undefined}) ->
     [];
 watch_http3_loops(_QuicPool, #proto_opts{drain_table = Table}) ->
     [
-        {monitor(process, Pid), Cell}
-     || {Pid, Cell} <- ets:tab2list(Table),
+        monitor(process, Pid)
+     || {Pid, _Cell} <- ets:tab2list(Table),
         is_http3_loop(proc_lib:get_label(Pid))
     ].
 
@@ -4493,24 +4491,32 @@ watch_http3_loops(_QuicPool, #proto_opts{drain_table = Table}) ->
 is_http3_loop({roadrunner_conn_loop_http3, _ListenerName, _Conn}) -> true;
 is_http3_loop(_Label) -> false.
 
-%% Give back the slots of each watched loop as it goes down, which it
-%% does with its QUIC connection, torn down by the pool's stop through
-%% their link. One that ran its exit path emptied its cell already, so
-%% nothing is given back twice.
--spec reclaim_http3_loops(
-    [{reference(), roadrunner_conn:slot_cell()}], roadrunner_conn:proto_opts()
-) ->
-    ok.
-reclaim_http3_loops(Loops, ProtoOpts) ->
+%% Wait for each watched loop to go down, which it does with its QUIC
+%% connection, torn down by the pool's stop through their link.
+-spec await_http3_loops([reference()]) -> ok.
+await_http3_loops(Monitors) ->
     lists:foreach(
-        fun({Mon, Cell}) ->
+        fun(Mon) ->
             receive
-                {'DOWN', Mon, process, _Pid, _Reason} ->
-                    ok = reclaim_request_slots(Cell, ProtoOpts)
+                {'DOWN', Mon, process, _Pid, _Reason} -> ok
             end
         end,
-        Loops
+        Monitors
     ).
+
+%% One last reaper pass as the listener stops: no tick comes after it, and
+%% HTTP/2 connections that outlive the listener still admit requests
+%% against its counter. The slots of every registered conn that died
+%% without its exit path (killed since the last tick, or an HTTP/3 loop
+%% gone with its QUIC connection) are given back. One that ran its exit
+%% path emptied its cell already, so nothing is given back twice. With
+%% `graceful_drain => false` no conn registers, and none is known here.
+-spec reclaim_dead_conns(roadrunner_conn:proto_opts()) -> ok.
+reclaim_dead_conns(#proto_opts{slot_keeper = undefined}) ->
+    ok;
+reclaim_dead_conns(#proto_opts{drain_table = Table} = ProtoOpts) ->
+    _ = count_live_up_to(Table, 0, ProtoOpts),
+    ok.
 
 -spec stop_quic(pid() | undefined) -> ok.
 stop_quic(undefined) ->

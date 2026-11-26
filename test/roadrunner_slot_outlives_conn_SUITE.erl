@@ -45,6 +45,8 @@ The handlers announce themselves to the test process and wait for
     unread_hand_off_is_released_as_the_keeper_stops/1,
     listener_goes_down_with_its_keeper/1,
     dead_parked_conn_is_reclaimed_as_the_keeper_stops/1,
+    conn_killed_as_the_listener_stops_is_reclaimed/1,
+    killed_conn_is_reclaimed_as_the_listener_stops/1,
     http3_slots_are_released_as_the_listener_stops/1,
     http3_slots_are_released_beside_a_surviving_http2_conn/1,
     http3_listener_without_a_drain_registry_stops/1
@@ -65,7 +67,8 @@ groups() ->
         queued_until_the_old_handler_ends,
         parked_request_of_a_closed_conn_is_dropped,
         drained_conn_keeps_its_reset_handler_counted,
-        killed_conn_is_reclaimed
+        killed_conn_is_reclaimed,
+        killed_conn_is_reclaimed_as_the_listener_stops
     ],
     %% HTTP/3 has no case of a connection outliving its listener: stopping
     %% the listener stops its QUIC connections, and with them the linked
@@ -87,7 +90,8 @@ groups() ->
                     adopted_slots_are_released_as_the_keeper_stops,
                     unread_hand_off_is_released_as_the_keeper_stops,
                     listener_goes_down_with_its_keeper,
-                    dead_parked_conn_is_reclaimed_as_the_keeper_stops
+                    dead_parked_conn_is_reclaimed_as_the_keeper_stops,
+                    conn_killed_as_the_listener_stops_is_reclaimed
                 ]},
         {h3, [],
             Common ++
@@ -660,6 +664,57 @@ http3_listener_without_a_drain_registry_stops(Config) ->
     Handler = expect_handler(),
     ok = roadrunner_listener:stop(Name),
     ok = finish(Handler, release).
+
+%% A parked connection killed just before the listener stops leaves its
+%% slots in its cell, and its `DOWN` unread by the keeper, which is
+%% suspended to keep it so. No reaper tick comes after the stop, so the
+%% stop reclaims the cell itself: the connection that outlives it gets the
+%% whole ceiling back.
+conn_killed_as_the_listener_stops_is_reclaimed(Config) ->
+    Name = start(Config, 2, {queue, #{max_queued => 4, timeout => 10000}}),
+    Counter = counter(Name),
+    Other = connect(Config),
+    ok = request(Other),
+    OtherHandler = expect_handler(),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    ok = request(Client),
+    ok = await_parked(Name),
+    Conn = conn_of(Name, Client),
+    Keeper = keeper(Name),
+    ok = sys:suspend(Keeper),
+    Mon = monitor(process, Conn),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    ok = await_queued(Keeper, 1),
+    ?assertEqual(2, counters:get(Counter, 1)),
+    ok = stop_with_keeper(Name),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    ok = finish(OtherHandler, release),
+    ok = spin(
+        fun() -> counters:get(Counter, 1) =:= 0 end, erlang:monotonic_time(millisecond) + 5000
+    ).
+
+%% A connection killed while its handler runs, with no reaper tick before
+%% the listener stops: the stop reclaims its slot, and the handler's own
+%% end gives back nothing more.
+killed_conn_is_reclaimed_as_the_listener_stops(Config) ->
+    Name = start(Config, 2, refuse),
+    Counter = counter(Name),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    Conn = conn_of(Name, Client),
+    Mon = monitor(process, Conn),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = roadrunner_listener:stop(Name),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    ?assertEqual(0, counters:get(Counter, 1)).
 
 %% A connection that is up before its listener stops, so it outlives it.
 survivor(Config) ->
