@@ -39,7 +39,18 @@ The handlers announce themselves to the test process and wait for
     conn_closing_after_its_listener_stopped_exits_cleanly/1,
     parked_request_of_a_stopped_listener_is_refused/1,
     parked_request_of_an_ungraceful_drain_is_refused/1,
-    never_parked_conn_after_its_listener_stopped_admits_afresh/1
+    never_parked_conn_after_its_listener_stopped_admits_afresh/1,
+    hand_off_after_the_keeper_stopped_is_released/1,
+    hand_off_after_the_keeper_was_killed_is_released/1,
+    adopted_slots_are_released_as_the_keeper_stops/1,
+    unread_hand_off_is_released_as_the_keeper_stops/1,
+    listener_goes_down_with_its_keeper/1,
+    dead_parked_conn_is_reclaimed_as_the_keeper_stops/1,
+    conn_killed_as_the_listener_stops_is_reclaimed/1,
+    killed_conn_is_reclaimed_as_the_listener_stops/1,
+    http3_slots_are_released_as_the_listener_stops/1,
+    http3_slots_are_released_beside_a_surviving_http2_conn/1,
+    http3_listener_without_a_drain_registry_stops/1
 ]).
 
 -define(H3_REQUEST_REJECTED, 16#10B).
@@ -57,10 +68,12 @@ groups() ->
         queued_until_the_old_handler_ends,
         parked_request_of_a_closed_conn_is_dropped,
         drained_conn_keeps_its_reset_handler_counted,
-        killed_conn_is_reclaimed
+        killed_conn_is_reclaimed,
+        killed_conn_is_reclaimed_as_the_listener_stops
     ],
-    %% HTTP/3 has no listener-stopped case: stopping the listener stops its
-    %% QUIC connections, and with them the linked request loops.
+    %% HTTP/3 has no case of a connection outliving its listener: stopping
+    %% the listener stops its QUIC connections, and with them the linked
+    %% request loops.
     [
         {h2, [],
             Common ++
@@ -73,9 +86,22 @@ groups() ->
                     conn_closing_after_its_listener_stopped_exits_cleanly,
                     parked_request_of_a_stopped_listener_is_refused,
                     parked_request_of_an_ungraceful_drain_is_refused,
-                    never_parked_conn_after_its_listener_stopped_admits_afresh
+                    never_parked_conn_after_its_listener_stopped_admits_afresh,
+                    hand_off_after_the_keeper_stopped_is_released,
+                    hand_off_after_the_keeper_was_killed_is_released,
+                    adopted_slots_are_released_as_the_keeper_stops,
+                    unread_hand_off_is_released_as_the_keeper_stops,
+                    listener_goes_down_with_its_keeper,
+                    dead_parked_conn_is_reclaimed_as_the_keeper_stops,
+                    conn_killed_as_the_listener_stops_is_reclaimed
                 ]},
-        {h3, [], Common},
+        {h3, [],
+            Common ++
+                [
+                    http3_slots_are_released_as_the_listener_stops,
+                    http3_slots_are_released_beside_a_surviving_http2_conn,
+                    http3_listener_without_a_drain_registry_stops
+                ]},
         %% HTTP/1.1 counts a request against the ceiling in shed mode only,
         %% its handler running in the connection process itself.
         {h1, [], [killed_conn_is_reclaimed]}
@@ -477,6 +503,270 @@ parked_then_queue_gone(Name, Config, End) ->
     ok = finish(Served, release),
     ?assertEqual(ok, await_ok(Client)).
 
+%% The connections that outlive a stopped listener still admit requests
+%% against its counter. One that closes after the keeper stopped, its
+%% handler still running, has no keeper to hand that slot to: it releases
+%% it, so the others still get the whole ceiling.
+hand_off_after_the_keeper_stopped_is_released(Config) ->
+    Name = start(Config, 2, refuse),
+    Counter = counter(Name),
+    Old = connect(Config),
+    ok = request(Old),
+    Handler = expect_handler(),
+    Conn = conn_of(Name, Old),
+    Survivor = survivor(Config),
+    ok = stop_with_keeper(Name),
+    Mon = monitor(process, Conn),
+    ok = close(Old),
+    ok = await_down(Mon),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    ok = served_twice(Survivor, Counter).
+
+%% A keeper killed outright, taking its listener down, never runs its
+%% stop: a connection that closes after that, its handler still running,
+%% finds it gone and releases its slot itself.
+hand_off_after_the_keeper_was_killed_is_released(Config) ->
+    Name = start(Config, 2, refuse),
+    Counter = counter(Name),
+    Old = connect(Config),
+    ok = request(Old),
+    Handler = expect_handler(),
+    Conn = conn_of(Name, Old),
+    Listener = whereis(Name),
+    true = unlink(Listener),
+    ListenerMon = monitor(process, Listener),
+    Keeper = keeper(Name),
+    KeeperMon = monitor(process, Keeper),
+    true = exit(Keeper, kill),
+    ok = await_down(KeeperMon),
+    ok = await_down(ListenerMon),
+    Mon = monitor(process, Conn),
+    ok = close(Old),
+    ok = await_down(Mon),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release).
+
+%% The slots of handlers whose connection closed before the stop are the
+%% keeper's to release, and it releases them as it stops.
+adopted_slots_are_released_as_the_keeper_stops(Config) ->
+    Name = start(Config, 2, refuse),
+    Counter = counter(Name),
+    Old = connect(Config),
+    ok = request(Old),
+    Handler = expect_handler(),
+    ok = close_and_wait(Name, Old),
+    _ = sys:get_state(keeper(Name)),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    Survivor = survivor(Config),
+    ok = stop_with_keeper(Name),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    ok = served_twice(Survivor, Counter).
+
+%% A hand-off the keeper had not read when it stopped is released too. The
+%% keeper is suspended to stop it with the hand-off unread.
+unread_hand_off_is_released_as_the_keeper_stops(Config) ->
+    Name = start(Config, 2, refuse),
+    Counter = counter(Name),
+    Old = connect(Config),
+    ok = request(Old),
+    ok = request(Old),
+    Handlers = [expect_handler(), expect_handler()],
+    Keeper = keeper(Name),
+    ok = sys:suspend(Keeper),
+    ok = close_and_wait(Name, Old),
+    ok = await_queued(Keeper, 1),
+    ?assertEqual(2, counters:get(Counter, 1)),
+    Survivor = survivor(Config),
+    ok = stop_with_keeper(Name),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    [ok = finish(H, release) || H <- Handlers],
+    ok = served_twice(Survivor, Counter).
+
+%% A keeper that dies takes its listener down, whose stop then finds no
+%% keeper left to stop.
+listener_goes_down_with_its_keeper(Config) ->
+    Name = start(Config, 1, refuse),
+    Listener = whereis(Name),
+    true = unlink(Listener),
+    Mon = monitor(process, Listener),
+    true = exit(keeper(Name), kill),
+    receive
+        {'DOWN', Mon, process, Listener, Reason} -> ?assertEqual(killed, Reason)
+    after 5000 -> ct:fail(listener_did_not_exit)
+    end.
+
+%% A parked connection killed just before the stop, its `DOWN` unread by
+%% the keeper (suspended to keep it so), leaves its slots in its cell. The
+%% keeper gives them back as it stops. With `graceful_drain => false` the
+%% conn is not registered, so the listener's own last pass cannot.
+dead_parked_conn_is_reclaimed_as_the_keeper_stops(Config) ->
+    Name = start(Config, 2, {queue, #{max_queued => 4, timeout => 10000}}, #{
+        graceful_drain => false
+    }),
+    Counter = counter(Name),
+    Other = connect(Config),
+    ok = request(Other),
+    OtherHandler = expect_handler(),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    ok = request(Client),
+    ok = await_parked(Name),
+    Conn = labelled_conn(Client),
+    Keeper = keeper(Name),
+    ok = sys:suspend(Keeper),
+    Mon = monitor(process, Conn),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    ok = await_queued(Keeper, 1),
+    ?assertEqual(2, counters:get(Counter, 1)),
+    ok = stop_with_keeper(Name),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    ok = finish(OtherHandler, release),
+    ok = spin(
+        fun() -> counters:get(Counter, 1) =:= 0 end, erlang:monotonic_time(millisecond) + 5000
+    ).
+
+%% The server connection serving `Client`, found by its label: a listener
+%% with `graceful_drain => false` keeps no registry to look it up in.
+labelled_conn(Client) ->
+    Port = client_port(Client),
+    [Conn] = [Pid || Pid <- processes(), server_peer_port(Pid) =:= Port],
+    Conn.
+
+%% An HTTP/3 request loop goes down with its QUIC connection as the
+%% listener stops, without its exit path. The listener gives back the slots
+%% in its cell as it stops, as HTTP/2 connections that outlive it still
+%% count against them; the handler's own end gives back nothing more.
+http3_slots_are_released_as_the_listener_stops(Config) ->
+    Name = start(Config, 2, refuse),
+    Counter = counter(Name),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = roadrunner_listener:stop(Name),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    ?assertEqual(0, counters:get(Counter, 1)).
+
+%% On a listener that serves both, the HTTP/2 connection outlives the stop
+%% and keeps its slot; the HTTP/3 loop's slot is given back.
+http3_slots_are_released_beside_a_surviving_http2_conn(Config) ->
+    Name = start(Config, 2, refuse, #{protocols => [http2, http3]}),
+    Counter = counter(Name),
+    {ok, Tls} = ssl:connect(
+        {127, 0, 0, 1},
+        roadrunner_listener:port(Name),
+        [binary, {active, false}, {verify, verify_none}, {alpn_advertised_protocols, [~"h2"]}],
+        5000
+    ),
+    ok = ssl:send(Tls, [~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", <<0:24, 4, 0, 0:32>>]),
+    {ok, _} = ssl:recv(Tls, 0, 5000),
+    {ok, H3} = roadrunner_quic_test_h3:connect(
+        {127, 0, 0, 1}, roadrunner_listener:quic_port(Name)
+    ),
+    ok = request({h3, H3}),
+    Handler = expect_handler(),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = roadrunner_listener:stop(Name),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    %% The HTTP/2 connection is still up: it answers a PING.
+    ok = ssl:send(Tls, roadrunner_http2_frame:encode({ping, 0, <<1, 2, 3, 4, 5, 6, 7, 8>>})),
+    {ok, _} = ssl:recv(Tls, 0, 5000),
+    ok = ssl:close(Tls).
+
+%% A guard: with `graceful_drain => false` no loop registers for drain, so
+%% the listener has none to watch as it stops, and the stop does not wait
+%% on them.
+http3_listener_without_a_drain_registry_stops(Config) ->
+    Name = start(Config, 2, refuse, #{graceful_drain => false}),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    ok = roadrunner_listener:stop(Name),
+    ok = finish(Handler, release).
+
+%% A parked connection killed just before the listener stops leaves its
+%% slots in its cell, and its `DOWN` unread by the keeper, which is
+%% suspended to keep it so. No reaper tick comes after the stop, so the
+%% stop reclaims the cell itself: the connection that outlives it gets the
+%% whole ceiling back.
+conn_killed_as_the_listener_stops_is_reclaimed(Config) ->
+    Name = start(Config, 2, {queue, #{max_queued => 4, timeout => 10000}}),
+    Counter = counter(Name),
+    Other = connect(Config),
+    ok = request(Other),
+    OtherHandler = expect_handler(),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    ok = request(Client),
+    ok = await_parked(Name),
+    Conn = conn_of(Name, Client),
+    Keeper = keeper(Name),
+    ok = sys:suspend(Keeper),
+    Mon = monitor(process, Conn),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    ok = await_queued(Keeper, 1),
+    ?assertEqual(2, counters:get(Counter, 1)),
+    ok = stop_with_keeper(Name),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    ok = finish(OtherHandler, release),
+    ok = spin(
+        fun() -> counters:get(Counter, 1) =:= 0 end, erlang:monotonic_time(millisecond) + 5000
+    ).
+
+%% A connection killed while its handler runs, with no reaper tick before
+%% the listener stops: the stop reclaims its slot, and the handler's own
+%% end gives back nothing more.
+killed_conn_is_reclaimed_as_the_listener_stops(Config) ->
+    Name = start(Config, 2, refuse),
+    Counter = counter(Name),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    Conn = conn_of(Name, Client),
+    Mon = monitor(process, Conn),
+    true = exit(Conn, kill),
+    ok = await_down(Mon),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = roadrunner_listener:stop(Name),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    ?assertEqual(0, counters:get(Counter, 1)).
+
+%% A connection that is up before its listener stops, so it outlives it.
+survivor(Config) ->
+    {h2, Sock} = Client = connect(Config),
+    ok = await_ping_ack(Sock),
+    Client.
+
+%% Stop the listener and wait for its keeper to be gone.
+stop_with_keeper(Name) ->
+    KeeperMon = monitor(process, keeper(Name)),
+    ok = roadrunner_listener:stop(Name),
+    await_down(KeeperMon).
+
+%% Two requests on the connection both run at once: the whole ceiling of
+%% two is there for it. Each slot comes back as its handler ends.
+served_twice({h2, Sock} = Client, Counter) ->
+    ok = request(Client),
+    ok = request(Client),
+    Handlers = [expect_handler(), expect_handler()],
+    ?assertEqual(2, counters:get(Counter, 1)),
+    [ok = finish(H, release) || H <- Handlers],
+    ok = spin(
+        fun() -> counters:get(Counter, 1) =:= 0 end, erlang:monotonic_time(millisecond) + 5000
+    ),
+    gen_tcp:close(Sock).
+
 %% =============================================================================
 %% Listener and slot accounting
 %% =============================================================================
@@ -486,18 +776,13 @@ start(Config, Max, Overload) ->
 
 start(Config, Max, Overload, Extra) ->
     Name = ?config(listener, Config),
-    {ok, _} = roadrunner_listener:start_link(
-        Name,
-        listener_opts(
-            ?config(protocol, Config),
-            Extra#{
-                port => 0,
-                routes => roadrunner_h2_slot_handler,
-                max_concurrent_requests => Max,
-                overload_mode => Overload
-            }
-        )
-    ),
+    Opts = listener_opts(?config(protocol, Config), #{
+        port => 0,
+        routes => roadrunner_h2_slot_handler,
+        max_concurrent_requests => Max,
+        overload_mode => Overload
+    }),
+    {ok, _} = roadrunner_listener:start_link(Name, maps:merge(Opts, Extra)),
     Name.
 
 listener_opts(h1, Opts) ->
@@ -517,6 +802,10 @@ inflight(Name) ->
 keeper(Name) ->
     #{slot_keeper := Keeper} = proto_opts(Name),
     Keeper.
+
+counter(Name) ->
+    #{inflight_counter := Counter} = proto_opts(Name),
+    Counter.
 
 waiters(Name) ->
     #{overload := {queue, _Pid, Waiters, _Timeout, _MaxQueued}} = proto_opts(Name),

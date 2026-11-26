@@ -2524,14 +2524,14 @@ discard_stream(#h3{cfg = #h3_cfg{conn = Conn}, streams = Streams} = State, Strea
 %% and opens another run handlers past `max_concurrent_requests`. A loop
 %% taken down with its QUIC connection never gets here: the slot keeper
 %% (for a loop that parked a request) or the listener's reaper
-%% (`slot_reconciliation`) empties its cell instead, and its workers still
-%% running stop counting then.
+%% (`slot_reconciliation`, with a last pass as the listener stops) empties
+%% its cell instead, and its workers still running stop counting then.
 -spec hand_off_slots(#h3{}) -> ok.
 hand_off_slots(#h3{cfg = #h3_cfg{slot_cell = undefined}}) ->
     ok;
 hand_off_slots(#h3{
     cfg = #h3_cfg{
-        proto_opts = #proto_opts{slot_keeper = Keeper},
+        proto_opts = #proto_opts{slot_keeper = Keeper, slot_keeper_stopping = Stopping},
         max_concurrent_requests = Max,
         inflight_counter = Counter,
         slot_cell = Cell,
@@ -2541,7 +2541,7 @@ hand_off_slots(#h3{
     parked = Parked
 }) ->
     roadrunner_conn:hand_off_request_slots(
-        Keeper, Cell, maps:values(Pids), Parked, Max, Counter, Overload
+        {Keeper, Stopping}, Cell, maps:values(Pids), Parked, Max, Counter, Overload
     ).
 
 -spec terminate(#h3{}, roadrunner_event_handler:close_reason()) -> ok.

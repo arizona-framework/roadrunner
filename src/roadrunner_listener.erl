@@ -2877,6 +2877,10 @@ setup_overload({queue, #{max_queued := MaxQueued, timeout := Timeout}}, Max, Cou
 setup_overload({shed, #{retry_after := RetryAfter}}, Max, Counter) ->
     {{shed, RetryAfter}, start_slot_keeper(Max, Counter, Max, normal)}.
 
+-spec keeper_stopping(pid() | undefined) -> atomics:atomics_ref() | undefined.
+keeper_stopping(undefined) -> undefined;
+keeper_stopping(Keeper) -> roadrunner_overload_queue:stopping_ref(Keeper).
+
 %% `MaxQueued` matters in queue mode only; nothing parks otherwise. A
 %% queue's keeper runs at high priority: it hands freed slots out only as
 %% fast as it gets to run, and on a server busy with the very requests it
@@ -3177,6 +3181,7 @@ build_proto_opts(Opts, ListenerName) ->
         max_concurrent_requests = MaxConcurrentRequests,
         overload = Overload,
         slot_keeper = SlotKeeper,
+        slot_keeper_stopping = keeper_stopping(SlotKeeper),
         client_counter = ClientCounter,
         drain_table = DrainTable,
         requests_counter = RequestsCounter,
@@ -4454,16 +4459,70 @@ terminate(_Reason, #state{
     route_keepers = RouteKeepers,
     route_stopping = RouteStopping
 }) ->
+    %% `drain/2` already closed the TCP sockets on its way out
+    %% (`closed`), and an HTTP/3-only listener never had one (`none`).
+    %% Closed first, so no connection comes in while the rest stops.
+    ok = close_tcp(LSockets, UnixFile),
     erase_routes(ProtoOpts),
+    Loops = watch_http3_loops(QuicListener, ProtoOpts),
     ok = stop_quic(QuicListener),
+    ok = await_http3_loops(Loops),
+    ok = reclaim_dead_conns(ProtoOpts),
     ok = stop_slot_keeper(ProtoOpts),
     %% A link takes the keepers down when this process crashes, but not on a
     %% normal stop. Their tables go with this process.
     _ = [exit(Pid, shutdown) || _Key := #route_keeper{pid = Pid} <- RouteKeepers],
     _ = [exit(Pid, shutdown) || Pid := _Table <- RouteStopping],
-    %% `drain/2` already closed the TCP sockets on its way out
-    %% (`closed`), and an HTTP/3-only listener never had one (`none`).
-    close_tcp(LSockets, UnixFile).
+    ok.
+
+%% The HTTP/3 request loops registered for drain, watched as the QUIC pool
+%% stops: each is linked to its QUIC connection and goes down with it,
+%% without its exit path, and its slots are reclaimed once it is gone
+%% (`reclaim_dead_conns/1`). Only a listener with a request ceiling has
+%% slots to give back.
+-spec watch_http3_loops(pid() | undefined, roadrunner_conn:proto_opts()) -> [reference()].
+watch_http3_loops(undefined, _ProtoOpts) ->
+    [];
+watch_http3_loops(_QuicPool, #proto_opts{slot_keeper = undefined}) ->
+    [];
+watch_http3_loops(_QuicPool, #proto_opts{drain_table = Table}) ->
+    [
+        monitor(process, Pid)
+     || {Pid, _Cell} <- ets:tab2list(Table),
+        is_http3_loop(proc_lib:get_label(Pid))
+    ].
+
+-spec is_http3_loop(term()) -> boolean().
+is_http3_loop({roadrunner_conn_loop_http3, _ListenerName, _Conn}) -> true;
+is_http3_loop(_Label) -> false.
+
+%% Wait for each watched loop to go down, which it does with its QUIC
+%% connection, torn down by the pool's stop through their link.
+-spec await_http3_loops([reference()]) -> ok.
+await_http3_loops(Monitors) ->
+    lists:foreach(
+        fun(Mon) ->
+            receive
+                {'DOWN', Mon, process, _Pid, _Reason} -> ok
+            end
+        end,
+        Monitors
+    ).
+
+%% One last reaper pass as the listener stops: no tick comes after it, and
+%% HTTP/2 connections that outlive the listener still admit requests
+%% against its counter. The slots of every registered conn that died
+%% without its exit path (killed since the last tick, or an HTTP/3 loop
+%% gone with its QUIC connection) are given back. One that ran its exit
+%% path emptied its cell or handed it to the keeper, and each cell is
+%% emptied with an exchange, so nothing is given back twice. With
+%% `graceful_drain => false` no conn registers, and none is known here.
+-spec reclaim_dead_conns(roadrunner_conn:proto_opts()) -> ok.
+reclaim_dead_conns(#proto_opts{slot_keeper = undefined}) ->
+    ok;
+reclaim_dead_conns(#proto_opts{drain_table = Table} = ProtoOpts) ->
+    _ = count_live_up_to(Table, 0, ProtoOpts),
+    ok.
 
 -spec stop_quic(pid() | undefined) -> ok.
 stop_quic(undefined) ->
@@ -4474,15 +4533,21 @@ stop_quic(QuicPool) ->
     true = unlink(QuicPool),
     roadrunner_quic_listener_sup:stop(QuicPool).
 
-%% A link stops the keeper when the listener crashes, but not on a normal
-%% stop. Its counter goes with the listener, so nothing it keeps counting
-%% is read any more. Asynchronous, as the keeper may be what stopped us.
+%% Stop the slot keeper, which gives back the slots it still counts as it
+%% goes (`roadrunner_overload_queue`): connections that outlive the
+%% listener still admit requests against its counter. The stop waits for
+%% the keeper to finish what is in its mailbox, so it is never cut off
+%% between taking a slot and handing it on. A keeper already gone is what
+%% stopped us.
 -spec stop_slot_keeper(roadrunner_conn:proto_opts()) -> ok.
 stop_slot_keeper(#proto_opts{slot_keeper = undefined}) ->
     ok;
 stop_slot_keeper(#proto_opts{slot_keeper = Pid}) ->
-    true = exit(Pid, shutdown),
-    ok.
+    try
+        gen_server:stop(Pid, shutdown, infinity)
+    catch
+        exit:noproc -> ok
+    end.
 
 -spec erase_routes(roadrunner_conn:proto_opts()) -> ok.
 erase_routes(#proto_opts{dispatch = {router, Name}}) ->

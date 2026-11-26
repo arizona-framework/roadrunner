@@ -15,7 +15,7 @@
 %% and the connection releases it on the worker's `DOWN`. Workers are
 %% monitored, not linked, so they can outlive their connection (the client
 %% went away, or a drain ended it). A closing connection hands the workers
-%% still running to this process (`adopt/4`), which monitors them and
+%% still running to this process (`adopt/3`), which monitors them and
 %% releases each slot as its worker ends. Without that, a client could fill
 %% the ceiling with slow handlers, drop the connection, reconnect and
 %% repeat, running any number of handlers past it.
@@ -72,12 +72,13 @@
     note_release/1,
     waiting/1,
     waiters_ref/1,
-    adopt/4
+    stopping_ref/1,
+    adopt/3
 ]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 %% A connection that parked a request here. It stays until its exit
-%% hand-off (`adopt/4`) or its `DOWN`, so a grant that reaches it after it
+%% hand-off (`adopt/3`) or its `DOWN`, so a grant that reaches it after it
 %% died is always taken back.
 -record(conn, {
     monitor :: reference(),
@@ -105,8 +106,12 @@
     parked = 0 :: non_neg_integer(),
     conns = #{} :: #{pid() => #conn{}},
     %% The monitors of workers whose connection closed while they ran
-    %% (`adopt/4`). Each holds one slot, released on its `DOWN`.
-    adopted = #{} :: #{reference() => []}
+    %% (`adopt/3`). Each holds one slot, released on its `DOWN`.
+    adopted = #{} :: #{reference() => []},
+    %% Set once this process stops (`terminate/2`), before it reads the
+    %% hand-offs left in its mailbox: a connection that hands off after
+    %% then takes its slots back itself (`stopping_ref/1`).
+    stopping :: atomics:atomics_ref()
 }).
 
 -type key() :: {pid(), term()}.
@@ -169,17 +174,26 @@ waiters_ref(Pid) ->
 %% Hand the in-flight slots of `Workers`, the handlers still running as the
 %% calling connection closes, to the keeper at `Pid`, which releases each
 %% one when its worker ends (at once for one already gone), and withdraw
-%% every request the caller has parked. The caller has emptied its `Cell`
-%% already: `Raced` are the grants it held beyond its workers, released at
-%% once, and the keeper empties the cell again once the caller's parked
-%% requests are withdrawn, for a grant sent in between. Asynchronous: the
-%% caller is exiting. A keeper already gone went down with its listener:
-%% the slots handed to it then stay counted, which HTTP/2 connections that
-%% outlive the listener still admit requests against.
--spec adopt(pid(), atomics:atomics_ref(), [pid()], non_neg_integer()) -> ok.
-adopt(Pid, Cell, Workers, Raced) ->
-    _ = erlang:send(Pid, {adopt, self(), Cell, Workers, Raced}),
+%% every request the caller has parked. The slots stay in the caller's
+%% `Cell`: the keeper empties it once the caller's parked requests are
+%% withdrawn, so a grant sent in between is collected with them, and
+%% releases what it holds beyond the workers at once. Asynchronous: the
+%% caller is exiting, and reads the keeper's `stopping_ref/1` flag after
+%% the send (`roadrunner_conn:hand_off_request_slots/7`).
+-spec adopt(pid(), atomics:atomics_ref(), [pid()]) -> ok.
+adopt(Pid, Cell, Workers) ->
+    _ = erlang:send(Pid, {adopt, self(), Cell, Workers}),
     ok.
+
+%% The flag this process sets as it stops, before it reads the hand-offs
+%% left in its mailbox (`terminate/2`). A connection reads it after its
+%% hand-off is sent: while it is clear the hand-off reaches a mailbox
+%% that is still to be read, and once it is set the connection empties its
+%% cell itself. Whichever of the two empties the cell first takes the
+%% slots, so each is released once.
+-spec stopping_ref(pid()) -> atomics:atomics_ref().
+stopping_ref(Pid) ->
+    gen_server:call(Pid, stopping_ref, infinity).
 
 -spec init({pos_integer(), counters:counters_ref(), pos_integer()}) -> {ok, #state{}}.
 init({Max, Counter, MaxQueued}) ->
@@ -187,11 +201,14 @@ init({Max, Counter, MaxQueued}) ->
         max = Max,
         counter = Counter,
         max_queued = MaxQueued,
-        waiters = atomics:new(1, [{signed, false}])
+        waiters = atomics:new(1, [{signed, false}]),
+        stopping = atomics:new(1, [])
     }}.
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
 handle_call(waiters_ref, _From, #state{waiters = Ref} = State) ->
+    {reply, Ref, State};
+handle_call(stopping_ref, _From, #state{stopping = Ref} = State) ->
     {reply, Ref, State};
 handle_call(_Other, _From, State) ->
     {reply, {error, unknown_call}, State}.
@@ -239,10 +256,10 @@ handle_info({expire, Pid, Token}, #state{conns = Conns} = State) ->
             %% Served or withdrawn while the timer fired.
             {noreply, State}
     end;
-handle_info({adopt, Conn, Cell, Workers, Raced}, #state{conns = Conns} = State) ->
+handle_info({adopt, Conn, Cell, Workers}, #state{conns = Conns} = State) ->
     %% The connection's parked requests have no stream left to serve. Once
     %% they are gone no grant can reach its cell, so what it holds now is
-    %% the last of the grants that raced the close.
+    %% its workers' slots and the grants that raced the close.
     State1 =
         case Conns of
             #{Conn := #conn{monitor = Mon} = Gone} ->
@@ -251,13 +268,7 @@ handle_info({adopt, Conn, Cell, Workers, Raced}, #state{conns = Conns} = State) 
             #{} ->
                 State
         end,
-    Adopted = lists:foldl(
-        fun(Worker, Acc) -> Acc#{erlang:monitor(process, Worker) => []} end,
-        State1#state.adopted,
-        Workers
-    ),
-    Late = atomics:exchange(Cell, 1, 0),
-    {noreply, release(Raced + Late, State1#state{adopted = Adopted})};
+    {noreply, adopt_held(atomics:exchange(Cell, 1, 0), Workers, State1)};
 handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{adopted = Adopted} = State) when
     is_map_key(Mon, Adopted)
 ->
@@ -297,6 +308,67 @@ park(Pid, Token, Cell, Timeout, #state{order = Order, parked = Parked, conns = C
     State#state{
         order = queue:in({Pid, Token}, Order), parked = Parked + 1, conns = Conns#{Pid => Conn}
     }.
+
+%% Its listener stops it (`roadrunner_listener`), and connections that
+%% outlive the listener still admit requests against its counter: the
+%% slots it counts are given back, so they don't shrink the ceiling those
+%% connections see for good. That is each worker it watches, still running
+%% or not, and each hand-off still in its mailbox, whose workers no one
+%% will watch now. Nothing parked holds a slot. A worker it gives back
+%% runs on uncounted: only the connections left from before the stop admit
+%% new requests, and they are no more than there were. It also gives back
+%% what a connection that parked here and died without its exit path
+%% still holds (`dead_conns/1`), its `DOWN` perhaps still unread. The
+%% `stopping` flag goes up first: a hand-off sent after the mailbox is
+%% read is then taken back by its own connection.
+-spec terminate(term(), #state{}) -> ok.
+terminate(_Reason, #state{
+    counter = Counter, adopted = Adopted, conns = Conns, stopping = Stopping
+}) ->
+    ok = atomics:put(Stopping, 1, 1),
+    counters:sub(Counter, 1, map_size(Adopted) + unread_hand_offs() + dead_conns(Conns)).
+
+%% Watch the workers of a hand-off whose cell held `Held` slots, each
+%% worker keeping one until it ends, and release the rest at once. A cell
+%% the listener's reaper emptied first (its connection died before it left
+%% the drain registry) holds fewer slots than workers: those were released
+%% already, and the workers are not watched.
+-spec adopt_held(non_neg_integer(), [pid()], #state{}) -> #state{}.
+adopt_held(Held, Workers, #state{adopted = Adopted} = State) ->
+    case Held - length(Workers) of
+        Beyond when Beyond >= 0 ->
+            Watched = lists:foldl(
+                fun(Worker, Acc) -> Acc#{erlang:monitor(process, Worker) => []} end,
+                Adopted,
+                Workers
+            ),
+            release(Beyond, State#state{adopted = Watched});
+        _Fewer ->
+            release(Held, State)
+    end.
+
+%% The slots of the hand-offs (`adopt/3`) still in the mailbox: their
+%% workers' as well, as no one will watch them now.
+-spec unread_hand_offs() -> non_neg_integer().
+unread_hand_offs() ->
+    receive
+        {adopt, _Conn, Cell, _Workers} ->
+            atomics:exchange(Cell, 1, 0) + unread_hand_offs()
+    after 0 ->
+        0
+    end.
+
+%% The slots in the cells of the connections that parked here and are
+%% dead. The listener's last reaper pass, which runs before this process
+%% stops, already emptied the cells of the registered ones, so this takes
+%% only those of connections that never registered (`graceful_drain =>
+%% false`) or died after that pass. The exchange takes each slot once.
+-spec dead_conns(#{pid() => #conn{}}) -> non_neg_integer().
+dead_conns(Conns) ->
+    lists:sum([
+        atomics:exchange(Cell, 1, 0)
+     || Pid := #conn{cell = Cell} <- Conns, not is_process_alive(Pid)
+    ]).
 
 %% Hand freed slots to the oldest parked requests. Each slot is taken
 %% here, on that caller's behalf, so it cannot be stolen by a request

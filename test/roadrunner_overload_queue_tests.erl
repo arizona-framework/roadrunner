@@ -253,11 +253,10 @@ cell(N) ->
     Cell.
 
 %% A conn's side of the hand-off (`roadrunner_conn:hand_off_request_slots/7`):
-%% it empties its cell and sends what it held beyond its workers. Adopting
-%% is asynchronous; a call from the same process lands behind it.
+%% it sends its workers, the slots left in its cell. Adopting is
+%% asynchronous; a call from the same process lands behind it.
 adopt(Pid, Cell, Workers) ->
-    Raced = atomics:exchange(Cell, 1, 0) - length(Workers),
-    ok = roadrunner_overload_queue:adopt(Pid, Cell, Workers, Raced),
+    ok = roadrunner_overload_queue:adopt(Pid, Cell, Workers),
     sync(Pid).
 
 %% An adopted worker keeps its slot until it ends, then the keeper
@@ -330,23 +329,27 @@ adopt_releases_the_grants_that_raced_it_test_() ->
         ?assertEqual(0, counters:get(Counter, 1))
     end}.
 
-%% A grant the keeper sends after the conn emptied its cell, but before it
-%% reads the hand-off, lands in the cell; the keeper empties it again once
-%% the conn's parked requests are gone.
-adopt_releases_a_grant_sent_after_the_conn_emptied_its_cell_test_() ->
+%% A cell the listener's reaper emptied before the keeper read the
+%% hand-off (its conn died still registered) holds fewer slots than
+%% workers: those were released already, so the workers are not watched
+%% and their ends release nothing.
+adopt_of_an_emptied_cell_watches_no_worker_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
-        Cell = cell(),
-        ok = enqueue(Pid, s1, Cell, 5000),
+        Worker = spawn(fun() ->
+            receive
+                stop -> ok
+            end
+        end),
+        Mon = monitor(process, Worker),
+        ok = adopt(Pid, cell(), [Worker]),
+        ?assertEqual(1, counters:get(Counter, 1)),
+        Worker ! stop,
+        receive
+            {'DOWN', Mon, process, Worker, _} -> ok
+        end,
         ok = sync(Pid),
-        0 = atomics:exchange(Cell, 1, 0),
-        release(Counter, Pid),
-        ok = sync(Pid),
-        ?assertEqual(1, atomics:get(Cell, 1)),
-        ok = roadrunner_overload_queue:adopt(Pid, Cell, [], 0),
-        ok = sync(Pid),
-        ?assertEqual(0, counters:get(Counter, 1)),
-        ?assertEqual(0, atomics:get(Cell, 1))
+        ?assertEqual(1, counters:get(Counter, 1))
     end}.
 
 %% A grant to a parked conn that died, its `DOWN` still unread, is taken
@@ -439,7 +442,51 @@ adopt_with_the_keeper_gone_test_() ->
         receive
             {'DOWN', Mon, process, Gone, _} -> ok
         end,
-        ?assertEqual(ok, roadrunner_overload_queue:adopt(Gone, cell(), [self()], 0))
+        ?assertEqual(ok, roadrunner_overload_queue:adopt(Gone, cell(), [self()]))
+    end}.
+
+%% The keeper raises its `stopping` flag as it stops, before it reads the
+%% hand-offs left in its mailbox, and gives back their slots, workers'
+%% included. The keeper is suspended so the hand-off is still unread.
+stopping_keeper_flags_and_gives_back_unread_hand_offs_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        ok = counters:add(Counter, 1, 3),
+        Pid = start(3, Counter, 3),
+        Stopping = roadrunner_overload_queue:stopping_ref(Pid),
+        ?assertEqual(0, atomics:get(Stopping, 1)),
+        ok = sys:suspend(Pid),
+        Cell = cell(3),
+        ok = roadrunner_overload_queue:adopt(Pid, Cell, [self()]),
+        true = unlink(Pid),
+        ok = gen_server:stop(Pid),
+        ?assertEqual(1, atomics:get(Stopping, 1)),
+        ?assertEqual(0, counters:get(Counter, 1)),
+        ?assertEqual(0, atomics:get(Cell, 1))
+    end}.
+
+%% A hand-off to a keeper that is stopping is never read: the keeper set
+%% its flag before it read its mailbox for the last time. The connection
+%% reads the flag after its send and gives its slots back itself. The
+%% keeper here is a process that never reads, its flag already set, as
+%% the real one is from its last read of its mailbox until it is gone.
+hand_off_to_a_stopping_keeper_is_given_back_by_the_conn_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        ok = counters:add(Counter, 1, 2),
+        Keeper = spawn_link(fun() ->
+            receive
+                never -> ok
+            end
+        end),
+        Stopping = atomics:new(1, []),
+        ok = atomics:put(Stopping, 1, 1),
+        Cell = cell(2),
+        ok = roadrunner_conn:hand_off_request_slots(
+            {Keeper, Stopping}, Cell, [self()], false, 2, Counter, refuse
+        ),
+        ?assertEqual(0, counters:get(Counter, 1)),
+        ?assertEqual(0, atomics:get(Cell, 1))
     end}.
 
 %% A `full` answer leaves the queue as full as it was: the refused request

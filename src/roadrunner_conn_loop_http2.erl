@@ -4068,7 +4068,7 @@ hand_off_slots(#loop{cfg = #h2_cfg{slot_cell = undefined}}) ->
     ok;
 hand_off_slots(#loop{
     cfg = #h2_cfg{
-        proto_opts = #proto_opts{slot_keeper = Keeper},
+        proto_opts = #proto_opts{slot_keeper = Keeper, slot_keeper_stopping = Stopping},
         max_concurrent_requests = Max,
         inflight_counter = Counter,
         slot_cell = Cell,
@@ -4078,5 +4078,5 @@ hand_off_slots(#loop{
     parked = Parked
 }) ->
     roadrunner_conn:hand_off_request_slots(
-        Keeper, Cell, maps:keys(Workers), Parked =/= false, Max, Counter, Overload
+        {Keeper, Stopping}, Cell, maps:keys(Workers), Parked =/= false, Max, Counter, Overload
     ).

@@ -763,15 +763,28 @@ each one when its worker ends. Workers are monitored, not linked, so they
 can outlive their connection; releasing their slots with it would let a
 client that drops and reopens connections run handlers past
 `max_concurrent_requests`. What the cell holds beyond the workers are
-grants that raced the close, released at once.
+grants that raced the close, released at once. `Keeper` comes with its
+`stopping` flag (`roadrunner_overload_queue:stopping_ref/1`).
 
 A connection that `Parked` a request, its keeper still there when it last
 looked, goes through the keeper even with no worker left: the keeper
 withdraws its parked requests and then empties the cell again, so a grant
 sent before the withdrawal is released rather than lost.
+
+The slots stay in the cell through the hand-off, and the flag is read
+after it is sent. A keeper that stopped with its listener, which the
+connection outlived, set the flag before it read the hand-offs in its
+mailbox: one sent after that is never read, so the connection empties the
+cell itself, and whichever of the two empties it first takes the slots.
+So does a connection whose keeper is gone without setting the flag
+(killed, with its listener or on its own).
+Its workers then stop counting: the connections left from before the stop
+still admit requests against the listener's counter, and a slot nothing
+will release would shrink their ceiling for good. No new connection comes
+to run more handlers on the slots let go early.
 """.
 -spec hand_off_request_slots(
-    pid(),
+    {pid(), atomics:atomics_ref()},
     atomics:atomics_ref(),
     [pid()],
     boolean(),
@@ -781,12 +794,14 @@ sent before the withdrawal is released rather than lost.
 ) -> ok.
 hand_off_request_slots(_Keeper, Cell, [], false, Max, Counter, Overload) ->
     reclaim_request_slots(Cell, Max, Counter, Overload);
-hand_off_request_slots(Keeper, Cell, Workers, _Parked, _Max, _Counter, _Overload) ->
-    %% Emptied here, while no one else may touch a live conn's cell: the
-    %% workers' slots go with them to the keeper, which collects the
-    %% grants that reach the cell later.
-    Raced = atomics:exchange(Cell, 1, 0) - length(Workers),
-    roadrunner_overload_queue:adopt(Keeper, Cell, Workers, Raced).
+hand_off_request_slots({Keeper, Stopping}, Cell, Workers, _Parked, Max, Counter, Overload) ->
+    ok = roadrunner_overload_queue:adopt(Keeper, Cell, Workers),
+    %% A keeper killed outright never set its flag: being gone says the
+    %% same.
+    case atomics:get(Stopping, 1) =:= 0 andalso is_process_alive(Keeper) of
+        true -> ok;
+        false -> reclaim_request_slots(Cell, Max, Counter, Overload)
+    end.
 
 -doc false.
 -spec refine_conn_label(
@@ -2486,6 +2501,10 @@ parse_error_status(_) -> 400.
 %% hands the process a fresh binary, and a client that sends as fast as it
 %% can would otherwise pile up garbage until the process next collects,
 %% hundreds of kilobytes per lingering connection.
+%% The listener owns the budget's table, and a connection can outlive it
+%% (`roadrunner_listener:stop/1` does not wait for its connections): with
+%% the table gone there is no cap left to count against, and the
+%% connection lingers all the same.
 -doc false.
 -spec linger(roadrunner_transport:socket(), non_neg_integer(), linger_budget()) -> ok.
 linger(_Socket, 0, _Budget) ->
@@ -2495,17 +2514,34 @@ linger(Socket, Timeout, {Table, Skipped, Max}) ->
     %% lingers, which skips the `after` below, leaves a row for a dead
     %% process, and the listener's slot reaper drops it
     %% (`prune_lingering/1`).
-    true = ets:insert(Table, {self()}),
-    case ets:info(Table, size) of
-        Lingering when Lingering > Max ->
-            true = ets:delete(Table, self()),
+    case count_lingering(Table) of
+        Lingering when is_integer(Lingering), Lingering > Max ->
+            ok = uncount_lingering(Table),
             atomics:add(Skipped, 1, 1);
         _ ->
             try
                 linger_read(Socket, Timeout)
             after
-                true = ets:delete(Table, self())
+                ok = uncount_lingering(Table)
             end
+    end.
+
+%% Count the calling connection as lingering, and return how many linger
+%% now: `undefined` once the listener and its table are gone.
+-spec count_lingering(ets:table()) -> non_neg_integer() | undefined.
+count_lingering(Table) ->
+    try ets:insert(Table, {self()}) of
+        true -> ets:info(Table, size)
+    catch
+        error:badarg -> undefined
+    end.
+
+-spec uncount_lingering(ets:table()) -> ok.
+uncount_lingering(Table) ->
+    try ets:delete(Table, self()) of
+        true -> ok
+    catch
+        error:badarg -> ok
     end.
 
 %% A new budget of `Max` connections lingering at once, none lingering yet.
