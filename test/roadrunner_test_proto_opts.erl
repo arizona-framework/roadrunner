@@ -45,7 +45,7 @@ index(Field, [], _I) -> error({unknown_proto_opts_field, Field}).
 with_slot_keeper(#{max_concurrent_requests := Max, inflight_counter := Counter} = Fields) when
     is_integer(Max)
 ->
-    {ok, Keeper} = roadrunner_overload_queue:start_link(Max, Counter, Max),
+    {ok, Keeper} = roadrunner_overload_queue:start_link(Max, Counter, Max, normal),
     Fields#{slot_keeper => Keeper, slot_cell => atomics:new(1, [])};
 with_slot_keeper(Fields) ->
     Fields.

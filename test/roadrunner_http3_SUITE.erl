@@ -95,6 +95,8 @@ process with its own listener, mirroring `roadrunner_http2_*_SUITE`.
     max_concurrent_requests_queue/1,
     max_concurrent_requests_queue_expires/1,
     stop_sending_withdraws_a_parked_request/1,
+    reset_of_an_unparked_stream_leaves_the_queue_alone/1,
+    reset_withdraws_a_parked_request/1,
     max_concurrent_requests_queue_stale_grant/1,
     max_concurrent_requests_queue_survives_drain/1,
     stream_cancel/1,
@@ -220,6 +222,8 @@ all() ->
         max_concurrent_requests_queue,
         max_concurrent_requests_queue_expires,
         stop_sending_withdraws_a_parked_request,
+        reset_of_an_unparked_stream_leaves_the_queue_alone,
+        reset_withdraws_a_parked_request,
         max_concurrent_requests_queue_stale_grant,
         max_concurrent_requests_queue_survives_drain,
         stream_cancel,
@@ -298,6 +302,8 @@ init_per_testcase(Case, Config) when
     Case =:= max_concurrent_requests_queue;
     Case =:= max_concurrent_requests_queue_expires;
     Case =:= stop_sending_withdraws_a_parked_request;
+    Case =:= reset_of_an_unparked_stream_leaves_the_queue_alone;
+    Case =:= reset_withdraws_a_parked_request;
     Case =:= max_concurrent_requests_queue_stale_grant;
     Case =:= max_concurrent_requests_queue_survives_drain;
     Case =:= crashed_worker_frees_its_slot;
@@ -1698,6 +1704,80 @@ stop_sending_withdraws_a_parked_request(_Config) ->
         roadrunner_listener:stop(Name)
     end.
 
+reset_withdraws_a_parked_request(_Config) ->
+    %% As `stop_sending_withdraws_a_parked_request`, for a RESET_STREAM: the
+    %% parked request leaves the queue, its side is reset, and the slot
+    %% freed later goes to no one, so the last request is served. Were it
+    %% dispatched, the parked `/block` would hold the only slot; were it
+    %% dropped here but never withdrawn from the queue, the count of parked
+    %% requests would stay up until the park expired. A guard for the reset
+    %% path's withdrawal of a parked stream: it passes on the earlier code
+    %% too.
+    Name = listener_name(reset_withdraws_a_parked_request),
+    {ok, _} = start_h3(Name, #{
+        max_concurrent_requests => 1,
+        overload_mode => {queue, #{max_queued => 4, timeout => 5000}}
+    }),
+    #{overload := {queue, _Keeper, Waiters, _Timeout, _MaxQueued}} =
+        roadrunner_test_proto_opts:to_map(element(4, sys:get_state(whereis(Name)))),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        ok = wait_for_unregister(roadrunner_h3_block_test, 5000),
+        {ok, _} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/block")),
+        Worker = wait_for_register(roadrunner_h3_block_test, 1000),
+        {ok, Parked} = roadrunner_quic_test_h3:open_request(Conn, headers(~"GET", ~"/block")),
+        ok = roadrunner_quic_test_conn:reset_stream(Conn, Parked, ?H3_REQUEST_CANCELLED),
+        ?assertEqual(?H3_REQUEST_CANCELLED, server_reset(Conn, Parked)),
+        ok = wait_until_unparked(Waiters, 1000),
+        Worker ! release,
+        ?assertMatch({200, _, _}, get(Conn, ~"/")),
+        receive
+            {quic_test_stream, Conn, Parked, Late, _} -> ct:fail({parked_answered, Late})
+        after 0 -> ok
+        end
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+reset_of_an_unparked_stream_leaves_the_queue_alone(_Config) ->
+    %% A request still coming in was never parked, so a RESET_STREAM or a
+    %% STOP_SENDING on it sends the queue process nothing: a client that
+    %% resets streams cannot keep that high-priority process busy. The
+    %% queue process's mailbox is traced, and the request served after the
+    %% two resets shows the connection got to both.
+    Name = listener_name(reset_of_an_unparked_stream_leaves_the_queue_alone),
+    {ok, _} = start_h3(Name, #{
+        max_concurrent_requests => 1,
+        overload_mode => {queue, #{max_queued => 4, timeout => 5000}}
+    }),
+    #{slot_keeper := Keeper} =
+        roadrunner_test_proto_opts:to_map(element(4, sys:get_state(whereis(Name)))),
+    Conn = connect(roadrunner_listener:port(Name)),
+    try
+        1 = erlang:trace(Keeper, true, ['receive']),
+        {ok, Reset} = roadrunner_quic_test_h3:open_request(Conn, headers(~"POST", ~"/"), false),
+        ok = roadrunner_quic_test_conn:reset_stream(Conn, Reset, ?H3_REQUEST_CANCELLED),
+        {ok, Stopped} = roadrunner_quic_test_h3:open_request(Conn, headers(~"POST", ~"/"), false),
+        ok = roadrunner_quic_test_conn:stop_sending(Conn, Stopped, ?H3_REQUEST_CANCELLED),
+        ?assertMatch({200, _, _}, get(Conn, ~"/")),
+        1 = erlang:trace(Keeper, false, ['receive']),
+        Delivered = erlang:trace_delivered(Keeper),
+        receive
+            {trace_delivered, Keeper, Delivered} -> ok
+        end,
+        ?assertEqual([], traced_receives(Keeper))
+    after
+        close(Conn),
+        roadrunner_listener:stop(Name)
+    end.
+
+traced_receives(Pid) ->
+    receive
+        {trace, Pid, 'receive', Message} -> [Message | traced_receives(Pid)]
+    after 0 -> []
+    end.
+
 max_concurrent_requests_queue_expires(_Config) ->
     %% Nothing frees a slot before the deadline, so a parked request falls
     %% back to exactly the refusal `refuse` mode would have produced.
@@ -2593,6 +2673,18 @@ wait_for_new_register(Name, Old, RemainingMs) ->
             wait_for_new_register(Name, Old, RemainingMs - 10);
         New ->
             New
+    end.
+
+%% Wait for the queue to have every park withdrawn or answered.
+wait_until_unparked(_Waiters, RemainingMs) when RemainingMs =< 0 ->
+    ct:fail(still_parked);
+wait_until_unparked(Waiters, RemainingMs) ->
+    case roadrunner_overload_queue:waiting(Waiters) of
+        false ->
+            ok;
+        true ->
+            timer:sleep(10),
+            wait_until_unparked(Waiters, RemainingMs - 10)
     end.
 
 wait_for_unregister(_Name, RemainingMs) when RemainingMs =< 0 ->

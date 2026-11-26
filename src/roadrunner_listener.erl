@@ -452,8 +452,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   described above. `{queue, Opts}` instead
   parks it until a slot frees, so handler memory stays bounded without
   shedding the request: latency rises under overload rather than the
-  error rate. A request still waiting after `Ms` is refused exactly as
-  `refuse` would, and one arriving when `N` are already parked is
+  error rate. Parked requests are served first in, first out: while any
+  request waits, a new one waits behind it rather than taking a slot
+  that frees first. A request still waiting after `Ms` is refused exactly
+  as `refuse` would, and one arriving when `N` are already parked is
   refused immediately, so overload still sheds rather than queueing
   without bound. Requires a finite `max_concurrent_requests`: there is
   nothing to queue behind otherwise, and asking for it without one is a
@@ -2841,8 +2843,9 @@ validate_overload_mode(Other, _Max, _RequestTimeout) ->
 %% workers end. In queue mode the same process parks waiters.
 %%
 %% `refuse` costs nothing at all on the release path; the queue form
-%% carries the process, the atomic that says whether anyone is parked,
-%% and the wait deadline, so the hot path never reads proto_opts again.
+%% carries the process, the atomic that counts the parked requests, the
+%% wait deadline and `max_queued`, so the hot path never reads proto_opts
+%% again.
 %% The shed form carries only its `Retry-After`, and like `refuse` has
 %% nothing to wake on release.
 -spec setup_overload(
@@ -2855,17 +2858,26 @@ validate_overload_mode(Other, _Max, _RequestTimeout) ->
 setup_overload(refuse, infinity, _Counter) ->
     {refuse, undefined};
 setup_overload(refuse, Max, Counter) ->
-    {refuse, start_slot_keeper(Max, Counter, Max)};
+    {refuse, start_slot_keeper(Max, Counter, Max, normal)};
 setup_overload({queue, #{max_queued := MaxQueued, timeout := Timeout}}, Max, Counter) ->
-    Pid = start_slot_keeper(Max, Counter, MaxQueued),
-    {{queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout}, Pid};
+    Pid = start_slot_keeper(Max, Counter, MaxQueued, high),
+    {{queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), Timeout, MaxQueued}, Pid};
 setup_overload({shed, #{retry_after := RetryAfter}}, Max, Counter) ->
-    {{shed, RetryAfter}, start_slot_keeper(Max, Counter, Max)}.
+    {{shed, RetryAfter}, start_slot_keeper(Max, Counter, Max, normal)}.
 
-%% `MaxQueued` matters in queue mode only; nothing parks otherwise.
--spec start_slot_keeper(pos_integer(), counters:counters_ref(), pos_integer()) -> pid().
-start_slot_keeper(Max, Counter, MaxQueued) ->
-    {ok, Pid} = roadrunner_overload_queue:start_link(Max, Counter, MaxQueued),
+%% `MaxQueued` matters in queue mode only; nothing parks otherwise. A
+%% queue's keeper runs at high priority: it hands freed slots out only as
+%% fast as it gets to run, and on a server busy with the very requests it
+%% counts a normal-priority keeper would wait its turn behind them while the
+%% slots sat free. A request over a full queue with every slot taken is
+%% refused by the connection without a message to it
+%% (`roadrunner_conn:acquire_request_slot/5`), so a flood cannot keep it
+%% busy. In the other modes it only counts the handlers closing connections
+%% leave behind, and runs at normal priority.
+-spec start_slot_keeper(pos_integer(), counters:counters_ref(), pos_integer(), high | normal) ->
+    pid().
+start_slot_keeper(Max, Counter, MaxQueued, Priority) ->
+    {ok, Pid} = roadrunner_overload_queue:start_link(Max, Counter, MaxQueued, Priority),
     Pid.
 
 %% A TLS listener that also reads the PROXY protocol cannot hand its

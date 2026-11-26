@@ -1832,6 +1832,37 @@ overload_mode_queue_derives_its_knobs_test() ->
     ok = gen_tcp:close(Sock),
     ok = roadrunner_listener:stop(Name).
 
+%% In queue mode the slot keeper hands out the freed slots, so it runs at
+%% high priority, and the connections carry `max_queued` to refuse a full
+%% queue themselves; in the other modes it only counts orphaned handlers and
+%% stays at normal priority.
+overload_mode_queue_keeper_runs_at_high_priority_test() ->
+    lists:foreach(
+        fun({Name, Mode, Priority, Want}) ->
+            {ok, _} = roadrunner_listener:start_link(Name, #{
+                port => 0,
+                routes => roadrunner_hello_handler,
+                max_concurrent_requests => 4,
+                overload_mode => Mode
+            }),
+            #{slot_keeper := Keeper, overload := Overload} =
+                roadrunner_test_proto_opts:to_map(element(4, sys:get_state(whereis(Name)))),
+            ?assertEqual({priority, Priority}, erlang:process_info(Keeper, priority)),
+            ?assertEqual(Want, overload_shape(Overload, Keeper)),
+            ok = roadrunner_listener:stop(Name)
+        end,
+        [
+            {overload_priority_queue, {queue, #{max_queued => 16}}, high, {queue, keeper, 16}},
+            {overload_priority_refuse, refuse, normal, refuse},
+            {overload_priority_shed, {shed, #{}}, normal, {shed, 1}}
+        ]
+    ).
+
+overload_shape({queue, Keeper, _Waiters, _Timeout, MaxQueued}, Keeper) ->
+    {queue, keeper, MaxQueued};
+overload_shape(Other, _Keeper) ->
+    Other.
+
 overload_mode_queue_starts_a_listener_test() ->
     Name = overload_queue_ok,
     {ok, _} = roadrunner_listener:start_link(Name, #{

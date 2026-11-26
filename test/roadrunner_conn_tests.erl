@@ -1642,9 +1642,9 @@ slot_queue_mode_parks_and_wakes_test_() ->
     {spawn, fun() ->
         Counter = counters:new(1, [write_concurrency]),
         Cell = atomics:new(1, []),
-        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8),
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8, high),
         Waiters = roadrunner_overload_queue:waiters_ref(Pid),
-        Overload = {queue, Pid, Waiters, 5000},
+        Overload = {queue, Pid, Waiters, 5000, 8},
         ?assert(roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s1)),
         ?assertEqual(queued, roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s2)),
         ok = roadrunner_conn:release_request_slot(1, Counter, Cell, Overload),
@@ -1662,8 +1662,8 @@ slot_queue_mode_release_without_waiters_test_() ->
     {spawn, fun() ->
         Counter = counters:new(1, [write_concurrency]),
         Cell = atomics:new(1, []),
-        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8),
-        Overload = {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), 5000},
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8, high),
+        Overload = {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), 5000, 8},
         true = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s1),
         ok = roadrunner_conn:release_request_slot(1, Counter, Cell, Overload),
         ok = roadrunner_conn:release_request_slots(1, Counter, 0, Overload),
@@ -1675,8 +1675,8 @@ slot_queue_mode_cancel_test_() ->
     {spawn, fun() ->
         Counter = counters:new(1, [write_concurrency]),
         Cell = atomics:new(1, []),
-        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8),
-        Overload = {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), 5000},
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8, high),
+        Overload = {queue, Pid, roadrunner_overload_queue:waiters_ref(Pid), 5000, 8},
         Waiters = roadrunner_overload_queue:waiters_ref(Pid),
         true = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s1),
         queued = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, s2),
@@ -1695,6 +1695,132 @@ slot_queue_mode_cancel_test_() ->
             end,
         ?assertEqual(nothing, Got)
     end}.
+
+%% Queue mode is first in, first out: while a request is parked, a new one
+%% parks behind it, even when a slot has freed and the queue process has not
+%% handed it on yet. Suspending that process stands in for a busy server
+%% where it waits for its turn to run.
+slot_queue_mode_late_request_waits_behind_a_parked_one_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        Cell = atomics:new(1, []),
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8, high),
+        Waiters = roadrunner_overload_queue:waiters_ref(Pid),
+        Overload = {queue, Pid, Waiters, 5000, 8},
+        true = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, first),
+        queued = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, second),
+        ?assert(until(fun() -> roadrunner_overload_queue:waiting(Waiters) end)),
+        ok = sys:suspend(Pid),
+        ok = roadrunner_conn:release_request_slot(1, Counter, Cell, Overload),
+        %% The slot is free, but `second` asked for it first.
+        ?assertEqual(
+            queued, roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, third)
+        ),
+        ok = sys:resume(Pid),
+        ?assertEqual(granted, slot_outcome(second, 2000)),
+        ?assertEqual(nothing, slot_outcome(third, 200))
+    end}.
+
+%% A park still on its way to the queue process counts too: with that
+%% process behind on its mailbox (suspended here), a request that comes
+%% after it waits behind it even with a slot free.
+slot_queue_mode_park_on_its_way_holds_back_a_later_request_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        Cell = atomics:new(1, []),
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 8, high),
+        Waiters = roadrunner_overload_queue:waiters_ref(Pid),
+        Overload = {queue, Pid, Waiters, 5000, 8},
+        true = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, first),
+        ok = sys:suspend(Pid),
+        queued = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, second),
+        ok = roadrunner_conn:release_request_slot(1, Counter, Cell, Overload),
+        ?assertEqual(
+            queued, roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, third)
+        ),
+        ok = sys:resume(Pid),
+        ?assertEqual(granted, slot_outcome(second, 2000)),
+        ?assertEqual(nothing, slot_outcome(third, 200))
+    end}.
+
+%% A full queue with a slot free still parks the request, so the queue
+%% process hears of the slot and hands it to the oldest. The slot freed
+%% here without a wake-up, as when a release and the queue process both
+%% failed to take it at once.
+slot_queue_mode_full_queue_with_a_free_slot_parks_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        Cell = atomics:new(1, []),
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 1, high),
+        Waiters = roadrunner_overload_queue:waiters_ref(Pid),
+        Overload = {queue, Pid, Waiters, 5000, 1},
+        true = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, first),
+        queued = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, second),
+        _ = roadrunner_overload_queue:waiters_ref(Pid),
+        ok = atomics:sub(Cell, 1, 1),
+        ok = counters:sub(Counter, 1, 1),
+        ?assertEqual(
+            queued, roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, third)
+        ),
+        ?assertEqual(granted, slot_outcome(second, 2000)),
+        ?assertEqual(nothing, slot_outcome(third, 200))
+    end}.
+
+%% A request that found nobody parked can race a park that fills the queue:
+%% its attempt and the queue process's attempt for the oldest both fail on
+%% each other's add, and it reads the queue process's add as every slot
+%% taken. It is refused, and it wakes the queue process, so the slot both
+%% let go of goes to the oldest. The slot frees here without a wake-up,
+%% as one the queue process already took, the queue process is suspended
+%% as if mid-race, and this test's add stands in for its own.
+slot_queue_mode_raced_refusal_wakes_the_queue_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        Cell = atomics:new(1, []),
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 1, high),
+        Waiters = roadrunner_overload_queue:waiters_ref(Pid),
+        Overload = {queue, Pid, Waiters, 5000, 1},
+        true = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, first),
+        queued = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, second),
+        _ = roadrunner_overload_queue:waiters_ref(Pid),
+        ok = atomics:sub(Cell, 1, 1),
+        ok = counters:sub(Counter, 1, 1),
+        ok = sys:suspend(Pid),
+        ok = counters:add(Counter, 1, 1),
+        ?assertEqual(
+            false, roadrunner_conn:take_request_slot(1, Counter, Cell, Overload, third)
+        ),
+        ok = counters:sub(Counter, 1, 1),
+        ok = sys:resume(Pid),
+        ?assertEqual(granted, slot_outcome(second, 2000))
+    end}.
+
+%% A request that finds `max_queued` parked and every slot taken is
+%% refused by its own connection, without a message to the queue process,
+%% so a flood over the queue never keeps that process busy.
+slot_queue_mode_full_queue_refuses_without_a_message_test_() ->
+    {spawn, fun() ->
+        Counter = counters:new(1, [write_concurrency]),
+        Cell = atomics:new(1, []),
+        {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, 1, high),
+        Waiters = roadrunner_overload_queue:waiters_ref(Pid),
+        Overload = {queue, Pid, Waiters, 5000, 1},
+        true = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, first),
+        queued = roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, second),
+        ?assert(until(fun() -> roadrunner_overload_queue:waiting(Waiters) end)),
+        ok = sys:suspend(Pid),
+        ?assertEqual(
+            false, roadrunner_conn:acquire_request_slot(1, Counter, Cell, Overload, third)
+        ),
+        ?assertEqual({message_queue_len, 0}, erlang:process_info(Pid, message_queue_len)),
+        ok = sys:resume(Pid)
+    end}.
+
+slot_outcome(Token, Ms) ->
+    receive
+        {roadrunner_slot, Token, Outcome} -> Outcome
+    after Ms -> nothing
+    end.
 
 until(Fun) ->
     until(Fun, 200).

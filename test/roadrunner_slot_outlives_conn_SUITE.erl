@@ -435,7 +435,7 @@ keeper(Name) ->
     Keeper.
 
 waiters(Name) ->
-    #{overload := {queue, _Pid, Waiters, _Timeout}} = proto_opts(Name),
+    #{overload := {queue, _Pid, Waiters, _Timeout, _MaxQueued}} = proto_opts(Name),
     Waiters.
 
 %% End a handler and wait until it is gone. Its slot is released by whoever
