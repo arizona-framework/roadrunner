@@ -2531,7 +2531,7 @@ hand_off_slots(#h3{cfg = #h3_cfg{slot_cell = undefined}}) ->
     ok;
 hand_off_slots(#h3{
     cfg = #h3_cfg{
-        proto_opts = #proto_opts{slot_keeper = Keeper},
+        proto_opts = #proto_opts{slot_keeper = Keeper, slot_keeper_stopping = Stopping},
         max_concurrent_requests = Max,
         inflight_counter = Counter,
         slot_cell = Cell,
@@ -2541,7 +2541,7 @@ hand_off_slots(#h3{
     parked = Parked
 }) ->
     roadrunner_conn:hand_off_request_slots(
-        Keeper, Cell, maps:values(Pids), Parked, Max, Counter, Overload
+        {Keeper, Stopping}, Cell, maps:values(Pids), Parked, Max, Counter, Overload
     ).
 
 -spec terminate(#h3{}, roadrunner_event_handler:close_reason()) -> ok.

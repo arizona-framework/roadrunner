@@ -80,6 +80,10 @@
     %% of the workers still running, so they stay counted until those
     %% workers end. `undefined` with no ceiling.
     slot_keeper = undefined :: pid() | undefined,
+    %% The flag the slot keeper sets as it stops
+    %% (`roadrunner_overload_queue:stopping_ref/1`), which a closing conn
+    %% reads after its hand-off. `undefined` with no ceiling.
+    slot_keeper_stopping = undefined :: atomics:atomics_ref() | undefined,
     %% The conn's own in-flight cell (`roadrunner_conn:with_slot_cell/1`),
     %% set per connection as it starts when the ceiling is finite. The
     %% listener's copy carries `undefined`.

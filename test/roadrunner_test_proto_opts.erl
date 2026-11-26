@@ -46,6 +46,10 @@ with_slot_keeper(#{max_concurrent_requests := Max, inflight_counter := Counter} 
     is_integer(Max)
 ->
     {ok, Keeper} = roadrunner_overload_queue:start_link(Max, Counter, Max, normal),
-    Fields#{slot_keeper => Keeper, slot_cell => atomics:new(1, [])};
+    Fields#{
+        slot_keeper => Keeper,
+        slot_keeper_stopping => roadrunner_overload_queue:stopping_ref(Keeper),
+        slot_cell => atomics:new(1, [])
+    };
 with_slot_keeper(Fields) ->
     Fields.

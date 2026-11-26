@@ -763,22 +763,26 @@ each one when its worker ends. Workers are monitored, not linked, so they
 can outlive their connection; releasing their slots with it would let a
 client that drops and reopens connections run handlers past
 `max_concurrent_requests`. What the cell holds beyond the workers are
-grants that raced the close, released at once.
+grants that raced the close, released at once. `Keeper` comes with its
+`stopping` flag (`roadrunner_overload_queue:stopping_ref/1`).
 
 A connection that `Parked` a request, its keeper still there when it last
 looked, goes through the keeper even with no worker left: the keeper
 withdraws its parked requests and then empties the cell again, so a grant
 sent before the withdrawal is released rather than lost.
 
-A keeper already gone stopped with its listener, which the connection
-outlived. Its workers then stop counting, and every slot it holds is
-released at once: the connections left from before the stop still admit
-requests against the listener's counter, and a slot nothing will release
-would shrink their ceiling for good. No new connection comes to run more
-handlers on the slots let go early.
+The slots stay in the cell through the hand-off, and the flag is read
+after it is sent. A keeper that stopped with its listener, which the
+connection outlived, set the flag before it read the hand-offs in its
+mailbox: one sent after that is never read, so the connection empties the
+cell itself, and whichever of the two empties it first takes the slots.
+Its workers then stop counting: the connections left from before the stop
+still admit requests against the listener's counter, and a slot nothing
+will release would shrink their ceiling for good. No new connection comes
+to run more handlers on the slots let go early.
 """.
 -spec hand_off_request_slots(
-    pid(),
+    {pid(), atomics:atomics_ref()},
     atomics:atomics_ref(),
     [pid()],
     boolean(),
@@ -788,16 +792,11 @@ handlers on the slots let go early.
 ) -> ok.
 hand_off_request_slots(_Keeper, Cell, [], false, Max, Counter, Overload) ->
     reclaim_request_slots(Cell, Max, Counter, Overload);
-hand_off_request_slots(Keeper, Cell, Workers, _Parked, Max, Counter, Overload) ->
-    %% Emptied here, while no one else may touch a live conn's cell: the
-    %% workers' slots go with them to the keeper, which collects the
-    %% grants that reach the cell later.
-    Held = atomics:exchange(Cell, 1, 0),
-    case is_process_alive(Keeper) of
-        true ->
-            roadrunner_overload_queue:adopt(Keeper, Cell, Workers, Held - length(Workers));
-        false ->
-            release_request_slots(Max, Counter, Held, Overload)
+hand_off_request_slots({Keeper, Stopping}, Cell, Workers, _Parked, Max, Counter, Overload) ->
+    ok = roadrunner_overload_queue:adopt(Keeper, Cell, Workers),
+    case atomics:get(Stopping, 1) of
+        0 -> ok;
+        _Stopped -> reclaim_request_slots(Cell, Max, Counter, Overload)
     end.
 
 -doc false.

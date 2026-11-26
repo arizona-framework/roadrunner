@@ -2877,6 +2877,10 @@ setup_overload({queue, #{max_queued := MaxQueued, timeout := Timeout}}, Max, Cou
 setup_overload({shed, #{retry_after := RetryAfter}}, Max, Counter) ->
     {{shed, RetryAfter}, start_slot_keeper(Max, Counter, Max, normal)}.
 
+-spec keeper_stopping(pid() | undefined) -> atomics:atomics_ref() | undefined.
+keeper_stopping(undefined) -> undefined;
+keeper_stopping(Keeper) -> roadrunner_overload_queue:stopping_ref(Keeper).
+
 %% `MaxQueued` matters in queue mode only; nothing parks otherwise. A
 %% queue's keeper runs at high priority: it hands freed slots out only as
 %% fast as it gets to run, and on a server busy with the very requests it
@@ -3177,6 +3181,7 @@ build_proto_opts(Opts, ListenerName) ->
         max_concurrent_requests = MaxConcurrentRequests,
         overload = Overload,
         slot_keeper = SlotKeeper,
+        slot_keeper_stopping = keeper_stopping(SlotKeeper),
         client_counter = ClientCounter,
         drain_table = DrainTable,
         requests_counter = RequestsCounter,
