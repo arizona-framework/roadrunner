@@ -277,17 +277,24 @@ compress(Headers, Body, Size, Encoding) ->
 %% A whole buffered body in one deflate call, with the window sized to the
 %% body: deflate never looks further back than the bytes it has, so a
 %% window covering the body plus deflate's 262-byte lookahead
-%% (`MIN_LOOKAHEAD`) produces the same compressed data as the full 32 KB
-%% one, while the context zlib allocates shrinks with the body (a 4 KB
-%% body takes 160 KB instead of 256 KB), for every request compressing at
-%% the same time. `gzip` is the RFC 1952 wrapper (`windowBits + 16`);
-%% `deflate` is the zlib wrapper RFC 9110 §8.4.1.3 specifies (RFC 1950),
-%% whose header records the window.
+%% (`MIN_LOOKAHEAD`) finds every match the full 32 KB one would. `memLevel`
+%% follows the window (`windowBits - 7`, 4 to 8): it sizes the match hash
+%% table to one entry per window byte and the symbol buffer that ends a
+%% block to half the window. A body fits in the window, so it takes at most
+%% one extra block: text compresses within a few bytes of the default 8,
+%% data that does not compress takes 5 more bytes, and data that partly
+%% compresses (base64, mixed binary) up to about 64 more for the extra
+%% block's Huffman table. The context zlib allocates shrinks with the body
+%% (a 3 KB body takes 40 KB instead of 150 KB at `memLevel` 8), for every
+%% request compressing at the same time. `gzip` is the RFC 1952
+%% wrapper (`windowBits + 16`); `deflate` is the zlib wrapper RFC 9110
+%% §8.4.1.3 specifies (RFC 1950), whose header records the window.
 -spec compress_body(iodata(), pos_integer(), gzip | deflate) -> binary().
 compress_body(Body, Size, Encoding) ->
     Z = zlib:open(),
     try
-        ok = zlib:deflateInit(Z, default, deflated, window_bits(Encoding, Size), 8, default),
+        Bits = body_window_bits(Size),
+        ok = zlib:deflateInit(Z, default, deflated, wrapped(Encoding, Bits), Bits - 7, default),
         iolist_to_binary(zlib:deflate(Z, Body, finish))
     after
         zlib:close(Z)
@@ -312,9 +319,10 @@ body_window_bits(_Size) -> 15.
 window_bits(gzip) -> 16 + 15;
 window_bits(deflate) -> 15.
 
--spec window_bits(gzip | deflate, pos_integer()) -> integer().
-window_bits(gzip, Size) -> 16 + body_window_bits(Size);
-window_bits(deflate, Size) -> body_window_bits(Size).
+%% The `windowBits` argument that picks the wrapper for a sized window.
+-spec wrapped(gzip | deflate, 11..15) -> integer().
+wrapped(gzip, Bits) -> 16 + Bits;
+wrapped(deflate, Bits) -> Bits.
 
 -spec encoding_token(gzip | deflate) -> binary().
 encoding_token(gzip) -> ~"gzip";

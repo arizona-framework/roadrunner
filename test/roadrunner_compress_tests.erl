@@ -56,10 +56,11 @@ deflate_window_follows_body_size_test() ->
         ]
     ].
 
-gzip_output_matches_the_full_window_test() ->
-    %% A window covering the body plus the lookahead finds every match the
-    %% full 32 KB window would, so gzip output is byte for byte what
-    %% `zlib:gzip/1` gives, on either side of each window step.
+gzip_output_stays_as_small_as_the_full_window_test() ->
+    %% A guard, not a regression test: on either side of each window step,
+    %% both wrappers inflate whole, and this word-built text comes out no
+    %% larger than `zlib:gzip/1` makes it (other text can take a few bytes
+    %% more; `deflate_mem_level_follows_the_window_test` checks the settings).
     rand:seed(exsss, {11, 12, 13}),
     Words = [~"\"id\":", ~"\"name\":\"Item ", ~"\",\"price\":", ~"},{", ~"lorem ipsum "],
     [
@@ -68,14 +69,41 @@ gzip_output_matches_the_full_window_test() ->
                 [lists:nth(rand:uniform(length(Words)), Words) || _ <- lists:seq(1, Size)]
             ),
             Body = binary:part(Text, 0, Size),
-            {{200, _, Out}, _} = roadrunner_compress:call(
-                req([{~"accept-encoding", ~"gzip"}]), fun(R) -> {{200, [], Body}, R} end, undefined
-            ),
-            ?assertEqual(zlib:gzip(Body), Out, Size)
+            Gzip = compressed(~"gzip", Body),
+            ?assertEqual(Body, zlib:gunzip(Gzip), Size),
+            ?assertEqual(Body, zlib:uncompress(compressed(~"deflate", Body)), Size),
+            ?assert(byte_size(Gzip) =< byte_size(zlib:gzip(Body)), Size)
         end
      || Step <- [10, 11, 12, 13, 14, 15],
         Size <- [(1 bsl Step) - 263, (1 bsl Step) - 261],
         Size >= 860
+    ].
+
+deflate_mem_level_follows_the_window_test() ->
+    %% `memLevel` is the window's `windowBits - 7`, 4 at the 2 KB window up
+    %% to zlib's default 8 at 32 KB: the output is what zlib gives with
+    %% those settings. Random bytes do not compress, so deflate stores them
+    %% in a block per half window of symbols, and every block past the
+    %% first adds 5 bytes; at the default 8 they would take one block.
+    rand:seed(exsss, {14, 15, 16}),
+    [
+        begin
+            Body = rand:bytes(Size),
+            Gzip = compressed(~"gzip", Body),
+            ?assertEqual(sized_deflate(Body, 16 + Bits, Bits - 7), Gzip, Size),
+            ?assertEqual(Body, zlib:gunzip(Gzip), Size),
+            Deflate = compressed(~"deflate", Body),
+            ?assertEqual(sized_deflate(Body, Bits, Bits - 7), Deflate, Size),
+            ?assertEqual(Body, zlib:uncompress(Deflate), Size),
+            ?assertEqual(byte_size(zlib:gzip(Body)) + Extra, byte_size(Gzip), Size)
+        end
+     || {Size, Bits, Extra} <- [
+            {1500, 11, 5},
+            {(1 bsl 12) - 262, 12, 5},
+            {(1 bsl 13) - 262, 13, 5},
+            {(1 bsl 14) - 262, 14, 5},
+            {100000, 15, 0}
+        ]
     ].
 
 compresses_when_gzip_listed_among_others_test() ->
@@ -542,3 +570,16 @@ collect_chunks() ->
         {chunk, Bytes} -> <<Bytes/binary, (collect_chunks())/binary>>
     after 50 -> <<>>
     end.
+
+compressed(Encoding, Body) ->
+    {{200, _, Out}, _} = roadrunner_compress:call(
+        req([{~"accept-encoding", Encoding}]), fun(R) -> {{200, [], Body}, R} end, undefined
+    ),
+    Out.
+
+sized_deflate(Body, WindowBits, MemLevel) ->
+    Z = zlib:open(),
+    ok = zlib:deflateInit(Z, default, deflated, WindowBits, MemLevel, default),
+    Out = iolist_to_binary(zlib:deflate(Z, Body, finish)),
+    ok = zlib:close(Z),
+    Out.
