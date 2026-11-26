@@ -769,6 +769,13 @@ A connection that `Parked` a request, its keeper still there when it last
 looked, goes through the keeper even with no worker left: the keeper
 withdraws its parked requests and then empties the cell again, so a grant
 sent before the withdrawal is released rather than lost.
+
+A keeper already gone stopped with its listener, which the connection
+outlived. Its workers then stop counting, and every slot it holds is
+released at once: the connections left from before the stop still admit
+requests against the listener's counter, and a slot nothing will release
+would shrink their ceiling for good. No new connection comes to run more
+handlers on the slots let go early.
 """.
 -spec hand_off_request_slots(
     pid(),
@@ -781,12 +788,17 @@ sent before the withdrawal is released rather than lost.
 ) -> ok.
 hand_off_request_slots(_Keeper, Cell, [], false, Max, Counter, Overload) ->
     reclaim_request_slots(Cell, Max, Counter, Overload);
-hand_off_request_slots(Keeper, Cell, Workers, _Parked, _Max, _Counter, _Overload) ->
+hand_off_request_slots(Keeper, Cell, Workers, _Parked, Max, Counter, Overload) ->
     %% Emptied here, while no one else may touch a live conn's cell: the
     %% workers' slots go with them to the keeper, which collects the
     %% grants that reach the cell later.
-    Raced = atomics:exchange(Cell, 1, 0) - length(Workers),
-    roadrunner_overload_queue:adopt(Keeper, Cell, Workers, Raced).
+    Held = atomics:exchange(Cell, 1, 0),
+    case is_process_alive(Keeper) of
+        true ->
+            roadrunner_overload_queue:adopt(Keeper, Cell, Workers, Held - length(Workers));
+        false ->
+            release_request_slots(Max, Counter, Held, Overload)
+    end.
 
 -doc false.
 -spec refine_conn_label(

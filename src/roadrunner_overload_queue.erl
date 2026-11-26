@@ -74,7 +74,7 @@
     waiters_ref/1,
     adopt/4
 ]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 %% A connection that parked a request here. It stays until its exit
 %% hand-off (`adopt/4`) or its `DOWN`, so a grant that reaches it after it
@@ -173,9 +173,10 @@ waiters_ref(Pid) ->
 %% already: `Raced` are the grants it held beyond its workers, released at
 %% once, and the keeper empties the cell again once the caller's parked
 %% requests are withdrawn, for a grant sent in between. Asynchronous: the
-%% caller is exiting. A keeper already gone went down with its listener:
-%% the slots handed to it then stay counted, which HTTP/2 connections that
-%% outlive the listener still admit requests against.
+%% caller is exiting. The caller checks that the keeper is there first
+%% (`roadrunner_conn:hand_off_request_slots/7`): one that stopped with its
+%% listener gave back what it counted, and the caller then gives back its
+%% own slots.
 -spec adopt(pid(), atomics:atomics_ref(), [pid()], non_neg_integer()) -> ok.
 adopt(Pid, Cell, Workers, Raced) ->
     _ = erlang:send(Pid, {adopt, self(), Cell, Workers, Raced}),
@@ -297,6 +298,40 @@ park(Pid, Token, Cell, Timeout, #state{order = Order, parked = Parked, conns = C
     State#state{
         order = queue:in({Pid, Token}, Order), parked = Parked + 1, conns = Conns#{Pid => Conn}
     }.
+
+%% Its listener stops it (`roadrunner_listener`), and connections that
+%% outlive the listener still admit requests against its counter: the
+%% slots it counts are given back, so they don't shrink the ceiling those
+%% connections see for good. That is each worker it watches, still running
+%% or not, and each hand-off still in its mailbox, whose workers no one
+%% will watch now. Nothing parked holds a slot. A worker it gives back
+%% runs on uncounted: only the connections left from before the stop admit
+%% new requests, and they are no more than there were. So is what a
+%% connection that parked here and died without its exit path still holds
+%% (`dead_conns/1`), its `DOWN` perhaps still unread.
+-spec terminate(term(), #state{}) -> ok.
+terminate(_Reason, #state{counter = Counter, adopted = Adopted, conns = Conns}) ->
+    counters:sub(Counter, 1, map_size(Adopted) + unread_hand_offs() + dead_conns(Conns)).
+
+%% The slots of the hand-offs (`adopt/4`) still in the mailbox.
+-spec unread_hand_offs() -> non_neg_integer().
+unread_hand_offs() ->
+    receive
+        {adopt, _Conn, Cell, Workers, Raced} ->
+            Raced + atomics:exchange(Cell, 1, 0) + length(Workers) + unread_hand_offs()
+    after 0 ->
+        0
+    end.
+
+%% The slots in the cells of the connections that parked here and are
+%% dead. The cell is emptied, so whoever looks at it next (the
+%% listener's last reaper pass) takes nothing again.
+-spec dead_conns(#{pid() => #conn{}}) -> non_neg_integer().
+dead_conns(Conns) ->
+    lists:sum([
+        atomics:exchange(Cell, 1, 0)
+     || Pid := #conn{cell = Cell} <- Conns, not is_process_alive(Pid)
+    ]).
 
 %% Hand freed slots to the oldest parked requests. Each slot is taken
 %% here, on that caller's behalf, so it cannot be stolen by a request

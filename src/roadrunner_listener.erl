@@ -4474,15 +4474,21 @@ stop_quic(QuicPool) ->
     true = unlink(QuicPool),
     roadrunner_quic_listener_sup:stop(QuicPool).
 
-%% A link stops the keeper when the listener crashes, but not on a normal
-%% stop. Its counter goes with the listener, so nothing it keeps counting
-%% is read any more. Asynchronous, as the keeper may be what stopped us.
+%% Stop the slot keeper, which gives back the slots it still counts as it
+%% goes (`roadrunner_overload_queue`): connections that outlive the
+%% listener still admit requests against its counter. The stop waits for
+%% the keeper to finish what is in its mailbox, so it is never cut off
+%% between taking a slot and handing it on. A keeper already gone is what
+%% stopped us.
 -spec stop_slot_keeper(roadrunner_conn:proto_opts()) -> ok.
 stop_slot_keeper(#proto_opts{slot_keeper = undefined}) ->
     ok;
 stop_slot_keeper(#proto_opts{slot_keeper = Pid}) ->
-    true = exit(Pid, shutdown),
-    ok.
+    try
+        gen_server:stop(Pid, shutdown, infinity)
+    catch
+        exit:noproc -> ok
+    end.
 
 -spec erase_routes(roadrunner_conn:proto_opts()) -> ok.
 erase_routes(#proto_opts{dispatch = {router, Name}}) ->
