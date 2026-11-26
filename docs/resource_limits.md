@@ -457,8 +457,8 @@ it): the slot is released when the handler ends, not with the
 connection, so a client that fills the ceiling, drops the connection
 and reconnects cannot run more handlers than it allows. A connection
 that dies without closing (killed, or crashed) has the slots it held
-reclaimed on the next `slot_reconciliation` tick (at once when it had a
-request queued): the handlers it leaves running stop counting then.
+reclaimed on the next `slot_reconciliation` tick (at once when it ever
+parked a request): the handlers it leaves running stop counting then.
 With `graceful_drain => false` there is no registry to reclaim from, so
 those slots stay counted until the listener restarts. Over the
 ceiling, a new HTTP/2 or HTTP/3 stream is refused with `REFUSED_STREAM` /
@@ -483,8 +483,16 @@ higher; streams past that are refused.
 
 `overload_mode` picks what a request over the ceiling gets. `refuse`, the
 default, is the refusal above. `{queue, #{max_queued => N, timeout =>
-Ms}}` parks it until a slot frees, refusing it only when the wait runs
-out or the queue is full. `{shed, #{retry_after => Secs}}` answers it
+Ms}}` parks it until a slot frees, first in, first out, refusing it only
+when the wait runs out or the queue is full. The process that keeps the
+queue runs at high priority, so on a busy server it hands each slot on as
+it frees. A connection taken down by another process (an exit signal,
+such as an HTTP/3 connection's QUIC connection crashing) just as it
+parks a request can leave the count of parked requests one over for the
+rest of the listener's life: later requests then go through the queue
+process even under the ceiling, and the queue holds one fewer each time.
+A close, a crash or an exit at any other point does not.
+`{shed, #{retry_after => Secs}}` answers it
 `503 Service Unavailable` with `Retry-After` (default 1 second, RFC 9110
 §15.6.4) and no body, before any handler runs: clients wait and come
 back instead of retrying at once, which suits clients that talk to the

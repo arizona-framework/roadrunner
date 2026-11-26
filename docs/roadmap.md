@@ -354,6 +354,35 @@ handlers that never fall behind, and it is new API.
 
 **Scope:** small.
 
+### Cheaper parked requests in queue mode — medium
+
+**What:** in queue mode (`overload_mode => {queue, _}`) under sustained
+overload, every request goes through the listener's queue process: its
+park and its grant are messages, and its connection wakes once more for
+the grant. Against a queue that let new requests take freed slots first,
+that measured 7.4% fewer requests a second and 7.4% more CPU per request
+(128 slots, 2048 open HTTP/2 streams). A direct hand-off, where the
+connection that frees a slot takes the oldest parked request off a
+shared ordered table and grants it itself, would take the queue process
+out of the path of each request.
+
+**Why deferred:** it changes how slots move between connections. The
+queue process now orders every grant, expiry, cancel and close one at a
+time, which is what keeps each slot released exactly once; a hand-off
+without it needs the same guarantee from atomic table operations.
+
+**Scope:** medium.
+
+### Other queue orders for sustained overload — medium
+
+**What:** a `queue` option or a new mode that serves the newest request
+first, or drops ones past a target wait (CoDel-style, where `timeout` is a
+fixed deadline): most requests stay fast when clients time out early, but
+the oldest can wait out their whole `timeout`. Only for a measured need;
+first in, first out stays the default.
+
+**Scope:** medium.
+
 ### Cheaper accepts under load — medium
 
 **What:** acceptors run at high priority by default (`accept_priority`)

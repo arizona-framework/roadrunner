@@ -530,10 +530,12 @@
     %% (`dispatch_request/5`). They hold no worker and no in-flight slot;
     %% `run_queued/1` dispatches them as handlers end.
     queued = queue:new() :: queue:queue({stream_id(), {body, iodata()} | reader}),
-    %% Whether a request ever parked here: the conn's exit then goes through
-    %% the slot keeper, which withdraws what it parked before emptying its
-    %% cell, so a grant on its way is released rather than lost.
-    parked = false :: boolean(),
+    %% The monitor of the listener's queue process, set when a request
+    %% first parks here, or `false`. A conn that parked exits through the
+    %% slot keeper, which withdraws what it parked before emptying its
+    %% cell, so a grant on its way is released rather than lost. The
+    %% monitor tells it when that process is gone (`queue_gone/1`).
+    parked = false :: false | reference(),
     %% Stream table, keyed by stream id.
     streams = #{} :: #{stream_id() => #stream{}},
     %% Worker pid → stream id, for DOWN correlation: the workers that hold
@@ -899,7 +901,8 @@ recv_more(
         cfg = #h2_cfg{
             msg_data = MData, msg_closed = MClosed, msg_error = MError, msg_passive = MPassive
         },
-        buffer = Buf
+        buffer = Buf,
+        parked = QueueMon
     } = State
 ) ->
     receive
@@ -930,6 +933,8 @@ recv_more(
             recv_more(skip_continue(State, StreamId));
         {roadrunner_cancel_stream, StreamId} ->
             recv_more(maybe_exit_when_drained(cancel_stream(State, StreamId, deadline)));
+        {'DOWN', QueueMon, process, _Queue, _Reason} ->
+            recv_more(run_queued(maybe_exit_when_drained(queue_gone(State))));
         {'DOWN', MonRef, process, Pid, Reason} ->
             ok = roadrunner_route_keeper:worker_down(Pid),
             recv_more(
@@ -2645,7 +2650,7 @@ start_request(
                                 req_id_buffer = NewBuf,
                                 streams = Streams#{StreamId := Stream},
                                 awaiting_slot = Awaiting#{StreamId => Req},
-                                parked = true
+                                parked = watch_queue(State#loop.parked, Overload)
                             };
                         false ->
                             %% Listener-wide in-flight ceiling reached —
@@ -3583,6 +3588,59 @@ unqueue(#loop{queued = Queued} = State, StreamId) ->
             State#loop{queued = queue:filter(fun({Id, _Body}) -> Id =/= StreamId end, Queued)}
     end.
 
+%% The monitor of the listener's queue process, set at the first park: a
+%% park is the only thing here that waits on that process.
+-spec watch_queue(false | reference(), roadrunner_conn:overload()) -> false | reference().
+watch_queue(false, {queue, Queue, _Waiters, _Timeout, _MaxQueued}) ->
+    erlang:monitor(process, Queue);
+watch_queue(QueueMon, _Overload) ->
+    QueueMon.
+
+%% The listener's queue process went down while this conn lives on: the
+%% listener stopped without draining its connections
+%% (`roadrunner_listener:stop/1`, or a drain that ran out with
+%% `graceful_drain => false`, which kills no conn at its deadline).
+%% Nothing will answer what is parked here, and the count of parked
+%% requests it kept stays up, so every request here would park and hang
+%% from now on. Each parked request takes a slot if one is free, as a
+%% request arriving now would, and is refused otherwise; from now on a
+%% request over the ceiling is refused instead of parked. A watch set
+%% after the process is gone fires at once, so a conn that parks first
+%% after it went comes here too.
+-spec queue_gone(#loop{}) -> #loop{}.
+queue_gone(#loop{cfg = Cfg, awaiting_slot = Awaiting} = State) ->
+    Refusing = State#loop{cfg = Cfg#h2_cfg{overload = refuse}, parked = false},
+    lists:foldl(
+        fun({StreamId, Req}, Acc) -> readmit(Acc, StreamId, Req) end,
+        Refusing,
+        lists:sort(maps:to_list(Awaiting))
+    ).
+
+%% Admit a request parked here as one arriving now, oldest first (stream
+%% ids grow): a free slot runs it, and without one it is refused.
+-spec readmit(#loop{}, stream_id(), roadrunner_req:request()) -> #loop{}.
+readmit(
+    #loop{
+        cfg = #h2_cfg{
+            max_concurrent_requests = Max,
+            inflight_counter = Counter,
+            slot_cell = Cell,
+            overload = Overload
+        },
+        awaiting_slot = Awaiting
+    } = State,
+    StreamId,
+    Req
+) ->
+    case roadrunner_conn:acquire_request_slot(Max, Counter, Cell, Overload, StreamId) of
+        true ->
+            spawn_parked(
+                State#loop{awaiting_slot = maps:remove(StreamId, Awaiting)}, StreamId, Req
+            );
+        false ->
+            handle_slot(State, StreamId, full)
+    end.
+
 %% A parked stream's admission resolved. `granted` means the queue has
 %% already taken the slot on our behalf, so a stream that has gone away
 %% in the meantime must hand it back rather than drop it.
@@ -4020,5 +4078,5 @@ hand_off_slots(#loop{
     parked = Parked
 }) ->
     roadrunner_conn:hand_off_request_slots(
-        Keeper, Cell, maps:keys(Workers), Parked, Max, Counter, Overload
+        Keeper, Cell, maps:keys(Workers), Parked =/= false, Max, Counter, Overload
     ).

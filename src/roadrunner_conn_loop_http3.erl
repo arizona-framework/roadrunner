@@ -1412,12 +1412,23 @@ handle_stream_reset(#h3{uni = Uni} = State0, StreamId) ->
                     %% already complete (its FIN out) is left as it is
                     %% (`do_reset_stream` sends nothing on it).
                     ok = cancel_and_release(State, StreamId),
-                    ok = roadrunner_conn:cancel_slot_wait(State#h3.cfg#h3_cfg.overload, StreamId),
-                    State#h3{
-                        streams = maps:remove(StreamId, Streams),
-                        awaiting_slot = maps:remove(StreamId, State#h3.awaiting_slot)
-                    }
+                    Withdrawn = withdraw_parked(State, StreamId),
+                    Withdrawn#h3{streams = maps:remove(StreamId, Streams)}
             end
+    end.
+
+%% Withdraw a request parked for an in-flight slot. Only a stream in
+%% `awaiting_slot` has a park to withdraw, so the reset of any other one
+%% sends the queue process nothing, as on HTTP/2. A grant already in
+%% flight still arrives, and `handle_slot/3` gives that slot back.
+-spec withdraw_parked(#h3{}, non_neg_integer()) -> #h3{}.
+withdraw_parked(#h3{awaiting_slot = Awaiting} = State, StreamId) ->
+    case Awaiting of
+        #{StreamId := _} ->
+            ok = roadrunner_conn:cancel_slot_wait(State#h3.cfg#h3_cfg.overload, StreamId),
+            State#h3{awaiting_slot = maps:remove(StreamId, Awaiting)};
+        #{} ->
+            State
     end.
 
 %% A peer STOP_SENDING (RFC 9000 §3.5): it will not read our response. The
@@ -1442,8 +1453,7 @@ handle_stop_sending(#h3{streams = Streams, worker_pids = WorkerPids} = State, St
             %% Not dispatched: a request parked for an in-flight slot leaves
             %% the queue, its answer unwanted (`awaiting_slot` holds a
             %% complete auto-mode one; a manual-mode one keeps its stream).
-            ok = roadrunner_conn:cancel_slot_wait(State#h3.cfg#h3_cfg.overload, StreamId),
-            State1 = State#h3{awaiting_slot = maps:remove(StreamId, State#h3.awaiting_slot)},
+            State1 = withdraw_parked(State, StreamId),
             case Streams of
                 #{StreamId := Stream} -> stop_unanswered(State1, StreamId, Stream);
                 #{} -> State1

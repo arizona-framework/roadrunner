@@ -117,7 +117,8 @@
     response_status/1,
     final_response/3,
     response_kind/1,
-    head_response/2
+    head_response/2,
+    take_request_slot/5
 ]).
 
 -export_type([
@@ -176,13 +177,16 @@ How a request over the listener-wide `max_concurrent_requests` ceiling
 is handled. `refuse` is the default and today's behavior: reject it
 immediately. The queue form parks it until a slot frees, so handler
 memory stays bounded without shedding the request; it carries the
-listener's queue process, the atomic that says whether anyone is parked
-(read on the release path to avoid a message per request), and the wait
-deadline in milliseconds. The shed form answers it `503` with the
+listener's queue process, the atomic that counts the requests parked
+(read on every acquire and release, so no request skips ahead of a parked
+one and a release sends no message while nobody waits), the wait deadline
+in milliseconds, and `max_queued`. The shed form answers it `503` with the
 `Retry-After` seconds it carries.
 """.
 -type overload() ::
-    refuse | {queue, pid(), atomics:atomics_ref(), pos_integer()} | {shed, pos_integer()}.
+    refuse
+    | {queue, pid(), atomics:atomics_ref(), pos_integer(), pos_integer()}
+    | {shed, pos_integer()}.
 
 -type dispatch() ::
     {handler, module(), roadrunner_middleware:next(), State :: term()}
@@ -561,15 +565,23 @@ rate_limit_evict_full(Table, NowMs, Rate, Cap) ->
 
 -doc """
 Take an in-flight slot, or park the request when the listener is in
-queue mode. The fast path is `try_acquire_request_slot/2` and nothing
-else, so a listener that never reaches its ceiling pays a single
-`counters` operation.
+queue mode. The fast path is `try_acquire_request_slot/2`, a `counters`
+operation, with one `atomics` read before it in queue mode.
+
+In queue mode the requests are served first in, first out: while any
+request is parked, one whose park is still on its way to the queue
+process included, a new one parks behind it instead of taking a slot
+that frees before the queue process hands it to the oldest. A request
+that finds `max_queued` requests parked and no slot free is refused
+here, without a message to the queue process, unless it found the queue
+empty a moment before: that one raced the park that filled it, and it
+wakes the queue process as it is refused.
 
 Returns `true` when the slot is held and the caller may spawn its
 worker, `false` when the caller should refuse the request exactly as it
-does today, `{shed, RetryAfterSecs}` when the listener sheds instead and
-the caller answers `503` with that `Retry-After`, and `queued` when the
-request is parked. A parked caller
+does today (in queue mode, a full queue), `{shed, RetryAfterSecs}` when
+the listener sheds instead and the caller answers `503` with that
+`Retry-After`, and `queued` when the request is parked. A parked caller
 MUST NOT block: it returns to its loop and later receives
 `{roadrunner_slot, Token, granted | timeout | full}`. `granted` means the
 slot is already held on its behalf, so a caller that has since dropped
@@ -587,22 +599,73 @@ is the natural choice.
 ) -> true | false | queued | {shed, pos_integer()}.
 acquire_request_slot(infinity, _Counter, _Cell, _Overload, _Token) ->
     true;
+acquire_request_slot(
+    Max, Counter, Cell, {queue, _Pid, Waiters, _Timeout, _MaxQueued} = Queue, Token
+) ->
+    case roadrunner_overload_queue:waiting(Waiters) of
+        true -> park(Queue, Max, Counter, Cell, Token);
+        false -> take_request_slot(Max, Counter, Cell, Queue, Token)
+    end;
 acquire_request_slot(Max, Counter, Cell, Overload, Token) ->
+    take_request_slot(Max, Counter, Cell, Overload, Token).
+
+%% The path of a request that found nobody parked. Exported for a direct
+%% test of the queue mode race below, where the count of parked requests
+%% rises between that check and this one.
+-doc false.
+-spec take_request_slot(pos_integer(), inflight_counter(), slot_cell(), overload(), term()) ->
+    true | false | queued | {shed, pos_integer()}.
+take_request_slot(Max, Counter, Cell, Overload, Token) ->
     case try_acquire_request_slot(Max, Counter) of
         true ->
             ok = atomics:add(Cell, 1, 1),
             true;
         false ->
-            park(Overload, Cell, Token)
+            park_after_fast_path(Overload, Max, Counter, Cell, Token)
     end.
 
--spec park(overload(), slot_cell(), term()) -> false | queued | {shed, pos_integer()}.
-park(refuse, _Cell, _Token) ->
+%% A request that found nobody parked, failed to take a slot, and then
+%% found the queue full raced a park that filled it. Its own attempt and
+%% the queue process's attempt for the oldest can both fail on the
+%% other's passing add, and it can read that add as every slot taken, so
+%% it wakes the queue process as it is refused: a slot both let go of
+%% cannot sit free while the oldest waits. Requests that see the queue
+%% full from the start never come this way, so a flood over a full queue
+%% still sends nothing.
+-spec park_after_fast_path(overload(), pos_integer(), inflight_counter(), slot_cell(), term()) ->
+    false | queued | {shed, pos_integer()}.
+park_after_fast_path(
+    {queue, Pid, _Waiters, _Timeout, _MaxQueued} = Queue, Max, Counter, Cell, Token
+) ->
+    case park(Queue, Max, Counter, Cell, Token) of
+        false ->
+            ok = roadrunner_overload_queue:note_release(Pid),
+            false;
+        Parked ->
+            Parked
+    end;
+park_after_fast_path(Overload, Max, Counter, Cell, Token) ->
+    park(Overload, Max, Counter, Cell, Token).
+
+%% A full queue with every slot taken refuses here, from the count the
+%% parking requests keep, so a flood over it never reaches the queue
+%% process. With a slot free the request parks even so: the queue process
+%% serves the queue before it decides, so the slot cannot sit free while
+%% the oldest waits. Requests that raced others to the last place are
+%% refused there instead (`full`).
+-spec park(overload(), pos_integer(), inflight_counter(), slot_cell(), term()) ->
+    false | queued | {shed, pos_integer()}.
+park(refuse, _Max, _Counter, _Cell, _Token) ->
     false;
-park({queue, Pid, _Waiters, Timeout}, Cell, Token) ->
-    ok = roadrunner_overload_queue:enqueue(Pid, Token, Cell, Timeout),
-    queued;
-park({shed, _RetryAfter} = Shed, _Cell, _Token) ->
+park({queue, Pid, Waiters, Timeout, MaxQueued}, Max, Counter, Cell, Token) ->
+    case atomics:get(Waiters, 1) >= MaxQueued andalso counters:get(Counter, 1) >= Max of
+        true ->
+            false;
+        false ->
+            ok = roadrunner_overload_queue:enqueue(Pid, Waiters, Token, Cell, Timeout),
+            queued
+    end;
+park({shed, _RetryAfter} = Shed, _Max, _Counter, _Cell, _Token) ->
     Shed.
 
 -doc """
@@ -611,7 +674,7 @@ connection is going away. Racing an in-flight grant is expected: the
 caller may still receive `granted` afterwards and must release that slot.
 """.
 -spec cancel_slot_wait(overload(), term()) -> ok.
-cancel_slot_wait({queue, Pid, _Waiters, _Timeout}, Token) ->
+cancel_slot_wait({queue, Pid, _Waiters, _Timeout, _MaxQueued}, Token) ->
     roadrunner_overload_queue:cancel(Pid, Token);
 cancel_slot_wait(_NeverParks, _Token) ->
     ok.
@@ -636,7 +699,7 @@ release_request_slot(_Max, Counter, Cell, Overload) ->
     notify_release(Overload).
 
 -spec notify_release(overload()) -> ok.
-notify_release({queue, Pid, Waiters, _Timeout}) ->
+notify_release({queue, Pid, Waiters, _Timeout, _MaxQueued}) ->
     case roadrunner_overload_queue:waiting(Waiters) of
         true -> roadrunner_overload_queue:note_release(Pid);
         false -> ok
@@ -702,10 +765,10 @@ client that drops and reopens connections run handlers past
 `max_concurrent_requests`. What the cell holds beyond the workers are
 grants that raced the close, released at once.
 
-A connection that ever `Parked` a request goes through the keeper even
-with no worker left: the keeper withdraws its parked requests and then
-empties the cell again, so a grant sent before the withdrawal is released
-rather than lost.
+A connection that `Parked` a request, its keeper still there when it last
+looked, goes through the keeper even with no worker left: the keeper
+withdraws its parked requests and then empties the cell again, so a grant
+sent before the withdrawal is released rather than lost.
 """.
 -spec hand_off_request_slots(
     pid(),

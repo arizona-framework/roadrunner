@@ -15,8 +15,24 @@
 saturated(MaxQueued) ->
     Counter = counters:new(1, [write_concurrency]),
     true = roadrunner_conn:try_acquire_request_slot(1, Counter),
-    {ok, Pid} = roadrunner_overload_queue:start_link(1, Counter, MaxQueued),
-    {Pid, Counter}.
+    {start(1, Counter, MaxQueued), Counter}.
+
+%% The parked count is fetched once here, so a test can park requests
+%% while the keeper is suspended.
+start(Max, Counter, MaxQueued) ->
+    {ok, Pid} = roadrunner_overload_queue:start_link(Max, Counter, MaxQueued, high),
+    put({waiters, Pid}, roadrunner_overload_queue:waiters_ref(Pid)),
+    Pid.
+
+%% Park as a conn does: the caller counts its request, then sends it.
+enqueue(Pid, Token, Cell, Timeout) ->
+    enqueue(Pid, get({waiters, Pid}), Token, Cell, Timeout).
+
+enqueue(Pid, Waiters, Token, Cell, Timeout) ->
+    roadrunner_overload_queue:enqueue(Pid, Waiters, Token, Cell, Timeout).
+
+parked(Pid) ->
+    atomics:get(get({waiters, Pid}), 1).
 
 %% Enqueue and cancel are casts, so a test that depends on ordering has
 %% to wait for them to land. `waiters_ref/1` is a call from the same
@@ -38,7 +54,7 @@ release(Counter, Pid) ->
 granted_when_a_slot_frees_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, cell(), 5000),
+        ok = enqueue(Pid, s1, cell(), 5000),
         ok = sync(Pid),
         release(Counter, Pid),
         ?assertEqual(granted, recv_slot(s1)),
@@ -49,9 +65,9 @@ granted_when_a_slot_frees_test_() ->
 fifo_order_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
-        ok = roadrunner_overload_queue:enqueue(Pid, first, cell(), 5000),
+        ok = enqueue(Pid, first, cell(), 5000),
         ok = sync(Pid),
-        ok = roadrunner_overload_queue:enqueue(Pid, second, cell(), 5000),
+        ok = enqueue(Pid, second, cell(), 5000),
         ok = sync(Pid),
         release(Counter, Pid),
         ?assertEqual(granted, recv_slot(first)),
@@ -62,7 +78,7 @@ fifo_order_test_() ->
 expires_after_the_deadline_test_() ->
     {spawn, fun() ->
         {Pid, _Counter} = saturated(8),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, cell(), 50),
+        ok = enqueue(Pid, s1, cell(), 50),
         %% No slot ever frees — the queue owns the deadline and answers.
         ?assertEqual(timeout, recv_slot(s1))
     end}.
@@ -70,9 +86,9 @@ expires_after_the_deadline_test_() ->
 full_queue_sheds_immediately_test_() ->
     {spawn, fun() ->
         {Pid, _Counter} = saturated(1),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, cell(), 5000),
+        ok = enqueue(Pid, s1, cell(), 5000),
         ok = sync(Pid),
-        ok = roadrunner_overload_queue:enqueue(Pid, s2, cell(), 5000),
+        ok = enqueue(Pid, s2, cell(), 5000),
         %% The shed valve: overload sheds rather than queueing without bound.
         ?assertEqual(full, recv_slot(s2))
     end}.
@@ -80,9 +96,9 @@ full_queue_sheds_immediately_test_() ->
 cancelled_entry_is_skipped_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
-        ok = roadrunner_overload_queue:enqueue(Pid, gone, cell(), 5000),
+        ok = enqueue(Pid, gone, cell(), 5000),
         ok = sync(Pid),
-        ok = roadrunner_overload_queue:enqueue(Pid, kept, cell(), 5000),
+        ok = enqueue(Pid, kept, cell(), 5000),
         ok = sync(Pid),
         ok = roadrunner_overload_queue:cancel(Pid, gone),
         ok = sync(Pid),
@@ -96,7 +112,7 @@ cancelling_an_unknown_token_is_a_noop_test_() ->
         {Pid, Counter} = saturated(8),
         ok = roadrunner_overload_queue:cancel(Pid, never_queued),
         ok = sync(Pid),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, cell(), 5000),
+        ok = enqueue(Pid, s1, cell(), 5000),
         ok = sync(Pid),
         release(Counter, Pid),
         ?assertEqual(granted, recv_slot(s1))
@@ -106,8 +122,9 @@ dead_waiter_is_dropped_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
         Self = self(),
+        Waiters = get({waiters, Pid}),
         Dying = spawn(fun() ->
-            ok = roadrunner_overload_queue:enqueue(Pid, doomed, cell(), 5000),
+            ok = enqueue(Pid, Waiters, doomed, cell(), 5000),
             Self ! queued,
             receive
                 die -> ok
@@ -125,7 +142,7 @@ dead_waiter_is_dropped_test_() ->
         end,
         %% Our own entry still gets the slot; nothing was taken for the
         %% dead one, so nothing leaked.
-        ok = roadrunner_overload_queue:enqueue(Pid, mine, cell(), 5000),
+        ok = enqueue(Pid, mine, cell(), 5000),
         ok = sync(Pid),
         release(Counter, Pid),
         ?assertEqual(granted, recv_slot(mine))
@@ -134,7 +151,7 @@ dead_waiter_is_dropped_test_() ->
 keeps_its_place_when_the_slot_is_lost_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, cell(), 5000),
+        ok = enqueue(Pid, s1, cell(), 5000),
         ok = sync(Pid),
         %% Notify without actually freeing anything: the queue tries to
         %% take a slot, fails, and must keep the entry at the head rather
@@ -163,11 +180,37 @@ waiting_flag_tracks_the_queue_test_() ->
         {Pid, Counter} = saturated(8),
         Ref = roadrunner_overload_queue:waiters_ref(Pid),
         ?assertNot(roadrunner_overload_queue:waiting(Ref)),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, cell(), 5000),
-        ?assert(wait_until(fun() -> roadrunner_overload_queue:waiting(Ref) end)),
+        ok = enqueue(Pid, s1, cell(), 5000),
+        ?assert(roadrunner_overload_queue:waiting(Ref)),
         release(Counter, Pid),
         ?assertEqual(granted, recv_slot(s1)),
         ?assert(wait_until(fun() -> not roadrunner_overload_queue:waiting(Ref) end))
+    end}.
+
+%% The count goes up in the parking request, before its park reaches the
+%% keeper: a keeper behind on its mailbox (suspended here) still has every
+%% request that asks after it wait behind it.
+waiting_counts_a_park_still_on_its_way_test_() ->
+    {spawn, fun() ->
+        {Pid, Counter} = saturated(8),
+        ok = sys:suspend(Pid),
+        ok = enqueue(Pid, s1, cell(), 5000),
+        ?assertEqual(1, parked(Pid)),
+        ok = sys:resume(Pid),
+        release(Counter, Pid),
+        ?assertEqual(granted, recv_slot(s1)),
+        ?assertEqual(0, parked(Pid))
+    end}.
+
+%% A refused park takes its count back down, so a flood that the keeper
+%% turns away leaves the count where it was.
+full_queue_takes_the_count_back_test_() ->
+    {spawn, fun() ->
+        {Pid, _Counter} = saturated(1),
+        ok = enqueue(Pid, s1, cell(), 5000),
+        ok = enqueue(Pid, s2, cell(), 5000),
+        ?assertEqual(full, recv_slot(s2)),
+        ?assertEqual(1, parked(Pid))
     end}.
 
 unknown_messages_do_not_disturb_it_test_() ->
@@ -176,7 +219,7 @@ unknown_messages_do_not_disturb_it_test_() ->
         ?assertEqual({error, unknown_call}, gen_server:call(Pid, nonsense)),
         ok = gen_server:cast(Pid, nonsense),
         Pid ! nonsense,
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, cell(), 5000),
+        ok = enqueue(Pid, s1, cell(), 5000),
         ok = sync(Pid),
         release(Counter, Pid),
         ?assertEqual(granted, recv_slot(s1))
@@ -187,9 +230,9 @@ unknown_messages_do_not_disturb_it_test_() ->
 late_expire_for_a_served_entry_is_ignored_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
-        Pid ! {expire, {self(), never_queued}},
+        Pid ! {expire, self(), never_queued},
         ok = sync(Pid),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, cell(), 5000),
+        ok = enqueue(Pid, s1, cell(), 5000),
         ok = sync(Pid),
         release(Counter, Pid),
         ?assertEqual(granted, recv_slot(s1))
@@ -232,7 +275,7 @@ adopted_worker_keeps_its_slot_until_it_ends_test_() ->
         ?assertEqual(0, atomics:get(Cell, 1)),
         ?assertEqual(1, counters:get(Counter, 1)),
         Parked = cell(),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, Parked, 5000),
+        ok = enqueue(Pid, s1, Parked, 5000),
         ok = sync(Pid),
         Worker ! stop,
         ?assertEqual(granted, recv_slot(s1)),
@@ -260,7 +303,7 @@ adopt_withdraws_the_callers_parked_requests_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
         Cell = cell(),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, Cell, 5000),
+        ok = enqueue(Pid, s1, Cell, 5000),
         ok = sync(Pid),
         ok = adopt(Pid, Cell, []),
         ?assertNot(roadrunner_overload_queue:waiting(roadrunner_overload_queue:waiters_ref(Pid))),
@@ -277,7 +320,7 @@ adopt_releases_the_grants_that_raced_it_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
         Cell = cell(),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, Cell, 5000),
+        ok = enqueue(Pid, s1, Cell, 5000),
         ok = sync(Pid),
         release(Counter, Pid),
         ok = sync(Pid),
@@ -294,7 +337,7 @@ adopt_releases_a_grant_sent_after_the_conn_emptied_its_cell_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
         Cell = cell(),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, Cell, 5000),
+        ok = enqueue(Pid, s1, Cell, 5000),
         ok = sync(Pid),
         0 = atomics:exchange(Cell, 1, 0),
         release(Counter, Pid),
@@ -314,9 +357,10 @@ grant_to_a_dead_conn_is_taken_back_test_() ->
     {spawn, fun() ->
         {Pid, Counter} = saturated(8),
         Self = self(),
+        Waiters = get({waiters, Pid}),
         Cell = cell(),
         Conn = spawn(fun() ->
-            ok = roadrunner_overload_queue:enqueue(Pid, s1, Cell, 5000),
+            ok = enqueue(Pid, Waiters, s1, Cell, 5000),
             Self ! parked,
             receive
                 die -> ok
@@ -346,9 +390,9 @@ several_freed_slots_grant_several_requests_test_() ->
     {spawn, fun() ->
         Counter = counters:new(1, [write_concurrency]),
         ok = counters:add(Counter, 1, 2),
-        {ok, Pid} = roadrunner_overload_queue:start_link(2, Counter, 8),
-        ok = roadrunner_overload_queue:enqueue(Pid, s1, cell(), 5000),
-        ok = roadrunner_overload_queue:enqueue(Pid, s2, cell(), 5000),
+        Pid = start(2, Counter, 8),
+        ok = enqueue(Pid, s1, cell(), 5000),
+        ok = enqueue(Pid, s2, cell(), 5000),
         ok = sync(Pid),
         ok = roadrunner_conn:release_request_slots(2, Counter, 2, refuse),
         roadrunner_overload_queue:note_release(Pid),
@@ -365,8 +409,9 @@ dead_parked_conn_is_reclaimed_test_() ->
         Self = self(),
         %% It holds the saturating slot, and parks another request.
         Cell = cell(1),
+        Waiters = get({waiters, Pid}),
         Conn = spawn(fun() ->
-            ok = roadrunner_overload_queue:enqueue(Pid, s1, Cell, 5000),
+            ok = enqueue(Pid, Waiters, s1, Cell, 5000),
             Self ! parked,
             receive
                 die -> exit(crashed)
@@ -395,6 +440,113 @@ adopt_with_the_keeper_gone_test_() ->
             {'DOWN', Mon, process, Gone, _} -> ok
         end,
         ?assertEqual(ok, roadrunner_overload_queue:adopt(Gone, cell(), [self()], 0))
+    end}.
+
+%% A `full` answer leaves the queue as full as it was: the refused request
+%% was never parked, so the next park over the queue is refused too.
+full_queue_stays_full_after_refusing_test_() ->
+    {spawn, fun() ->
+        {Pid, _Counter} = saturated(1),
+        ok = enqueue(Pid, s1, cell(), 5000),
+        ok = enqueue(Pid, s2, cell(), 5000),
+        ?assertEqual(full, recv_slot(s2)),
+        ok = enqueue(Pid, s3, cell(), 5000),
+        ?assertEqual(full, recv_slot(s3))
+    end}.
+
+%% A full queue that gets a park while a slot is free serves first: the
+%% conn parked it because a slot looked free, and the slot must not sit
+%% free while the oldest waits. Here the slot freed without a wake-up, as
+%% when a release and the keeper both failed to take it at once.
+full_queue_serves_before_answering_test_() ->
+    {spawn, fun() ->
+        {Pid, Counter} = saturated(1),
+        ok = enqueue(Pid, s1, cell(), 5000),
+        ok = sync(Pid),
+        ok = counters:sub(Counter, 1, 1),
+        ok = enqueue(Pid, s2, cell(), 5000),
+        ?assertEqual(granted, recv_slot(s1)),
+        %% Granting `s1` made room, so `s2` waits for the next slot.
+        ?assertEqual(timeout_waiting_for_reply, recv_slot_short(s2)),
+        ?assertEqual(1, parked(Pid))
+    end}.
+
+%% Granting never asks whether the conn is alive. With the grant queued
+%% at the conn, that question waits until the conn next runs, which on a
+%% busy server holds up every grant behind it; the conn's `DOWN` already
+%% covers a grant to one that died. Tracing the keeper's calls shows it.
+grant_does_not_ask_whether_the_conn_is_alive_test_() ->
+    {spawn, fun() ->
+        {Pid, Counter} = saturated(8),
+        ok = enqueue(Pid, s1, cell(), 5000),
+        ok = sync(Pid),
+        MFA = {erlang, is_process_alive, 1},
+        _ = erlang:trace_pattern(MFA, true, [global]),
+        1 = erlang:trace(Pid, true, [call]),
+        release(Counter, Pid),
+        ?assertEqual(granted, recv_slot(s1)),
+        ok = sync(Pid),
+        1 = erlang:trace(Pid, false, [call]),
+        _ = erlang:trace_pattern(MFA, false, [global]),
+        ?assertEqual(
+            none,
+            receive
+                {trace, Pid, call, {erlang, is_process_alive, _}} = Call -> Call
+            after 0 -> none
+            end
+        )
+    end}.
+
+%% A conn that dies with several requests parked has them all dropped on
+%% its one `DOWN`, and none of them is granted.
+dead_conn_drops_every_request_it_parked_test_() ->
+    {spawn, fun() ->
+        {Pid, Counter} = saturated(8),
+        Self = self(),
+        Waiters = get({waiters, Pid}),
+        Conn = spawn(fun() ->
+            [ok = enqueue(Pid, Waiters, T, cell(), 5000) || T <- [s1, s2, s3]],
+            Self ! parked,
+            receive
+                die -> ok
+            end
+        end),
+        receive
+            parked -> ok
+        end,
+        ok = sync(Pid),
+        ?assertEqual(3, parked(Pid)),
+        Mon = monitor(process, Conn),
+        Conn ! die,
+        receive
+            {'DOWN', Mon, process, Conn, _} -> ok
+        end,
+        ?assert(wait_until(fun() -> parked(Pid) =:= 0 end)),
+        ok = enqueue(Pid, mine, cell(), 5000),
+        ok = sync(Pid),
+        release(Counter, Pid),
+        ?assertEqual(granted, recv_slot(mine))
+    end}.
+
+%% Parking and cancelling behind a head that is never served leaves keys
+%% in the arrival order, and they are dropped once they outnumber the
+%% parked requests, so a client that does it on and on cannot grow it.
+%% `order` is the sixth element of the keeper's state.
+order_stays_bounded_when_parks_are_cancelled_test_() ->
+    {spawn, fun() ->
+        {Pid, _Counter} = saturated(8),
+        ok = enqueue(Pid, head, cell(), 60000),
+        Cell = cell(),
+        lists:foreach(
+            fun(N) ->
+                ok = enqueue(Pid, {churn, N}, Cell, 60000),
+                ok = roadrunner_overload_queue:cancel(Pid, {churn, N})
+            end,
+            lists:seq(1, 1000)
+        ),
+        ok = sync(Pid),
+        ?assertEqual(1, parked(Pid)),
+        ?assert(queue:len(element(6, sys:get_state(Pid))) < 100)
     end}.
 
 wait_until(Fun) ->
