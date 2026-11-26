@@ -175,8 +175,8 @@ tcp_drain_closes_a_conn_before_its_header(_Config) ->
 
 tcp_header_wait_never_wakes(_Config) ->
     %% A connection waiting for its header, before any byte or with part of
-    %% it in (no rate to keep), does no work while it waits: its reductions
-    %% do not move over a second of silence.
+    %% it in (no rate to keep), never wakes while it waits: over a second of
+    %% silence nothing reaches it and its receive never times out.
     Port = start_tcp_listener(#{request_timeout => 20000, min_bytes_per_second => 0}),
     {ok, Idle} = connect(Port),
     ok = still_while_silent(Idle, ~""),
@@ -260,14 +260,40 @@ serves(Pid, Local, Sent) ->
         erlang:ports()
     ).
 
-%% The connection serving `Tcp` does no work over a second in which the
-%% client sends nothing.
+%% The connection serving `Tcp` never wakes over a second in which the
+%% client sends nothing: a trace of its `receive` catches no message and no
+%% timeout. Its reductions would not tell, as the VM charges a process for
+%% the housekeeping it does on it: a `persistent_term` value bigger than a
+%% word, replaced or erased anywhere in the node, has every process scanned
+%% for it, and the replacements here have the wait scanned too.
 still_while_silent(Tcp, Sent) ->
     Conn = waiting_for_header(Tcp, Sent),
-    {reductions, Before} = erlang:process_info(Conn, reductions),
+    1 = erlang:trace(Conn, true, ['receive']),
+    ok = replace_persistent_term(20),
     ?assertEqual({error, timeout}, gen_tcp:recv(Tcp, 0, 1000)),
-    ?assertEqual({reductions, Before}, erlang:process_info(Conn, reductions)),
+    1 = erlang:trace(Conn, false, ['receive']),
+    ?assertEqual([], traced(Conn)),
     ok.
+
+%% Replace a `persistent_term` value `N` times, then erase it.
+replace_persistent_term(N) ->
+    Key = {?MODULE, scanned},
+    lists:foreach(fun(_) -> ok = persistent_term:put(Key, make_ref()) end, lists:seq(1, N)),
+    true = persistent_term:erase(Key),
+    ok.
+
+%% What a trace of `Conn`'s `receive` caught, once all of it has arrived.
+traced(Conn) ->
+    Ref = erlang:trace_delivered(Conn),
+    receive
+        {trace_delivered, Conn, Ref} -> traced_messages(Conn)
+    end.
+
+traced_messages(Conn) ->
+    receive
+        {trace, Conn, 'receive', Msg} -> [Msg | traced_messages(Conn)]
+    after 0 -> []
+    end.
 
 start_tcp_listener(Extra) ->
     {ok, _} = roadrunner_listener:start_link(
