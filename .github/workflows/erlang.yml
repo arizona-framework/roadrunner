@@ -180,6 +180,15 @@ jobs:
       - name: Run eunit + ct (with cover)
         run: make eunit ct
 
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-logs-otp-29-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/test/logs
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Coverage gate (100 %)
         run: make cover
 
@@ -211,6 +220,15 @@ jobs:
 
       - name: Run eunit + ct
         run: make eunit ct
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-logs-otp-${{ matrix.otp }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/test/logs
+          if-no-files-found: ignore
+          retention-days: 14
 
   # HTTP/2 conformance — backs the README "h2spec strict 100 %" claim, on
   # every supported OTP (h2 framing behaviour can shift with the runtime).
