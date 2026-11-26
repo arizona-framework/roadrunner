@@ -776,6 +776,8 @@ after it is sent. A keeper that stopped with its listener, which the
 connection outlived, set the flag before it read the hand-offs in its
 mailbox: one sent after that is never read, so the connection empties the
 cell itself, and whichever of the two empties it first takes the slots.
+So does a connection whose keeper is gone without setting the flag
+(killed, with its listener or on its own).
 Its workers then stop counting: the connections left from before the stop
 still admit requests against the listener's counter, and a slot nothing
 will release would shrink their ceiling for good. No new connection comes
@@ -794,9 +796,11 @@ hand_off_request_slots(_Keeper, Cell, [], false, Max, Counter, Overload) ->
     reclaim_request_slots(Cell, Max, Counter, Overload);
 hand_off_request_slots({Keeper, Stopping}, Cell, Workers, _Parked, Max, Counter, Overload) ->
     ok = roadrunner_overload_queue:adopt(Keeper, Cell, Workers),
-    case atomics:get(Stopping, 1) of
-        0 -> ok;
-        _Stopped -> reclaim_request_slots(Cell, Max, Counter, Overload)
+    %% A keeper killed outright never set its flag: being gone says the
+    %% same.
+    case atomics:get(Stopping, 1) =:= 0 andalso is_process_alive(Keeper) of
+        true -> ok;
+        false -> reclaim_request_slots(Cell, Max, Counter, Overload)
     end.
 
 -doc false.

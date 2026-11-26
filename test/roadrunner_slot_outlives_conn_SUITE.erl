@@ -41,6 +41,7 @@ The handlers announce themselves to the test process and wait for
     parked_request_of_an_ungraceful_drain_is_refused/1,
     never_parked_conn_after_its_listener_stopped_admits_afresh/1,
     hand_off_after_the_keeper_stopped_is_released/1,
+    hand_off_after_the_keeper_was_killed_is_released/1,
     adopted_slots_are_released_as_the_keeper_stops/1,
     unread_hand_off_is_released_as_the_keeper_stops/1,
     listener_goes_down_with_its_keeper/1,
@@ -87,6 +88,7 @@ groups() ->
                     parked_request_of_an_ungraceful_drain_is_refused,
                     never_parked_conn_after_its_listener_stopped_admits_afresh,
                     hand_off_after_the_keeper_stopped_is_released,
+                    hand_off_after_the_keeper_was_killed_is_released,
                     adopted_slots_are_released_as_the_keeper_stops,
                     unread_hand_off_is_released_as_the_keeper_stops,
                     listener_goes_down_with_its_keeper,
@@ -520,6 +522,30 @@ hand_off_after_the_keeper_stopped_is_released(Config) ->
     ?assertEqual(0, counters:get(Counter, 1)),
     ok = finish(Handler, release),
     ok = served_twice(Survivor, Counter).
+
+%% A keeper killed outright, taking its listener down, never runs its
+%% stop: a connection that closes after that, its handler still running,
+%% finds it gone and releases its slot itself.
+hand_off_after_the_keeper_was_killed_is_released(Config) ->
+    Name = start(Config, 2, refuse),
+    Counter = counter(Name),
+    Old = connect(Config),
+    ok = request(Old),
+    Handler = expect_handler(),
+    Conn = conn_of(Name, Old),
+    Listener = whereis(Name),
+    true = unlink(Listener),
+    ListenerMon = monitor(process, Listener),
+    Keeper = keeper(Name),
+    KeeperMon = monitor(process, Keeper),
+    true = exit(Keeper, kill),
+    ok = await_down(KeeperMon),
+    ok = await_down(ListenerMon),
+    Mon = monitor(process, Conn),
+    ok = close(Old),
+    ok = await_down(Mon),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release).
 
 %% The slots of handlers whose connection closed before the stop are the
 %% keeper's to release, and it releases them as it stops.
