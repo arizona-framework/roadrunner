@@ -28,6 +28,8 @@ picks what it does with the body.
     body_over_the_cap_fails_the_read/1,
     credit_waits_for_the_reader/1,
     credit_comes_back_as_the_reader_reads/1,
+    credit_comes_back_for_a_frame_still_arriving/1,
+    credit_comes_back_for_frames_with_no_body/1,
     credit_counts_the_headers/1,
     content_length_overrun_resets/1,
     malformed_content_length_resets/1,
@@ -75,6 +77,8 @@ all() ->
         body_over_the_cap_fails_the_read,
         credit_waits_for_the_reader,
         credit_comes_back_as_the_reader_reads,
+        credit_comes_back_for_a_frame_still_arriving,
+        credit_comes_back_for_frames_with_no_body,
         credit_counts_the_headers,
         content_length_overrun_resets,
         malformed_content_length_resets,
@@ -327,6 +331,32 @@ credit_comes_back_as_the_reader_reads(Config) ->
     ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, binary:copy(~"y", 200000), true),
     ?assertMatch({200, _, ~"400000"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
 
+credit_comes_back_for_a_frame_still_arriving(Config) ->
+    %% One DATA frame larger than the stream's window, the window all in
+    %% before the handler reads: the read gives back the credit of the
+    %% frame's bytes so far, or the client could never send the rest of it.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/gated", []),
+    ok = read_past_the_window(Conn, StreamId, binary:copy(~"x", 300000)),
+    ?assertMatch({200, _, ~"300000"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
+
+credit_comes_back_for_frames_with_no_body(Config) ->
+    %% A frame of a reserved type (RFC 9114 §7.2.8), which carries no body,
+    %% ends right at the stream's window before the handler reads: the read
+    %% gives its credit back, or the client could never send the body.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/gated", []),
+    Headers = iolist_size(
+        roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(headers(~"/gated")))
+    ),
+    %% The type (one byte) and a four-byte length come before the payload.
+    Payload = 262144 - Headers - 5,
+    Reserved = [16#21, roadrunner_quic_varint:encode(Payload), binary:copy(<<0>>, Payload)],
+    ?assertEqual(262144, Headers + iolist_size(Reserved)),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, Reserved, false),
+    ok = read_past_the_window(Conn, StreamId, ~"body"),
+    ?assertMatch({200, _, ~"4"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
+
 credit_counts_the_headers(Config) ->
     %% The credit given back covers every byte of the stream, its HEADERS
     %% frame too, so a reader never shrinks its own window.
@@ -550,6 +580,17 @@ headers(Path) ->
         {~":authority", ~"localhost"},
         {~":path", Path}
     ].
+
+%% Send `Body` as the rest of the request on `StreamId`, past the credit
+%% the stream has left. Once the client waits for more and all it sent is
+%% in, the gated handler reads: its read must give the stream's credit
+%% back for the send to finish.
+read_past_the_window(Conn, StreamId, Body) ->
+    ok = waiting_send(Conn, StreamId, Body),
+    %% A request sent after the window is answered once all of it is in.
+    {_, _, _} = post(Conn, ~"/read", ~"sync"),
+    ok = go(),
+    send_answer().
 
 %% A POST's HEADERS with `Extra` fields, its body to follow.
 open(Conn, Path, Extra) ->

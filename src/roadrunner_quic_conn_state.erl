@@ -259,9 +259,9 @@
     %% When a request stream's receive credit is granted back: as its data
     %% arrives (`on_receipt`), or as the owner consumes it (`on_read`,
     %% `handle_consumed/4`), so a request body is held to one window past
-    %% what its reader has read. Connection-level credit is always granted on
-    %% receipt, so one slow reader never stalls the connection's other
-    %% streams.
+    %% what the owner reports consumed. Connection-level credit is always
+    %% granted on receipt, so one slow reader never stalls the connection's
+    %% other streams.
     stream_credit = on_receipt :: on_receipt | on_read
 }).
 

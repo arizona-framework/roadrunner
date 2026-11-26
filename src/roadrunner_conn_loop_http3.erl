@@ -151,6 +151,21 @@
 %% fires on genuinely huge header sets; tracks `max_header_block` when set.
 -define(DEFAULT_MAX_FIELD_SECTION_SIZE, (2 * ?MAX_HEADER_BLOCK)).
 
+%% The bytes a manual-mode stream holds unread before a worker waiting on
+%% them gives their QUIC credit back (`reader_waits/3`): a quarter of the
+%% request stream's 256 KiB window (`roadrunner_quic_listener_sup`), whose
+%% credit is refilled once more than a quarter of it is consumed past the
+%% last grant (`roadrunner_quic_flow`). A client that has used all its
+%% credit, with no grant on the way, leaves at least three quarters of the
+%% window held, so a waiting worker always gives it more; with less held
+%% the client has credit left, or a grant on the way, and what it sends
+%% gives the credit back as it arrives (`body_in/3`). A stream blocked on
+%% QPACK inserts is the exception: what arrives while it waits for them is
+%% held apart, its credit coming back once they come (`resume/2`). If the
+%% window, or the share of it `roadrunner_quic_flow` refills at, ever
+%% changes, keep this at most what a client out of credit leaves held.
+-define(WAITING_RELEASE, 65536).
+
 %% A critical stream role can be claimed at most once per connection.
 -type critical_role() :: control | qpack_encoder | qpack_decoder.
 -type critical_set() :: #{critical_role() => true}.
@@ -190,7 +205,8 @@
     body_len = 0 :: non_neg_integer(),
     %% Raw stream bytes received and not yet handed back to QUIC flow
     %% control. Only manual mode counts them: its request streams' credit
-    %% is granted as the worker reads (`deliver/3`).
+    %% is granted as the worker reads (`deliver/3`), or waits on bytes it
+    %% cannot read yet (`reader_waits/3`).
     unreleased = 0 :: non_neg_integer(),
     %% The listener's `max_content_length` until a body outgrows it and
     %% its route raises it (`raise_body_cap/5`), to `infinity` for a
@@ -843,8 +859,10 @@ blocked_in(
     Stream1 = Stream#h3_stream{buf = <<Buf/binary, Data/binary>>, blocked = {Ric, Fin, Held1}},
     blocked_bytes(State#h3{streams = Streams#{StreamId := Stream1}}, StreamId).
 
-%% What a blocked stream may hold. A manual-mode stream gives its QUIC
-%% credit back only as it is read, so its window bounds what it holds. An
+%% What a blocked stream may hold. A manual-mode stream gives back no QUIC
+%% credit, until it is unblocked, for what arrives while it is blocked, so
+%% its window bounds what it takes in then, on top of what came before the
+%% block. An
 %% auto-mode stream's credit comes back as its bytes arrive, so it is
 %% bounded here: by its body cap plus two field sections' worth (the
 %% request's and its trailers'), frame headers counted. Its route, which
@@ -1039,10 +1057,15 @@ refuse_request(
 
 %% Dispatch a manual-mode request whose body is still to come: its worker
 %% starts now and reads the body as it asks (`handle_body_demand/3`), the
-%% stream's QUIC credit given back with each delivery (`deliver/3`), so a
-%% stream holds at most one window of body its worker has not read. A 100
-%% Continue the client holds its body back for (`ContinueOwed`) goes out on
-%% the first ask. A malformed `content-length` is a malformed request.
+%% stream's QUIC credit given back with each delivery (`deliver/3`) and,
+%% once `?WAITING_RELEASE` bytes or more are held, as the worker waits on
+%% bytes it cannot read (`reader_waits/3`: a frame still arriving, or
+%% frames that carry no body). A stream so holds at most one window past
+%% what its worker has read, plus one frame (up to 1 MiB of payload) whose
+%% credit came back before it was whole, and a window more while its
+%% trailers wait on QPACK inserts. A 100 Continue the client holds its
+%% body back for (`ContinueOwed`) goes out on the first ask. A malformed
+%% `content-length` is a malformed request.
 -spec dispatch_reading(#h3{}, non_neg_integer(), roadrunner_http:headers(), boolean()) ->
     handle_result().
 dispatch_reading(#h3{streams = Streams} = State, StreamId, Headers, ContinueOwed) ->
@@ -1063,7 +1086,8 @@ dispatch_reading(#h3{streams = Streams} = State, StreamId, Headers, ContinueOwed
     end.
 
 %% Count a chunk's raw bytes toward what a manual-mode stream hands back to
-%% QUIC flow control once its worker reads them (`deliver/3`).
+%% QUIC flow control once its worker reads them (`deliver/3`) or waits on
+%% them (`reader_waits/3`).
 -spec unreleased(#h3_stream{}, non_neg_integer(), #h3{}) -> #h3_stream{}.
 unreleased(#h3_stream{unreleased = Unreleased} = Stream, Received, #h3{
     cfg = #h3_cfg{body_buffering = manual}
@@ -1097,8 +1121,10 @@ body_in(#h3{streams = Streams} = State, StreamId, Fin) ->
     end.
 
 %% Hand a manual-mode stream's received DATA to its waiting worker, `Fin`
-%% marking the body's end, and give the stream's QUIC credit back for every
-%% raw byte received so far, now that all of it has left the connection.
+%% marking the body's end, and, before the body's end, give back the QUIC
+%% credit of the raw bytes counted so far (`unreleased`), those of a frame
+%% still arriving included; bytes taken in while the stream waits on QPACK
+%% inserts count only from `resume/2`.
 -spec deliver(#h3{}, non_neg_integer(), #h3_stream{}) -> #h3{}.
 deliver(
     #h3{cfg = #h3_cfg{conn = Conn}, streams = Streams} = State,
@@ -1140,8 +1166,8 @@ body_over_cap(#h3{streams = Streams} = State, StreamId, #h3_stream{reader = Read
 %% (`roadrunner_conn:stream_body_reader/5`). The first ask sends a 100
 %% Continue the client is holding its body back for. It gets what has
 %% arrived, the body's end once it came, or, with nothing yet, the next
-%% DATA as it arrives (`body_in/3`). A body that cannot be read fails the
-%% read, and a stream that is gone or being discarded ends it.
+%% DATA as it arrives (`reader_waits/3`). A body that cannot be read fails
+%% the read, and a stream that is gone or being discarded ends it.
 -spec handle_body_demand(#h3{}, pid(), non_neg_integer()) -> #h3{}.
 handle_body_demand(#h3{streams = Streams} = State, Worker, StreamId) ->
     case Streams of
@@ -1158,7 +1184,7 @@ handle_body_demand(#h3{streams = Streams} = State, Worker, StreamId) ->
             #h3_stream{body = Body, fin = Fin} = Asked,
             case Fin orelse iolist_size(Body) > 0 of
                 true -> deliver(State1, StreamId, Asked);
-                false -> State1#h3{streams = Streams#{StreamId := Asked}}
+                false -> reader_waits(State1, StreamId, Asked)
             end;
         #{StreamId := #h3_stream{manual = true, body_error = Reason}} ->
             ok = roadrunner_conn:send_body_error(Worker, StreamId, Reason),
@@ -1167,6 +1193,23 @@ handle_body_demand(#h3{streams = Streams} = State, Worker, StreamId) ->
             ok = roadrunner_conn:send_body_error(Worker, StreamId, closed),
             State
     end.
+
+%% A worker asks with nothing to read yet and waits for the next DATA
+%% (`body_in/3`). With `?WAITING_RELEASE` bytes or more held unread, their
+%% QUIC credit goes back now: they are a frame still arriving, which can be
+%% larger than the stream's window, or frames that carry no body, and with
+%% their credit held a client that has used all of it could never send the
+%% DATA the worker waits for.
+-spec reader_waits(#h3{}, non_neg_integer(), #h3_stream{}) -> #h3{}.
+reader_waits(
+    #h3{cfg = #h3_cfg{conn = Conn}, streams = Streams} = State,
+    StreamId,
+    #h3_stream{unreleased = Unreleased} = Stream
+) when Unreleased >= ?WAITING_RELEASE ->
+    ok = roadrunner_quic:consumed(Conn, StreamId, Unreleased),
+    State#h3{streams = Streams#{StreamId := Stream#h3_stream{unreleased = 0}}};
+reader_waits(#h3{streams = Streams} = State, StreamId, Stream) ->
+    State#h3{streams = Streams#{StreamId := Stream}}.
 
 %% A worker's body read timed out (`roadrunner_conn:stream_recv/2`) and
 %% takes its demand back: DATA arriving later stays with the stream
