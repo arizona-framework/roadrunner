@@ -36,7 +36,10 @@ The handlers announce themselves to the test process and wait for
     grant_to_a_reaped_conn_is_reclaimed/1,
     reclaimed_slots_are_all_granted/1,
     drained_conn_keeps_its_reset_handler_counted/1,
-    conn_closing_after_its_listener_stopped_exits_cleanly/1
+    conn_closing_after_its_listener_stopped_exits_cleanly/1,
+    parked_request_of_a_stopped_listener_is_refused/1,
+    parked_request_of_an_ungraceful_drain_is_refused/1,
+    never_parked_conn_after_its_listener_stopped_admits_afresh/1
 ]).
 
 -define(H3_REQUEST_REJECTED, 16#10B).
@@ -67,7 +70,10 @@ groups() ->
                     grant_racing_a_crash_is_reclaimed,
                     grant_to_a_reaped_conn_is_reclaimed,
                     reclaimed_slots_are_all_granted,
-                    conn_closing_after_its_listener_stopped_exits_cleanly
+                    conn_closing_after_its_listener_stopped_exits_cleanly,
+                    parked_request_of_a_stopped_listener_is_refused,
+                    parked_request_of_an_ungraceful_drain_is_refused,
+                    never_parked_conn_after_its_listener_stopped_admits_afresh
                 ]},
         {h3, [], Common},
         %% HTTP/1.1 counts a request against the ceiling in shed mode only,
@@ -399,20 +405,98 @@ conn_closing_after_its_listener_stopped_exits_cleanly(Config) ->
     end,
     Handler ! release.
 
+%% A listener stopped while requests are parked takes its queue process
+%% with it, but not the HTTP/2 connection, which it does not link. That
+%% connection refuses what it had parked instead of leaving it to hang,
+%% and from then on refuses a request over the ceiling instead of parking
+%% it with no one to answer; one under the ceiling is still served.
+parked_request_of_a_stopped_listener_is_refused(Config) ->
+    Name = start(Config, 1, {queue, #{max_queued => 4, timeout => 30000}}),
+    ok = parked_then_queue_gone(Name, Config, fun() -> roadrunner_listener:stop(Name) end).
+
+%% A drain with `graceful_drain => false` kills no connection at its
+%% deadline, having no registry of them, so one that outlives it ends as
+%% after `roadrunner_listener:stop/1`: its listener and queue process gone.
+parked_request_of_an_ungraceful_drain_is_refused(Config) ->
+    Name = start(Config, 1, {queue, #{max_queued => 4, timeout => 30000}}, #{
+        graceful_drain => false
+    }),
+    ok = parked_then_queue_gone(Name, Config, fun() ->
+        {timeout, 1} = roadrunner_listener:drain(Name, 100),
+        ok
+    end).
+
+%% A connection that never parked has no watch on the queue process, and
+%% once that process is gone the count of parked requests stays up, so the
+%% connection's first request still parks. The watch it sets then fires at
+%% once, and the request is admitted as one arriving now: refused over the
+%% ceiling, served under it.
+never_parked_conn_after_its_listener_stopped_admits_afresh(Config) ->
+    Name = start(Config, 1, {queue, #{max_queued => 4, timeout => 30000}}),
+    {h2, HolderSock} = Holder = connect(Config),
+    ok = request(Holder),
+    Handler = expect_handler(),
+    ok = request(Holder),
+    ok = await_parked(Name),
+    {h2, OverSock} = Over = connect(Config),
+    ok = await_ping_ack(OverSock),
+    {h2, UnderSock} = Under = connect(Config),
+    ok = await_ping_ack(UnderSock),
+    KeeperMon = monitor(process, keeper(Name)),
+    ok = roadrunner_listener:stop(Name),
+    ok = await_down(KeeperMon),
+    ?assertEqual({rst_stream, refused_stream}, h2_end(HolderSock)),
+    ?assertEqual(refused, request_outcome(Over)),
+    ok = finish(Handler, release),
+    ?assertEqual(complete, h2_end(HolderSock)),
+    %% The holder frees the slot on its worker's `DOWN`, which comes before
+    %% this PING, so the ACK proves the slot free.
+    ok = await_ping_ack(HolderSock),
+    ok = request(Under),
+    Served = expect_handler(),
+    ok = finish(Served, release),
+    ?assertEqual(ok, await_ok(Under)).
+
+%% One request holds the only slot and a second parks; `End` takes the
+%% listener and its queue process down while the connection lives on.
+parked_then_queue_gone(Name, Config, End) ->
+    {h2, Sock} = Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    ok = request(Client),
+    ok = await_parked(Name),
+    KeeperMon = monitor(process, keeper(Name)),
+    ok = End(),
+    ok = await_down(KeeperMon),
+    ?assertEqual({rst_stream, refused_stream}, h2_end(Sock)),
+    ?assertEqual(refused, request_outcome(Client)),
+    ok = finish(Handler, release),
+    ?assertEqual(complete, h2_end(Sock)),
+    ok = request(Client),
+    Served = expect_handler(),
+    ok = finish(Served, release),
+    ?assertEqual(ok, await_ok(Client)).
+
 %% =============================================================================
 %% Listener and slot accounting
 %% =============================================================================
 
 start(Config, Max, Overload) ->
+    start(Config, Max, Overload, #{}).
+
+start(Config, Max, Overload, Extra) ->
     Name = ?config(listener, Config),
     {ok, _} = roadrunner_listener:start_link(
         Name,
-        listener_opts(?config(protocol, Config), #{
-            port => 0,
-            routes => roadrunner_h2_slot_handler,
-            max_concurrent_requests => Max,
-            overload_mode => Overload
-        })
+        listener_opts(
+            ?config(protocol, Config),
+            Extra#{
+                port => 0,
+                routes => roadrunner_h2_slot_handler,
+                max_concurrent_requests => Max,
+                overload_mode => Overload
+            }
+        )
     ),
     Name.
 

@@ -1477,7 +1477,15 @@ with `port/1`.
 start_link(Name, Opts) when is_atom(Name), is_map(Opts) ->
     gen_server:start_link({local, Name}, ?MODULE, Opts, []).
 
--doc "Stop a listener and release its port. In-flight conns are not waited on.".
+-doc """
+Stop a listener and release its port. In-flight conns are not waited on.
+
+An HTTP/2 connection lives on until it closes, as it does whenever its
+listener goes without draining it. In queue mode (`overload_mode`), as
+the listener goes, each request it had parked takes a slot if one is free
+and is refused otherwise, and from then on a request over the ceiling is
+refused instead of parked.
+""".
 -spec stop(Name :: atom()) -> ok.
 stop(Name) ->
     gen_server:stop(Name).
@@ -1489,7 +1497,11 @@ every active conn, and then polls the live-connection counter until it
 hits zero or `Timeout` milliseconds elapse. Conns still alive at the
 deadline are hard-killed via `exit(Pid, kill)`, which a conn running
 a handler that traps exits (a WebSocket session does, if its handler
-turns `trap_exit` on) cannot turn into a message and outlive.
+turns `trap_exit` on) cannot turn into a message and outlive. A
+`graceful_drain => false` listener keeps no registry of its conns, so it
+neither tells nor kills them: the HTTP/1.1 and HTTP/2 ones still open at
+the deadline outlive it, as after `stop/1`; HTTP/3 ones close with its
+QUIC connections.
 
 An idle HTTP/1.1 conn closes, and an HTTP/2 or HTTP/3 conn sends GOAWAY,
 refuses new requests and closes once its in-flight requests finish. On

@@ -765,10 +765,10 @@ client that drops and reopens connections run handlers past
 `max_concurrent_requests`. What the cell holds beyond the workers are
 grants that raced the close, released at once.
 
-A connection that ever `Parked` a request goes through the keeper even
-with no worker left: the keeper withdraws its parked requests and then
-empties the cell again, so a grant sent before the withdrawal is released
-rather than lost.
+A connection that `Parked` a request, its keeper still there when it last
+looked, goes through the keeper even with no worker left: the keeper
+withdraws its parked requests and then empties the cell again, so a grant
+sent before the withdrawal is released rather than lost.
 """.
 -spec hand_off_request_slots(
     pid(),

@@ -173,8 +173,9 @@ waiters_ref(Pid) ->
 %% already: `Raced` are the grants it held beyond its workers, released at
 %% once, and the keeper empties the cell again once the caller's parked
 %% requests are withdrawn, for a grant sent in between. Asynchronous: the
-%% caller is exiting. A keeper already gone went down with its listener,
-%% whose counter nothing reads any more.
+%% caller is exiting. A keeper already gone went down with its listener:
+%% the slots handed to it then stay counted, which HTTP/2 connections that
+%% outlive the listener still admit requests against.
 -spec adopt(pid(), atomics:atomics_ref(), [pid()], non_neg_integer()) -> ok.
 adopt(Pid, Cell, Workers, Raced) ->
     _ = erlang:send(Pid, {adopt, self(), Cell, Workers, Raced}),

@@ -383,32 +383,6 @@ first in, first out stays the default.
 
 **Scope:** medium.
 
-### Answer parked HTTP/2 requests when a listener stops — small
-
-**What:** `roadrunner_listener:stop/1` takes the listener's queue process
-down with it, while HTTP/2 connections, which are not linked to the
-listener, live on (HTTP/3 ones go down with their QUIC connections). On a
-surviving connection, a request that was parked never hears back, nor
-does the first one over the ceiling after the stop. Once the count of
-parked requests is up (from a request parked before the stop, or the
-first one over the ceiling after it), it stays up, so every later request
-on every surviving connection parks and hangs too, under the ceiling as
-well, until its client gives up. Connections could watch the queue
-process from their first park (a watch set after it is gone fires at
-once) and, once it is gone, refuse what they have parked and refuse
-instead of parking. `drain/2` is not affected while `graceful_drain` is
-on (the default): the queue process outlives the connections it waits
-for, and the deadline kills the rest first. With
-`graceful_drain => false` the deadline kills nobody, so a drain that runs
-out ends like `stop/1`.
-
-**Why deferred:** found in review of the queue's first in, first out
-fix, which made it reach requests under the ceiling too (before, only
-requests over it parked), and it needs the HTTP/2 loop to tell the queue
-process's `DOWN` from its workers'.
-
-**Scope:** small.
-
 ### Cheaper accepts under load — medium
 
 **What:** acceptors run at high priority by default (`accept_priority`)
