@@ -4454,16 +4454,63 @@ terminate(_Reason, #state{
     route_keepers = RouteKeepers,
     route_stopping = RouteStopping
 }) ->
+    %% `drain/2` already closed the TCP sockets on its way out
+    %% (`closed`), and an HTTP/3-only listener never had one (`none`).
+    %% Closed first, so no connection comes in while the rest stops.
+    ok = close_tcp(LSockets, UnixFile),
     erase_routes(ProtoOpts),
+    Loops = watch_http3_loops(QuicListener, ProtoOpts),
     ok = stop_quic(QuicListener),
+    ok = reclaim_http3_loops(Loops, ProtoOpts),
     ok = stop_slot_keeper(ProtoOpts),
     %% A link takes the keepers down when this process crashes, but not on a
     %% normal stop. Their tables go with this process.
     _ = [exit(Pid, shutdown) || _Key := #route_keeper{pid = Pid} <- RouteKeepers],
     _ = [exit(Pid, shutdown) || Pid := _Table <- RouteStopping],
-    %% `drain/2` already closed the TCP sockets on its way out
-    %% (`closed`), and an HTTP/3-only listener never had one (`none`).
-    close_tcp(LSockets, UnixFile).
+    ok.
+
+%% The HTTP/3 request loops registered for drain, watched as the QUIC pool
+%% stops: each is linked to its QUIC connection and goes down with it,
+%% without its exit path, so the in-flight slots in its cell would stay
+%% counted, and HTTP/2 connections that outlive the listener still admit
+%% requests against that count. Only a listener with a request ceiling
+%% has slots to give back, and only loops registered for drain are known:
+%% none are with `graceful_drain => false`.
+-spec watch_http3_loops(pid() | undefined, roadrunner_conn:proto_opts()) ->
+    [{reference(), roadrunner_conn:slot_cell()}].
+watch_http3_loops(undefined, _ProtoOpts) ->
+    [];
+watch_http3_loops(_QuicPool, #proto_opts{slot_keeper = undefined}) ->
+    [];
+watch_http3_loops(_QuicPool, #proto_opts{drain_table = Table}) ->
+    [
+        {monitor(process, Pid), Cell}
+     || {Pid, Cell} <- ets:tab2list(Table),
+        is_http3_loop(proc_lib:get_label(Pid))
+    ].
+
+-spec is_http3_loop(term()) -> boolean().
+is_http3_loop({roadrunner_conn_loop_http3, _ListenerName, _Conn}) -> true;
+is_http3_loop(_Label) -> false.
+
+%% Give back the slots of each watched loop as it goes down, which it
+%% does with its QUIC connection, torn down by the pool's stop through
+%% their link. One that ran its exit path emptied its cell already, so
+%% nothing is given back twice.
+-spec reclaim_http3_loops(
+    [{reference(), roadrunner_conn:slot_cell()}], roadrunner_conn:proto_opts()
+) ->
+    ok.
+reclaim_http3_loops(Loops, ProtoOpts) ->
+    lists:foreach(
+        fun({Mon, Cell}) ->
+            receive
+                {'DOWN', Mon, process, _Pid, _Reason} ->
+                    ok = reclaim_request_slots(Cell, ProtoOpts)
+            end
+        end,
+        Loops
+    ).
 
 -spec stop_quic(pid() | undefined) -> ok.
 stop_quic(undefined) ->

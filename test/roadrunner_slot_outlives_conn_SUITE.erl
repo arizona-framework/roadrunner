@@ -44,7 +44,10 @@ The handlers announce themselves to the test process and wait for
     adopted_slots_are_released_as_the_keeper_stops/1,
     unread_hand_off_is_released_as_the_keeper_stops/1,
     listener_goes_down_with_its_keeper/1,
-    dead_parked_conn_is_reclaimed_as_the_keeper_stops/1
+    dead_parked_conn_is_reclaimed_as_the_keeper_stops/1,
+    http3_slots_are_released_as_the_listener_stops/1,
+    http3_slots_are_released_beside_a_surviving_http2_conn/1,
+    http3_listener_without_a_drain_registry_stops/1
 ]).
 
 -define(H3_REQUEST_REJECTED, 16#10B).
@@ -64,8 +67,9 @@ groups() ->
         drained_conn_keeps_its_reset_handler_counted,
         killed_conn_is_reclaimed
     ],
-    %% HTTP/3 has no listener-stopped case: stopping the listener stops its
-    %% QUIC connections, and with them the linked request loops.
+    %% HTTP/3 has no case of a connection outliving its listener: stopping
+    %% the listener stops its QUIC connections, and with them the linked
+    %% request loops.
     [
         {h2, [],
             Common ++
@@ -85,7 +89,13 @@ groups() ->
                     listener_goes_down_with_its_keeper,
                     dead_parked_conn_is_reclaimed_as_the_keeper_stops
                 ]},
-        {h3, [], Common},
+        {h3, [],
+            Common ++
+                [
+                    http3_slots_are_released_as_the_listener_stops,
+                    http3_slots_are_released_beside_a_surviving_http2_conn,
+                    http3_listener_without_a_drain_registry_stops
+                ]},
         %% HTTP/1.1 counts a request against the ceiling in shed mode only,
         %% its handler running in the connection process itself.
         {h1, [], [killed_conn_is_reclaimed]}
@@ -597,6 +607,60 @@ labelled_conn(Client) ->
     [Conn] = [Pid || Pid <- processes(), server_peer_port(Pid) =:= Port],
     Conn.
 
+%% An HTTP/3 request loop goes down with its QUIC connection as the
+%% listener stops, without its exit path. The listener gives back the slots
+%% in its cell as it stops, as HTTP/2 connections that outlive it still
+%% count against them; the handler's own end gives back nothing more.
+http3_slots_are_released_as_the_listener_stops(Config) ->
+    Name = start(Config, 2, refuse),
+    Counter = counter(Name),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = roadrunner_listener:stop(Name),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    ?assertEqual(0, counters:get(Counter, 1)).
+
+%% On a listener that serves both, the HTTP/2 connection outlives the stop
+%% and keeps its slot; the HTTP/3 loop's slot is given back.
+http3_slots_are_released_beside_a_surviving_http2_conn(Config) ->
+    Name = start(Config, 2, refuse, #{protocols => [http2, http3]}),
+    Counter = counter(Name),
+    {ok, Tls} = ssl:connect(
+        {127, 0, 0, 1},
+        roadrunner_listener:port(Name),
+        [binary, {active, false}, {verify, verify_none}, {alpn_advertised_protocols, [~"h2"]}],
+        5000
+    ),
+    ok = ssl:send(Tls, [~"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", <<0:24, 4, 0, 0:32>>]),
+    {ok, _} = ssl:recv(Tls, 0, 5000),
+    {ok, H3} = roadrunner_quic_test_h3:connect(
+        {127, 0, 0, 1}, roadrunner_listener:quic_port(Name)
+    ),
+    ok = request({h3, H3}),
+    Handler = expect_handler(),
+    ?assertEqual(1, counters:get(Counter, 1)),
+    ok = roadrunner_listener:stop(Name),
+    ?assertEqual(0, counters:get(Counter, 1)),
+    ok = finish(Handler, release),
+    %% The HTTP/2 connection is still up: it answers a PING.
+    ok = ssl:send(Tls, roadrunner_http2_frame:encode({ping, 0, <<1, 2, 3, 4, 5, 6, 7, 8>>})),
+    {ok, _} = ssl:recv(Tls, 0, 5000),
+    ok = ssl:close(Tls).
+
+%% A guard: with `graceful_drain => false` no loop registers for drain, so
+%% the listener has none to watch as it stops, and the stop does not wait
+%% on them.
+http3_listener_without_a_drain_registry_stops(Config) ->
+    Name = start(Config, 2, refuse, #{graceful_drain => false}),
+    Client = connect(Config),
+    ok = request(Client),
+    Handler = expect_handler(),
+    ok = roadrunner_listener:stop(Name),
+    ok = finish(Handler, release).
+
 %% A connection that is up before its listener stops, so it outlives it.
 survivor(Config) ->
     {h2, Sock} = Client = connect(Config),
@@ -631,18 +695,13 @@ start(Config, Max, Overload) ->
 
 start(Config, Max, Overload, Extra) ->
     Name = ?config(listener, Config),
-    {ok, _} = roadrunner_listener:start_link(
-        Name,
-        listener_opts(
-            ?config(protocol, Config),
-            Extra#{
-                port => 0,
-                routes => roadrunner_h2_slot_handler,
-                max_concurrent_requests => Max,
-                overload_mode => Overload
-            }
-        )
-    ),
+    Opts = listener_opts(?config(protocol, Config), #{
+        port => 0,
+        routes => roadrunner_h2_slot_handler,
+        max_concurrent_requests => Max,
+        overload_mode => Overload
+    }),
+    {ok, _} = roadrunner_listener:start_link(Name, maps:merge(Opts, Extra)),
     Name.
 
 listener_opts(h1, Opts) ->
