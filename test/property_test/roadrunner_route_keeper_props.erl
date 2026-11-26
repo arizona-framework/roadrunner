@@ -12,12 +12,14 @@ keepers. Two kinds of requesters drive it, one operation at a time:
   connection and HTTP/3's loop do: start and monitor their workers, keep
   the key each takes on its own, and free it on the worker's `'DOWN'`. A
   worker waits until its stream resets or its connection goes, and its
-  request ends with it; a connection killed with workers running leaves
-  them counted until they end.
+  request ends with it; a worker running ends its request when it is
+  released or its stream resets, and a connection killed with workers
+  running leaves them counted until they end.
 
 The operations: requests, releases, releases racing new requests (a
 kept-alive connection's home racing the slot it frees, and any waiter's
-claim on it) and stream resets, holder and waiter deaths, a connection
+claim on it) and stream resets (a reset landing before or after the grant
+of the slot the release frees), holder and waiter deaths, a connection
 going with its workers waiting or running, keeper crashes (plain, with a
 release and a request landing while no keeper runs, in the middle of a
 grant, and in the middle of giving a kept-alive connection a new home), reloads changing the ceiling and queue depth, reloads that move
@@ -115,7 +117,7 @@ op() ->
         {3, {race_reuse, nat(), nat(), oneof([shed, long, short])}},
         {2, {kill, nat()}},
         {2, {reset, nat()}},
-        {1, {race_reset, nat(), nat()}},
+        {1, {race_reset, nat(), nat(), boolean()}},
         {2, {conn_gone, nat()}},
         {1, {kill_conn_and_worker, nat()}},
         {2, {stream_then_kill_conn, nat()}},
@@ -264,14 +266,29 @@ step({reset, N}, Model) ->
             Pid ! {reset, Pid, peer},
             settle(apply_result(receive_result(Pid), Model))
     end;
-step({race_reset, N, M}, Model) ->
+step({race_reset, N, M, Settled}, Model) ->
+    %% A release and a waiting worker's reset: the reset sent at once, racing
+    %% the grant of the slot the release frees, or, when `Settled`, once the
+    %% release has settled, so it lands after that grant. A worker granted
+    %% first runs, and its reset then ends its request. The settled order
+    %% guards the model itself: the race meets it seldom, and to the keeper
+    %% it is a worker ending, as a release is.
     case {[P || P <- pick(parked, Model), mode(P, Model) =:= reset], pick(running, Model)} of
         {[_ | _] = Waiting, [_ | _] = Running} ->
             Waiter = lists:nth(N rem length(Waiting) + 1, Waiting),
             Holder = lists:nth(M rem length(Running) + 1, Running),
-            Model1 = release(Holder, Model),
+            Model1 =
+                case Settled of
+                    true -> settle(release(Holder, Model));
+                    false -> release(Holder, Model)
+                end,
             Waiter ! {reset, Waiter, peer},
-            settle(apply_result(receive_result(Waiter), Model1));
+            Model2 =
+                case (client(Waiter, Model1))#client.status of
+                    running -> Model1;
+                    parked -> apply_result(receive_result(Waiter), Model1)
+                end,
+            settle(set_status(Waiter, gone, Model2));
         _ ->
             Model
     end;
@@ -663,12 +680,16 @@ conn_loop() ->
     end.
 
 worker(Ceiling, Conn, Driver) ->
-    Result = roadrunner_route_keeper:acquire(Ceiling, {reset, self()}, Conn, Conn),
-    Driver ! {client, self(), Result},
+    Self = self(),
+    Result = roadrunner_route_keeper:acquire(Ceiling, {reset, Self}, Conn, Conn),
+    Driver ! {client, Self, Result},
     case Result of
         {ok, _Token} ->
+            %% A reset can land after the grant it raced: it ends the
+            %% request as a release does.
             receive
-                release -> ok
+                release -> ok;
+                {reset, Self, _Why} -> ok
             end;
         _ ->
             ok
