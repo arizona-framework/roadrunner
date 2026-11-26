@@ -383,9 +383,11 @@ A request whose headers (or trailers) use table entries still on their
 way is held until they arrive (a blocked stream, RFC 9204 §2.1.2). At
 most `qpack_blocked_streams` requests of a connection wait this way at
 once; a client that goes past that is closed with
-`QPACK_DECOMPRESSION_FAILED`. A waiting request holds no in-flight slot
-until it can be read. With `body_buffering => manual` what it holds
-stays within its stream's flow-control window. Otherwise it holds at
+`QPACK_DECOMPRESSION_FAILED`. A request waiting on its headers holds no
+in-flight slot until they can be read. With `body_buffering => manual`
+what a waiting request holds stays within its stream's flow-control
+window, or, for one waiting on its trailers, two windows and one frame
+of up to 1 MiB of payload. Otherwise it holds at
 most `max_content_length` plus twice `max_header_block` bytes, frame
 headers counted, and past that it is answered `413`, since its route
 (which may allow a larger body) is not known before its headers are

@@ -6,7 +6,7 @@
 
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
 -export([init_per_testcase/2, end_per_testcase/2]).
--export([native_client_get/1, native_client_post/1]).
+-export([native_client_get/1, native_client_post/1, native_client_waits_for_credit/1]).
 -export([quic_port_of_ephemeral_co_listener/1, quic_port_without_http3/1]).
 -export([ephemeral_pool_port_is_not_shared/1]).
 
@@ -17,6 +17,7 @@ all() ->
     [
         native_client_get,
         native_client_post,
+        native_client_waits_for_credit,
         quic_port_of_ephemeral_co_listener,
         quic_port_without_http3,
         ephemeral_pool_port_is_not_shared
@@ -65,6 +66,22 @@ native_client_post(Config) ->
     ok = roadrunner_quic_test_h3:close(Conn),
     ?assertEqual(200, Status),
     ?assertEqual(~"hello there", Body).
+
+%% A body past the server's stream window: the client sends up to the window
+%% and waits there until the server's MAX_STREAM_DATA lets it send the rest
+%% (RFC 9000 §4.1).
+native_client_waits_for_credit(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, Port, #{blocked_events => true}),
+    Body = binary:copy(~"x", 300000),
+    {Status, _Headers, Echoed} = roadrunner_quic_test_h3:post(Conn, ~"/echo", Body),
+    ok = roadrunner_quic_test_h3:close(Conn),
+    ?assertEqual(200, Status),
+    ?assertEqual(Body, Echoed),
+    receive
+        {quic_test_blocked, Conn, _StreamId} -> ok
+    after 0 -> ct:fail(client_never_waited)
+    end.
 
 %% =============================================================================
 %% quic_port/1

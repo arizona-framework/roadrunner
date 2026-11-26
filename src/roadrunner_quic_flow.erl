@@ -49,8 +49,9 @@
     bytes_received = 0 :: non_neg_integer(),
     recv_max :: non_neg_integer(),
     %% A held window grants new credit from the bytes its owner has consumed
-    %% (`on_data_consumed/2`) rather than the bytes received, so a reader that
-    %% falls behind holds the peer to one window past what it has read.
+    %% (`on_data_consumed/2`) rather than the bytes received, so an owner that
+    %% falls behind holds the peer to one window past what it reports
+    %% consumed.
     held = false :: boolean(),
     bytes_consumed = 0 :: non_neg_integer(),
     %% The window size granted each refill.

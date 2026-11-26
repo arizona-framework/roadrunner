@@ -107,8 +107,9 @@ stop_sending(Conn, StreamId, ErrorCode) ->
 
 -doc """
 Report `Bytes` of a request stream consumed, on a connection whose request
-streams grant their credit as it is read (`stream_credit => on_read`): the
-connection grants the peer more once enough of the stream's window is read.
+streams grant their credit as the owner consumes it (`stream_credit =>
+on_read`): the connection grants the peer more once enough of the stream's
+window is consumed.
 Asynchronous, so the reader never waits on it.
 """.
 -spec consumed(pid(), non_neg_integer(), non_neg_integer()) -> ok.

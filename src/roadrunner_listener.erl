@@ -638,9 +638,13 @@ Optional middleware and timing knobs (durations in milliseconds):
   first reads it, and one declaring a body over the cap gets its 413
   at once). In manual mode an HTTP/2 or HTTP/3 handler runs as
   soon as the headers are in, and a stream holds at most one
-  flow-control window of body it has not read (its window, or its QUIC
-  stream credit, is given back only as the handler reads); a handler that
-  answers without reading the body ends the client's upload
+  flow-control window of body past what the handler has read (its
+  window, or its QUIC stream credit, is given back as the handler
+  reads). On HTTP/3 a frame's credit can come back before the frame is
+  whole, so a stream can also hold one frame, of up to 1 MiB of
+  payload, that the handler has not read, and a request whose trailers
+  wait on QPACK table entries a window more. A handler that answers
+  without reading the body ends the client's upload
   (`RST_STREAM(NO_ERROR)` on HTTP/2, `STOP_SENDING` on HTTP/3).
 - `slot_reconciliation`: `#{interval := Ms}` (default 60000) for the
   periodic reaper that releases slots orphaned by brutal-kill exits,

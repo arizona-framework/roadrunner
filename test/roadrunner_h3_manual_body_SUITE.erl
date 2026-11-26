@@ -28,6 +28,8 @@ picks what it does with the body.
     body_over_the_cap_fails_the_read/1,
     credit_waits_for_the_reader/1,
     credit_comes_back_as_the_reader_reads/1,
+    credit_comes_back_for_a_frame_still_arriving/1,
+    credit_comes_back_for_frames_with_no_body/1,
     credit_counts_the_headers/1,
     content_length_overrun_resets/1,
     malformed_content_length_resets/1,
@@ -40,7 +42,9 @@ picks what it does with the body.
     parked_until_a_slot_frees/1,
     stop_sending_withdraws_a_parked_request/1,
     stop_sending_after_the_answer_changes_nothing/1,
-    write_after_a_short_body_fails/1
+    write_after_a_short_body_fails/1,
+    stop_sending_drops_a_waiting_send/1,
+    connection_close_fails_a_waiting_send/1
 ]).
 
 -define(H, roadrunner_manual_body_handler).
@@ -48,6 +52,7 @@ picks what it does with the body.
 %% RFC 9114 §8.1.
 -define(H3_REQUEST_CANCELLED, 16#10c).
 -define(H3_MESSAGE_ERROR, 16#10e).
+-define(H3_STREAM_CREATION_ERROR, 16#103).
 %% RFC 9000 §20.1 FLOW_CONTROL_ERROR.
 -define(FLOW_CONTROL_ERROR, 16#3).
 
@@ -72,6 +77,8 @@ all() ->
         body_over_the_cap_fails_the_read,
         credit_waits_for_the_reader,
         credit_comes_back_as_the_reader_reads,
+        credit_comes_back_for_a_frame_still_arriving,
+        credit_comes_back_for_frames_with_no_body,
         credit_counts_the_headers,
         content_length_overrun_resets,
         malformed_content_length_resets,
@@ -84,7 +91,9 @@ all() ->
         parked_until_a_slot_frees,
         stop_sending_withdraws_a_parked_request,
         stop_sending_after_the_answer_changes_nothing,
-        write_after_a_short_body_fails
+        write_after_a_short_body_fails,
+        stop_sending_drops_a_waiting_send,
+        connection_close_fails_a_waiting_send
     ].
 
 init_per_suite(Config) ->
@@ -111,7 +120,9 @@ init_per_testcase(Case, Config) ->
             extra(Case)
         )
     ),
-    {ok, Conn} = roadrunner_quic_test_h3:connect({127, 0, 0, 1}, roadrunner_listener:port(?MODULE)),
+    {ok, Conn} = roadrunner_quic_test_h3:connect(
+        {127, 0, 0, 1}, roadrunner_listener:port(?MODULE), client(Case)
+    ),
     [{conn, Conn} | Config].
 
 end_per_testcase(_Case, Config) ->
@@ -131,6 +142,13 @@ extra(stop_sending_withdraws_a_parked_request) ->
 extra(_Case) ->
     #{}.
 
+%% The client tells the test when a send waits for the server's credit;
+%% the one case that sends past that credit ignores it instead.
+client(credit_waits_for_the_reader) ->
+    #{ignore_credit => true};
+client(_Case) ->
+    #{blocked_events => true}.
+
 routes(TestPid) ->
     [
         {~"/read", ?H, read},
@@ -139,6 +157,12 @@ routes(TestPid) ->
         {~"/reject", ?H, reject},
         #{path => ~"/gated", handler => ?H, state => {gated, ?GATED}, max_content_length => 500000},
         {~"/gated-small", ?H, {gated, ?GATED}},
+        #{
+            path => ~"/held-unread",
+            handler => ?H,
+            state => {held_unread, TestPid},
+            max_content_length => 500000
+        },
         #{
             path => ~"/gated-pieces",
             handler => ?H,
@@ -283,7 +307,8 @@ body_over_the_cap_fails_the_read(Config) ->
 
 credit_waits_for_the_reader(Config) ->
     %% The handler has not read yet, so the stream's 262144-byte window is
-    %% never granted again: sending past it is a flow-control error.
+    %% never granted again: a client that sends past it anyway is a
+    %% flow-control error.
     Conn = ?config(conn, Config),
     StreamId = open(Conn, ~"/gated", []),
     ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, binary:copy(~"x", 270000), false),
@@ -305,6 +330,32 @@ credit_comes_back_as_the_reader_reads(Config) ->
     end,
     ok = roadrunner_quic_test_h3:send_data(Conn, StreamId, binary:copy(~"y", 200000), true),
     ?assertMatch({200, _, ~"400000"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
+
+credit_comes_back_for_a_frame_still_arriving(Config) ->
+    %% One DATA frame larger than the stream's window, the window all in
+    %% before the handler reads: the read gives back the credit of the
+    %% frame's bytes so far, or the client could never send the rest of it.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/gated", []),
+    ok = read_past_the_window(Conn, StreamId, binary:copy(~"x", 300000)),
+    ?assertMatch({200, _, ~"300000"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
+
+credit_comes_back_for_frames_with_no_body(Config) ->
+    %% A frame of a reserved type (RFC 9114 §7.2.8), which carries no body,
+    %% ends right at the stream's window before the handler reads: the read
+    %% gives its credit back, or the client could never send the body.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/gated", []),
+    Headers = iolist_size(
+        roadrunner_quic_h3_frame:encode_headers(roadrunner_qpack:encode(headers(~"/gated")))
+    ),
+    %% The type (one byte) and a four-byte length come before the payload.
+    Payload = 262144 - Headers - 5,
+    Reserved = [16#21, roadrunner_quic_varint:encode(Payload), binary:copy(<<0>>, Payload)],
+    ?assertEqual(262144, Headers + iolist_size(Reserved)),
+    ok = roadrunner_quic_test_conn:send(Conn, StreamId, Reserved, false),
+    ok = read_past_the_window(Conn, StreamId, ~"body"),
+    ?assertMatch({200, _, ~"4"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
 
 credit_counts_the_headers(Config) ->
     %% The credit given back covers every byte of the stream, its HEADERS
@@ -469,6 +520,45 @@ write_after_a_short_body_fails(Config) ->
     after 5000 -> ct:fail(no_write_result)
     end.
 
+stop_sending_drops_a_waiting_send(Config) ->
+    %% The handler answers without reading while the client waits for
+    %% credit, so the server asks the client to stop sending (RFC 9000
+    %% §3.5): what the client still waits to send is dropped and its send
+    %% answered.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/held-unread", []),
+    ok = waiting_send(Conn, StreamId, binary:copy(~"x", 300000)),
+    Handler =
+        receive
+            {held, Pid} -> Pid
+        after 5000 -> ct:fail(never_held)
+        end,
+    Handler ! go,
+    ?assertEqual(ok, send_answer()),
+    ?assertMatch({200, _, ~"ok"}, roadrunner_quic_test_h3:collect(Conn, StreamId)).
+
+connection_close_fails_a_waiting_send(Config) ->
+    %% The server closes the connection while the client waits for credit
+    %% (a second control stream, RFC 9114 §6.2.1): the send fails at once.
+    Conn = ?config(conn, Config),
+    StreamId = open(Conn, ~"/gated", []),
+    ok = waiting_send(Conn, StreamId, binary:copy(~"x", 300000)),
+    Control = roadrunner_quic_test_conn:open_uni(Conn),
+    ok = roadrunner_quic_test_conn:send(
+        Conn,
+        Control,
+        [
+            roadrunner_quic_h3_frame:encode_stream_type(control),
+            roadrunner_quic_h3_frame:encode_settings(#{qpack_max_table_capacity => 0})
+        ],
+        false
+    ),
+    receive
+        {quic_test_closed, Conn, Code} -> ?assertEqual(?H3_STREAM_CREATION_ERROR, Code)
+    after 5000 -> ct:fail(not_closed)
+    end,
+    ?assertEqual({error, closed}, send_answer()).
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -490,6 +580,17 @@ headers(Path) ->
         {~":authority", ~"localhost"},
         {~":path", Path}
     ].
+
+%% Send `Body` as the rest of the request on `StreamId`, past the credit
+%% the stream has left. Once the client waits for more and all it sent is
+%% in, the gated handler reads: its read must give the stream's credit
+%% back for the send to finish.
+read_past_the_window(Conn, StreamId, Body) ->
+    ok = waiting_send(Conn, StreamId, Body),
+    %% A request sent after the window is answered once all of it is in.
+    {_, _, _} = post(Conn, ~"/read", ~"sync"),
+    ok = go(),
+    send_answer().
 
 %% A POST's HEADERS with `Extra` fields, its body to follow.
 open(Conn, Path, Extra) ->
@@ -579,3 +680,23 @@ go() ->
     ok = wait_gated(),
     ?GATED ! go,
     ok.
+
+%% Start sending `Body` on `StreamId` from another process, past the
+%% credit the stream has left, and return once the client waits for more;
+%% `send_answer/0` takes what the send returns.
+waiting_send(Conn, StreamId, Body) ->
+    Test = self(),
+    _ = spawn_link(fun() ->
+        Test ! {sent, roadrunner_quic_test_h3:send_data(Conn, StreamId, Body, true)}
+    end),
+    receive
+        {quic_test_blocked, Conn, StreamId} -> ok
+    after 5000 -> ct:fail(client_never_waited)
+    end.
+
+%% What a `waiting_send/3` returned, well before its own 5 s timeout.
+send_answer() ->
+    receive
+        {sent, Sent} -> Sent
+    after 4000 -> ct:fail(send_never_answered)
+    end.

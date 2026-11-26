@@ -99,8 +99,10 @@ request(Conn, Headers, <<>>) ->
     collect(Conn, StreamId);
 request(Conn, Headers, Body) ->
     {ok, StreamId} = open_request(Conn, Headers, false),
-    ok = send_data(Conn, StreamId, Body, true),
-    collect(Conn, StreamId).
+    case send_data(Conn, StreamId, Body, true) of
+        ok -> collect(Conn, StreamId);
+        {error, _} = Error -> Error
+    end.
 
 -doc "Open a request stream and send its HEADERS, finishing the stream.".
 -spec open_request(pid(), headers()) -> {ok, non_neg_integer()}.
@@ -115,8 +117,13 @@ open_request(Conn, Headers, EndStream) ->
     ok = roadrunner_quic_test_conn:send(Conn, StreamId, iolist_to_binary(Frame), EndStream),
     {ok, StreamId}.
 
--doc "Send a DATA frame on a request stream, with the FIN bit when `Fin`.".
--spec send_data(pid(), non_neg_integer(), binary(), boolean()) -> ok.
+-doc """
+Send a DATA frame on a request stream, with the FIN bit when `Fin`. Past the
+server's flow-control credit the rest of the frame waits for more, so this
+returns once all of it is sent, as `roadrunner_quic_test_conn:send/4` does.
+""".
+-spec send_data(pid(), non_neg_integer(), binary(), boolean()) ->
+    ok | {error, timeout | closed}.
 send_data(Conn, StreamId, Data, Fin) ->
     Frame = roadrunner_quic_h3_frame:encode_data(Data),
     roadrunner_quic_test_conn:send(Conn, StreamId, iolist_to_binary(Frame), Fin).

@@ -17,6 +17,14 @@
 %% {quic_test_stream, Conn, StreamId, Data, Fin}. The h3 framing on top is
 %% roadrunner_quic_test_h3.
 %%
+%% It keeps to the server's flow control (RFC 9000 §4.1): stream data goes
+%% out only within the stream's and the connection's send limits, which start
+%% at the server's transport parameters and grow with its MAX_STREAM_DATA and
+%% MAX_DATA. A send that reaches a limit waits for more credit, with the later
+%% sends on its stream, and is answered once all its data is out, or once its
+%% stream or the connection ends first. The `ignore_credit` option turns this
+%% off, so a test can make the server see a client send past its limits.
+%%
 %% The client keeps the server's stateless reset tokens (the handshake id's
 %% from its transport parameters, the rest from NEW_CONNECTION_ID) and tells
 %% the owner of a datagram that does not decrypt and ends in one, as
@@ -158,8 +166,31 @@
     new_tokens = [] :: [binary()],
     %% The stream whose FIN-carrying datagram to discard unread, as a lossy
     %% network would (`drop_fin/2`), or `undefined`.
-    drop_fin = undefined :: non_neg_integer() | undefined
+    drop_fin = undefined :: non_neg_integer() | undefined,
+    %% Send-side flow control (RFC 9000 §4.1). The server's connection limit
+    %% (initial_max_data, then its MAX_DATA) and the stream bytes sent so far.
+    max_data = 0 :: non_neg_integer(),
+    data_sent = 0 :: non_neg_integer(),
+    %% Each stream's limit once a MAX_STREAM_DATA raised it, and the one it
+    %% starts at by stream type (`StreamId rem 4`), from the server's
+    %% initial_max_stream_data_*; the client may not send on the server's
+    %% unidirectional streams, so that type has none.
+    max_stream_data = #{} :: #{non_neg_integer() => non_neg_integer()},
+    initial_stream_data = #{} :: #{0..2 => non_neg_integer()},
+    %% The sends waiting for credit, oldest first, each answered once its
+    %% data is all out; a stream's sends go out in order.
+    sends = queue:new() :: queue:queue(pending_send()),
+    %% Whether sends ignore the server's limits (the `ignore_credit` connect
+    %% option), and whether the owner is told of each send that has to wait
+    %% for credit, as `{quic_test_blocked, Conn, StreamId}` (the
+    %% `blocked_events` connect option).
+    ignore_credit = false :: boolean(),
+    blocked_events = false :: boolean()
 }).
+
+%% A send waiting for credit: the stream, the data still to send, whether a
+%% FIN ends it, and the caller to answer.
+-type pending_send() :: {non_neg_integer(), binary(), boolean(), pid(), reference()}.
 
 %% =============================================================================
 %% API
@@ -187,7 +218,11 @@ secp256r1` is the one key exchange group offered, with its key share
 (default x25519). `cid_events => true` tells the owner of each connection
 id the server issues, as `{quic_test_new_cid, Conn, Seq, CID}`.
 `max_streams_events => true` tells the owner of each MAX_STREAMS the server
-sends, as `{quic_test_max_streams, Conn, bidi | uni, Max}`. `token =>
+sends, as `{quic_test_max_streams, Conn, bidi | uni, Max}`.
+`blocked_events => true` tells the owner when a send has to wait for the
+server's flow-control credit, as `{quic_test_blocked, Conn, StreamId}`.
+`ignore_credit => true` sends stream data past the server's flow-control
+limits, as a client breaking RFC 9000 §4.1 would. `token =>
 Token` puts an address validation token in the Initial (RFC 9000 §8.1.3).
 `initial_sends => N` sends the first Initial `N` times (default 1): 0 as if
 it was lost, so the client's resend carries the handshake, 2 as a duplicate.
@@ -230,16 +265,23 @@ open_uni(Pid) ->
     call(Pid, open_uni).
 
 -doc """
-Send `Data` on `StreamId` in a 1-RTT packet, with the FIN bit when `Fin`.
-Received stream data is delivered to the connection owner as
+Send `Data` on `StreamId` in 1-RTT packets, with the FIN bit when `Fin`.
+Data past the server's flow-control limits waits for its credit (RFC 9000
+§4.1), so this returns `ok` once all of it is sent, or once the stream ends
+first: `reset_stream/3` or the server's STOP_SENDING drops what is left. It
+returns `{error, closed}` when the connection closes first, and
+`{error, timeout}` after 5 s still waiting, the rest still going out as
+credit comes. What a STOP_SENDING drops leaves the stream open, with no FIN
+or RESET_STREAM sent for it, and a send made after it still waits for
+credit. Received stream data is delivered to the connection owner as
 `{quic_test_stream, Conn, StreamId, Data, Fin}`.
 """.
--spec send(pid(), non_neg_integer(), iodata(), boolean()) -> ok.
+-spec send(pid(), non_neg_integer(), iodata(), boolean()) -> ok | {error, timeout | closed}.
 send(Pid, StreamId, Data, Fin) ->
     Ref = make_ref(),
     Pid ! {send, self(), Ref, StreamId, Data, Fin},
     receive
-        {Ref, ok} -> ok
+        {Ref, Result} -> Result
     after 5000 ->
         {error, timeout}
     end.
@@ -248,7 +290,8 @@ send(Pid, StreamId, Data, Fin) ->
 Send a RESET_STREAM for `StreamId` with `ErrorCode` (RFC 9000 §19.4). The
 final size is the number of bytes already sent on the stream; declaring a
 smaller one than the peer received is a FINAL_SIZE_ERROR (§4.5), so the loop
-fills it in from its per-stream send offset.
+fills it in from its per-stream send offset. Data still waiting for credit on
+the stream is dropped.
 """.
 -spec reset_stream(pid(), non_neg_integer(), non_neg_integer()) -> ok.
 reset_stream(Pid, StreamId, ErrorCode) ->
@@ -435,7 +478,9 @@ init(Parent, Ref, Host, Port, Opts) ->
         conn_flow = roadrunner_quic_flow:new(?CONN_MAX_DATA, 786432),
         ack = roadrunner_quic_ack:new(),
         cid_events = maps:get(cid_events, Opts, false),
-        max_streams_events = maps:get(max_streams_events, Opts, false)
+        max_streams_events = maps:get(max_streams_events, Opts, false),
+        ignore_credit = maps:get(ignore_credit, Opts, false),
+        blocked_events = maps:get(blocked_events, Opts, false)
     },
     case handshake(Conn) of
         {ok, Conn1} ->
@@ -595,7 +640,19 @@ complete(Conn, ServerHelloFramed, HandshakeBytes) ->
             {continue, Conn1#conn{
                 finished_sent = true,
                 reset_tokens = transport_param(16#02, ServerParams),
-                max_idle_timeout = param_max_idle_timeout(ServerParams),
+                max_idle_timeout = varint_param(16#01, ServerParams),
+                %% The server's limits on what the client sends (RFC 9000
+                %% §18.2): initial_max_data (0x04), and per stream type the
+                %% server's initial_max_stream_data_bidi_remote (0x06) for
+                %% the client's bidirectional streams, _bidi_local (0x05)
+                %% for its own and _uni (0x07) for the client's
+                %% unidirectional ones.
+                max_data = varint_param(16#04, ServerParams),
+                initial_stream_data = #{
+                    0 => varint_param(16#06, ServerParams),
+                    1 => varint_param(16#05, ServerParams),
+                    2 => varint_param(16#07, ServerParams)
+                },
                 app_server_keys = keys_for(application, server, Installs),
                 app_client_keys = keys_for(application, client, Installs)
             }};
@@ -617,15 +674,16 @@ transport_param(Id, Params) ->
         _ -> transport_param(Id, Rest)
     end.
 
-%% The max_idle_timeout transport parameter (id 0x01, a varint), 0 when absent.
--spec param_max_idle_timeout(binary()) -> non_neg_integer().
-param_max_idle_timeout(Params) ->
-    case transport_param(16#01, Params) of
+%% The value of the varint transport parameter `Id` among the server's, 0 when
+%% absent (RFC 9000 §18.2: no idle timeout, no flow-control credit).
+-spec varint_param(non_neg_integer(), binary()) -> non_neg_integer().
+varint_param(Id, Params) ->
+    case transport_param(Id, Params) of
         [] ->
             0;
         [Value] ->
-            {ok, Ms, <<>>} = roadrunner_quic_varint:decode(Value),
-            Ms
+            {ok, Int, <<>>} = roadrunner_quic_varint:decode(Value),
+            Int
     end.
 
 %% Send a bare Handshake-level PING to validate the client's address, lifting
@@ -772,31 +830,23 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
             From ! {Ref, ok},
             connected_loop(Conn#conn{drop_fin = StreamId});
         {send, From, Ref, StreamId, Data, Fin} ->
-            Conn1 = send_stream(Conn, StreamId, Data, Fin),
-            From ! {Ref, ok},
+            Send = {StreamId, iolist_to_binary(Data), Fin, From, Ref},
+            Conn1 = send_queued(Conn#conn{sends = queue:in(Send, Conn#conn.sends)}),
+            ok = blocked_event(Conn1, StreamId, Ref),
             connected_loop(Conn1);
         {frame, From, Ref, Frame} ->
             Conn1 = send_frame(Conn, Frame),
             From ! {Ref, ok},
             connected_loop(Conn1);
         {frames, From, Ref, Frames} ->
-            Offsets = lists:foldl(
-                fun
-                    ({stream, Sid, Offset, Data, _Fin}, Acc) ->
-                        Acc#{Sid => max(maps:get(Sid, Acc, 0), Offset + byte_size(Data))};
-                    (_Frame, Acc) ->
-                        Acc
-                end,
-                Conn#conn.send_offsets,
-                Frames
-            ),
-            Conn1 = send_packet(Conn#conn{send_offsets = Offsets}, Frames, 0),
+            Conn1 = send_packet(lists:foldl(fun written_stream_frame/2, Conn, Frames), Frames, 0),
             From ! {Ref, ok},
             connected_loop(Conn1);
         stop ->
             %% RFC 9000 §10.2: send an application CONNECTION_CLOSE so the
             %% server tears the connection down promptly (its owner loop
             %% observes the close) instead of waiting out the idle timeout.
+            _ = close_sends(Conn),
             _ = send_wire_frame(Conn, {connection_close, application, 0, 0, <<>>}),
             _ = roadrunner_quic_socket:close(Socket),
             ok;
@@ -817,12 +867,119 @@ connected_loop(#conn{socket = Socket, unacked = Unacked} = Conn) ->
         connected_loop(flush_ack(Conn))
     end.
 
+%% Send the waiting stream data, oldest first, as far as the server's credit
+%% allows (RFC 9000 §4.1), answering each send once all its data is out. A
+%% send that runs out of credit keeps the rest of its data and the later
+%% sends on its stream wait behind it, so a stream's data goes out in order,
+%% while the other streams go on with the credit they have.
+-spec send_queued(#conn{}) -> #conn{}.
+send_queued(#conn{sends = Sends} = Conn) ->
+    {Kept, Conn1} = send_queued(queue:to_list(Sends), #{}, Conn),
+    Conn1#conn{sends = queue:from_list(Kept)}.
+
+-spec send_queued([pending_send()], #{non_neg_integer() => []}, #conn{}) ->
+    {[pending_send()], #conn{}}.
+send_queued([], _Stalled, Conn) ->
+    {[], Conn};
+send_queued([{StreamId, _Bin, _Fin, _From, _Ref} = Send | Rest], Stalled, Conn) when
+    is_map_key(StreamId, Stalled)
+->
+    {Kept, Conn1} = send_queued(Rest, Stalled, Conn),
+    {[Send | Kept], Conn1};
+send_queued([{StreamId, Bin, Fin, From, Ref} | Rest], Stalled, Conn) ->
+    Size = byte_size(Bin),
+    case sendable(Conn, StreamId, Size) of
+        Size ->
+            Conn1 = send_stream_bin(Conn, StreamId, Bin, Fin),
+            _ = From ! {Ref, ok},
+            send_queued(Rest, Stalled, Conn1);
+        Credit ->
+            <<Now:Credit/binary, Later/binary>> = Bin,
+            {Kept, Conn1} = send_queued(
+                Rest, Stalled#{StreamId => []}, send_part(Conn, StreamId, Now)
+            ),
+            {[{StreamId, Later, Fin, From, Ref} | Kept], Conn1}
+    end.
+
+%% The part of a waiting send its credit lets out now, if any.
+-spec send_part(#conn{}, non_neg_integer(), binary()) -> #conn{}.
+send_part(Conn, _StreamId, <<>>) ->
+    Conn;
+send_part(Conn, StreamId, Part) ->
+    send_stream_bin(Conn, StreamId, Part, false).
+
+%% How many of the next `Size` bytes of `StreamId` the client may send now:
+%% those within both the stream's and the connection's credit, or all of them
+%% with `ignore_credit`.
+-spec sendable(#conn{}, non_neg_integer(), non_neg_integer()) -> non_neg_integer().
+sendable(#conn{ignore_credit = true}, _StreamId, Size) ->
+    Size;
+sendable(
+    #conn{max_data = MaxData, data_sent = DataSent, send_offsets = Offsets} = Conn,
+    StreamId,
+    Size
+) ->
+    StreamCredit = stream_limit(StreamId, Conn) - maps:get(StreamId, Offsets, 0),
+    max(0, lists:min([Size, MaxData - DataSent, StreamCredit])).
+
+%% The server's limit on the data the client may send on `StreamId`: the one
+%% its last MAX_STREAM_DATA for it set, else the initial one for the stream's
+%% type.
+-spec stream_limit(non_neg_integer(), #conn{}) -> non_neg_integer().
+stream_limit(StreamId, #conn{max_stream_data = Limits, initial_stream_data = Initial}) ->
+    case Limits of
+        #{StreamId := Limit} -> Limit;
+        #{} -> maps:get(StreamId rem 4, Initial, 0)
+    end.
+
+%% Tell the owner, with `blocked_events`, when the send just made on
+%% `StreamId` (the one `Ref` answers) has to wait for credit.
+-spec blocked_event(#conn{}, non_neg_integer(), reference()) -> ok.
+blocked_event(#conn{blocked_events = true, sends = Sends, owner = Owner}, StreamId, Ref) ->
+    case queue:any(fun({_Sid, _Bin, _Fin, _From, R}) -> R =:= Ref end, Sends) of
+        true ->
+            _ = Owner ! {quic_test_blocked, self(), StreamId},
+            ok;
+        false ->
+            ok
+    end;
+blocked_event(_Conn, _StreamId, _Ref) ->
+    ok.
+
+%% A reset stream carries no more data (RFC 9000 §3.1), and one the server
+%% stopped reading should carry no more either (§3.5): drop what the sends
+%% on `StreamId` still wait to send, answering them. A later send is not
+%% stopped.
+-spec drop_sends(non_neg_integer(), #conn{}) -> #conn{}.
+drop_sends(StreamId, #conn{sends = Sends} = Conn) ->
+    {Dropped, Kept} = lists:partition(
+        fun({Sid, _Bin, _Fin, _From, _Ref}) -> Sid =:= StreamId end, queue:to_list(Sends)
+    ),
+    _ = [From ! {Ref, ok} || {_Sid, _Bin, _Fin, From, Ref} <- Dropped],
+    Conn#conn{sends = queue:from_list(Kept)}.
+
+%% The connection is closed: every send still waiting fails.
+-spec close_sends(#conn{}) -> #conn{}.
+close_sends(#conn{sends = Sends} = Conn) ->
+    _ = [From ! {Ref, {error, closed}} || {_Sid, _Bin, _Fin, From, Ref} <- queue:to_list(Sends)],
+    Conn#conn{sends = queue:new()}.
+
+%% A STREAM frame written as is (`send_frames/2`) moves its stream's send
+%% offset past its data, and its new bytes count against the connection's
+%% credit.
+-spec written_stream_frame(roadrunner_quic_frame:frame(), #conn{}) -> #conn{}.
+written_stream_frame(
+    {stream, StreamId, Offset, Data, _Fin},
+    #conn{send_offsets = Offsets, data_sent = DataSent} = Conn
+) ->
+    Sent = maps:get(StreamId, Offsets, 0),
+    End = max(Sent, Offset + byte_size(Data)),
+    Conn#conn{send_offsets = Offsets#{StreamId => End}, data_sent = DataSent + End - Sent};
+written_stream_frame(_Frame, Conn) ->
+    Conn.
+
 %% Send stream data, splitting it across 1-RTT packets so each datagram stays
 %% within the MTU; the FIN rides the last chunk.
--spec send_stream(#conn{}, non_neg_integer(), iodata(), boolean()) -> #conn{}.
-send_stream(Conn, StreamId, Data, Fin) ->
-    send_stream_bin(Conn, StreamId, iolist_to_binary(Data), Fin).
-
 -spec send_stream_bin(#conn{}, non_neg_integer(), binary(), boolean()) -> #conn{}.
 send_stream_bin(Conn, StreamId, Bin, Fin) when byte_size(Bin) =< ?MAX_STREAM_CHUNK ->
     send_stream_packet(Conn, StreamId, Bin, Fin);
@@ -831,7 +988,8 @@ send_stream_bin(Conn, StreamId, Bin, Fin) ->
     send_stream_bin(send_stream_packet(Conn, StreamId, Chunk, false), StreamId, Rest, Fin).
 
 %% One STREAM frame on a 1-RTT (short-header) packet addressed to the server's
-%% CID, tracking the per-stream offset and the 1-RTT packet number.
+%% CID, tracking the per-stream offset, the stream bytes sent and the 1-RTT
+%% packet number.
 -spec send_stream_packet(#conn{}, non_neg_integer(), binary(), boolean()) -> #conn{}.
 send_stream_packet(
     #conn{
@@ -842,7 +1000,8 @@ send_stream_packet(
         server_scid = ServerScid,
         app_client_keys = Keys,
         send_pn = Pn,
-        send_offsets = Offsets
+        send_offsets = Offsets,
+        data_sent = DataSent
     } = Conn,
     StreamId,
     Chunk,
@@ -854,18 +1013,23 @@ send_stream_packet(
         #{application => #quic_entry{frames = [Frame], keys = Keys, pn = Pn}}, ServerScid, Scid
     ),
     _ = roadrunner_quic_socket:send(Socket, Host, Port, Datagram),
-    Conn#conn{send_pn = Pn + 1, send_offsets = Offsets#{StreamId => Offset + byte_size(Chunk)}}.
+    Conn#conn{
+        send_pn = Pn + 1,
+        send_offsets = Offsets#{StreamId => Offset + byte_size(Chunk)},
+        data_sent = DataSent + byte_size(Chunk)
+    }.
 
 %% Send a single non-STREAM frame (RESET_STREAM, STOP_SENDING) on a 1-RTT
 %% packet. A RESET_STREAM marker (no final size) is resolved here against the
 %% bytes already sent on the stream, since a final size below the largest sent
-%% offset is a FINAL_SIZE_ERROR (RFC 9000 §4.5).
+%% offset is a FINAL_SIZE_ERROR (RFC 9000 §4.5); the data still waiting for
+%% credit on the stream is never sent.
 -spec send_frame(
     #conn{}, {reset_stream, non_neg_integer(), non_neg_integer()} | roadrunner_quic_frame:frame()
 ) -> #conn{}.
 send_frame(#conn{send_offsets = Offsets} = Conn, {reset_stream, StreamId, ErrorCode}) ->
     FinalSize = maps:get(StreamId, Offsets, 0),
-    send_wire_frame(Conn, {reset_stream, StreamId, ErrorCode, FinalSize});
+    send_wire_frame(drop_sends(StreamId, Conn), {reset_stream, StreamId, ErrorCode, FinalSize});
 send_frame(Conn, Frame) ->
     send_wire_frame(Conn, Frame).
 
@@ -898,14 +1062,15 @@ send_packet(
     Conn#conn{send_pn = Pn + 1}.
 
 %% Decrypt a 1-RTT datagram and route its STREAM frames through per-stream
-%% reassembly, delivering deliverable bytes to the owner.
+%% reassembly, delivering deliverable bytes to the owner; the credit its
+%% MAX_DATA and MAX_STREAM_DATA grant goes to the sends waiting for it.
 -spec handle_app_datagram(#conn{}, binary()) -> #conn{}.
 handle_app_datagram(#conn{app_server_keys = Keys, scid = Scid} = Conn, Datagram) ->
     Outcomes = roadrunner_quic_recv:datagram(
         Datagram, byte_size(Scid), #{application => Keys}, #{}
     ),
     ok = maybe_stateless_reset(Outcomes, Datagram, Conn),
-    maybe_send_ack(lists:foldl(fun handle_app_packet/2, Conn, Outcomes)).
+    send_queued(maybe_send_ack(lists:foldl(fun handle_app_packet/2, Conn, Outcomes))).
 
 %% Whether `Datagram` carries the FIN of the stream `drop_fin/2` named.
 -spec carries_dropped_fin(#conn{}, binary()) -> boolean().
@@ -996,10 +1161,16 @@ handle_app_frame({reset_stream, StreamId, ErrorCode, _FinalSize}, #conn{owner = 
     Conn;
 handle_app_frame({stop_sending, StreamId, ErrorCode}, #conn{owner = Owner} = Conn) ->
     _ = Owner ! {quic_test_stop_sending, self(), StreamId, ErrorCode},
-    Conn;
+    drop_sends(StreamId, Conn);
 handle_app_frame({connection_close, _Domain, ErrorCode, _FrameType, _Reason}, Conn) ->
     _ = Conn#conn.owner ! {quic_test_closed, self(), ErrorCode},
-    Conn;
+    close_sends(Conn);
+%% The server's credit for the client's sends only grows: a MAX_DATA or
+%% MAX_STREAM_DATA that would lower a limit is ignored (RFC 9000 §4.1).
+handle_app_frame({max_data, Max}, #conn{max_data = MaxData} = Conn) ->
+    Conn#conn{max_data = max(MaxData, Max)};
+handle_app_frame({max_stream_data, StreamId, Max}, #conn{max_stream_data = Limits} = Conn) ->
+    Conn#conn{max_stream_data = Limits#{StreamId => max(stream_limit(StreamId, Conn), Max)}};
 handle_app_frame({max_streams, Type, Max}, #conn{max_streams_events = true} = Conn) ->
     _ = Conn#conn.owner ! {quic_test_max_streams, self(), Type, Max},
     Conn;

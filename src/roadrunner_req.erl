@@ -450,7 +450,8 @@ body-buffering modes:
   `Req` is returned as-is.
 - **manual**: the conn parked the body on the socket (on HTTP/2 and
   HTTP/3, the stream holds what has arrived, its flow-control credit
-  given back only as the handler reads). This drains it and returns the bytes. The returned `Req2` carries the updated
+  given back as the handler reads, and on HTTP/3 also as it waits on
+  bytes it cannot read yet). This drains it and returns the bytes. The returned `Req2` carries the updated
   body-read state — to enable keep-alive on the same connection in
   manual mode, hand `Req2` back as the second element of the handler's
   `{Response, Req2}` return so the conn can drain whatever the handler
