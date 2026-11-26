@@ -355,9 +355,10 @@ Optional middleware and timing knobs (durations in milliseconds):
   share the port, the kernel spreads new connections over them, and
   each socket has acceptors of its own, so taking connections in does
   not queue on one socket. Sharing needs a kernel that spreads a port's
-  connections over its sockets: Linux (`SO_REUSEPORT`), and FreeBSD with
-  the default `inet` backend (`SO_REUSEPORT_LB`). Elsewhere, and for a
-  Unix domain socket, the listener binds one socket whatever the value.
+  connections over its sockets: Linux (`SO_REUSEPORT`; with the `socket`
+  backend only from OTP 29), and FreeBSD with the default `inet` backend
+  (`SO_REUSEPORT_LB`). Elsewhere, and for a Unix domain socket, the
+  listener binds one socket whatever the value.
   `auto` binds one socket per acceptor, except on a TLS listener without
   `proxy_protocol`, which binds one: OTP keeps the TLS session cache and
   the TLS 1.3 ticket keys per listen socket, so with several sockets a
@@ -1802,14 +1803,23 @@ start_tcp(Port, Opts, Protocols, ProtoOpts) ->
 
 %% The socket option that lets the listener's sockets share its port and
 %% spreads new connections over them, or `none` where the kernel does not:
-%% `SO_REUSEPORT` does on Linux, with either `inet_backend`, and
-%% `SO_REUSEPORT_LB` (`reuseport_lb`, which the `socket` backend does not
-%% take) on FreeBSD. Exported for a direct test of each system.
+%% `SO_REUSEPORT` does on Linux, with the `inet` backend and with the
+%% `socket` one from OTP 29 (before it, `gen_tcp` on that backend raises
+%% `badarg` for `reuseport`), and `SO_REUSEPORT_LB` (`reuseport_lb`, which
+%% the `socket` backend does not take) on FreeBSD. Only the clauses the
+%% running OTP can use are compiled. Exported for a direct test of each
+%% system.
 -doc false.
 -spec port_sharing({atom(), atom()}, inet | socket) -> port_sharing().
+-if(?OTP_RELEASE >= 29).
 port_sharing({unix, linux}, _Backend) -> {reuseport, true};
 port_sharing({unix, freebsd}, inet) -> {reuseport_lb, true};
 port_sharing(_OsType, _Backend) -> none.
+-else.
+port_sharing({unix, linux}, inet) -> {reuseport, true};
+port_sharing({unix, freebsd}, inet) -> {reuseport_lb, true};
+port_sharing(_OsType, _Backend) -> none.
+-endif.
 
 %% The sharing and socket count a listener ends up with: the port check
 %% before sharing (`port_free/2`) binds through the `socket` module, so an

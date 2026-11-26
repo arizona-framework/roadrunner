@@ -660,9 +660,10 @@ connection, while the rest are fast.
 The kernel spreads new connections over them, and each socket has its
 own queue and its own acceptors, so connections are taken in parallel.
 That needs a kernel that spreads a port's connections over the sockets
-bound to it: Linux (`SO_REUSEPORT`), and FreeBSD with the default
-`inet` backend (`SO_REUSEPORT_LB`). Elsewhere, and for a Unix domain
-socket, a listener binds one socket whatever the setting.
+bound to it: Linux (`SO_REUSEPORT`; with the `socket` backend only from
+OTP 29), and FreeBSD with the default `inet` backend (`SO_REUSEPORT_LB`).
+Elsewhere, and for a Unix domain socket, a listener binds one socket
+whatever the setting.
 
 The default, `auto`, binds one socket per acceptor (`num_acceptors`),
 except on a TLS listener without `proxy_protocol`, which binds one. OTP

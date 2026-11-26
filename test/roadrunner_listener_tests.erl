@@ -103,15 +103,23 @@ listener_honors_num_acceptors_opt_test() ->
     ok = roadrunner_listener:stop(listener_test_pool).
 
 listener_port_sharing_test() ->
-    %% `SO_REUSEPORT` spreads a port's connections on Linux with either
-    %% backend, `SO_REUSEPORT_LB` on FreeBSD with the `inet` one only.
+    %% `SO_REUSEPORT` spreads a port's connections on Linux with the `inet`
+    %% backend, and with the `socket` one from OTP 29 (its `gen_tcp` raises
+    %% `badarg` for `reuseport` before); `SO_REUSEPORT_LB` on FreeBSD with
+    %% the `inet` one only.
     Sharing = fun roadrunner_listener:port_sharing/2,
     ?assertEqual({reuseport, true}, Sharing({unix, linux}, inet)),
-    ?assertEqual({reuseport, true}, Sharing({unix, linux}, socket)),
+    ?assertEqual(socket_backend_sharing(), Sharing({unix, linux}, socket)),
     ?assertEqual({reuseport_lb, true}, Sharing({unix, freebsd}, inet)),
     ?assertEqual(none, Sharing({unix, freebsd}, socket)),
     ?assertEqual(none, Sharing({unix, darwin}, inet)),
     ?assertEqual(none, Sharing({win32, nt}, inet)).
+
+-if(?OTP_RELEASE >= 29).
+socket_backend_sharing() -> {reuseport, true}.
+-else.
+socket_backend_sharing() -> none.
+-endif.
 
 listener_checked_sharing_test() ->
     %% Sharing needs the `socket` module the port check binds through; a

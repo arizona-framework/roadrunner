@@ -13,6 +13,12 @@ too.
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
+-if(?OTP_RELEASE >= 29).
+-define(SOCKET_BACKEND_SOCKETS, 2).
+-else.
+-define(SOCKET_BACKEND_SOCKETS, 1).
+-endif.
+
 -export([suite/0, all/0, init_per_testcase/2, end_per_testcase/2]).
 -export([
     every_socket_is_served/1,
@@ -179,15 +185,17 @@ tls_binds_one_socket_by_default(_Config) ->
 
 the_socket_backend_shares_the_port(_Config) ->
     %% `SO_REUSEPORT` through `reuseport`, which the `socket` backend takes
-    %% as the `inet` one does, so a node running `gen_tcp` on it still
-    %% starts the listener and serves every socket.
+    %% from OTP 29 as the `inet` one does; before it, that backend's
+    %% `gen_tcp` raises `badarg` for `reuseport`, so the listener binds one
+    %% socket. Either way, a node running `gen_tcp` on it starts the
+    %% listener and serves every socket.
     ok = persistent_term:put({kernel, inet_backend}, socket),
     ok = application:set_env(kernel, inet_backend, socket),
     process_flag(trap_exit, true),
     {ok, Pid} = roadrunner_listener:start_link(
         rr_sockets_a, opts(#{num_acceptors => 1, num_listen_sockets => 2})
     ),
-    ?assertEqual(2, length(listen_sockets(Pid))),
+    ?assertEqual(?SOCKET_BACKEND_SOCKETS, length(listen_sockets(Pid))),
     Port = roadrunner_listener:port(rr_sockets_a),
     _ = [?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, request(Port)) || _ <- lists:seq(1, 10)],
     ok = roadrunner_listener:stop(rr_sockets_a).
